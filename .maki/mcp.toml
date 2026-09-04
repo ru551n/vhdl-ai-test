@@ -1,0 +1,40 @@
+# Maki project MCP configuration for vhdl-ai-test.
+#
+# Adapted from ~/git/vhdl-skills/integrations/maki/mcp.toml, pointed at the
+# already-cloned-and-synced local checkouts of each MCP server (uv run
+# --directory <repo>) instead of `uvx --from git+https://...`, so servers
+# start from a local, already-`uv sync`'d venv without a GitHub fetch on
+# every launch. Swap back to the git+https form if these local checkouts
+# move/disappear.
+#
+# `timeout` is the per-tool-call timeout in milliseconds (Maki allows
+# 1..=300000).
+
+defer_tools = 10
+
+[mcp.vhdl-rag-mcp]
+command = ["uv", "--directory", "/home/sebbe/vhdl-rag-mcp", "run", "vhdl-rag-mcp"]
+timeout = 300000
+enabled = true
+
+[mcp.vunit-mcp]
+command = ["uv", "--directory", "/home/sebbe/git/vunit-mcp", "run", "vunit-mcp"]
+# Project under test (this repo), not the vunit-mcp server's own checkout.
+# VUNIT_MCP_PYTHON: this project's run.py imports tsfpga.module.get_modules(),
+# which is not installed in vunit-mcp's own server venv -- point at the
+# interpreter that actually has both tsfpga and vunit-hdl (see mcp_issues_log.md).
+environment = { VUNIT_MCP_PROJECT_DIR = "/home/sebbe/git/vhdl-ai-test", VUNIT_MCP_TIMEOUT = "240", VUNIT_MCP_PYTHON = "/usr/bin/python3" }
+timeout = 300000
+enabled = true
+
+[mcp.waver-mcp]
+command = ["uv", "--directory", "/home/sebbe/git/waver-mcp", "run", "waver-mcp"]
+timeout = 300000
+enabled = true
+
+[mcp.tsfpga-mcp]
+command = ["uv", "--directory", "/home/sebbe/git/tsfpga-mcp", "run", "tsfpga-mcp"]
+# Local GHDL/yosys toolchain locations (see ~sebbe memory tsfpga_mcp.md).
+environment = { TSFPGA_MCP_GHDL_PLUGIN = "/home/sebbe/git/ghdl-yosys-plugin/ghdl.so" }
+timeout = 300000
+enabled = true
