@@ -12,8 +12,8 @@
 
 defer_tools = 10
 
-[mcp.vhdl-rag-mcp]
-command = ["uv", "--directory", "/home/sebbe/vhdl-rag-mcp", "run", "vhdl-rag-mcp"]
+[mcp.corvidex-mcp]
+command = ["uv", "--directory", "/home/sebbe/corvidex-mcp", "run", "corvidex-mcp"]
 timeout = 300000
 enabled = true
 
@@ -27,8 +27,8 @@ environment = { VUNIT_MCP_PROJECT_DIR = "/home/sebbe/git/vhdl-ai-test", VUNIT_MC
 timeout = 300000
 enabled = true
 
-[mcp.waver-mcp]
-command = ["uv", "--directory", "/home/sebbe/git/waver-mcp", "run", "waver-mcp"]
+[mcp.peeper-mcp]
+command = ["uv", "--directory", "/home/sebbe/git/peeper-mcp", "run", "peeper-mcp"]
 timeout = 300000
 enabled = true
 
