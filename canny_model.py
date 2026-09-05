@@ -50,7 +50,7 @@ def sliding_window_3x3(
     `border_in`: incoming per-position border bit, same raster order as
     `values`. `None` models `g_user_width=1` (first instance in the chain,
     no border marked yet upstream) -> treated as constant 0 for all 9 taps,
-    per `modules/canny_window3x3/doc/canny_window3x3_req.md`.
+    per `modules/canny/doc/canny_window3x3_req.md`.
 
     Out-of-bounds taps (before row 0 / after the last row / before col 0 /
     after the last col) read as 0, for both `values` and `border_in` — a

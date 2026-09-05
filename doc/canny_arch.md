@@ -86,13 +86,13 @@ reported with `TDATA(0) = '0'`.
 |---|---|---|---|
 | `axi_stream_join` | Generic 2-input AXI-Stream rendezvous: emits a joined transfer only when both inputs are valid, applying combined backpressure to both. Used to resynchronize the Sobel magnitude/direction forks before NMS without assuming equal per-branch latency. | new, generic (not canny-specific) | `modules/axi_stream_join/src/axi_stream_join.vhd` |
 | `axi_stream_fifo` | Elastic buffering for the Sobel direction-sideband fork | reuse, unmodified | `hdl-modules/modules/axi_stream/src/axi_stream_fifo.vhd` |
-| `canny_window3x3` | Generic AXI-Stream 3x3 sliding-window generator over a raster stream: 2 elastic line-buffer FIFOs (reusing hdl-modules `fifo.fifo_wrapper`, the same primitive `axi_stream_fifo` wraps) + 2-deep column taps, all gated by `tready`/`tvalid` so a stall never drops or duplicates a pixel. Generic over `data_width`; `tuser(0)` (SOF) passes through untouched; `tuser(1)` (border) is dilated across all 9 taps — see "Growing border" below. | new, reused 4x (W1 raw, W2 smoothed, W3 magnitude, W4 classification) | `modules/canny_window3x3/src/canny_window3x3.vhd` |
-| `canny_gaussian3x3` | 3x3 approximate Gaussian smoothing (`[1,2,1;2,4,2;1,2,1]/16`) | new | `modules/canny_gaussian3x3/src/canny_gaussian3x3.vhd` |
-| `canny_sobel3x3` | 3x3 Sobel gradient, L1 magnitude (abs(Gx)+abs(Gy)), 4-sector direction; forks into two AXI-Stream outputs (magnitude, direction) from one accepted input, gated so both forks advance together | new | `modules/canny_sobel3x3/src/canny_sobel3x3.vhd` |
-| `canny_nms` | Non-maximum suppression along the gradient sector; input is the `axi_stream_join` of (windowed magnitude, direction) | new | `modules/canny_nms/src/canny_nms.vhd` |
-| `canny_threshold` | Double-threshold classification (none/weak/strong) | new | `modules/canny_threshold/src/canny_threshold.vhd` |
-| `canny_hysteresis` | Local (3x3) hysteresis: promote weak pixels adjacent to a strong pixel | new | `modules/canny_hysteresis/src/canny_hysteresis.vhd` |
-| `canny_top` | Structural top: flat AXI4-Stream ports, wires the blocks below in a single raster-scan pipeline | new | `modules/canny_top/src/canny_top.vhd` |
+| `canny_window3x3` | Generic AXI-Stream 3x3 sliding-window generator over a raster stream: 2 elastic line-buffer FIFOs (reusing hdl-modules `fifo.fifo_wrapper`, the same primitive `axi_stream_fifo` wraps) + 2-deep column taps, all gated by `tready`/`tvalid` so a stall never drops or duplicates a pixel. Generic over `data_width`; `tuser(0)` (SOF) passes through untouched; `tuser(1)` (border) is dilated across all 9 taps — see "Growing border" below. | new, reused 4x (W1 raw, W2 smoothed, W3 magnitude, W4 classification) | `modules/canny/src/canny_window3x3.vhd` |
+| `canny_gaussian3x3` | 3x3 approximate Gaussian smoothing (`[1,2,1;2,4,2;1,2,1]/16`) | new | `modules/canny/src/canny_gaussian3x3.vhd` |
+| `canny_sobel3x3` | 3x3 Sobel gradient, L1 magnitude (abs(Gx)+abs(Gy)), 4-sector direction; forks into two AXI-Stream outputs (magnitude, direction) from one accepted input, gated so both forks advance together | new | `modules/canny/src/canny_sobel3x3.vhd` |
+| `canny_nms` | Non-maximum suppression along the gradient sector; input is the `axi_stream_join` of (windowed magnitude, direction) | new | `modules/canny/src/canny_nms.vhd` |
+| `canny_threshold` | Double-threshold classification (none/weak/strong) | new | `modules/canny/src/canny_threshold.vhd` |
+| `canny_hysteresis` | Local (3x3) hysteresis: promote weak pixels adjacent to a strong pixel | new | `modules/canny/src/canny_hysteresis.vhd` |
+| `canny_top` | Structural top: flat AXI4-Stream ports, wires the blocks below in a single raster-scan pipeline | new | `modules/canny/src/canny_top.vhd` |
 
 `canny_delay` (rev 1) is retired: it assumed fixed, equal per-branch
 latency to keep the Sobel direction sideband aligned with the magnitude
@@ -308,7 +308,7 @@ Consequences of this choice, made explicit here per that same policy:
   `tvalid` independently of `tready`; a held-low `tready` is legal
   backpressure, not a deadlock).
 - The full pipeline gets a self-checking VUnit integration test under
-  `modules/canny_top/test/`, comparing against a golden Python model
+  `modules/canny/test/`, comparing against a golden Python model
   implementing the identical integer approximations described above, run
   with randomized backpressure on `m_axis_tready` and randomized gaps on
   `s_axis_tvalid`.
