@@ -28,64 +28,55 @@ end entity tb_axi_stream_join;
 
 architecture tb of tb_axi_stream_join is
 
-  constant c_data_width_a : positive := 8;
-  constant c_data_width_b : positive := 6;
-  constant c_user_width   : positive := 2;
+  constant data_width_a : positive := 8;
+  constant data_width_b : positive := 6;
+  constant user_width   : positive := 2;
 
-  constant c_clk_period : time := 10 ns;
+  constant clock_period : time := 10 ns;
 
-  signal clk   : std_logic := '0';
-  signal rst_n : std_logic := '0';
+  signal clk : std_logic := '0';
 
   signal s_axis_a_tvalid, s_axis_a_tready, s_axis_a_tlast : std_logic;
-  signal s_axis_a_tdata : std_logic_vector(c_data_width_a - 1 downto 0);
-  signal s_axis_a_tuser : std_logic_vector(c_user_width - 1 downto 0);
+  signal s_axis_a_tdata : std_logic_vector(data_width_a - 1 downto 0);
+  signal s_axis_a_tuser : std_logic_vector(user_width - 1 downto 0);
 
   signal s_axis_b_tvalid, s_axis_b_tready, s_axis_b_tlast : std_logic;
-  signal s_axis_b_tdata : std_logic_vector(c_data_width_b - 1 downto 0);
-  signal s_axis_b_tuser : std_logic_vector(c_user_width - 1 downto 0);
+  signal s_axis_b_tdata : std_logic_vector(data_width_b - 1 downto 0);
+  signal s_axis_b_tuser : std_logic_vector(user_width - 1 downto 0);
 
   signal m_axis_tvalid, m_axis_tready, m_axis_tlast : std_logic;
-  signal m_axis_tdata : std_logic_vector(c_data_width_a + c_data_width_b - 1 downto 0);
-  signal m_axis_tuser : std_logic_vector(c_user_width - 1 downto 0);
+  signal m_axis_tdata : std_logic_vector(data_width_a + data_width_b - 1 downto 0);
+  signal m_axis_tuser : std_logic_vector(user_width - 1 downto 0);
 
-  constant c_stall_config : stall_config_t := new_stall_config(
+  constant stall_config : stall_config_t := new_stall_config(
     stall_probability => real(stall_probability_percent) / 100.0,
     min_stall_cycles   => 1,
     max_stall_cycles   => 4
   );
 
   constant axi_master_a : axi_stream_master_t := new_axi_stream_master(
-    data_length  => c_data_width_a,
-    user_length  => c_user_width,
-    stall_config => c_stall_config,
+    data_length  => data_width_a,
+    user_length  => user_width,
+    stall_config => stall_config,
     logger       => get_logger("axi_master_a")
   );
   constant axi_master_b : axi_stream_master_t := new_axi_stream_master(
-    data_length  => c_data_width_b,
-    user_length  => c_user_width,
-    stall_config => c_stall_config,
+    data_length  => data_width_b,
+    user_length  => user_width,
+    stall_config => stall_config,
     logger       => get_logger("axi_master_b")
   );
   constant axi_slave_result : axi_stream_slave_t := new_axi_stream_slave(
-    data_length  => c_data_width_a + c_data_width_b,
-    user_length  => c_user_width,
-    stall_config => c_stall_config,
+    data_length  => data_width_a + data_width_b,
+    user_length  => user_width,
+    stall_config => stall_config,
     logger       => get_logger("axi_slave_result")
   );
 
 begin
 
   test_runner_watchdog(runner, 2 ms);
-  clk <= not clk after c_clk_period / 2;
-
-  rst_n_gen : process
-  begin
-    rst_n <= '0';
-    wait for 3 * c_clk_period;
-    rst_n <= '1';
-    wait;
-  end process;
+  clk <= not clk after clock_period / 2;
 
 
   ------------------------------------------------------------------------------
@@ -105,16 +96,16 @@ begin
       variable a_border, b_border : std_logic;
       variable sof, is_last       : std_logic;
       variable expected_data      : std_logic_vector(
-        c_data_width_a + c_data_width_b - 1 downto 0
+        data_width_a + data_width_b - 1 downto 0
       );
-      variable expected_user : std_logic_vector(c_user_width - 1 downto 0);
+      variable expected_user : std_logic_vector(user_width - 1 downto 0);
       variable start_time    : time;
     begin
       start_time := now;
 
       for word_idx in 0 to num_words - 1 loop
-        a_word   := rnd.RandInt(0, 2 ** c_data_width_a - 1);
-        b_word   := rnd.RandInt(0, 2 ** c_data_width_b - 1);
+        a_word   := rnd.RandInt(0, 2 ** data_width_a - 1);
+        b_word   := rnd.RandInt(0, 2 ** data_width_b - 1);
         -- OSVVM's RandSlv(Size) returns a (1 to Size)-ranged vector, not
         -- (Size - 1 downto 0), so index with (1) not (0).
         a_border := rnd.RandSlv(1)(1);
@@ -133,8 +124,8 @@ begin
         end if;
 
         expected_data := (
-          std_logic_vector(to_unsigned(a_word, c_data_width_a))
-          & std_logic_vector(to_unsigned(b_word, c_data_width_b))
+          std_logic_vector(to_unsigned(a_word, data_width_a))
+          & std_logic_vector(to_unsigned(b_word, data_width_b))
         );
         -- Leftmost element of the actual maps to the formal's high (MSB)
         -- index regardless of the literal's own ascending/descending index
@@ -145,14 +136,14 @@ begin
         push_axi_stream(
           net        => net,
           axi_stream => axi_master_a,
-          tdata      => std_logic_vector(to_unsigned(a_word, c_data_width_a)),
+          tdata      => std_logic_vector(to_unsigned(a_word, data_width_a)),
           tlast      => is_last,
           tuser      => a_border & sof
         );
         push_axi_stream(
           net        => net,
           axi_stream => axi_master_b,
-          tdata      => std_logic_vector(to_unsigned(b_word, c_data_width_b)),
+          tdata      => std_logic_vector(to_unsigned(b_word, data_width_b)),
           tlast      => is_last,
           tuser      => b_border & sof
         );
@@ -173,7 +164,7 @@ begin
         -- essentially num_words cycles (small margin for the initial
         -- reset/startup latency only).
         check_relation(
-          (now - start_time) < (num_words + 5) * c_clk_period,
+          (now - start_time) < (num_words + 5) * clock_period,
           "join did not sustain full throughput at zero stall"
         );
       end if;
@@ -184,8 +175,6 @@ begin
   begin
     test_runner_setup(runner, runner_cfg);
     rnd.InitSeed(get_string_seed(runner_cfg));
-
-    wait until rst_n = '1' and rising_edge(clk);
 
     if run("test_random_data") then
       run_join_test(num_words => 300);
@@ -218,22 +207,22 @@ begin
         push_axi_stream(
           net        => net,
           axi_stream => axi_master_a,
-          tdata      => std_logic_vector(to_unsigned(combo, c_data_width_a)),
+          tdata      => std_logic_vector(to_unsigned(combo, data_width_a)),
           tlast      => is_last,
           tuser      => a_border & sof
         );
         push_axi_stream(
           net        => net,
           axi_stream => axi_master_b,
-          tdata      => std_logic_vector(to_unsigned(combo, c_data_width_b)),
+          tdata      => std_logic_vector(to_unsigned(combo, data_width_b)),
           tlast      => is_last,
           tuser      => b_border & sof
         );
         check_axi_stream(
           net        => net,
           axi_stream => axi_slave_result,
-          expected   => std_logic_vector(to_unsigned(combo, c_data_width_a))
-                        & std_logic_vector(to_unsigned(combo, c_data_width_b)),
+          expected   => std_logic_vector(to_unsigned(combo, data_width_a))
+                        & std_logic_vector(to_unsigned(combo, data_width_b)),
           tlast      => is_last,
           tuser      => (a_border or b_border) & sof,
           msg        => "combo=" & to_string(combo)
@@ -290,12 +279,11 @@ begin
   ------------------------------------------------------------------------------
   dut : entity work.axi_stream_join
     generic map (
-      g_data_width_a => c_data_width_a,
-      g_data_width_b => c_data_width_b
+      data_width_a => data_width_a,
+      data_width_b => data_width_b
     )
     port map (
-      clk   => clk,
-      rst_n => rst_n,
+      clk => clk,
 
       s_axis_a_tvalid => s_axis_a_tvalid,
       s_axis_a_tready => s_axis_a_tready,

@@ -10,22 +10,21 @@ to both inputs together. Not canny-specific.
 
 ## Interface (copied from the requirement's structural section)
 
-Generics: `g_data_width_a : positive`, `g_data_width_b : positive`.
+Generics: `data_width_a : positive`, `data_width_b : positive`.
 
-Ports: `clk`, `rst_n`, `s_axis_a_{tvalid,tready,tdata,tuser,tlast}`,
+Ports: `clk`, `s_axis_a_{tvalid,tready,tdata,tuser,tlast}`,
 `s_axis_b_{tvalid,tready,tdata,tuser,tlast}`,
 `m_axis_{tvalid,tready,tdata,tuser,tlast}` — `s_axis_a_tuser`/
 `s_axis_b_tuser`/`m_axis_tuser` are `std_logic_vector(1 downto 0)`
 (bit0=SOF, bit1=border) per the project's internal-link `tuser` convention
 (`doc/canny_arch.md`); `m_axis_tdata` width is
-`g_data_width_a + g_data_width_b`.
+`data_width_a + data_width_b`.
 
 ## Clock/reset behavior
 
-Single clock, synchronous active-low reset. No stateful elements are
-required for the join function itself (`handshake_merger` is purely
-combinational); `rst_n` is only used by the simulation-only consistency
-assertion's reporting path, not by any functional logic.
+Single clock, resetless. No stateful elements are required for the join
+function itself (`handshake_merger` is purely combinational); the module
+is purely combinational end-to-end, so no reset is needed.
 
 ## Architecture and dataflow
 
@@ -61,7 +60,7 @@ internally: `result_valid and result_ready`, i.e. `input_valid(0) and
 input_valid(1) and m_axis_tready`):
 
 - `m_axis_tdata <= s_axis_a_tdata & s_axis_b_tdata` (concatenation, `a` in
-  the upper `g_data_width_a` bits).
+  the upper `data_width_a` bits).
 - `m_axis_tuser(1) <= s_axis_a_tuser(1) or s_axis_b_tuser(1)` (border
   OR-reduction).
 - `m_axis_tuser(0) <= s_axis_a_tuser(0)`; `m_axis_tlast <= s_axis_a_tlast`

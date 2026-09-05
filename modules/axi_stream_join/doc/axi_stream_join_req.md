@@ -11,27 +11,26 @@ dependency on any canny-specific type or width.
 ## Generics
 | Generic | Type | Notes |
 |---|---|---|
-| `g_data_width_a` | positive | width of `s_axis_a_tdata` |
-| `g_data_width_b` | positive | width of `s_axis_b_tdata` |
+| `data_width_a` | positive | width of `s_axis_a_tdata` |
+| `data_width_b` | positive | width of `s_axis_b_tdata` |
 
 ## Ports
 | Port | Dir | Type |
 |---|---|---|
 | `clk` | in | std_logic |
-| `rst_n` | in | std_logic |
 | `s_axis_a_tvalid` | in | std_logic |
 | `s_axis_a_tready` | out | std_logic |
-| `s_axis_a_tdata` | in | std_logic_vector(g_data_width_a-1 downto 0) |
+| `s_axis_a_tdata` | in | std_logic_vector(data_width_a-1 downto 0) |
 | `s_axis_a_tuser` | in | std_logic_vector(1 downto 0) — bit 0 = SOF, bit 1 = border |
 | `s_axis_a_tlast` | in | std_logic — EOL |
 | `s_axis_b_tvalid` | in | std_logic |
 | `s_axis_b_tready` | out | std_logic |
-| `s_axis_b_tdata` | in | std_logic_vector(g_data_width_b-1 downto 0) |
+| `s_axis_b_tdata` | in | std_logic_vector(data_width_b-1 downto 0) |
 | `s_axis_b_tuser` | in | std_logic_vector(1 downto 0) — bit 0 = SOF, bit 1 = border |
 | `s_axis_b_tlast` | in | std_logic — EOL |
 | `m_axis_tvalid` | out | std_logic |
 | `m_axis_tready` | in | std_logic |
-| `m_axis_tdata` | out | std_logic_vector(g_data_width_a+g_data_width_b-1 downto 0) — `s_axis_a_tdata` in the upper `g_data_width_a` bits, `s_axis_b_tdata` in the lower `g_data_width_b` bits |
+| `m_axis_tdata` | out | std_logic_vector(data_width_a+data_width_b-1 downto 0) — `s_axis_a_tdata` in the upper `data_width_a` bits, `s_axis_b_tdata` in the lower `data_width_b` bits |
 | `m_axis_tuser` | out | std_logic_vector(1 downto 0) — see Functional Description |
 | `m_axis_tlast` | out | std_logic — see Functional Description |
 
@@ -49,10 +48,10 @@ No internal register/pipeline stage — combinational pass-through gated by
 zero-latency contract.
 
 ## Clock/reset
-Single clock, synchronous active-low reset. No stateful elements besides
-what `handshake_merger` itself requires (none, per its own datasheet — it
-is purely combinational); `rst_n` is only needed for the equality-check
-assertion's reporting, not for functional logic.
+Single clock, resetless. No stateful elements besides what
+`handshake_merger` itself requires (none, per its own datasheet — it is
+purely combinational); the module is purely combinational end-to-end, so
+no reset is needed.
 
 <!-- functional-spec: hand-owned below this line -->
 

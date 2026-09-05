@@ -10,42 +10,40 @@ resynchronization primitive.
 
 ## Entity and architecture
 
-Entity `axi_stream_join`, architecture `rtl`.
+Entity `axi_stream_join`, architecture `a`.
 
 ## Generics
 
 | Name | Type | Default | Meaning | Constraints |
 |---|---|---|---|---|
-| `g_data_width_a` | positive | — | width of `s_axis_a_tdata` | > 0 |
-| `g_data_width_b` | positive | — | width of `s_axis_b_tdata` | > 0 |
+| `data_width_a` | positive | — | width of `s_axis_a_tdata` | > 0 |
+| `data_width_b` | positive | — | width of `s_axis_b_tdata` | > 0 |
 
 ## Ports
 
 | Name | Mode | Type/width | Description |
 |---|---|---|---|
 | `clk` | in | std_logic | single clock domain |
-| `rst_n` | in | std_logic | synchronous active-low reset |
 | `s_axis_a_tvalid` | in | std_logic | input A valid |
 | `s_axis_a_tready` | out | std_logic | backpressure to input A's producer |
-| `s_axis_a_tdata` | in | std_logic_vector(g_data_width_a-1 downto 0) | input A payload |
+| `s_axis_a_tdata` | in | std_logic_vector(data_width_a-1 downto 0) | input A payload |
 | `s_axis_a_tuser` | in | std_logic_vector(1 downto 0) | bit0=SOF, bit1=border |
 | `s_axis_a_tlast` | in | std_logic | end-of-line |
 | `s_axis_b_tvalid` | in | std_logic | input B valid |
 | `s_axis_b_tready` | out | std_logic | backpressure to input B's producer |
-| `s_axis_b_tdata` | in | std_logic_vector(g_data_width_b-1 downto 0) | input B payload |
+| `s_axis_b_tdata` | in | std_logic_vector(data_width_b-1 downto 0) | input B payload |
 | `s_axis_b_tuser` | in | std_logic_vector(1 downto 0) | bit0=SOF, bit1=border |
 | `s_axis_b_tlast` | in | std_logic | end-of-line |
 | `m_axis_tvalid` | out | std_logic | joined output valid |
 | `m_axis_tready` | in | std_logic | backpressure from consumer |
-| `m_axis_tdata` | out | std_logic_vector(g_data_width_a+g_data_width_b-1 downto 0) | `s_axis_a_tdata` in upper bits, `s_axis_b_tdata` in lower bits |
+| `m_axis_tdata` | out | std_logic_vector(data_width_a+data_width_b-1 downto 0) | `s_axis_a_tdata` in upper bits, `s_axis_b_tdata` in lower bits |
 | `m_axis_tuser` | out | std_logic_vector(1 downto 0) | bit0=SOF (from A), bit1=border (A or B) |
 | `m_axis_tlast` | out | std_logic | end-of-line (from A) |
 
 ## Clocking and reset
 
-Single clock (`clk`), synchronous active-low reset (`rst_n`). No functional
-state is reset (the join is purely combinational); `rst_n` is only wired
-for the simulation-only consistency assertion's own bookkeeping.
+Single clock (`clk`), resetless. The join is purely combinational
+end-to-end, so no reset is needed.
 
 ## Interfaces/protocols
 

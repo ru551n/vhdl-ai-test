@@ -8,34 +8,33 @@ library common;
 -- modules/axi_stream_join/doc/axi_stream_join_proposal.md.
 entity axi_stream_join is
   generic (
-    g_data_width_a : positive;
-    g_data_width_b : positive
+    data_width_a : positive;
+    data_width_b : positive
   );
   port (
-    clk   : in std_logic;
-    rst_n : in std_logic;
+    clk : in std_logic;
 
     s_axis_a_tvalid : in  std_logic;
     s_axis_a_tready : out std_logic;
-    s_axis_a_tdata  : in  std_logic_vector(g_data_width_a - 1 downto 0);
+    s_axis_a_tdata  : in  std_logic_vector(data_width_a - 1 downto 0);
     s_axis_a_tuser  : in  std_logic_vector(1 downto 0);
     s_axis_a_tlast  : in  std_logic;
 
     s_axis_b_tvalid : in  std_logic;
     s_axis_b_tready : out std_logic;
-    s_axis_b_tdata  : in  std_logic_vector(g_data_width_b - 1 downto 0);
+    s_axis_b_tdata  : in  std_logic_vector(data_width_b - 1 downto 0);
     s_axis_b_tuser  : in  std_logic_vector(1 downto 0);
     s_axis_b_tlast  : in  std_logic;
 
     m_axis_tvalid : out std_logic;
     m_axis_tready : in  std_logic;
-    m_axis_tdata  : out std_logic_vector(g_data_width_a + g_data_width_b - 1 downto 0);
+    m_axis_tdata  : out std_logic_vector(data_width_a + data_width_b - 1 downto 0);
     m_axis_tuser  : out std_logic_vector(1 downto 0);
     m_axis_tlast  : out std_logic
   );
 end entity axi_stream_join;
 
-architecture rtl of axi_stream_join is
+architecture a of axi_stream_join is
 
   signal input_ready : std_logic_vector(0 to 1);
   signal input_valid  : std_logic_vector(0 to 1);
@@ -82,4 +81,4 @@ begin
     end if;
   end process;
 
-end architecture rtl;
+end architecture a;
