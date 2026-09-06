@@ -21,11 +21,21 @@ Preferred workflow:
 `vharch` → `vhdesign` → `vhfill` → `vhtestgen` → `vhtestrun` → `vhdebug` as needed → `vhsynth` → `vhdoc`.
 Direct VUnit authoring/repair/migration (`run.py`, testbenches, VUnit 4→5) uses the `vhunit` skill with `shared/Vunit.md`.
 
+Environment:
+- Python dependencies come from `requirements.txt` (simulation: the `ru551n/vunit` fork, which carries the `--wave` flag that headless waveform recording needs) and `requirements-synth.txt` (netlist synthesis: released VUnit 4.7.1 — see that file for why the two cannot share one env). Only `hdl-modules` is a git submodule.
+- `.venv` runs `run.py`; `.venv-synth` runs `build_fpga.py`. vunit-mcp creates and activates `.venv` on its own. tsfpga-mcp would do the same, so point it at the synthesis env explicitly: `TSFPGA_MCP_PROJECT_PYTHON=<worktree>/.venv-synth/bin/python`, created with `python3 -m venv .venv-synth && .venv-synth/bin/pip install -r requirements-synth.txt`. Neither server installs a VUnit or tsfpga of its own, so every tool answer comes from these pins.
+- Enable the hook once per clone: `git config core.hooksPath .githooks` — it populates `hdl-modules` on every checkout and in every new worktree.
+
+Several agents on one clone:
+- give each agent its own `git worktree` and start its MCP servers with that worktree as cwd; `vunit_out`, the venvs, caches and the git index are then disjoint with no configuration
+- without that, concurrent `run.py` invocations clobber a shared `vunit_out` — set a per-agent `VUNIT_MCP_OUTPUT_DIR` instead
+- never run `git worktree add` against a branch another agent has checked out
+
 Tool policy:
 - prefer `corvidex-mcp` for semantic VHDL/docs/source retrieval
 - prefer `vunit-mcp` for compile, test discovery, regressions, logs and waveform paths
 - prefer `peeper-mcp` for waveform measurements/debug
-- prefer `tsfpga-mcp` for portable VHDL synthesis/resource summaries
+- prefer `tsfpga-mcp` for this project's netlist and top-level builds (`tsfpga_project_*`, which drive `build_fpga.py`); it no longer synthesizes standalone entities
 - fall back to local tools only when the relevant MCP server is unavailable, unhealthy, or unsuitable
 - never claim compile/test/waveform/synthesis/timing/power success without a real tool result
 

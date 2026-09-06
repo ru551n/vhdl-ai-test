@@ -1,0 +1,15 @@
+# Python dependencies for netlist synthesis (build_fpga.py, Yosys + GHDL).
+#
+# A separate environment from requirements.txt on purpose: it pins a
+# *different* VUnit. tsfpga uses VUnit internally only to assemble the source
+# file list for a netlist build (no testbench is ever run), and its build
+# runner targets VUnit's released API — against the 5.0.0.dev fork used for
+# simulation it dies with
+#   TestResult.__init__() missing 3 required keyword-only arguments
+# so the synthesis flow runs on released VUnit 4.7.1. This mirrors what CI's
+# `synthesize` job has always done (.github/workflows/ci.yml).
+#
+# Install:  python3 -m venv .venv-synth
+#           .venv-synth/bin/pip install -r requirements-synth.txt
+vunit_hdl==4.7.1
+tsfpga @ git+https://github.com/ru551n/tsfpga.git@6304052f52d13b2b9986cdfba5d0ee02eb2b16ff

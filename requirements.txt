@@ -1,0 +1,31 @@
+# Python dependencies for simulation (run.py) and the golden models.
+#
+# These used to be git submodules (`tsfpga/`, `vunit/`) installed with
+# `pip install ./vunit ./tsfpga`. They are ordinary Python distributions, so
+# pip is their natural home; pinning the exact commit here keeps the same
+# reproducibility the submodule pointers gave, without every `git clone` and
+# every `git worktree add` having to materialize ~39 MB of their history.
+#
+# `hdl-modules` is deliberately NOT here: it is a VHDL source library, not a
+# Python distribution (not on PyPI, no build backend), and stays a submodule.
+# See readme/AGENTS.md.
+#
+# Install:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#     (or)  uv venv && uv pip install -r requirements.txt
+
+# VUnit 5.0.0.dev12 + PR #1101 (the headless `--wave` flag: vcd on GHDL, fst
+# on NVC). The testbenches and vunit-mcp's waveform support are developed
+# against this fork; stock 5.0.0.dev12 (VUnit/vunit@bbbe9ca, the parent of
+# this commit) has no `--wave` and can only record through the viewer flags.
+vunit-hdl @ git+https://github.com/ru551n/vunit.git@6304bcf2c80b239077d44aeb52e37c8924047a68
+
+# tsfpga fork carrying the Yosys+GHDL netlist-build support
+# (`tsfpga.yosys.project`, `BuildProjectList`) that upstream has not released.
+# run.py only needs `tsfpga.module.get_modules()`; build_fpga.py needs the
+# Yosys half — but under a *different* VUnit, see requirements-synth.txt.
+tsfpga @ git+https://github.com/ru551n/tsfpga.git@6304052f52d13b2b9986cdfba5d0ee02eb2b16ff
+
+# Golden-model test suites (test_canny_model.py,
+# modules/cnn_accel/test_cnn_accel_model.py). Both models are pure stdlib by
+# design, so nothing numeric is pinned here.
+pytest

@@ -46,8 +46,8 @@ jobs:
         # model silently invalidates every simulation result downstream.
         #
         # Paths are listed explicitly rather than letting pytest discover from
-        # the repo root, which would descend into the tsfpga/vunit/hdl-modules
-        # submodules and try to collect their suites too.
+        # the repo root, which would descend into the hdl-modules submodule and
+        # try to collect its suite too.
         run: >
           python -m pytest -q
           test_canny_model.py
@@ -83,7 +83,8 @@ jobs:
     steps:
       # Must precede actions/checkout: the image is deliberately minimal and
       # ships neither git nor python, and checkout needs git for the
-      # submodules (tsfpga, hdl-modules, vunit).
+      # hdl-modules submodule (and pip needs it for the git-pinned
+      # requirements).
       - name: Install git and Python
         run: |
           apt-get update
@@ -100,14 +101,15 @@ jobs:
         run: git config --global --add safe.directory '*'
 
       - name: Install Python dependencies
-        # Both from the pinned submodules rather than PyPI, so the exact
-        # VUnit and tsfpga revisions are recorded in this repo's history.
-        # VUnit comes from the `vunit` submodule (ru551n's fork) because that
-        # is what the testbenches and vunit-mcp are developed against.
+        # Commit-pinned in requirements.txt rather than taken from PyPI, so
+        # the exact VUnit and tsfpga revisions stay recorded in this repo's
+        # history (they used to be submodules). VUnit is ru551n's fork,
+        # because that is what the testbenches and vunit-mcp are developed
+        # against.
         run: |
           python3 -m venv /opt/venv
           /opt/venv/bin/pip install --upgrade pip
-          /opt/venv/bin/pip install ./vunit ./tsfpga
+          /opt/venv/bin/pip install -r requirements.txt
 
       - name: Run VUnit regression
         env:
@@ -152,7 +154,7 @@ jobs:
         run: |
           python3 -m venv /opt/venv
           /opt/venv/bin/pip install --upgrade pip
-          /opt/venv/bin/pip install ./vunit ./tsfpga
+          /opt/venv/bin/pip install -r requirements.txt
 
       - name: Run the known-issue test on NVC
         env:
@@ -187,21 +189,15 @@ jobs:
         run: git config --global --add safe.directory '*'
 
       - name: Install Python dependencies
-        # The `tsfpga` submodule tracks ru551n/tsfpga, which carries the Yosys
-        # netlist-build support (`tsfpga.yosys.project`) that upstream has not
-        # released yet; `build_fpga.py` does not work without it.
-        #
-        # VUnit here is the *released* 4.7.1 from PyPI, NOT the `vunit`
-        # submodule used by the simulate jobs. tsfpga only uses VUnit
-        # internally to assemble the source-file list for a netlist build (no
-        # testbench is ever run), and its build runner targets VUnit's
-        # released API. Against the VUnit 5.0.0.dev in the submodule it dies
-        # with "TestResult.__init__() missing 3 required keyword-only
-        # arguments". Revisit once tsfpga supports the 5.x API.
+        # requirements-synth.txt, not requirements.txt: the pinned ru551n
+        # tsfpga carries the Yosys netlist-build support
+        # (`tsfpga.yosys.project`) that upstream has not released, but it must
+        # run against *released* VUnit 4.7.1 rather than the 5.0.0.dev fork
+        # the simulate jobs use. See the file's own comment for why.
         run: |
           python3 -m venv /opt/venv
           /opt/venv/bin/pip install --upgrade pip
-          /opt/venv/bin/pip install "vunit_hdl==4.7.1" ./tsfpga
+          /opt/venv/bin/pip install -r requirements-synth.txt
 
       - name: Check the toolchain is wired up
         # Fails loudly and early if a future image drops or moves the plugin,
