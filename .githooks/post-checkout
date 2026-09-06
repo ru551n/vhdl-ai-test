@@ -1,0 +1,25 @@
+#!/bin/sh
+# Populate the hdl-modules submodule automatically.
+#
+# `git worktree add` runs this hook in the new worktree (verified on git
+# 2.53), and it has no --recurse-submodules flag of its own -- without this,
+# every new worktree starts with an empty hdl-modules/ and run.py fails with
+# a confusing "no modules found" rather than "you forgot a git command".
+# Also covers plain `git checkout` across commits that move the submodule
+# pointer.
+#
+# Enable once per clone (hooks are not cloned, but ARE shared by all of a
+# repo's worktrees):
+#     git config core.hooksPath .githooks
+#
+# $3 is 1 for a branch checkout, 0 for a file checkout -- only the former can
+# change the submodule pointer.
+[ "$3" = "1" ] || exit 0
+
+# Cheap and idempotent: a no-op (~10 ms) when the submodule is already at the
+# recorded commit, ~1.4 s when it has to be cloned into a fresh worktree.
+git submodule update --init --recursive || {
+	echo "post-checkout: 'git submodule update --init --recursive' failed;" >&2
+	echo "hdl-modules is missing -- run.py and build_fpga.py will not work." >&2
+	exit 1
+}
