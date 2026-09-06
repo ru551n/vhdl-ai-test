@@ -159,8 +159,9 @@ class Module(BaseModule):
                     "g_max_row_tile_words": _MAX_ROW_TILE_WORDS,
                     "g_tile_channels": _TILE_CHANNELS,
                 },
-                # Baseline 2026-09 (Yosys v0.68 release): 23757 LUTs,
-                # 199 FFs, 0 BRAM, 8 DSP.
+                # Baseline 2026-09 (Yosys v0.68 release): 23950 LUTs,
+                # 199 FFs, 0 BRAM, 8 DSP. The D15 change (array payloads for the
+                # window record) added ~193 LUTs from the prior measured 23757.
                 #
                 # KNOWN BLOWUP, deliberately fenced rather than hidden: the
                 # proposal (section 7) budgets ~3 BRAM36 and modest logic for
@@ -193,30 +194,27 @@ class Module(BaseModule):
                     "g_tile_channels": _TILE_CHANNELS,
                     "g_weight_buffer_depth": _WEIGHT_BUFFER_DEPTH,
                 },
-                # TODO: re-baseline from CI (Yosys v0.68 *release*, per this
-                # file's own comment above on why CI's numbers -- not a
-                # local dev Yosys -- are the ones that count). Measured
-                # locally on Yosys v0.68+182 (dev) 2026-09: 2888 LUTs,
-                # 1119 FFs, 0 BRAM, 65 DSP. Limits below are set well above
-                # that (LUTs get the largest margin: this file's own
-                # window_gen/bias_requant/pool entries show local-dev vs
-                # CI-release LUT counts differing by 1.4x-2.7x; DSPs and
-                # BRAMs are hard-primitive counts and should not move
-                # between Yosys versions, so keep a tight margin there).
+                # Baseline 2026-09 (Yosys v0.68 release, CI run): 3474 LUTs,
+                # 1119 FFs, 0 BRAM, 65 DSP.
                 #
-                # DSP count is ~64 (g_pe_rows*g_pe_cols lanes), not
-                # ~g_pe_rows: broadcast-activation/per-lane-weight means
-                # every (row, col) PE cell does its own int8 x int8
-                # multiply every cycle (proposal doc section 6), not just
-                # one multiply per row -- g_pe_rows would only be the DSP
-                # count if g_pe_cols were 1. The +1 over 64 is an address
-                # adder Yosys folded into a DSP48E1's own adder rather than
-                # a 65th multiply lane.
+                # DSP count is 64 (g_pe_rows*g_pe_cols multiply lanes) + 1 address
+                # adder that Yosys folded into a DSP48E1. Broadcast activation +
+                # per-lane weight means every (row, col) PE cell does its own
+                # int8 x int8 multiply every cycle (proposal doc section 6), so
+                # we need g_pe_rows * g_pe_cols = 8 * 8 = 64 multiplies. With
+                # g_pe_cols=1 we would only need g_pe_rows DSPs; the full grid
+                # needs the full g_pe_rows*g_pe_cols count. The recorded 65
+                # matches the ratified proposal's predicted figure and is not
+                # an anomaly.
+                #
+                # BlockRams stays at LessThan(1): this entity's accumulators must
+                # stay in flip-flops; any block RAM here would mean something
+                # has gone wrong.
                 checkers=[
-                    TotalLuts(LessThan(7500)),
-                    Ffs(LessThan(1600)),
+                    TotalLuts(LessThan(4100)),
+                    Ffs(LessThan(1300)),
                     BlockRams(LessThan(1)),
-                    DspBlocks(LessThan(80)),
+                    DspBlocks(LessThan(70)),
                 ],
             ),
         ]
