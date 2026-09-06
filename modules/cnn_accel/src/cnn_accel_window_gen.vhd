@@ -310,10 +310,20 @@ begin
           -- and an exactly-dividing final tile ('last_tile_channels_q =
           -- g_tile_channels', making this a null loop range), are
           -- written verbatim.
+          -- The loop range is constant (0 .. g_tile_channels - 1) with the
+          -- runtime bound applied as a per-lane condition inside, rather
+          -- than the more direct 'for c in last_tile_channels_q to ...'.
+          -- Both are identical in simulation, but a variable loop range is
+          -- not synthesizable: it crashes GHDL's synthesis backend
+          -- ("limits of range are not constant", then an Ada assertion in
+          -- synth-vhdl_expr.adb). Caught by this module's netlist build --
+          -- see module_cnn_accel.py get_build_projects().
           v_write_data := s_stream_m2s.data(c_lane_width - 1 downto 0);
           if wr_tile_q = n_tiles_q - 1 then
-            for c in last_tile_channels_q to g_tile_channels - 1 loop
-              v_write_data(8 * (c + 1) - 1 downto 8 * c) := (others => '0');
+            for c in 0 to g_tile_channels - 1 loop
+              if c >= last_tile_channels_q then
+                v_write_data(8 * (c + 1) - 1 downto 8 * c) := (others => '0');
+              end if;
             end loop;
           end if;
 
@@ -469,8 +479,20 @@ begin
             bank_idx := input_row mod g_max_kernel_size;
             tap := row_banks(bank_idx)(input_col * n_tiles_i + rd_tile_i);
 
+            -- 'tap_idx' depends on the runtime 'kw', so writing
+            -- 'data_i(c_lane_width*(tap_idx+1)-1 downto c_lane_width*tap_idx)'
+            -- directly is a dynamic slice, which crashes GHDL's synthesis
+            -- backend (Ada assertion in synth-vhdl_expr.adb). Select the
+            -- destination tap slot with a constant-bound loop instead --
+            -- identical in simulation, a mux in hardware. 'tap_idx' can
+            -- only ever land in 0 .. g_max_kernel_size**2 - 1, since
+            -- 'kr, kc < kh, kw <= g_max_kernel_size'.
             tap_idx := kr * kw + kc;
-            data_i(c_lane_width * (tap_idx + 1) - 1 downto c_lane_width * tap_idx) := tap;
+            for t in 0 to g_max_kernel_size * g_max_kernel_size - 1 loop
+              if t = tap_idx then
+                data_i(c_lane_width * (t + 1) - 1 downto c_lane_width * t) := tap;
+              end if;
+            end loop;
           end if;
         end if;
       end loop;

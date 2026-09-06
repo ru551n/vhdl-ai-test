@@ -189,9 +189,22 @@ begin
           bias_lane_q(bank) <= (others => '0');
         elsif accepted then
           if fill_is_bias = '0' then
-            weight_mem(bank)(to_integer(weight_wr_row_q(bank)))
-              (8 * (to_integer(weight_lane_q(bank)) + 1) - 1 downto 8 * to_integer(weight_lane_q(bank)))
-              <= s_stream_m2s.data(7 downto 0);
+            -- Constant-bound loop with the lane select as a per-lane
+            -- enable, rather than a dynamically-bounded slice
+            -- '(8*(to_integer(lane)+1)-1 downto 8*to_integer(lane))'.
+            -- Identical in simulation, but GHDL's synthesis backend
+            -- rejects the latter ("cannot extract same variable part for
+            -- dynamic slice", the same limitation as ghdl/ghdl#2658). This
+            -- is the standard wide-word byte-write-enable form anyway.
+            -- Caught by this module's netlist build -- see
+            -- module_cnn_accel.py get_build_projects().
+            for lane in 0 to c_weight_lanes - 1 loop
+              if to_integer(weight_lane_q(bank)) = lane then
+                weight_mem(bank)(to_integer(weight_wr_row_q(bank)))
+                  (8 * (lane + 1) - 1 downto 8 * lane)
+                  <= s_stream_m2s.data(7 downto 0);
+              end if;
+            end loop;
 
             if to_integer(weight_lane_q(bank)) = c_weight_lanes - 1 then
               weight_lane_q(bank) <= (others => '0');
@@ -200,9 +213,14 @@ begin
               weight_lane_q(bank) <= weight_lane_q(bank) + 1;
             end if;
           else
-            bias_mem(bank)(to_integer(bias_wr_row_q(bank)))
-              (g_accum_width * (to_integer(bias_lane_q(bank)) + 1) - 1 downto g_accum_width * to_integer(bias_lane_q(bank)))
-              <= s_stream_m2s.data(g_accum_width - 1 downto 0);
+            -- Constant-bound loop, same reason as the weight region above.
+            for lane in 0 to c_bias_lanes - 1 loop
+              if to_integer(bias_lane_q(bank)) = lane then
+                bias_mem(bank)(to_integer(bias_wr_row_q(bank)))
+                  (g_accum_width * (lane + 1) - 1 downto g_accum_width * lane)
+                  <= s_stream_m2s.data(g_accum_width - 1 downto 0);
+              end if;
+            end loop;
 
             if to_integer(bias_lane_q(bank)) = c_bias_lanes - 1 then
               bias_lane_q(bank) <= (others => '0');
