@@ -5,7 +5,11 @@ from typing import TYPE_CHECKING
 
 from tsfpga.module import BaseModule, get_modules
 
-from ghdl_yosys_env import resolve_ghdl_plugin_path, resolve_ghdl_prefix
+from ghdl_yosys_env import (
+    resolve_ghdl_plugin_path,
+    resolve_ghdl_prefix,
+    resolve_vivado_path,
+)
 
 if TYPE_CHECKING:
     from vunit.ui import VUnit
@@ -36,6 +40,13 @@ _ACCUM_WIDTH = 32
 _POOL_MAX_KERNEL_SIZE = 3
 # Must hold `_POOL_MAX_KERNEL_SIZE**2 * 127` = 1143 without overflow.
 _POOL_ACCUM_WIDTH = 16
+
+# D12 was XC7A100T; raised to XC7A200T once the real target network's 320x320
+# input was priced in. Package and speed grade are arbitrary among the
+# xc7a200t family for a *netlist* build -- it is out-of-context synthesis with
+# no I/O and no timing closure, so only the die's primitive mix affects the
+# reported LUT/FF/BRAM/DSP counts. Revisit when an actual board is chosen.
+_VIVADO_PART = "xc7a200tfbg484-2"
 
 
 class Module(BaseModule):
@@ -101,7 +112,7 @@ class Module(BaseModule):
         # from local numbers. Local builds are still useful for *relative*
         # before/after comparisons and, per the above, for FF/DSP/BRAM
         # absolute numbers too; only LUT absolute numbers must come from CI.
-        return [
+        projects = [
             build(
                 name="cnn_accel_bias_requant",
                 generics={
@@ -317,48 +328,115 @@ class Module(BaseModule):
                 # entity, with the LUT figure dominated by window_gen's
                 # known blowup (23950 of the 35056).
                 #
-                # M7 FIXED window_gen's BRAM inference (see its own build
-                # above); measured post-fix 2026-09 (local dev Yosys
-                # v0.68+182): 10323 LUTs, 2033 FFs, 75 BRAM (11 RAMB36 +
-                # 64 RAMB18), 106 DSP.
+                # M7 fixed window_gen's BRAM inference and M7b reworked
+                # weight_buffer (see both builds above). Measured after both,
+                # 2026-09 (local dev Yosys v0.68+182): 11116 LUTs, 3066 FFs,
+                # 18 BRAM (3 RAMB36 + 15 RAMB18), 106 DSP -- BRAM down 72 ->
+                # 18, a 75% cut, which was the whole point of M7/M7b.
                 #
                 # FFs/BRAM/DSP are trusted directly -- and this composition
-                # entity is exactly what confirmed, this session, that those
-                # three resources are Yosys-version-insensitive: each new
-                # number here is the *exact* arithmetic sum of the old CI
-                # baseline (with window_gen's old contribution subtracted
-                # out) plus window_gen's new local measurement --
-                #   DSP:  (105 - 8) + 9  = 106 (measured 106)
-                #   BRAM: (72  - 0) + 3  = 75  (measured 75; all 72 old BRAM
-                #                               was weight_buffer's, window_gen
-                #                               contributed 0 before and 3 now)
-                #   FF:   (1443 - 199) + 789 = 2033 (measured 2033)
-                # all match this session's measurement exactly, so those
-                # three limits below are re-baselined straight from it.
+                # entity is exactly what confirmed, twice, that those three
+                # resources are Yosys-version-insensitive: each number is the
+                # arithmetic sum of the four leaves as measured individually
+                # above (window_gen / weight_buffer / pe_array /
+                # bias_requant) --
+                #   DSP:  9 + 0 + 65 + 32       = 106  (measured 106, exact)
+                #   BRAM: 3 + 15 + 0 + 0        = 18   (measured 18,  exact)
+                #   FF:   789 + 1093 + 1119 + 66 = 3067 (measured 3066, -1)
+                #   LUT:  2753 + 881 + 2888 + 4658 = 11180 (measured 11116,
+                #                    -64 from cross-boundary optimization)
+                # so those three limits below are re-baselined straight from
+                # this measurement. Note the FF limit had to move a long way
+                # (2200 -> 3200): M7b traded ~1030 FFs for 57 BRAM in
+                # weight_buffer, and this entity inherits all of it.
+                #
+                # Cross-checked against real vendor synthesis -- see the
+                # `cnn_accel_conv_core_vivado` project registered below
+                # (xc7a200tfbg484-2, out-of-context): 15358 LUTs, 2824 FFs,
+                # 14 RAMB36 + 2 RAMB18, 36 DSP, 0 LUTRAM. The BRAM story
+                # agrees (15 RAMB36-equivalents vs Yosys's 18, both far
+                # below the old 72), which is what mattered here. The other
+                # three differ structurally rather than noisily, and neither
+                # tool's number belongs in the other's limit:
+                #   - DSP 36 vs 106: Vivado packs the 8x8 MAC array two
+                #     8-bit multiplies per DSP48E1 (32 DSPs for 64 lanes,
+                #     confirmed from its own DSP report), which Yosys does
+                #     not do. Since xc7a200t has 740 DSPs and DSP is not the
+                #     scarce resource here, this is headroom, not a problem.
+                #   - LUT 15358 vs 11116 is the other side of that trade.
+                #   - Vivado puts weight_buffer's prefetch FIFO in block RAM
+                #     (hence 0 LUTRAM) where Yosys uses 49 RAM32M.
                 #
                 # LUTs remain CI-sensitive (see window_gen's own comment and
-                # the module-level note above): composing window_gen's own
-                # ~2.7x local-to-CI LUT estimate (2753 -> ~7430) with the
-                # other three submodules' *unchanged* CI-measured LUT
-                # baselines (pe_array 3474 + bias_requant 7255 +
-                # weight_buffer 175 + ~380 glue) gives a composed CI
-                # estimate of ~18500 LUTs, roughly a 47% reduction from the
-                # old 35056 -- but per this project's standing rule (see
+                # the module-level note above). Composing window_gen's own
+                # ~2.7x local-to-CI LUT estimate (2753 -> ~7430) with
+                # pe_array's and bias_requant's *unchanged* CI-measured
+                # baselines (3474 + 7255), weight_buffer's new but
+                # local-only 881, and ~380 of glue, gives a composed CI
+                # estimate of ~19400 LUTs -- roughly a 45% reduction from
+                # the old 35056. Per this project's standing rule (see
                 # window_gen's own comment above and proposal doc section
-                # 7.1 item 6), that estimate is not itself a CI measurement,
+                # 7.1 item 6) that estimate is not itself a CI measurement,
                 # so the limit below is a deliberately loose PROVISIONAL
                 # guard rail (far below the old 35056/37000, comfortable
-                # headroom above the ~18500 estimate) rather than a tight
+                # headroom above the ~19400 estimate) rather than a tight
                 # re-baseline. TODO: tighten to the real CI-measured number
                 # the first time this build runs on CI.
                 checkers=[
                     TotalLuts(LessThan(24000)),
-                    Ffs(LessThan(2200)),
-                    BlockRams(LessThan(80)),
+                    Ffs(LessThan(3200)),
+                    BlockRams(LessThan(20)),
                     DspBlocks(LessThan(115)),
                 ],
             ),
         ]
+
+        # Vendor-accurate cross-check of the composition entity, registered
+        # ONLY when this machine actually has Vivado -- see
+        # ghdl_yosys_env.resolve_vivado_path()'s docstring for why that guard
+        # is mandatory rather than defensive (CI's hdl-docker image has no
+        # Vivado, and CI builds every registered project with no filter).
+        #
+        # Why Vivado for this one entity and Yosys for the rest: conv_core is
+        # the only build big enough for the Yosys run to take ~14 minutes,
+        # and it is also the only one whose numbers are a *system* footprint
+        # claim ("does the accelerator fit an XC7A200T") rather than a
+        # relative before/after guard rail. Vendor synthesis is the right
+        # tool for the former; Yosys, which is fast and already wired into
+        # CI, is the right tool for the latter. The Yosys conv_core build
+        # above is NOT replaced by this -- it stays the CI-gating one.
+        #
+        # Deliberately no build_result_checkers here. The Yosys and Vivado
+        # numbers are not comparable (different technology mapping), so a
+        # limit derived from one must never be attached to the other, and
+        # this project's baselines are all Yosys-derived. This project exists
+        # to be read, not to gate.
+        vivado_path = resolve_vivado_path()
+        if vivado_path is not None:
+            from tsfpga.vivado.project import VivadoNetlistProject
+
+            projects.append(
+                VivadoNetlistProject(
+                    name="cnn_accel_conv_core_vivado",
+                    modules=modules,
+                    part=_VIVADO_PART,
+                    top="cnn_accel_conv_core",
+                    generics={
+                        "g_max_kernel_size": _MAX_KERNEL_SIZE,
+                        "g_pe_rows": _PE_ROWS,
+                        "g_pe_cols": _PE_COLS,
+                        "g_accum_width": _ACCUM_WIDTH,
+                        "g_tile_channels": _TILE_CHANNELS,
+                        "g_max_row_tile_words": _MAX_ROW_TILE_WORDS,
+                        "g_weight_buffer_depth": _WEIGHT_BUFFER_DEPTH,
+                        "g_bias_buffer_depth": _BIAS_BUFFER_DEPTH,
+                    },
+                    vivado_path=vivado_path,
+                    defined_at=Path(__file__),
+                )
+            )
+
+        return projects
 
     def setup_vunit(self, vunit_proj: VUnit, **kwargs) -> None:
         library = vunit_proj.library(self.library_name)

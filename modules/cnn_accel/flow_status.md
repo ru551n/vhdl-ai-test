@@ -18,6 +18,7 @@ it via the main agent, they do not edit it themselves).
 | 3b. `conv_core` bit-exact vs `cnn_accel_model.py` | COMPLETE | M6b, commit `52adb45`. 73/73 VUnit, bit-exact vs Python vectors (decision D5) |
 | 7a. `window_gen` block-RAM inference (M7, Option 3a) | COMPLETE | 23950 LUTs / 0 BRAM -> 2753 LUTs / 3 RAMB36. See "M7" below |
 | 7b. `weight_buffer` single-buffer + streaming rework | COMPLETE | 72 BRAM -> 15 BRAM. See "M7b" below |
+| 7c. `conv_core` re-measured (Yosys + Vivado) | COMPLETE | **72 -> 18 BRAM** end to end. See "M7c" below |
 | 2/3. Design + TDD, AXI-facing engines (`cnn_accel_axi_read_dma`, `cnn_accel_ofmap_dma`, `cnn_accel_csr`) | PENDING | |
 | 2/3. Design + TDD, `cnn_accel_layer_ctrl` | PENDING | |
 | 2/3. Design + TDD, `cnn_accel_sequencer` | PENDING | |
@@ -270,22 +271,81 @@ old arbitrary 512.
   shallow for Yosys to pick block RAM) buy the 57-BRAM reduction.
 
 ### Open
-- **`conv_core` has not been re-measured since this change.** Its checkers
-  and comments still carry the M7 figures (75 BRAM). By leaf additivity the
-  expected new figure is `15 + 3 = 18` BRAM; `BlockRams(LessThan(80))` still
-  passes, so this is stale rather than wrong, but it must be re-measured.
-  Standing decision: run that one on **Vivado** (`xc7a200t`), not Yosys —
-  `conv_core` takes ~14 min on Yosys and Vivado gives vendor-accurate
-  numbers.
 - **Requirement doc conflict, deliberately left for the user.**
   `doc/cnn_accel_weight_buffer_req.md`'s Responsibility/Generics/Ports/
   Protocols sections are updated, but its hand-owned Functional Description
   still describes the old double-buffered A/B design. That section is
   user-owned; it is flagged here rather than rewritten.
 
+## M7c — `conv_core` re-measured, and the Vivado backend, 2026-09-07
+
+### Result: the BRAM goal is met
+
+| `conv_core` | LUTs | FFs | BRAM | DSP |
+|---|---|---|---|---|
+| pre-M7 (CI Yosys) | 35 056 | 1 443 | **72** | 105 |
+| post-M7+M7b (local dev Yosys) | 11 116 | 3 066 | **18** (3xRAMB36 + 15xRAMB18) | 106 |
+| post-M7+M7b (Vivado, `xc7a200tfbg484-2`, OOC) | 15 358 | 2 824 | **14xRAMB36 + 2xRAMB18** | 36 |
+
+**BRAM 72 -> 18, a 75% cut**, and Vivado independently agrees (15
+RAMB36-equivalents). Both are comfortably inside the ~11 (single-buffered)
+/ ~19 (double-buffered) target band.
+
+Leaf additivity held exactly again, which is why the FF/BRAM/DSP checkers
+are re-baselined straight from the local Yosys run:
+
+| | window_gen | weight_buffer | pe_array | bias_requant | sum | measured |
+|---|---|---|---|---|---|---|
+| DSP | 9 | 0 | 65 | 32 | 106 | **106** |
+| BRAM | 3 | 15 | 0 | 0 | 18 | **18** |
+| FF | 789 | 1093 | 1119 | 66 | 3067 | **3066** |
+| LUT | 2753 | 881 | 2888 | 4658 | 11180 | 11116 |
+
+### Bug caught by this build (would have broken CI)
+The M7b commit (`2d78d59`) left `conv_core`'s `Ffs(LessThan(2200))` checker
+in place while M7b added ~1030 FFs to `weight_buffer`, which `conv_core`
+inherits. The build **failed** on `Got 3066, expected < 2200`. Checkers now
+read `Ffs(LessThan(3200))` and `BlockRams(LessThan(20))` (was
+`LessThan(80)`). Lesson: a leaf-level resource trade must be re-checked
+against every composition entity above it in the same pass, not deferred.
+
+### Yosys vs Vivado: not noise, structural differences
+- **DSP 36 vs 106.** Vivado packs the 8x8 MAC array two 8-bit multiplies
+  per DSP48E1 (32 DSPs for 64 lanes, from its own DSP report); Yosys does
+  not. `xc7a200t` has 740 DSPs, so this is headroom, not a problem.
+- **LUT 15 358 vs 11 116** is the other side of that same trade.
+- **LUTRAM 0 vs 49xRAM32M.** Vivado puts `weight_buffer`'s prefetch FIFO in
+  block RAM; Yosys uses distributed RAM.
+
+Neither tool's number belongs in the other's limit. Yosys stays the
+CI-gating backend; Vivado is the vendor-accurate cross-check.
+
+### Vivado backend wiring (new)
+- `ghdl_yosys_env.resolve_vivado_path()`: env `VIVADO_PATH`, then `PATH`,
+  then newest `/opt/xilinx/*/Vivado/bin/vivado` (this machine: 2026.1, not
+  on `PATH`).
+- `module_cnn_accel.py` registers `cnn_accel_conv_core_vivado`
+  (`VivadoNetlistProject`, part `xc7a200tfbg484-2`) **only when that
+  resolver returns a path**. The guard is mandatory, not defensive: CI's
+  `ru551n/hdl-docker` image has no Vivado and the `synthesize` job runs
+  `build_fpga.py --netlist-builds` with **no filter**, so an unconditional
+  Vivado project breaks CI.
+- That project carries **no** `build_result_checkers`, since Yosys- and
+  Vivado-derived limits are not interchangeable.
+- Speed note: Vivado did `conv_core` in **50 s**; Yosys takes **~18 min**
+  (1098 s). Prefer Vivado for the large composition entities.
+- Target part raised `xc7a100t` -> `xc7a200t` for the real 320x320 network.
+  Package/speed grade are arbitrary for an out-of-context netlist build
+  (no I/O, no timing closure); revisit when a board is chosen.
+
+### Open
+- LUT limits (`window_gen` <12000, `conv_core` <24000) are still
+  **PROVISIONAL** local-Yosys guard rails. Composed CI estimate for
+  `conv_core` is ~19 400. Tighten from a real CI run.
+- `pe_array` DSP packing: Vivado gets 64 MAC lanes into 32 DSP48E1s, Yosys
+  into 65. Not acted on — DSP is not the scarce resource on `xc7a200t`.
+
 ### Next recommended action
-1. Re-measure `conv_core` on Vivado (`xc7a200t`) and tighten its
-   FF/BRAM/DSP checkers to the measured numbers.
-2. M8 `cnn_accel_layer_ctrl` (incl. the D6 output-channel tile loop), then
-   M9 DMAs, per the milestone table in
-   `~/.local/state/maki/plans/cosmic-hip-cod.md`.
+M8 `cnn_accel_layer_ctrl` (incl. the D6 output-channel tile loop), then M9
+DMAs, per the milestone table in
+`~/.local/state/maki/plans/cosmic-hip-cod.md`.
