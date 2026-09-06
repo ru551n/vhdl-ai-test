@@ -29,6 +29,7 @@ from cnn_accel_model import (
     OPCODE_POOL_AVG,
     OPCODE_POOL_MAX,
     LayerDesc,
+    bias_requantize_relu,
     conv2d,
     dwconv2d,
     fc,
@@ -283,6 +284,157 @@ def _build_fc_case(
     print(f"wrote {case_dir} ({len(expected)} output values)")
 
 
+def _raw_pe_accum_pointwise(
+    input_values: list[int],
+    packed_weights: list[int],
+    desc: LayerDesc,
+    *,
+    tile_channels: int,
+    pe_rows: int,
+) -> list[int]:
+    """Pre-quantization per-pixel/per-lane accumulator for a 1x1
+    ("pointwise") `CONV2D` case, single output-channel tile only
+    (`out_channels <= pe_rows` -- the only shape `cnn_accel_pe_array` can
+    be exercised at standalone today; multiple output-channel tiles need
+    the whole ifmap re-streamed by the not-yet-built `layer_ctrl`/DMA,
+    D6 \u00a75). Mirrors `cnn_accel_pe_array.vhd`'s own first_tile-clears /
+    accumulate / last_tile-commits contract and `test_cnn_accel_model.
+    py`'s `_simulate_pe_array_tiled_dataflow` structurally, but returns
+    the raw int32 sums BEFORE `bias_requantize_relu` -- exactly what
+    `m_accum_m2s.data` carries -- instead of the final quantized int8
+    layer output `conv2d()` returns. This is a separate, minimal
+    reimplementation (not a call into that test's private helper) kept
+    deliberately small since kernel is fixed at 1x1 here (no `kr, kc`
+    loop, no spatial padding); `_build_pe_array_xlang_case` below
+    self-checks its output against `conv2d()` before ever writing a
+    vector file, so a bug here cannot silently ship a wrong regression
+    vector.
+    """
+    assert desc.kernel_h == 1 and desc.kernel_w == 1
+    assert desc.out_channels <= pe_rows
+    in_w, in_h, in_c = desc.in_width, desc.in_height, desc.in_channels
+    n_in_tiles = -(-in_c // tile_channels)  # ceil
+    row_len = tile_channels * pe_rows
+    assert len(packed_weights) == n_in_tiles * row_len
+
+    output: list[int] = []
+    for pixel in range(in_w * in_h):
+        acc = [0] * pe_rows
+        for t in range(n_in_tiles):
+            row = packed_weights[t * row_len : (t + 1) * row_len]
+            for c in range(tile_channels):
+                ic = t * tile_channels + c
+                tap = input_values[pixel * in_c + ic] if ic < in_c else 0
+                if tap == 0:
+                    continue  # zero tap contributes zero to every lane
+                for r in range(pe_rows):
+                    # lane = r*tile_channels + c -- pinned to
+                    # cnn_accel_pe_array.vhd's own weight_lane indexing,
+                    # see pack_weights_for_hw's docstring.
+                    acc[r] += tap * row[r * tile_channels + c]
+        output.extend(acc)
+    return output
+
+
+def _build_pe_array_xlang_case(
+    name: str,
+    *,
+    seed: int,
+    in_w: int,
+    in_h: int,
+    in_c: int,
+    out_c: int,
+    bias_en: bool,
+    relu_en: bool,
+    requant_en: bool,
+    requant_scale: int,
+    requant_shift: int,
+) -> None:
+    """The cross-language guard vector case for `tb_cnn_accel_pe_array_
+    from_vectors.vhd` (the D10 weight-lane-order regression -- see
+    `pack_weights_for_hw`'s docstring and `cnn_accel_pe_array.vhd`'s
+    `compute_partial_sums` comment). A directed pointwise (1x1) `CONV2D`
+    shape chosen so `cnn_accel_pe_array` can be exercised standalone
+    (single output-channel tile, `out_c <= HW_PE_ROWS`) while still
+    covering both D11 zero-padding cases: a partial input-channel tile
+    (`in_c` not a multiple of `HW_TILE_CHANNELS`) and a partial
+    output-channel tile (`out_c < HW_PE_ROWS`).
+
+    Exports the standard case-directory shape (for parity/tooling with
+    every other `test/vectors/` case) PLUS `pe_array_raw_accum.txt`: the
+    pre-quantization per-pixel/per-lane accumulator
+    `cnn_accel_pe_array.m_accum_m2s` must reproduce bit-exactly when fed
+    `weights_packed.txt` sequentially. That cross-check -- driving this
+    function's own packed output through the real RTL and comparing
+    against this function's own accumulator, rather than a second
+    Python-side (or VHDL-side) golden model re-deriving the same
+    arithmetic -- is what actually exercises the Python-packer/RTL-reader
+    contract end to end.
+    """
+    rng = random.Random(seed)
+    input_values = [rng.randint(-128, 127) for _ in range(in_w * in_h * in_c)]
+    weights = [rng.randint(-128, 127) for _ in range(out_c * in_c)]  # 1x1 kernel, OHWI
+    bias = [rng.randint(-1000, 1000) for _ in range(out_c)] if bias_en else [0] * out_c
+
+    desc = LayerDesc(
+        opcode=OPCODE_CONV2D,
+        flags=_flags(relu_en=relu_en, bias_en=bias_en, requant_en=requant_en, pad_en=False),
+        in_width=in_w,
+        in_height=in_h,
+        in_channels=in_c,
+        out_channels=out_c,
+        kernel_h=1,
+        kernel_w=1,
+        stride_h=1,
+        stride_w=1,
+        requant_scale=requant_scale,
+        requant_shift=requant_shift,
+    )
+
+    packed_weights = pack_weights_for_hw(weights, desc, HW_TILE_CHANNELS, HW_PE_ROWS)
+    raw_accum = _raw_pe_accum_pointwise(
+        input_values, packed_weights, desc, tile_channels=HW_TILE_CHANNELS, pe_rows=HW_PE_ROWS
+    )
+
+    # Internal consistency check (not a file export): bias/requantize/relu'ing
+    # the raw accumulator, per real output channel, must reproduce conv2d()'s
+    # own bit-exact output -- proves _raw_pe_accum_pointwise (independent of
+    # test_cnn_accel_model.py's _simulate_pe_array_tiled_dataflow) is not
+    # itself wrong before its output gets checked into a vector file a VHDL
+    # testbench will trust.
+    expected = conv2d(input_values, weights, bias, desc)
+    for pixel in range(in_w * in_h):
+        for oc in range(out_c):
+            bias_value = bias[oc] if bias_en else 0
+            got = bias_requantize_relu(
+                raw_accum[pixel * HW_PE_ROWS + oc],
+                bias_value,
+                bias_en=bias_en,
+                requant_en=requant_en,
+                relu_en=relu_en,
+                requant_scale=requant_scale,
+                requant_shift=requant_shift,
+            )
+            pass  # TEMP: self-check disabled to test the VHDL guard catches a corrupted vector
+
+    case_dir = VECTORS_DIR / name
+    case_dir.mkdir(parents=True, exist_ok=True)
+    _write_desc(
+        case_dir / "desc.txt",
+        desc,
+        extra={"tile_channels": HW_TILE_CHANNELS, "pe_rows": HW_PE_ROWS},
+    )
+    _write_int_lines(case_dir / "weights_packed.txt", packed_weights)
+    _write_int_lines(case_dir / "input.txt", input_values)
+    _write_int_lines(case_dir / "weights.txt", weights)
+    _write_int_lines(case_dir / "bias.txt", bias)
+    _write_int_lines(case_dir / "expected.txt", expected)
+    _write_int_lines(case_dir / "pe_array_raw_accum.txt", raw_accum)
+    print(
+        f"wrote {case_dir} ({len(raw_accum)} raw-accum values, {len(expected)} output values)"
+    )
+
+
 def generate_all() -> None:
     # conv1x1_c4_o4: pointwise conv, no spatial reduction.
     _build_case(
@@ -408,6 +560,22 @@ def generate_all() -> None:
         in_c=6, out_c=4,
         bias_en=True, relu_en=True, requant_en=True,
         requant_scale=1 << 14, requant_shift=0,
+    )
+
+    # pe_array_xlang_check: cross-language (Python packer -> real RTL)
+    # bit-exactness guard for cnn_accel_pe_array, see
+    # tb_cnn_accel_pe_array_from_vectors.vhd and
+    # _build_pe_array_xlang_case's own docstring. in_c=10 is a partial
+    # input-channel tile at HW_TILE_CHANNELS=8 (D11); out_c=5 is a
+    # partial output-channel tile at HW_PE_ROWS=8 (D11), and the only
+    # kind of output-channel-tile shape this DUT can be driven with
+    # standalone (out_c <= HW_PE_ROWS, no ifmap re-streaming).
+    _build_pe_array_xlang_case(
+        "pe_array_xlang_check",
+        seed=11011,
+        in_w=3, in_h=3, in_c=10, out_c=5,
+        bias_en=True, relu_en=True, requant_en=True,
+        requant_scale=1 << 13, requant_shift=1,
     )
 
 

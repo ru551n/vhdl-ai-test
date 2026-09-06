@@ -1427,10 +1427,10 @@ def test_pack_weights_for_hw_matches_logical_ohwi_and_pads_zero() -> None:
             for t in range(n_in_tiles):
                 for kr in range(kernel):
                     for kc in range(kernel):
-                        for c in range(tile_channels):
-                            ic = t * tile_channels + c
-                            for r in range(pe_rows):
-                                oc = ot * pe_rows + r
+                        for r in range(pe_rows):
+                            oc = ot * pe_rows + r
+                            for c in range(tile_channels):
+                                ic = t * tile_channels + c
                                 if ic < in_c and oc < out_c:
                                     expected = weights[
                                         ((oc * kernel + kr) * kernel + kc) * in_c + ic
@@ -1453,6 +1453,58 @@ def test_pack_weights_for_hw_rejects_dwconv2d() -> None:
     weights = [0] * (4 * 3 * 3)
     with pytest.raises(ValueError):
         pack_weights_for_hw(weights, desc, tile_channels=8, pe_rows=8)
+
+
+def test_pack_weights_for_hw_lane_matches_pe_array_rtl_indexing() -> None:
+    """Guard against the D10 lane-order defect regressing silently: pins
+    `pack_weights_for_hw`'s within-row lane order to
+    `cnn_accel_pe_array.vhd`'s own `compute_partial_sums()` indexing
+    (`weight_lane := r * g_pe_cols + c`, `cnn_accel_pe_array.vhd:258`),
+    via an independent re-derivation rather than a copy of either
+    function's own loop nesting: for every lane in a packed row, DECODE
+    `(r, c)` by the RTL's formula (`r = lane // tile_channels`,
+    `c = lane % tile_channels` -- the inverse of `r*tile_channels + c`)
+    and check the packed value at that lane against the logical OHWI
+    weight at the `(oc, ic)` that `(r, c)` implies. Kernel is fixed at
+    1x1 here (`kr=kc=0`) -- the row-offset arithmetic for kernel > 1 is
+    already exhaustively covered by
+    `test_pack_weights_for_hw_matches_logical_ohwi_and_pads_zero` above;
+    this test's only job is the lane formula itself, swept over both a
+    partial input tile and a partial+multi output tile so an off-by-one
+    in `oc`/`ic` padding can't hide the lane formula being wrong.
+
+    If `pack_weights_for_hw` (or `cnn_accel_pe_array.vhd`) ever
+    reintroduces the transposed `c*pe_rows + r` convention, this test
+    fails without needing a simulator; `tb_cnn_accel_pe_array_from_
+    vectors.vhd` additionally closes the loop through the real RTL."""
+    rng = random.Random(0xBEEF)
+    for tile_channels, pe_rows in itertools.product([4, 8], [4, 8]):
+        in_c, out_c = 11, 10  # partial input tile and partial+multi output tile
+        desc = _desc(in_channels=in_c, out_channels=out_c, kernel_h=1, kernel_w=1)
+        weights = [rng.randint(-128, 127) for _ in range(out_c * in_c)]
+        packed = pack_weights_for_hw(weights, desc, tile_channels, pe_rows)
+
+        n_in_tiles = -(-in_c // tile_channels)
+        n_out_tiles = -(-out_c // pe_rows)
+        row_len = tile_channels * pe_rows
+
+        for ot in range(n_out_tiles):
+            for t in range(n_in_tiles):
+                row_idx = ot * n_in_tiles + t
+                row = packed[row_idx * row_len : (row_idx + 1) * row_len]
+                for lane in range(row_len):
+                    # Independent re-derivation of cnn_accel_pe_array.vhd's own
+                    # 'weight_lane := r * g_pe_cols + c' -- NOT pack_weights_for_hw's
+                    # own (r, c) loop variables.
+                    r = lane // tile_channels
+                    c = lane % tile_channels
+                    ic = t * tile_channels + c
+                    oc = ot * pe_rows + r
+                    expected = weights[oc * in_c + ic] if (ic < in_c and oc < out_c) else 0
+                    assert row[lane] == expected, (
+                        f"tile_channels={tile_channels} pe_rows={pe_rows} "
+                        f"ot={ot} t={t} lane={lane} r={r} c={c} ic={ic} oc={oc}"
+                    )
 
 
 def test_pack_bias_for_hw_matches_and_pads_zero() -> None:
@@ -1586,7 +1638,10 @@ def _simulate_pe_array_tiled_dataflow(
                                 if tap == 0:
                                     continue  # zero tap contributes zero to every lane
                                 for r in range(pe_rows):
-                                    acc[r] += tap * row[c * pe_rows + r]
+                                    # lane = r*tile_channels + c (row-major, pinned to
+                                    # cnn_accel_pe_array.vhd's own weight_lane indexing --
+                                    # see pack_weights_for_hw's docstring).
+                                    acc[r] += tap * row[r * tile_channels + c]
                 # last_tile: commit accumulators to the quantized output.
                 for r in range(pe_rows):
                     oc = ot * pe_rows + r

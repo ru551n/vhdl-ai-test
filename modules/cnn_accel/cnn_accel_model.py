@@ -476,8 +476,8 @@ def pack_weights_for_hw(
           for t in 0 .. T-1:                       # input-channel tile
             for kr in 0 .. kernel_h-1:
               for kc in 0 .. kernel_w-1:
-                for c in 0 .. tile_channels-1:      # channel within input tile
-                  for r in 0 .. pe_rows-1:          # output lane within output tile
+                for r in 0 .. pe_rows-1:          # output lane within output tile
+                  for c in 0 .. tile_channels-1:      # channel within input tile
                     ic = t*tile_channels + c
                     oc = ot*pe_rows + r
                     yield weights[((oc*kernel_h+kr)*kernel_w+kc)*in_channels+ic]
@@ -491,11 +491,25 @@ def pack_weights_for_hw(
     the next output-channel tile only when the whole ifmap is
     re-streamed (D6, §5) -- so within one `pe_array` pass over one
     output-channel tile, the row sweep is `t -> kr -> kc`, and each row
-    holds `tile_channels * pe_rows` int8 lanes (`c` fastest inside the
-    row is a don't-care for storage -- both `c` and `r` are consumed
-    combinationally by the same row read -- but `c` outer / `r` inner
-    is the convention fixed here so VHDL testbenches can address a
-    single lane at `row*tile_channels*pe_rows + c*pe_rows + r`).
+    holds `tile_channels * pe_rows` int8 lanes. Within a row, lane `r`
+    outer / `c` inner (`lane = r*tile_channels + c`) is NOT a free
+    convention picked here -- it is pinned bit-for-bit to
+    `cnn_accel_pe_array.vhd`'s own `compute_partial_sums()`, which reads
+    weight lane `weight_lane := r * g_pe_cols + c` (`cnn_accel_pe_array.
+    vhd:258`; `g_pe_cols` is this function's `tile_channels`). The two
+    sides used to disagree -- this function previously used
+    `c*pe_rows + r` (`c` outer, `r` inner), the transpose of the RTL's
+    own indexing, so every `r != c` weight landed on the wrong PE lane.
+    The RTL is the side verified by a passing 68/68 VUnit regression and
+    is the expensive side to change; the row layout itself is an
+    arbitrary convention with no other consumer, so this function is the
+    one that moved to match `cnn_accel_pe_array.vhd`, not the reverse.
+    Pinned against silent re-drift by
+    `test_pack_weights_for_hw_lane_matches_pe_array_rtl_indexing`
+    (`test_cnn_accel_model.py`, decodes `(r, c)` from a lane index by the
+    RTL's own formula and checks the packed value independently of this
+    function's loop nesting) and, end to end through the real RTL, by
+    `tb_cnn_accel_pe_array_from_vectors.vhd`.
 
     D11 (zero padding for partial tiles): whenever `in_channels` is not
     a multiple of `tile_channels` or `out_channels` is not a multiple
@@ -538,10 +552,10 @@ def pack_weights_for_hw(
         for t in range(n_in_tiles):
             for kr in range(k_h):
                 for kc in range(k_w):
-                    for c in range(tile_channels):
-                        ic = t * tile_channels + c
-                        for r in range(pe_rows):
-                            oc = ot * pe_rows + r
+                    for r in range(pe_rows):
+                        oc = ot * pe_rows + r
+                        for c in range(tile_channels):
+                            ic = t * tile_channels + c
                             if ic < in_c and oc < out_c:
                                 packed.append(
                                     weights[((oc * k_h + kr) * k_w + kc) * in_c + ic]

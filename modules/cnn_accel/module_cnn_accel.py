@@ -227,6 +227,7 @@ class Module(BaseModule):
         self._setup_cnn_accel_bias_requant(library)
         self._setup_cnn_accel_pool(library)
         self._setup_cnn_accel_pe_array(library)
+        self._setup_cnn_accel_pe_array_from_vectors(library)
 
     def _setup_cnn_accel_bias_requant(self, library) -> None:
         tb = library.test_bench("tb_cnn_accel_bias_requant")
@@ -245,6 +246,23 @@ class Module(BaseModule):
                     "stall_probability_percent_in": stall,
                     "stall_probability_percent_out": stall,
                 },
+            )
+
+    def _setup_cnn_accel_pe_array_from_vectors(self, library) -> None:
+        # Cross-language (Python packer -> real RTL) bit-exactness guard for
+        # the D10 weight-lane-order defect, see
+        # tb_cnn_accel_pe_array_from_vectors.vhd's own header comment.
+        # 'vectors_path' must be an absolute path (the simulator's own
+        # working directory is not this module's concern) -- self.path is
+        # tsfpga's own per-module root, so this is correct regardless of
+        # where run.py/vunit-mcp actually invokes the simulator from.
+        tb = library.test_bench("tb_cnn_accel_pe_array_from_vectors")
+        vectors_path = self.path / "test" / "vectors" / "pe_array_xlang_check"
+
+        for test in tb.get_tests():
+            self.add_vunit_config(
+                test=test,
+                generics={"vectors_path": str(vectors_path)},
             )
 
     def _setup_cnn_accel_pool(self, library) -> None:
