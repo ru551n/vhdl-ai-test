@@ -44,11 +44,25 @@ class Module(BaseModule):
         # time (breaks the stable-tsfpga VUnit/run.py flow).
         from tsfpga.yosys.project import YosysNetlistBuild
 
+        # "axi_stream" is deliberately NOT included from the real hdl-modules folder below:
+        # its axi_stream_pkg.vhd hits a real, still-open GHDL synthesis-backend limitation
+        # (dynamic-width slice in the `user`-field marshalling, matches
+        # github.com/ghdl/ghdl issue #2658) that only affects netlist synthesis, not
+        # simulation. `synth_workaround/axi_stream` below is a synth-only, bit-exact
+        # equivalent rewrite (never used for simulation/verification of this project) --
+        # see `synth_workaround/README.md` for the full rationale and equivalence proof.
+        # This substitution of a locally-patched copy for unmodified third-party code was
+        # explicitly signed off by the user (see doc/../flow_status.md history) as a
+        # deliberate, permanent exception to the project's default "reuse third-party code
+        # unmodified" policy.
         modules = get_modules(
             modules_folder=self.path.parent, names_include={"canny", "axi_stream_join"}
         ) + get_modules(
             modules_folder=self.path.parent.parent / "hdl-modules" / "modules",
-            names_include={"common", "axi_stream", "fifo", "math", "resync"},
+            names_include={"common", "fifo", "math", "resync"},
+        ) + get_modules(
+            modules_folder=self.path / "synth_workaround",
+            names_include={"axi_stream"},
         )
         ghdl_plugin_path = os.environ.get("TSFPGA_MCP_GHDL_PLUGIN")
         ghdl_prefix = os.environ.get("TSFPGA_MCP_GHDL_PREFIX")

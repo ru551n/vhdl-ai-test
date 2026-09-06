@@ -4,3 +4,5 @@ __pycache__/
 vunit_out/
 preprocessed/
 generated/
+tsfpga_mcp_out/
+.vunit-mcp-cache/
