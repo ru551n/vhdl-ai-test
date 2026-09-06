@@ -13,18 +13,19 @@ library axi_stream;
 use axi_stream.axi_stream_pkg.all;
 
 library cnn_accel;
+use cnn_accel.cnn_accel_pkg.all;
 
 -- VUnit-5 testbench for cnn_accel_bias_requant. See
 -- modules/cnn_accel/doc/cnn_accel_bias_requant_req.md and
 -- modules/cnn_accel/doc/cnn_accel_bias_requant_proposal.md sections 8-9
 -- for the corner-case list and verification plan. Hand-rolled record-port
--- stimulus/monitor procedures directly against the axi_stream_m2s_t/s2m_t
--- record signals (matching tb_cnn_accel_pool.vhd's/
--- tb_cnn_accel_weight_buffer.vhd's established precedent in this IP,
--- avoiding VUnit's raw axi_stream_master/slave verification components'
--- std_logic-typed flat ports, which would need an extra bridging layer
--- against this module's std_ulogic record ports for no behavioral
--- benefit).
+-- stimulus/monitor procedures directly against the accum_m2s_t/s2m_t (M6
+-- record retrofit) and axi_stream_m2s_t/s2m_t record signals (matching
+-- tb_cnn_accel_pool.vhd's/tb_cnn_accel_weight_buffer.vhd's established
+-- precedent in this IP, avoiding VUnit's raw axi_stream_master/slave
+-- verification components' std_logic-typed flat ports, which would need
+-- an extra bridging layer against this module's std_ulogic record ports
+-- for no behavioral benefit).
 --
 -- Expected values are computed by a testbench-local reference function
 -- (ref_bias_requantize_relu below), independently transliterated from
@@ -44,21 +45,24 @@ entity tb_cnn_accel_bias_requant is
     -- tb_cnn_accel_pool.vhd's three-link split).
     stall_probability_percent_in : natural := 20;
     stall_probability_percent_out : natural := 20;
+    -- Output-channel parallelism (lane count). Swept per test in
+    -- module_cnn_accel.py's setup_vunit method -- default is a directed
+    -- small value (4, not a typical round width together with
+    -- c_accum_width=20, so the module cannot silently assume 32/8
+    -- anywhere); the M6 record retrofit (accum_m2s_t/s2m_t replacing the
+    -- fixed 128-bit axi_stream_m2s_t on 's_accum') removed the old
+    -- g_accum_width*g_pe_rows<=128 ceiling, so full_throughput/
+    -- backpressure are additionally run at g_pe_rows=8 -- the width the
+    -- rest of the design actually uses.
+    g_pe_rows : positive := 4;
     runner_cfg : string
   );
 end entity tb_cnn_accel_bias_requant;
 
 architecture tb of tb_cnn_accel_bias_requant is
 
-  -- Deliberately not the arch doc's defaults (g_accum_width=32,
-  -- g_pe_rows=8): those exceed axi_stream_pkg's fixed 128-bit data width
-  -- (flagged in the proposal doc section 7 / final doc's Implementation
-  -- notes as an open cnn_accel_top integration item, not this module's
-  -- bug). c_accum_width=20 (not a typical round width) plus c_pe_rows=4
-  -- keeps g_accum_width*g_pe_rows=80 <= 128 and proves the module does
-  -- not silently assume 32/8 anywhere.
   constant c_accum_width : positive := 20;
-  constant c_pe_rows : positive := 4;
+  constant c_pe_rows : positive := g_pe_rows;
   constant c_bias_addr_width : positive := 1;
   constant c_max_requant_shift : natural := 31;
 
@@ -76,8 +80,9 @@ architecture tb of tb_cnn_accel_bias_requant is
   signal bias_rd_addr : std_ulogic_vector(c_bias_addr_width - 1 downto 0);
   signal bias_rd_data : std_ulogic_vector(c_accum_width * c_pe_rows - 1 downto 0) := (others => '0');
 
-  signal s_accum_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
-  signal s_accum_s2m : axi_stream_s2m_t;
+  signal s_accum_m2s : accum_m2s_t(data(0 to c_pe_rows - 1)(c_accum_width - 1 downto 0)) :=
+    (valid => '0', last => '0', data => (others => (others => '0')));
+  signal s_accum_s2m : accum_s2m_t;
 
   signal m_out_m2s : axi_stream_m2s_t;
   signal m_out_s2m : axi_stream_s2m_t := (ready => '0');
@@ -242,26 +247,28 @@ architecture tb of tb_cnn_accel_bias_requant is
   end function;
 
   ------------------------------------------------------------------------
-  -- Packing helpers matching this module's lane-packing convention: lane
-  -- 'l' occupies bits [w*(l+1)-1 downto w*l] of the AXI4-Stream 'data'
-  -- field, ascending from the low bits, zero-padded above the active
-  -- lanes.
+  -- Packing helpers. 's_accum_m2s.data' is now (M6 record retrofit) an
+  -- array of lanes (accum_array_t), so it is built directly, one
+  -- element per lane, rather than packed into a flat vector -- 'bias_rd_data'
+  -- (a plain std_ulogic_vector port, unaffected by this retrofit) and the
+  -- int8 output ('m_out_m2s.data') are still genuinely flat AXI4-Stream
+  -- payloads, so those two keep the old bit-packed convention: lane 'l'
+  -- occupies bits [w*(l+1)-1 downto w*l], ascending from the low bits,
+  -- zero-padded above the active lanes.
   ------------------------------------------------------------------------
 
-  function pack_lanes_wide(values : accum_arr_t) return std_ulogic_vector is
-    variable result : std_ulogic_vector(axi_stream_data_sz - 1 downto 0) := (others => '0');
+  function to_accum_array(values : accum_arr_t) return accum_array_t is
+    variable result : accum_array_t(0 to c_pe_rows - 1)(c_accum_width - 1 downto 0);
   begin
     for i in 0 to c_pe_rows - 1 loop
-      result(c_accum_width * (i + 1) - 1 downto c_accum_width * i) :=
-        std_ulogic_vector(to_signed(values(i), c_accum_width));
+      result(i) := to_signed(values(i), c_accum_width);
     end loop;
     return result;
   end function;
 
-  -- Same lane layout as pack_lanes_wide, but sized exactly to
-  -- 'bias_rd_data's actual port width (g_accum_width*g_pe_rows, no
-  -- axi_stream_data_sz padding -- that port is not an AXI4-Stream 'data'
-  -- field).
+  -- Sized exactly to 'bias_rd_data's actual port width
+  -- (g_accum_width*g_pe_rows, no axi_stream_data_sz padding -- that port
+  -- is not an AXI4-Stream 'data' field).
   function pack_lanes_bias(values : accum_arr_t) return std_ulogic_vector is
     variable result : std_ulogic_vector(c_accum_width * c_pe_rows - 1 downto 0);
   begin
@@ -404,7 +411,7 @@ begin
       cfg_requant_scale <= std_ulogic_vector(scale);
       cfg_requant_shift <= std_ulogic_vector(to_unsigned(shift, 8));
 
-      s_accum_m2s.data <= pack_lanes_wide(accum_vals);
+      s_accum_m2s.data <= to_accum_array(accum_vals);
       bias_rd_data <= pack_lanes_bias(bias_vals);
       s_accum_m2s.last <= beat_last;
 

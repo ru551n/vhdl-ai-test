@@ -7,6 +7,9 @@ use axi_stream.axi_stream_pkg.all;
 
 library math;
 
+library cnn_accel;
+use cnn_accel.cnn_accel_pkg.all;
+
 -- Shared output-quantization stage. See
 -- modules/cnn_accel/doc/cnn_accel_bias_requant_req.md and
 -- modules/cnn_accel/doc/cnn_accel_bias_requant_proposal.md.
@@ -66,8 +69,12 @@ entity cnn_accel_bias_requant is
     bias_rd_addr : out std_ulogic_vector(g_bias_addr_width - 1 downto 0);
     bias_rd_data : in std_ulogic_vector(g_accum_width * g_pe_rows - 1 downto 0);
 
-    s_accum_m2s : in axi_stream_m2s_t;
-    s_accum_s2m : out axi_stream_s2m_t;
+    -- One int32-ish (g_accum_width-bit) partial sum per PE row, from
+    -- cnn_accel_pe_array's 'm_accum_m2s'. An array of lanes (D15), not a
+    -- packed AXI4-Stream payload, so lane 'l' is indexed directly --
+    -- see cnn_accel_pkg.vhd's 'accum_m2s_t' doc comment.
+    s_accum_m2s : in accum_m2s_t(data(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0));
+    s_accum_s2m : out accum_s2m_t;
 
     m_out_m2s : out axi_stream_m2s_t;
     m_out_s2m : in axi_stream_s2m_t
@@ -150,13 +157,6 @@ architecture a of cnn_accel_bias_requant is
 
 begin
 
-  assert g_accum_width * g_pe_rows <= axi_stream_data_sz
-    report "cnn_accel_bias_requant: g_accum_width*g_pe_rows (" &
-      natural'image(g_accum_width * g_pe_rows) &
-      ") exceeds axi_stream_pkg's fixed data width (" &
-      natural'image(axi_stream_data_sz) & ") -- see proposal doc §2.1"
-    severity failure;
-
   assert 8 * g_pe_rows <= axi_stream_data_sz
     report "cnn_accel_bias_requant: 8*g_pe_rows exceeds axi_stream_pkg's fixed data width"
     severity failure;
@@ -205,7 +205,7 @@ begin
 
   begin
 
-    accum_l <= signed(s_accum_m2s.data(g_accum_width * (l + 1) - 1 downto g_accum_width * l));
+    accum_l <= s_accum_m2s.data(l);
     bias_l <= signed(bias_rd_data(g_accum_width * (l + 1) - 1 downto g_accum_width * l));
 
     total_l <= resize(accum_l, c_sum_width) + resize(bias_l, c_sum_width) when cfg_bias_en = '1' else

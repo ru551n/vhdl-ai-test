@@ -86,30 +86,33 @@ class Module(BaseModule):
                 name="cnn_accel_bias_requant",
                 generics={
                     "g_accum_width": _ACCUM_WIDTH,
-                    # NOT `_PE_ROWS` (8), deliberately. This entity still
-                    # carries its accumulator input on the fixed 128-bit
-                    # `axi_stream_m2s_t`, so its own
-                    # `g_accum_width*g_pe_rows <= axi_stream_data_sz` assert
-                    # caps it at 4 lanes -- 8 lanes x int32 is 256 bits and
-                    # fails to elaborate at all. The pending fix is to move
-                    # this port to the `accum_m2s_t`/`accum_s2m_t` records
-                    # already in `cnn_accel_pkg.vhd` (added for exactly this
-                    # by M2), which is part of the M6 conv_core work. Until
-                    # then this build pins the largest legal design point so
-                    # the entity still gets real synthesis coverage; raise
-                    # it to `_PE_ROWS` as soon as the retrofit lands.
-                    "g_pe_rows": 4,
+                    # M6 record retrofit landed: this entity's accumulator
+                    # input now carries `accum_m2s_t`/`accum_s2m_t` (an
+                    # array of `g_pe_rows` lanes, constrained at the
+                    # declaration site) instead of the fixed 128-bit
+                    # `axi_stream_m2s_t`, so the old
+                    # `g_accum_width*g_pe_rows <= axi_stream_data_sz` lane
+                    # ceiling is gone and this build now uses the project's
+                    # real `_PE_ROWS` (8), same as every other entity here.
+                    "g_pe_rows": _PE_ROWS,
                     "g_bias_addr_width": 9,
                 },
-                # Baseline 2026-09 (Yosys v0.68 release): 3686 LUTs, 34 FFs,
-                # 0 BRAM, 16 DSP. The DSPs are the 4 lanes' requant
-                # multiplies. Expect the LUT count to roughly double when
-                # `g_pe_rows` goes to 8 after the M6 record retrofit.
+                # Baseline 2026-09 (Yosys v0.68 release) at the old 4-lane
+                # pin (`g_pe_rows`=4): 3686 LUTs, 34 FFs, 0 BRAM, 16 DSP
+                # (the 4 lanes' requant multiplies).
+                # TODO: re-baseline from CI now that `g_pe_rows` is 8 -- the
+                # limits below are provisional (roughly double the 4-lane
+                # numbers, with headroom), not yet a measured CI baseline.
+                # As with every other entity here, only CI's Yosys v0.68
+                # *release* numbers are the real baseline; a local
+                # Yosys v0.68+182 (dev) build gives markedly smaller
+                # netlists for the same RTL and must not be used to set
+                # these limits.
                 checkers=[
-                    TotalLuts(LessThan(4300)),
-                    Ffs(LessThan(60)),
+                    TotalLuts(LessThan(8700)),
+                    Ffs(LessThan(130)),
                     BlockRams(LessThan(1)),
-                    DspBlocks(LessThan(20)),
+                    DspBlocks(LessThan(40)),
                 ],
             ),
             build(
@@ -245,6 +248,27 @@ class Module(BaseModule):
                     "stall_probability_percent_out": stall,
                 },
             )
+
+            # The M6 record retrofit (accum_m2s_t/s2m_t replacing the fixed
+            # 128-bit axi_stream_m2s_t on 's_accum') removed the old
+            # g_accum_width*g_pe_rows<=128 lane ceiling. Add explicit
+            # coverage at g_pe_rows=8 -- the width the rest of the design
+            # actually uses -- as an extra config alongside (not instead
+            # of) the directed g_pe_rows=4 default above, for the two
+            # tests whose behavior is genuinely lane-count-sensitive
+            # (per-beat parallel work, and thus throughput/backpressure
+            # timing; the directed golden-model tests exercise per-lane
+            # datapath correctness, which g_pe_rows=4 already covers fully
+            # since lanes are independent).
+            if "full_throughput" in test.name or "backpressure" in test.name:
+                self.add_vunit_config(
+                    test=test,
+                    generics={
+                        "stall_probability_percent_in": stall,
+                        "stall_probability_percent_out": stall,
+                        "g_pe_rows": 8,
+                    },
+                )
 
     def _setup_cnn_accel_pe_array_from_vectors(self, library) -> None:
         # Cross-language (Python packer -> real RTL) bit-exactness guard for
