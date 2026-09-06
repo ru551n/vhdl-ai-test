@@ -97,22 +97,26 @@ class Module(BaseModule):
                     "g_pe_rows": _PE_ROWS,
                     "g_bias_addr_width": 9,
                 },
-                # Baseline 2026-09 (Yosys v0.68 release) at the old 4-lane
-                # pin (`g_pe_rows`=4): 3686 LUTs, 34 FFs, 0 BRAM, 16 DSP
-                # (the 4 lanes' requant multiplies).
-                # TODO: re-baseline from CI now that `g_pe_rows` is 8 -- the
-                # limits below are provisional (roughly double the 4-lane
-                # numbers, with headroom), not yet a measured CI baseline.
+                # Baseline 2026-09 (Yosys v0.68 release, CI run) at
+                # `g_pe_rows`=8: 7255 LUTs, 66 FFs, 0 BRAM, 32 DSP.
+                #
+                # The previous 4-lane pin measured 3686 LUTs, 34 FFs, 0 BRAM,
+                # 16 DSP, so doubling the lane count in the M6 record
+                # retrofit roughly doubled the entity: the requant multiplies
+                # (2 DSP per lane) and the per-lane datapath scale linearly
+                # with `g_pe_rows`, and there is little shared logic to
+                # amortize.
+                #
                 # As with every other entity here, only CI's Yosys v0.68
                 # *release* numbers are the real baseline; a local
                 # Yosys v0.68+182 (dev) build gives markedly smaller
                 # netlists for the same RTL and must not be used to set
                 # these limits.
                 checkers=[
-                    TotalLuts(LessThan(8700)),
-                    Ffs(LessThan(130)),
+                    TotalLuts(LessThan(7800)),
+                    Ffs(LessThan(100)),
                     BlockRams(LessThan(1)),
-                    DspBlocks(LessThan(40)),
+                    DspBlocks(LessThan(36)),
                 ],
             ),
             build(
@@ -234,17 +238,28 @@ class Module(BaseModule):
                 # M6b composition entity (window_gen -> pe_array ->
                 # bias_requant, weight_buffer -> pe_array), no new datapath
                 # logic of its own -- see cnn_accel_conv_core.vhd's own
-                # header comment. Not yet measured on CI's Yosys v0.68
-                # release; limits below are provisional, set generously
-                # above the sum of the four submodules' own individual
-                # baselines above (with window_gen's already-known 23950
-                # LUTs dominating), pending a real CI run.
-                # TODO: re-baseline from CI once this project has run there.
+                # header comment.
+                #
+                # Baseline 2026-09 (Yosys v0.68 release, CI run): 35056 LUTs,
+                # 1443 FFs, 72 BRAM (8 RAMB36 + 64 RAMB18), 105 DSP.
+                #
+                # That is very nearly the plain sum of the four submodules as
+                # measured individually above -- LUTs 23950 + 3474 + 7255 =
+                # 34679 against 35056 measured, and DSPs 8 + 65 + 32 = 105
+                # exactly -- which is what a composition entity that adds
+                # only wiring should give. The ~380 LUT difference is the
+                # handshake glue between the stages.
+                #
+                # The LUT figure is dominated by window_gen's known
+                # distributed-RAM blowup (23950 of the 35056, see its build
+                # above); fixing that (M7, registered read port) is what will
+                # move this number, so tighten this limit together with
+                # window_gen's rather than on its own.
                 checkers=[
-                    TotalLuts(LessThan(35000)),
-                    Ffs(LessThan(1800)),
+                    TotalLuts(LessThan(37000)),
+                    Ffs(LessThan(1600)),
                     BlockRams(LessThan(80)),
-                    DspBlocks(LessThan(140)),
+                    DspBlocks(LessThan(115)),
                 ],
             ),
         ]
