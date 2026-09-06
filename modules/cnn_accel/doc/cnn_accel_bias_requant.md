@@ -6,8 +6,11 @@ Shared output-quantization stage used after `cnn_accel_pe_array`
 (`CONV2D`/`DWCONV2D`/`FC`) and after `cnn_accel_pool`'s avg-sum path
 (`bias_en=0`): per lane, `int32 accumulator -> (+ bias) -> (x
 requant_scale) -> (>> requant_shift, rounded) -> saturate to int8 ->
-(optional ReLU clamp at 0)`. Generic wrapper composing `math.saturate_signed`
-(genuinely reused, one instance per lane) around a bias-adder, a
+(optional ReLU clamp at 0)`; when `requant_scale`/shift are bypassed
+(`cfg_requant_en='0'`) the result is still saturated to int8, not wrapped
+(architectural decision D2: a single overflow semantic across both
+paths). Generic wrapper composing `math.saturate_signed` (genuinely
+reused, two instances per lane -- one per path) around a bias-adder, a
 requant-multiplier, and a hand-written round-to-even variable-shift
 function (see "Implementation notes" for why `math.truncate_round_signed`
 is not instantiated). See `cnn_accel_bias_requant_proposal.md` for the full
@@ -74,9 +77,10 @@ Per lane `l` (0 to `g_pe_rows - 1`), per accepted `s_accum` beat:
    `cfg_relu_en='1'` and `scaled_l < 0`, clamp to 0 (before saturate);
    `result_l = saturate_signed(scaled_l, 8)`.
 3. If `cfg_requant_en='0'` (bypass): if `cfg_relu_en='1'` and `total_l <
-   0`, clamp `total_l` to 0; `result_l` = the low 8 bits of `total_l`,
-   reinterpreted as a two's-complement `signed(7 downto 0)` (no scaling,
-   no saturation).
+   0`, clamp `total_l` to 0; `result_l = saturate_signed(total_l, 8)` (no
+   scaling, but SATURATED like the requant path -- a single overflow
+   semantic across both paths, per architectural decision D2, matching
+   `cnn_accel_model.py`'s golden reference).
 
 `bias_rd_addr` is driven constant all-zeros (see "Implementation notes").
 
@@ -93,8 +97,10 @@ result; `saturate_signed` clamps to the int8 range; when `cfg_relu_en`,
 negative results are clamped to 0 *before* the int8 saturate (so a
 large positive value still saturates at +127, not at ReLU's unbounded
 upper range). When `cfg_requant_en='0'`, the pipeline still applies
-bias/ReLU but passes the low 8 bits through unscaled (debug/bypass path,
-not expected in normal compiled programs).
+bias/ReLU (no scaling) and then saturates to int8 (debug/bypass path, not
+expected in normal compiled programs) -- saturating rather than wrapping
+so both paths share a single overflow semantic (architectural decision
+D2), matching the golden model.
 
 ## Timing/latency
 
@@ -117,7 +123,8 @@ driving `cnn_accel_layer_ctrl`, not yet designed).
 - `axi_stream.axi_stream_pkg` (`hdl-modules/modules/axi_stream/src/axi_stream_pkg.vhd`,
   read-only reuse) for `axi_stream_m2s_t`/`s2m_t` and `axi_stream_data_sz`.
 - `math.saturate_signed` (`hdl-modules/modules/math/src/saturate_signed.vhd`,
-  read-only reuse), one instance per lane.
+  read-only reuse), two instances per lane (requant path and bypass path,
+  both saturate to int8 -- architectural decision D2).
 - Source: `modules/cnn_accel/src/cnn_accel_bias_requant.vhd`.
 - Testbench: `modules/cnn_accel/test/tb_cnn_accel_bias_requant.vhd`.
 
@@ -153,8 +160,9 @@ list and verification plan, and the project's final report for the exact
 pass/fail result. Key corner cases: round-to-even ties (both parities,
 both signs), saturation both directions, ReLU-before-saturate ordering,
 all 8 `bias_en`/`requant_en`/`relu_en` combinations, the
-`cfg_requant_en='0'` bypass path's two's-complement wraparound, and
-full-throughput/randomized-backpressure handshake behavior. Expected
+`cfg_requant_en='0'` bypass path's int8 saturation (both directions, plus
+ReLU-before-saturate ordering), and full-throughput/randomized-
+backpressure handshake behavior. Expected
 values are computed by a testbench-local reference function independently
 transliterated from `cnn_accel_model.py` (not copied from this module's
 own RTL structure).

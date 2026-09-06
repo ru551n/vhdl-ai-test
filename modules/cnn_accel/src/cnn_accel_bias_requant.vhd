@@ -21,9 +21,11 @@ library math;
 --            -- error versus two separate rounding steps.
 --   relu   = max(scaled, 0) when cfg_relu_en, applied BEFORE the int8 clamp
 --   result = saturate_signed(relu, 8)
--- When cfg_requant_en='0': bias/relu are still applied to 'total', then the
--- low 8 bits of 'total' pass through as a two's-complement value (no
--- scaling, no saturation) -- debug/bypass path.
+-- When cfg_requant_en='0': bias/relu are still applied to 'total', then
+-- 'total' is saturated to int8 directly (no scaling) -- debug/bypass path.
+-- Saturates rather than wraps so both paths share one overflow semantic
+-- (architectural decision D2), matching cnn_accel_model.py's golden
+-- reference.
 --
 -- bias_rd_addr / bias tiling (v1 design decision, see proposal doc §3):
 -- this module always drives 'bias_rd_addr' to all-zeros, i.e. it assumes a
@@ -160,7 +162,7 @@ begin
     severity failure;
 
   assert g_accum_width >= 8
-    report "cnn_accel_bias_requant: g_accum_width must be >= 8 (bypass path needs 8 low bits)"
+    report "cnn_accel_bias_requant: g_accum_width must be >= 8 (bypass path's saturate_signed needs input_width >= result_width=8)"
     severity failure;
 
   assert (15 + g_max_requant_shift) <= (c_product_width - 2)
@@ -197,6 +199,7 @@ begin
     signal scaled_l : signed(c_product_width - 1 downto 0);
     signal relu_scaled_l : signed(c_product_width - 1 downto 0);
     signal sat_result_l : signed(7 downto 0);
+    signal relu_clamped_total_l : signed(c_sum_width - 1 downto 0);
     signal bypass_result_l : signed(7 downto 0);
     signal final_lane_l : signed(7 downto 0);
 
@@ -233,24 +236,35 @@ begin
       );
 
     -- Bypass path (cfg_requant_en='0'): bias/ReLU still applied to 'total',
-    -- then the low 8 bits pass through as two's-complement (no scaling, no
-    -- saturation).
-    bypass_proc : process(all)
-      variable relu_clamped_total : signed(c_sum_width - 1 downto 0);
-      -- Intermediate variable needed: some tools (e.g. nvc) reject slicing
-      -- a type conversion's result directly ("the prefix of a slice name
-      -- must be a name or a function call"), so the conversion is bound to
-      -- a variable first and that variable is sliced.
-      variable relu_clamped_slv : std_ulogic_vector(c_sum_width - 1 downto 0);
+    -- then saturated to int8 -- same overflow semantic (saturate, not
+    -- wrap) as the requant path, per architectural decision D2 (a single
+    -- overflow semantic across both paths, matching cnn_accel_model.py's
+    -- golden reference). Reuses 'math.saturate_signed' directly (same
+    -- primitive as the requant path above), rather than hand-rolling a
+    -- second saturation.
+    bypass_relu_proc : process(all)
     begin
       if cfg_relu_en = '1' and total_l(total_l'high) = '1' then
-        relu_clamped_total := (others => '0');
+        relu_clamped_total_l <= (others => '0');
       else
-        relu_clamped_total := total_l;
+        relu_clamped_total_l <= total_l;
       end if;
-      relu_clamped_slv := std_ulogic_vector(relu_clamped_total);
-      bypass_result_l <= signed(relu_clamped_slv(7 downto 0));
     end process;
+
+    bypass_saturate_signed_inst : entity math.saturate_signed
+      generic map (
+        input_width => c_sum_width,
+        result_width => 8,
+        enable_output_register => false
+      )
+      port map (
+        clk => clk,
+        input_valid => '1',
+        input_value => relu_clamped_total_l,
+        result_valid => open,
+        result_value => bypass_result_l,
+        result_is_saturated => open
+      );
 
     final_lane_l <= sat_result_l when cfg_requant_en = '1' else bypass_result_l;
 

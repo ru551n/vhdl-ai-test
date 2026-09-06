@@ -196,7 +196,9 @@ architecture tb of tb_cnn_accel_bias_requant is
   -- -> (+ bias) -> (x requant_scale, Q15) -> (>> requant_shift, rounded)
   -- -> saturate to int8 -> (optional ReLU clamp at 0, before the int8
   -- saturate). requant_en='0' bypasses scaling: bias/ReLU still applied,
-  -- then the low 8 bits pass through as two's-complement (no saturation).
+  -- then the result is SATURATED to int8 (same overflow semantic as the
+  -- requant_en='1' path -- architectural decision D2, single overflow
+  -- semantic across both paths, matching the golden model's fix #1).
   function ref_bias_requantize_relu(
     accum : signed;
     bias : signed;
@@ -212,11 +214,6 @@ architecture tb of tb_cnn_accel_bias_requant is
     variable product : signed(product_width - 1 downto 0);
     variable scaled : signed(product_width - 1 downto 0);
     variable bypass_total : signed(sum_width - 1 downto 0);
-    -- Intermediate variable needed: some tools (e.g. nvc) reject slicing a
-    -- type conversion's result directly, so the conversion is bound to a
-    -- variable first and that variable is sliced (same fix as the RTL's
-    -- own bypass_proc).
-    variable bypass_total_slv : std_ulogic_vector(sum_width - 1 downto 0);
   begin
     if bias_en = '1' then
       total := resize(accum, sum_width) + resize(bias, sum_width);
@@ -240,8 +237,7 @@ architecture tb of tb_cnn_accel_bias_requant is
         bypass_total := (others => '0');
       end if;
 
-      bypass_total_slv := std_ulogic_vector(bypass_total);
-      return signed(bypass_total_slv(7 downto 0));
+      return ref_saturate_signed(bypass_total, 8);
     end if;
   end function;
 
@@ -559,9 +555,12 @@ begin
       end loop;
       drain_and_check(500);
 
-    elsif run("test_bypass_wraparound") then
-      -- Directed: totals that force the low-8-bits two's-complement
-      -- wraparound (not saturation) when cfg_requant_en='0'.
+    elsif run("test_bypass_saturates") then
+      -- Directed: cfg_requant_en='0' must SATURATE to int8, not wrap
+      -- (architectural decision D2 -- a single overflow semantic shared
+      -- with the requant_en='1' path, matching the golden model's fix
+      -- #1). Exact boundary values +127/-128 pass through unchanged;
+      -- anything beyond clamps.
       send_directed(127, 0, '0', '0', '0', c_scale_one, 0);
       send_directed(128, 0, '0', '0', '0', c_scale_one, 0);
       send_directed(-128, 0, '0', '0', '0', c_scale_one, 0);
@@ -582,6 +581,25 @@ begin
           c_scale_one, 0, '0'
         );
       end loop;
+      drain_and_check(200);
+
+    elsif run("test_bypass_relu_before_saturate") then
+      -- Mirrors test_relu_before_saturate, but for the cfg_requant_en='0'
+      -- bypass path: ReLU must clamp negative totals to 0 BEFORE the int8
+      -- saturate, not after (a large negative total would otherwise
+      -- saturate to -128).
+      send_directed(1000, 0, '0', '0', '1', c_scale_one, 0);
+      -- Large negative: ReLU clamps to 0 (not -128, which is what it
+      -- would saturate to without ReLU).
+      send_directed(-1000, 0, '0', '0', '1', c_scale_one, 0);
+      -- Moderate positive, no saturation either way: passes through
+      -- unaffected by ReLU.
+      send_directed(50, 0, '0', '0', '1', c_scale_one, 0);
+      -- Moderate negative: ReLU clamps to 0.
+      send_directed(-50, 0, '0', '0', '1', c_scale_one, 0);
+      -- Same magnitude negative without ReLU, for contrast: must NOT be
+      -- clamped to 0 (passes through as -50, unaffected by relu_en='0').
+      send_directed(-50, 0, '0', '0', '0', c_scale_one, 0);
       drain_and_check(200);
 
     elsif run("test_full_throughput") then

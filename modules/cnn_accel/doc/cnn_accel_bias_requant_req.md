@@ -54,5 +54,7 @@ result; `saturate_signed` clamps to the int8 range; when `cfg_relu_en`,
 negative results are clamped to 0 *before* the int8 saturate (so a
 large positive value still saturates at +127, not at ReLU's unbounded
 upper range). When `cfg_requant_en='0'`, the pipeline still applies
-bias/ReLU but passes the low 8 bits through unscaled (debug/bypass path,
-not expected in normal compiled programs).
+bias/ReLU (no scaling) and then saturates the result to int8 (debug/bypass
+path, not expected in normal compiled programs) -- saturating rather than
+wrapping so there is a single overflow semantic across both paths,
+matching the golden model (architectural decision D2).
