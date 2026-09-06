@@ -342,9 +342,13 @@ class Module(BaseModule):
                 # bias_requant) --
                 #   DSP:  9 + 0 + 65 + 32       = 106  (measured 106, exact)
                 #   BRAM: 3 + 15 + 0 + 0        = 18   (measured 18,  exact)
-                #   FF:   789 + 1093 + 1119 + 66 = 3067 (measured 3066, -1)
-                #   LUT:  2753 + 881 + 2888 + 4658 = 11180 (measured 11116,
-                #                    -64 from cross-boundary optimization)
+                #   FF:   789 + 1093 + 1118 + 66 = 3066 (measured 3066, exact)
+                #   LUT:  2753 + 881 + 2891 + 4658 = 11183 (measured 11116,
+                #                    -67 from cross-boundary optimization)
+                # (all four leaf figures above are the *local* measurements
+                # from the same session, not the CI baselines quoted in each
+                # leaf's own comment -- pe_array for instance reads 2891/1118
+                # locally against its 3474/1119 CI baseline.)
                 # so those three limits below are re-baselined straight from
                 # this measurement. Note the FF limit had to move a long way
                 # (2200 -> 3200): M7b traded ~1030 FFs for 57 BRAM in

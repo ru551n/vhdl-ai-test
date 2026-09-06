@@ -298,8 +298,13 @@ are re-baselined straight from the local Yosys run:
 |---|---|---|---|---|---|---|
 | DSP | 9 | 0 | 65 | 32 | 106 | **106** |
 | BRAM | 3 | 15 | 0 | 0 | 18 | **18** |
-| FF | 789 | 1093 | 1119 | 66 | 3067 | **3066** |
-| LUT | 2753 | 881 | 2888 | 4658 | 11180 | 11116 |
+| FF | 789 | 1093 | 1118 | 66 | 3066 | **3066** |
+| LUT | 2753 | 881 | 2891 | 4658 | 11183 | 11116 |
+
+(Leaf figures are the *local* measurements from the same session, not the CI
+baselines in each leaf's own comment — `pe_array` reads 2891/1118 locally
+against its 3474/1119 CI baseline. LUTs come out 67 under the sum from
+cross-boundary optimization; FFs, BRAM and DSP are exact.)
 
 ### Bug caught by this build (would have broken CI)
 The M7b commit (`2d78d59`) left `conv_core`'s `Ffs(LessThan(2200))` checker
