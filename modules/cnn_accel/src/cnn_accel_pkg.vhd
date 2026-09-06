@@ -135,13 +135,24 @@ package cnn_accel_pkg is
   -- tile_channels window of int8 activations per beat, for a runtime
   -- generic-sized group ("tile") of input channels. 'data' is
   -- unconstrained here and must be constrained at the declaration site
-  -- (signal, port, etc.), sized via window_data_width() below, per
+  -- (signal, port, etc.), sized via window_data_length() below, per
   -- shared/InterfaceRecords.md's unconstrained-element pattern.
   --
-  -- Bit layout of 'data' (generalizes cnn_accel_window_gen.vhd:76-79):
-  -- tap 'i' (row-major, i = row * kernel_w + col), channel 'c' within the
-  -- tile, occupies bits '8*(i*tile_channels + c) + 7 downto
-  -- 8*(i*tile_channels + c)'.
+  -- Element layout of 'data': tap 'i' (row-major, i = row * kernel_w +
+  -- col), channel 'c' within the tile, is element 'i*tile_channels + c'.
+  --
+  -- 'data' is an *array of int8 elements*, not one wide packed vector
+  -- (D15). The consumer indexes it with a runtime tap/group counter, and
+  -- a runtime-indexed slice of a packed vector is a dynamic slice, which
+  -- GHDL's synthesis backend rejects outright ("cannot extract same
+  -- variable part for dynamic slice") while simulating perfectly happily
+  -- -- the same trap already worked around by hand in
+  -- cnn_accel_window_gen.vhd and cnn_accel_weight_buffer.vhd. An array
+  -- index is a first-class index: the tool infers the multiplexer and
+  -- nothing has to know the element width. See shared/ModernVHDL.md,
+  -- "Aggregate representation". Use to_slv/to_tap_array below only at
+  -- boundaries that genuinely need flat bits (AXI payloads, testbench
+  -- queues).
   --
   -- first_tile/last_tile: for an output pixel needing
   -- T = ceil(in_channels / tile_channels) tiles, the producer emits T
@@ -150,12 +161,18 @@ package cnn_accel_pkg is
   -- on first_tile and emits its result on last_tile.
   ------------------------------------------------------------------------
 
+  -- One int8 activation, and a run of them. The element width is fixed at
+  -- 8 (the accelerator's activation type, D-arithmetic contract), so this
+  -- array needs only its index range constrained at the declaration site.
+  subtype tap_t is std_ulogic_vector(7 downto 0);
+  type tap_array_t is array (natural range <>) of tap_t;
+
   type window_m2s_t is record
     valid      : std_ulogic;
     last       : std_ulogic;  -- last output pixel of the feature map
     first_tile : std_ulogic;  -- first input-channel tile of this output pixel
     last_tile  : std_ulogic;  -- last input-channel tile of this output pixel
-    data       : std_ulogic_vector;
+    data       : tap_array_t;
   end record;
 
   type window_s2m_t is record
@@ -163,40 +180,73 @@ package cnn_accel_pkg is
   end record;
 
   ------------------------------------------------------------------------
-  -- Accumulator link: pe_array -> bias_requant. 'data' is unconstrained
-  -- and must be constrained at the declaration site, sized via
-  -- accum_data_width() below: pe_rows lanes x accum_width bits each.
+  -- Accumulator link: pe_array -> bias_requant. One int32-ish partial sum
+  -- per PE row (output channel). Like the window link (D15) this is an
+  -- array of lanes rather than a packed vector, so a lane can be selected
+  -- by a runtime index without a dynamic slice.
+  --
+  -- Unlike 'tap_array_t' the element width is *not* fixed -- it follows
+  -- 'g_accum_width' -- so both the index range and the element range must
+  -- be constrained at the declaration site (VHDL-2008 array-of-
+  -- unconstrained-element):
+  --
+  --   signal m_accum_m2s : accum_m2s_t(data(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0));
   ------------------------------------------------------------------------
+
+  type accum_array_t is array (natural range <>) of signed;
 
   type accum_m2s_t is record
     valid : std_ulogic;
     last  : std_ulogic;
-    data  : std_ulogic_vector;  -- pe_rows lanes x accum_width bits
+    data  : accum_array_t;  -- one partial sum per PE row
   end record;
 
   type accum_s2m_t is record
     ready : std_ulogic;
   end record;
 
-  -- Width in bits of window_m2s_t.data for the given kernel size (K_h = K_w
-  -- = kernel_size) and tile_channels, per the bit layout documented above.
-  function window_data_width(kernel_size : positive; tile_channels : positive) return positive;
+  -- Number of int8 *elements* in window_m2s_t.data for the given kernel
+  -- size (K_h = K_w = kernel_size) and tile_channels, per the element
+  -- layout documented above. Constrain the record as
+  -- 'window_m2s_t(data(0 to window_data_length(...) - 1))'.
+  function window_data_length(kernel_size : positive; tile_channels : positive) return positive;
 
-  -- Width in bits of accum_m2s_t.data for the given pe_rows and accum_width.
-  function accum_data_width(pe_rows : positive; accum_width : positive) return positive;
+  -- Flat-bit views of a tap array, for the boundaries that still need
+  -- packed bits (AXI payloads, VUnit queue push/pop). Element 'i' of the
+  -- array occupies bits '8*i + 7 downto 8*i' of the vector, so this is
+  -- exactly the pre-D15 packing. Do not use these to work around indexing
+  -- inside RTL -- that is what the array is for.
+  function to_slv(data : tap_array_t) return std_ulogic_vector;
+  function to_tap_array(data : std_ulogic_vector) return tap_array_t;
 
 end package cnn_accel_pkg;
 
 package body cnn_accel_pkg is
 
-  function window_data_width(kernel_size : positive; tile_channels : positive) return positive is
+  function window_data_length(kernel_size : positive; tile_channels : positive) return positive is
   begin
-    return 8 * kernel_size * kernel_size * tile_channels;
+    return kernel_size * kernel_size * tile_channels;
   end function;
 
-  function accum_data_width(pe_rows : positive; accum_width : positive) return positive is
+  function to_slv(data : tap_array_t) return std_ulogic_vector is
+    variable result : std_ulogic_vector(8 * data'length - 1 downto 0);
+    variable idx : natural := 0;
   begin
-    return pe_rows * accum_width;
+    for i in data'range loop
+      result(8 * (idx + 1) - 1 downto 8 * idx) := data(i);
+      idx := idx + 1;
+    end loop;
+    return result;
+  end function;
+
+  function to_tap_array(data : std_ulogic_vector) return tap_array_t is
+    variable normalized : std_ulogic_vector(data'length - 1 downto 0) := data;
+    variable result : tap_array_t(0 to data'length / 8 - 1);
+  begin
+    for i in result'range loop
+      result(i) := normalized(8 * (i + 1) - 1 downto 8 * i);
+    end loop;
+    return result;
   end function;
 
 end package body cnn_accel_pkg;

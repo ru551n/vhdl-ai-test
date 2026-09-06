@@ -110,7 +110,7 @@ entity cnn_accel_window_gen is
     -- (D11), not garbage. 'first_tile'/'last_tile' mark the first/last
     -- tile of the current output pixel (both '1' when 'T = 1'). 'last' is
     -- '1' only for the final tile beat of the final window of the frame.
-    m_window_m2s : out window_m2s_t(data(window_data_width(g_max_kernel_size, g_tile_channels) - 1 downto 0));
+    m_window_m2s : out window_m2s_t(data(0 to window_data_length(g_max_kernel_size, g_tile_channels) - 1));
     m_window_s2m : in window_s2m_t
   );
 end entity cnn_accel_window_gen;
@@ -122,7 +122,7 @@ architecture a of cnn_accel_window_gen is
   ------------------------------------------------------------------------
 
   constant c_lane_width : positive := 8 * g_tile_channels;
-  constant c_window_data_width : positive := window_data_width(g_max_kernel_size, g_tile_channels);
+  constant c_window_data_length : positive := window_data_length(g_max_kernel_size, g_tile_channels);
 
   ------------------------------------------------------------------------
   -- Row banks: 'g_max_kernel_size' full-row buffers (BRAM-inference
@@ -409,7 +409,7 @@ begin
     variable row_ready : boolean;
     variable input_row, input_col : integer;
     variable in_frame : boolean;
-    variable data_i : std_ulogic_vector(c_window_data_width - 1 downto 0);
+    variable data_i : tap_array_t(0 to c_window_data_length - 1);
     variable tap : std_ulogic_vector(c_lane_width - 1 downto 0);
     variable tap_idx : integer;
     variable bank_idx : integer;
@@ -458,7 +458,7 @@ begin
 
     window_valid <= '1' when (active_q = '1' and row_ready) else '0';
 
-    data_i := (others => '0');
+    data_i := (others => (others => '0'));
 
     for kr in 0 to g_max_kernel_size - 1 loop
       for kc in 0 to g_max_kernel_size - 1 loop
@@ -479,18 +479,26 @@ begin
             bank_idx := input_row mod g_max_kernel_size;
             tap := row_banks(bank_idx)(input_col * n_tiles_i + rd_tile_i);
 
-            -- 'tap_idx' depends on the runtime 'kw', so writing
-            -- 'data_i(c_lane_width*(tap_idx+1)-1 downto c_lane_width*tap_idx)'
-            -- directly is a dynamic slice, which crashes GHDL's synthesis
-            -- backend (Ada assertion in synth-vhdl_expr.adb). Select the
-            -- destination tap slot with a constant-bound loop instead --
-            -- identical in simulation, a mux in hardware. 'tap_idx' can
-            -- only ever land in 0 .. g_max_kernel_size**2 - 1, since
+            -- 'tap_idx' depends on the runtime 'kw', so it cannot index
+            -- 'data_i' directly here: 'data_i' is a variable being built
+            -- combinationally, and a runtime-indexed *write* still has to
+            -- become a decoder. Select the destination tap slot with a
+            -- constant-bound loop -- identical in simulation, a mux in
+            -- hardware. 'tap_idx' can only ever land in
+            -- 0 .. g_max_kernel_size**2 - 1, since
             -- 'kr, kc < kh, kw <= g_max_kernel_size'.
+            --
+            -- The inner channel loop unpacks one row-bank cell (all
+            -- 'g_tile_channels' channels of one column, 'c_lane_width'
+            -- bits) into its individual int8 elements, per
+            -- cnn_accel_pkg's element layout: tap 't', channel 'c' is
+            -- element 't * g_tile_channels + c'.
             tap_idx := kr * kw + kc;
             for t in 0 to g_max_kernel_size * g_max_kernel_size - 1 loop
               if t = tap_idx then
-                data_i(c_lane_width * (t + 1) - 1 downto c_lane_width * t) := tap;
+                for c in 0 to g_tile_channels - 1 loop
+                  data_i(t * g_tile_channels + c) := tap(8 * (c + 1) - 1 downto 8 * c);
+                end loop;
               end if;
             end loop;
           end if;
@@ -498,8 +506,7 @@ begin
       end loop;
     end loop;
 
-    m_window_m2s.data <= (others => '0');
-    m_window_m2s.data(c_window_data_width - 1 downto 0) <= data_i;
+    m_window_m2s.data <= data_i;
   end process;
 
 end architecture a;

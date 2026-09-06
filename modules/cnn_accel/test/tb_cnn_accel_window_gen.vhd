@@ -56,7 +56,11 @@ architecture tb of tb_cnn_accel_window_gen is
   -- T=3) -- sized with headroom.
   constant c_row_tile_words_max : positive := 32;
 
-  constant c_max_window_bits : positive := window_data_width(c_kernel_max, c_tile_channels);
+  constant c_max_window_length : positive := window_data_length(c_kernel_max, c_tile_channels);
+  -- Flat-bit width of that many int8 elements. Only used for the VUnit
+  -- queue (push/pop have no overload for a user-defined array type) and
+  -- for check_equal's diff output; the DUT port itself is the array.
+  constant c_max_window_bits : positive := 8 * c_max_window_length;
   constant c_frame_max : positive := c_fmap_max;
 
   constant c_clk_period : time := 10 ns;
@@ -82,7 +86,7 @@ architecture tb of tb_cnn_accel_window_gen is
   signal s_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
   signal s_stream_s2m : axi_stream_s2m_t;
 
-  signal m_window_m2s : window_m2s_t(data(c_max_window_bits - 1 downto 0));
+  signal m_window_m2s : window_m2s_t(data(0 to c_max_window_length - 1));
   signal m_window_s2m : window_s2m_t := (ready => '0');
 
   -- Monitor's current randomized-stall probability (percent); the main
@@ -299,7 +303,7 @@ begin
         expected_last_tile := pop(expected_q);
         expected_last := pop(expected_q);
         check_equal(
-          m_window_m2s.data(c_max_window_bits - 1 downto 0), expected_data, "m_window data mismatch"
+          to_slv(m_window_m2s.data), expected_data, "m_window data mismatch"
         );
         check_equal(m_window_m2s.first_tile, expected_first_tile, "m_window first_tile mismatch");
         check_equal(m_window_m2s.last_tile, expected_last_tile, "m_window last_tile mismatch");
