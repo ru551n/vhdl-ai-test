@@ -1,0 +1,401 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+library axi_stream;
+use axi_stream.axi_stream_pkg.all;
+
+library math;
+use math.math_pkg.all;
+
+library cnn_accel;
+use cnn_accel.cnn_accel_pkg.all;
+
+-- int8 x int8 multiply-accumulate array, 'g_pe_rows' x 'g_pe_cols'
+-- parallelism, int32 ('g_accum_width') accumulation. See
+-- modules/cnn_accel/doc/cnn_accel_pe_array_req.md and
+-- modules/cnn_accel/doc/cnn_accel_pe_array_proposal.md.
+--
+-- Per accepted 's_window_m2s' beat, sequences 'weight_rd_addr' over the
+-- window's MAC taps (grouped 'g_pe_cols' at a time, one weight-buffer row
+-- per group, supplying one weight per lane), accumulating into 'g_pe_rows'
+-- parallel int32 accumulators (one per output channel currently in
+-- flight). 'OPCODE_CONV2D'/'OPCODE_FC' sum across all 'cfg_in_channels'
+-- (broadcast activation, per-lane weight); 'OPCODE_DWCONV2D' keeps each
+-- lane scoped to its own input channel (no cross-channel sum) -- see
+-- proposal doc section 3.5 for the exact per-opcode indexing. Once a
+-- window's MAC sequence completes, the 'g_pe_rows' accumulators are
+-- presented as one 'm_accum_m2s' beat ('last' mirrors the accepted
+-- window's 'last').
+--
+-- Naming note: per this round's project convention, this module's
+-- RTL/testbench entities use plain names ('pe_array'/'tb_pe_array'), not
+-- the 'cnn_accel_pe_array' prefix used by sibling leaf modules -- see
+-- proposal doc section 1.
+--
+-- Only one window is ever "in flight" through the compute engine (no
+-- deeper pipelining); the completed-but-undrained result is held in a
+-- separate one-entry output register so the compute engine can already
+-- start the next window's MAC sequence while the previous result awaits
+-- 'm_accum_s2m.ready' -- see proposal doc section 3.6/5 for the full state
+-- machine.
+entity pe_array is
+  generic (
+    -- Output-channel parallelism: number of parallel accumulator lanes.
+    g_pe_rows : positive;
+    -- Input-channel/MAC parallelism per cycle: weight-buffer columns
+    -- consumed per group.
+    g_pe_cols : positive;
+    -- Accumulator width (int32 default).
+    g_accum_width : positive := 32;
+    -- Upper bound on 'cfg_kernel_h'/'cfg_kernel_w' individually.
+    g_max_kernel_size : positive;
+    -- Rows in the active cnn_accel_weight_buffer bank. Added by vhdesign
+    -- (not in the requirement) so 'weight_rd_addr' can be sized to match
+    -- cnn_accel_weight_buffer's actual 'weight_rd_addr' width
+    -- (num_bits_needed(g_weight_buffer_depth - 1)) at cnn_accel_top
+    -- integration time -- see proposal doc section 3.1, same precedent
+    -- cnn_accel_bias_requant's 'g_bias_addr_width' already set.
+    g_weight_buffer_depth : positive
+  );
+  port (
+    clk : in std_ulogic;
+    -- Synchronous active-high reset ('reset_internal' at the IP top
+    -- level): clears the FSM to 'idle' and drops any in-flight/pending
+    -- accumulation and any pending-but-undrained output beat. The
+    -- accumulator registers' content does not need explicit reset (only
+    -- ever read while the, already-reset, state machine guarantees they
+    -- hold a value written during the current, post-reset MAC sequence).
+    reset : in std_ulogic := '0';
+    --# {{}}
+    -- 'OPCODE_CONV2D'/'OPCODE_FC' vs 'OPCODE_DWCONV2D' -- selects the
+    -- per-lane MAC indexing mode (proposal doc section 3.5). Any other
+    -- value is treated as the 'OPCODE_CONV2D' path (upstream routing
+    -- guarantees this module only ever receives these opcodes). Sampled
+    -- combinationally at 's_window' accept time; latched for the whole
+    -- (multi-cycle) MAC sequence.
+    cfg_opcode : in std_ulogic_vector(7 downto 0);
+    -- Input-channel count for the in-flight layer. 'cfg_out_channels' is
+    -- present per the requirement's port list but unused in the datapath
+    -- in v1 (out_channels <= g_pe_rows single-tile simplification -- see
+    -- proposal doc section 3.3, same simplification
+    -- cnn_accel_bias_requant/cnn_accel_weight_buffer already made).
+    cfg_in_channels : in std_ulogic_vector(15 downto 0);
+    cfg_out_channels : in std_ulogic_vector(15 downto 0);
+    -- Kernel height/width for the in-flight layer. Added by vhdesign (not
+    -- in the requirement's port list) -- see proposal doc section 3.2;
+    -- same port widths/types as cnn_accel_window_gen's own
+    -- 'cfg_kernel_h'/'cfg_kernel_w'.
+    cfg_kernel_h : in std_ulogic_vector(7 downto 0);
+    cfg_kernel_w : in std_ulogic_vector(7 downto 0);
+    --# {{}}
+    -- One window per beat, from cnn_accel_window_gen (already
+    -- opcode-selected upstream by a handshake_splitter). 'data' packs tap
+    -- 'i' (row-major spatial index, 'i = row*kernel_w + col'), channel
+    -- 'c', at bit offset '8*(i*in_channels + c)' -- unmodified pass-through
+    -- of cnn_accel_window_gen's own packing convention.
+    s_window_m2s : in axi_stream_m2s_t;
+    s_window_s2m : out axi_stream_s2m_t;
+    --# {{}}
+    -- Row (tile) address into the active cnn_accel_weight_buffer bank's
+    -- weight region. Sequenced 0 .. num_groups-1 (restarting at 0 for
+    -- every new window -- weights are per-layer constants, reused
+    -- unchanged across every window of that layer), driven unconditionally
+    -- by this module's own MAC-sequencing counter (not AXI4-Stream: a
+    -- simple, always-ready, 1-cycle-latency read port).
+    weight_rd_addr : out std_ulogic_vector(num_bits_needed(g_weight_buffer_depth - 1) - 1 downto 0);
+    -- One int8 weight per PE lane ('g_pe_rows*g_pe_cols' lanes), lane
+    -- 'l = r*g_pe_cols + c' (row-major) at bits '8*(l+1)-1 downto 8*l'.
+    -- Registered, 1 cycle read latency.
+    weight_rd_data : in std_ulogic_vector(8 * g_pe_rows * g_pe_cols - 1 downto 0);
+    --# {{}}
+    -- One int32 (g_accum_width-bit) accumulator per output-channel lane
+    -- ('g_pe_rows' lanes), lane 'l' at bits 'g_accum_width*(l+1)-1 downto
+    -- g_accum_width*l'; remaining high bits 0. 'last' mirrors the
+    -- accepted window's 'last'. To cnn_accel_bias_requant.
+    m_accum_m2s : out axi_stream_m2s_t;
+    m_accum_s2m : in axi_stream_s2m_t
+  );
+end entity pe_array;
+
+architecture a of pe_array is
+
+  ------------------------------------------------------------------------
+  -- Local sizing constants.
+  ------------------------------------------------------------------------
+
+  -- Maximum number of int8 taps a single 's_window_m2s.data' beat can
+  -- carry -- the fixed-width axi_stream_pkg data field's own hard limit
+  -- (proposal doc section 3.5).
+  constant c_max_taps : positive := axi_stream_data_sz / 8;
+
+  constant c_addr_width : positive := num_bits_needed(g_weight_buffer_depth - 1);
+
+  type state_t is (idle, run, done);
+  signal state_q : state_t := idle;
+
+  -- Per-window latched configuration/data (captured at 's_window' accept
+  -- time, held stable for the whole multi-cycle MAC sequence -- proposal
+  -- doc section 3.2).
+  signal window_q : std_ulogic_vector(axi_stream_data_sz - 1 downto 0) := (others => '0');
+  signal window_last_q : std_ulogic := '0';
+  signal is_dwconv_q : std_ulogic := '0';
+  signal in_channels_q : natural range 0 to 65535 := 0;
+  signal mac_taps_q : natural range 0 to c_max_taps := 0;
+  signal num_groups_q : natural range 0 to c_max_taps := 0;
+
+  -- MAC-sequencing group counter: runs 0 .. num_groups_q inclusive
+  -- ('num_groups_q + 1' cycles total per window -- proposal doc section 5).
+  signal cycle_q : natural range 0 to c_max_taps := 0;
+
+  type accum_arr_t is array (natural range <>) of signed(g_accum_width - 1 downto 0);
+  signal accum_q : accum_arr_t(0 to g_pe_rows - 1) := (others => (others => '0'));
+
+  -- One-entry output register, decoupled from the compute engine (proposal
+  -- doc section 3.6): a new window can start its MAC sequence while a
+  -- previous result still waits here on 'm_accum_s2m.ready'.
+  signal out_valid_q : std_ulogic := '0';
+  signal out_data_q : std_ulogic_vector(axi_stream_data_sz - 1 downto 0) := (others => '0');
+  signal out_last_q : std_ulogic := '0';
+
+  ------------------------------------------------------------------------
+  -- Per-lane MAC (shared by both opcode modes -- proposal doc section 6).
+  -- For PE row 'r', column 'c', group 'g' (the group whose weights are
+  -- valid on 'weight_data' this cycle): selects the operand index/validity
+  -- per opcode mode, multiplies by that lane's weight, and returns the
+  -- (masked) per-lane partial sum to be added into that group's
+  -- accumulators. Invalid (out-of-range) lanes are simply never sliced out
+  -- of 'window' -- 'idx' is only used inside the 'is_valid' branch, so no
+  -- defensive clamp is required for a legal (asserted-in-bounds)
+  -- configuration.
+  ------------------------------------------------------------------------
+
+  function compute_partial_sums(
+    window : std_ulogic_vector(axi_stream_data_sz - 1 downto 0);
+    weight_data : std_ulogic_vector(8 * g_pe_rows * g_pe_cols - 1 downto 0);
+    group : natural;
+    is_dwconv : std_ulogic;
+    in_channels : natural;
+    mac_taps : natural
+  ) return accum_arr_t is
+    variable result : accum_arr_t(0 to g_pe_rows - 1) := (others => (others => '0'));
+    variable spatial_t : natural;
+    variable idx : natural;
+    variable is_valid : boolean;
+    variable operand : signed(7 downto 0);
+    variable weight : signed(7 downto 0);
+    variable product : signed(15 downto 0);
+    variable weight_lane : natural;
+  begin
+    for r in 0 to g_pe_rows - 1 loop
+      for c in 0 to g_pe_cols - 1 loop
+        if is_dwconv = '1' then
+          spatial_t := group * g_pe_cols + c;
+          idx := spatial_t * in_channels + r;
+          is_valid := (spatial_t < mac_taps) and (r < in_channels);
+        else
+          idx := group * g_pe_cols + c;
+          is_valid := idx < mac_taps;
+        end if;
+
+        if is_valid then
+          operand := signed(window(8 * idx + 7 downto 8 * idx));
+        else
+          operand := to_signed(0, 8);
+        end if;
+
+        weight_lane := r * g_pe_cols + c;
+        weight := signed(weight_data(8 * (weight_lane + 1) - 1 downto 8 * weight_lane));
+
+        product := operand * weight;
+
+        if is_valid then
+          result(r) := result(r) + resize(product, g_accum_width);
+        end if;
+      end loop;
+    end loop;
+    return result;
+  end function;
+
+  -- Packs the final per-lane accumulators into the low
+  -- 'g_accum_width*g_pe_rows' bits of an 'm_accum_m2s.data'-shaped vector
+  -- (lane 'l' at bits 'g_accum_width*(l+1)-1 downto g_accum_width*l'),
+  -- remaining high bits 0.
+  function pack_accum(accum : accum_arr_t) return std_ulogic_vector is
+    variable result : std_ulogic_vector(axi_stream_data_sz - 1 downto 0) := (others => '0');
+  begin
+    for l in accum'range loop
+      result(g_accum_width * (l + 1) - 1 downto g_accum_width * l) := std_ulogic_vector(accum(l));
+    end loop;
+    return result;
+  end function;
+
+begin
+
+  ------------------------------------------------------------------------
+  -- Static sizing contract checks -- see the generics' doc comments.
+  ------------------------------------------------------------------------
+
+  assert g_accum_width * g_pe_rows <= axi_stream_data_sz
+    report "pe_array: g_accum_width*g_pe_rows (" & natural'image(g_accum_width * g_pe_rows) &
+      ") exceeds axi_stream_pkg's fixed data width (" & natural'image(axi_stream_data_sz) &
+      ") -- see proposal doc section 7"
+    severity failure;
+
+  assert 8 * g_pe_rows * g_pe_cols <= 8 * axi_stream_data_sz / 8 * g_pe_rows * g_pe_cols /
+    (g_pe_rows * g_pe_cols)
+    report "pe_array: internal sizing sanity check failed"
+    severity failure;
+
+  ------------------------------------------------------------------------
+  -- Handshake: 's_window_s2m.ready' is a pure function of registered
+  -- state ('state_q = idle'), never of 's_window_m2s.valid' itself -- no
+  -- combinational loop. 'weight_rd_addr' is likewise a pure function of
+  -- registered state, driven unconditionally while a group remains to be
+  -- issued this window (proposal doc section 10).
+  ------------------------------------------------------------------------
+
+  s_window_s2m.ready <= '1' when state_q = idle else '0';
+
+  weight_rd_addr <= std_ulogic_vector(to_unsigned(cycle_q, c_addr_width))
+                     when (state_q = run and cycle_q < num_groups_q) else
+                     (others => '0');
+
+  m_accum_m2s.valid <= out_valid_q;
+  m_accum_m2s.data <= out_data_q;
+  m_accum_m2s.last <= out_last_q;
+  m_accum_m2s.user <= (others => '-');
+
+  ------------------------------------------------------------------------
+  -- Compute engine: window accept (idle) -> MAC-group sequencing (run) ->
+  -- output-register wait (done, only entered when the output register was
+  -- still full at the last group's accumulate) -- proposal doc section 5.
+  ------------------------------------------------------------------------
+
+  main : process(clk)
+    variable kernel_h_v : natural;
+    variable kernel_w_v : natural;
+    variable in_channels_v : natural;
+    variable is_dwconv_v : std_ulogic;
+    variable total_window_taps_v : natural;
+    variable mac_taps_v : natural;
+    variable num_groups_v : natural;
+    variable partial_v : accum_arr_t(0 to g_pe_rows - 1);
+    variable final_accum_v : accum_arr_t(0 to g_pe_rows - 1);
+    variable can_commit_output_v : boolean;
+  begin
+    if rising_edge(clk) then
+      if reset = '1' then
+        state_q <= idle;
+        cycle_q <= 0;
+        out_valid_q <= '0';
+      else
+        can_commit_output_v := (out_valid_q = '0') or (m_accum_s2m.ready = '1');
+
+        -- Default output-register drain (overridden below by a same-cycle
+        -- commit, matching cnn_accel_pool's own register_stage idiom: no
+        -- bubble on back-to-back commit+drain).
+        if out_valid_q = '1' and m_accum_s2m.ready = '1' then
+          out_valid_q <= '0';
+        end if;
+
+        case state_q is
+
+          when idle =>
+            if s_window_m2s.valid = '1' then
+              kernel_h_v := to_integer(unsigned(cfg_kernel_h));
+              kernel_w_v := to_integer(unsigned(cfg_kernel_w));
+              in_channels_v := to_integer(unsigned(cfg_in_channels));
+              if cfg_opcode = OPCODE_DWCONV2D then
+                is_dwconv_v := '1';
+              else
+                is_dwconv_v := '0';
+              end if;
+
+              assert kernel_h_v <= g_max_kernel_size and kernel_w_v <= g_max_kernel_size
+                report "pe_array: cfg_kernel_h/cfg_kernel_w must be <= g_max_kernel_size"
+                severity failure;
+
+              total_window_taps_v := kernel_h_v * kernel_w_v * in_channels_v;
+
+              assert total_window_taps_v <= c_max_taps
+                report "pe_array: kernel_h*kernel_w*in_channels (" &
+                  natural'image(total_window_taps_v) &
+                  ") exceeds axi_stream_pkg's fixed tap capacity (" &
+                  natural'image(c_max_taps) & ") -- see proposal doc section 3.5"
+                severity failure;
+
+              if is_dwconv_v = '1' then
+                mac_taps_v := kernel_h_v * kernel_w_v;
+              else
+                mac_taps_v := total_window_taps_v;
+              end if;
+
+              num_groups_v := (mac_taps_v + g_pe_cols - 1) / g_pe_cols;
+
+              assert num_groups_v <= g_weight_buffer_depth
+                report "pe_array: num_groups (" & natural'image(num_groups_v) &
+                  ") exceeds g_weight_buffer_depth (" & natural'image(g_weight_buffer_depth) &
+                  ") -- see proposal doc section 3.1"
+                severity failure;
+
+              window_q <= s_window_m2s.data;
+              window_last_q <= s_window_m2s.last;
+              is_dwconv_q <= is_dwconv_v;
+              in_channels_q <= in_channels_v;
+              mac_taps_q <= mac_taps_v;
+              num_groups_q <= num_groups_v;
+              cycle_q <= 0;
+              accum_q <= (others => (others => '0'));
+              state_q <= run;
+            end if;
+
+          when run =>
+            if cycle_q >= 1 then
+              partial_v := compute_partial_sums(
+                window => window_q,
+                weight_data => weight_rd_data,
+                group => cycle_q - 1,
+                is_dwconv => is_dwconv_q,
+                in_channels => in_channels_q,
+                mac_taps => mac_taps_q
+              );
+            else
+              partial_v := (others => (others => '0'));
+            end if;
+
+            for r in 0 to g_pe_rows - 1 loop
+              final_accum_v(r) := accum_q(r) + partial_v(r);
+            end loop;
+
+            if cycle_q = num_groups_q then
+              if can_commit_output_v then
+                out_valid_q <= '1';
+                out_data_q <= pack_accum(final_accum_v);
+                out_last_q <= window_last_q;
+                state_q <= idle;
+                cycle_q <= 0;
+              else
+                accum_q <= final_accum_v;
+                state_q <= done;
+              end if;
+            else
+              accum_q <= final_accum_v;
+              cycle_q <= cycle_q + 1;
+            end if;
+
+          when done =>
+            if can_commit_output_v then
+              out_valid_q <= '1';
+              out_data_q <= pack_accum(accum_q);
+              out_last_q <= window_last_q;
+              state_q <= idle;
+              cycle_q <= 0;
+            end if;
+
+        end case;
+      end if;
+    end if;
+  end process;
+
+end architecture a;
