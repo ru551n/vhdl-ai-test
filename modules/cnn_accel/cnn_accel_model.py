@@ -235,6 +235,35 @@ def saturate_signed(value: int, result_width: int) -> int:
     return max(min_value, min(max_value, value))
 
 
+INT32_MIN = -(2**31)
+INT32_MAX = 2**31 - 1
+
+
+class AccumulatorOverflow(ValueError):
+    """Raised when a partial-sum value would leave the signed 32-bit
+    range the RTL accumulator actually implements. The golden model uses
+    unbounded Python ints for accumulation, so without this guard it
+    would silently diverge from any real (wrapping) 32-bit RTL
+    accumulator for programs whose true mathematical accumulation
+    exceeds int32 -- this makes that divergence a loud failure instead
+    of a silent bit-exactness mismatch."""
+
+
+def _check_accumulator(
+    value: int, *, opcode: int, out_channel: int, out_row: int, out_col: int
+) -> int:
+    """Enforce the int32 accumulator contract at an accumulation
+    boundary; returns `value` unchanged so call sites can wrap an
+    expression in-place."""
+    if value < INT32_MIN or value > INT32_MAX:
+        raise AccumulatorOverflow(
+            f"accumulator overflow: opcode=0x{opcode:02x} out_channel={out_channel} "
+            f"x={out_col} y={out_row} value={value} outside int32 range "
+            f"[{INT32_MIN}, {INT32_MAX}]"
+        )
+    return value
+
+
 def bias_requantize_relu(
     acc: int,
     bias: int,
@@ -256,25 +285,47 @@ def bias_requantize_relu(
     one rounding step, matching the RTL's documented option to "fold into
     one combined shift amount at vhdesign time".
 
-    When `requant_en=False`, per `cnn_accel_bias_requant_req.md`: "the
-    pipeline still applies bias/ReLU but passes the low 8 bits through
-    unscaled (debug/bypass path, not expected in normal compiled
-    programs)" -- i.e. two's-complement truncation to 8 bits, not
-    saturation.
+    Ratified 33-bit bias-sum contract (D9), ratified against the RTL, not
+    a model choice: `cnn_accel_bias_requant.vhd` declares
+    `c_sum_width = g_accum_width + 1` (line 81, one guard bit on top of
+    the 32-bit accumulator) specifically "so 'accum + bias' cannot
+    overflow", and `total_l <= resize(accum_l, c_sum_width) +
+    resize(bias_l, c_sum_width) ...` (line ~211) does the add at that
+    width. Both operands are full int32 (`acc` is the MAC accumulator,
+    range-checked to int32 by `_check_accumulator`/`AccumulatorOverflow`
+    at every call site before it ever reaches this function; `bias` is
+    the int32 value decoded from the bias buffer). int32 + int32 always
+    fits exactly in 33 bits -- there is no width in this pipeline at
+    which the bias add can wrap or need to saturate; the only saturating,
+    lossy step anywhere in `bias_requantize_relu` is the final int8
+    `saturate_signed` call below. Consequently this function's `total =
+    acc + (bias if bias_en else 0)` uses plain unbounded Python-int
+    addition deliberately (not a 33-bit or 32-bit masked/wrapped add) and
+    that is already bit-exact with the RTL: any width narrower than 33
+    bits (e.g. accidentally wrapping to int32 here) would silently
+    diverge from the RTL for exactly the acc=INT32_MAX/bias=INT32_MAX
+    (or INT32_MIN/INT32_MIN) corner, which is why that corner has a
+    dedicated regression test below.
+
+    When `requant_en=False`, per `cnn_accel_bias_requant_req.md`: the
+    pipeline still applies bias/ReLU but passes the value through
+    unscaled -- SATURATED to int8, identical semantics (and ordering:
+    bias -> ReLU -> saturate) to the `requant_en=True` path, just without
+    the scale/shift step. (Ratified fix: an earlier revision of this
+    model wrapped/truncated to the low 8 bits here instead of saturating,
+    which is a bit-exactness trap -- two different overflow semantics
+    for what is otherwise the same pipeline.)
     """
     total = acc + (bias if bias_en else 0)
 
     if requant_en:
         scaled = round_shift_right_signed(total * requant_scale, 15 + requant_shift)
-        if relu_en:
-            scaled = max(scaled, 0)
-        return saturate_signed(scaled, 8)
+    else:
+        scaled = total
 
-    # Bypass path: bias/ReLU still applied, no scaling; low 8 bits pass through.
     if relu_en:
-        total = max(total, 0)
-    value = total & 0xFF
-    return value - 256 if value >= 128 else value
+        scaled = max(scaled, 0)
+    return saturate_signed(scaled, 8)
 
 
 # ---------------------------------------------------------------------------
@@ -321,10 +372,18 @@ def _conv2d_generic(
     pad_bottom = desc.pad_bottom if desc.pad_en else 0
     pad_right = desc.pad_right if desc.pad_en else 0
 
+    if s_h == 0 or s_w == 0:
+        raise ValueError(f"conv: stride_h/stride_w must be nonzero, got ({s_h}, {s_w})")
+
     padded_h = in_h + pad_top + pad_bottom
     padded_w = in_w + pad_left + pad_right
     out_h = (padded_h - k_h) // s_h + 1
     out_w = (padded_w - k_w) // s_w + 1
+    if out_h <= 0 or out_w <= 0:
+        raise ValueError(
+            f"conv: computed output dims must be positive, got out_h={out_h} out_w={out_w} "
+            f"(padded {padded_h}x{padded_w}, kernel {k_h}x{k_w}, stride {s_h}x{s_w})"
+        )
 
     output: list[int] = []
     for out_row in range(out_h):
@@ -357,6 +416,9 @@ def _conv2d_generic(
                                 w = weights[((oc * k_h + kr) * k_w + kc) * in_c + ic]
                                 acc += tap * w
 
+                _check_accumulator(
+                    acc, opcode=desc.opcode, out_channel=oc, out_row=out_row, out_col=out_col
+                )
                 bias_value = bias[oc] if desc.bias_en else 0
                 output.append(
                     bias_requantize_relu(
@@ -399,14 +461,30 @@ def fc(input_values: list[int], weights: list[int], bias: list[int], desc: Layer
 def _pool_windows(input_values: list[int], desc: LayerDesc) -> list[list[int]]:
     """Per-channel pooling windows in output-raster order, one list of
     `pool_kernel_h * pool_kernel_w` int8 taps per (output position,
-    channel). Zero-padding is not modeled for pooling (v1 ISA has no
-    pooling-specific padding fields; `pad_en` only applies to
-    `CONV2D`/`DWCONV2D`/`FC`)."""
+    channel).
+
+    LIMITATION (v1): zero-padding is NOT modeled for pooling -- the v1
+    ISA has no pooling-specific padding fields, and `pad_en` is only
+    meaningful for `CONV2D`/`DWCONV2D`/`FC`. If `desc.pad_en` is set for
+    a pooling instruction this is a program-authoring error (the bit
+    would be silently ignored otherwise) and raises `ValueError`."""
+    if desc.pad_en:
+        raise ValueError(
+            "pooling has no padding support in v1 (pad_en must be 0 for "
+            "POOL_MAX/POOL_AVG)"
+        )
     in_w, in_h, channels = desc.in_width, desc.in_height, desc.in_channels
     k_h, k_w = desc.pool_kernel_h, desc.pool_kernel_w
     s_h, s_w = desc.pool_stride_h, desc.pool_stride_w
+    if s_h == 0 or s_w == 0:
+        raise ValueError(f"pool: pool_stride_h/pool_stride_w must be nonzero, got ({s_h}, {s_w})")
     out_h = (in_h - k_h) // s_h + 1
     out_w = (in_w - k_w) // s_w + 1
+    if out_h <= 0 or out_w <= 0:
+        raise ValueError(
+            f"pool: computed output dims must be positive, got out_h={out_h} out_w={out_w} "
+            f"(input {in_h}x{in_w}, kernel {k_h}x{k_w}, stride {s_h}x{s_w})"
+        )
 
     windows: list[list[int]] = []
     for out_row in range(out_h):
@@ -435,24 +513,58 @@ def pool_avg(input_values: list[int], desc: LayerDesc) -> list[int]:
     `bias_requantize_relu` with `bias_en=False` (division by the pool area
     is `requant_scale`/`requant_shift`, per
     `cnn_accel_pool_req.md`/`doc/cnn_accel_arch.md`)."""
-    return [
-        bias_requantize_relu(
-            sum(taps),
-            0,
-            bias_en=False,
-            requant_en=desc.requant_en,
-            relu_en=desc.relu_en,
-            requant_scale=desc.requant_scale,
-            requant_shift=desc.requant_shift,
-        )
-        for taps in _pool_windows(input_values, desc)
-    ]
+    windows = _pool_windows(input_values, desc)
+    channels = desc.in_channels
+    # windows is in (out_row, out_col, channel) raster order, see _pool_windows.
+    out_h = (desc.in_height - desc.pool_kernel_h) // desc.pool_stride_h + 1
+    out_w = (desc.in_width - desc.pool_kernel_w) // desc.pool_stride_w + 1
+    output: list[int] = []
+    idx = 0
+    for out_row in range(out_h):
+        for out_col in range(out_w):
+            for _ch in range(channels):
+                acc_sum = sum(windows[idx])
+                _check_accumulator(
+                    acc_sum,
+                    opcode=desc.opcode,
+                    out_channel=_ch,
+                    out_row=out_row,
+                    out_col=out_col,
+                )
+                output.append(
+                    bias_requantize_relu(
+                        acc_sum,
+                        0,
+                        bias_en=False,
+                        requant_en=desc.requant_en,
+                        relu_en=desc.relu_en,
+                        requant_scale=desc.requant_scale,
+                        requant_shift=desc.requant_shift,
+                    )
+                )
+                idx += 1
+    return output
 
 
 def run_layer(memory: bytearray, desc: LayerDesc) -> None:
     """Execute one decoded instruction against `memory` (read input/
     weights/bias, write output), in place."""
     in_w, in_h, in_c = desc.in_width, desc.in_height, desc.in_channels
+
+    if desc.opcode == OPCODE_FC and (
+        desc.in_width != 1 or desc.in_height != 1 or desc.kernel_h != 1 or desc.kernel_w != 1
+    ):
+        # fc() silently rebuilds its own degenerate 1x1-spatial LayerDesc
+        # internally; if the ORIGINAL desc (used here to slice memory) has
+        # non-degenerate in_width/in_height/kernel_h/kernel_w, the input
+        # byte count computed below (in_w*in_h*in_c) would not match what
+        # fc()/conv2d() actually consume (in_c only), silently dropping
+        # input bytes. Callers must emit the degenerate form explicitly.
+        raise ValueError(
+            "OPCODE_FC requires in_width=in_height=kernel_h=kernel_w=1 in the "
+            f"encoded instruction itself, got in_width={desc.in_width} "
+            f"in_height={desc.in_height} kernel_h={desc.kernel_h} kernel_w={desc.kernel_w}"
+        )
 
     if desc.opcode in (OPCODE_CONV2D, OPCODE_FC, OPCODE_DWCONV2D):
         in_size = in_w * in_h * in_c
