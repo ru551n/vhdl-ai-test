@@ -183,6 +183,42 @@ class Module(BaseModule):
                     DspBlocks(LessThan(12)),
                 ],
             ),
+            build(
+                name="cnn_accel_pe_array",
+                generics={
+                    "g_pe_rows": _PE_ROWS,
+                    "g_pe_cols": _PE_COLS,
+                    "g_accum_width": _ACCUM_WIDTH,
+                    "g_max_kernel_size": _MAX_KERNEL_SIZE,
+                    "g_tile_channels": _TILE_CHANNELS,
+                    "g_weight_buffer_depth": _WEIGHT_BUFFER_DEPTH,
+                },
+                # TODO: re-baseline from CI (Yosys v0.68 *release*, per this
+                # file's own comment above on why CI's numbers -- not a
+                # local dev Yosys -- are the ones that count). Measured
+                # locally on Yosys v0.68+182 (dev) 2026-09: 2888 LUTs,
+                # 1119 FFs, 0 BRAM, 65 DSP. Limits below are set well above
+                # that (LUTs get the largest margin: this file's own
+                # window_gen/bias_requant/pool entries show local-dev vs
+                # CI-release LUT counts differing by 1.4x-2.7x; DSPs and
+                # BRAMs are hard-primitive counts and should not move
+                # between Yosys versions, so keep a tight margin there).
+                #
+                # DSP count is ~64 (g_pe_rows*g_pe_cols lanes), not
+                # ~g_pe_rows: broadcast-activation/per-lane-weight means
+                # every (row, col) PE cell does its own int8 x int8
+                # multiply every cycle (proposal doc section 6), not just
+                # one multiply per row -- g_pe_rows would only be the DSP
+                # count if g_pe_cols were 1. The +1 over 64 is an address
+                # adder Yosys folded into a DSP48E1's own adder rather than
+                # a 65th multiply lane.
+                checkers=[
+                    TotalLuts(LessThan(7500)),
+                    Ffs(LessThan(1600)),
+                    BlockRams(LessThan(1)),
+                    DspBlocks(LessThan(80)),
+                ],
+            ),
         ]
 
     def setup_vunit(self, vunit_proj: VUnit, **kwargs) -> None:
@@ -190,6 +226,7 @@ class Module(BaseModule):
 
         self._setup_cnn_accel_bias_requant(library)
         self._setup_cnn_accel_pool(library)
+        self._setup_cnn_accel_pe_array(library)
 
     def _setup_cnn_accel_bias_requant(self, library) -> None:
         tb = library.test_bench("tb_cnn_accel_bias_requant")
@@ -226,5 +263,24 @@ class Module(BaseModule):
                     "stall_probability_percent_in": stall,
                     "stall_probability_percent_max": stall,
                     "stall_probability_percent_avgsum": stall,
+                },
+            )
+
+    def _setup_cnn_accel_pe_array(self, library) -> None:
+        tb = library.test_bench("tb_cnn_accel_pe_array")
+
+        for test in tb.get_tests():
+            # Zero stall on both links only for the dedicated
+            # full-throughput test (its check_relation timing check requires
+            # back-to-back beats); randomized independent per-link
+            # backpressure otherwise. Matches module_canny.py's
+            # `_setup_canny_threshold` precedent.
+            stall = 0 if "full_throughput" in test.name else 20
+
+            self.add_vunit_config(
+                test=test,
+                generics={
+                    "stall_probability_percent_in": stall,
+                    "stall_probability_percent_out": stall,
                 },
             )
