@@ -216,7 +216,14 @@ jobs:
         # each module's `get_build_projects()`), so this fails not only on a
         # synthesis error but also when an entity's LUT/FF/BRAM/DSP count
         # grows past its recorded baseline.
-        run: /opt/venv/bin/python build_fpga.py --netlist-builds --num-parallel-builds 4
+        #
+        # Serialized deliberately. With parallel builds, VUnit 4.7.1's test
+        # runner threads race on a stdout that the parent has already closed
+        # ("ValueError: I/O operation on closed file"), which kills the
+        # *create* phase of whichever projects those threads were handling.
+        # They then fail the build phase with a misleading 'Project "x" does
+        # not exist ... Call create before build'. One thread, no race.
+        run: /opt/venv/bin/python build_fpga.py --netlist-builds --num-parallel-builds 1
 
       - name: Upload synthesis reports
         if: always()
