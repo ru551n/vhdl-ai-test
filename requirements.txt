@@ -13,10 +13,10 @@
 # Install:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 #     (or)  uv venv && uv pip install -r requirements.txt
 
-# VUnit 5.0.0.dev12 + PR #1101 (the headless `--waves` flag: vcd on GHDL, fst
+# VUnit 5.0.0.dev12 + PR #1101 (the headless `--wave` flag: vcd on GHDL, fst
 # on NVC). The testbenches and vunit-mcp's waveform support are developed
 # against this fork; stock 5.0.0.dev12 (VUnit/vunit@bbbe9ca, the parent of
-# this commit) has no `--waves` and silently falls back to `--gtkwave-fmt`.
+# this commit) has no `--wave` and can only record through the viewer flags.
 vunit-hdl @ git+https://github.com/ru551n/vunit.git@6304bcf2c80b239077d44aeb52e37c8924047a68
 
 # tsfpga fork carrying the Yosys+GHDL netlist-build support
