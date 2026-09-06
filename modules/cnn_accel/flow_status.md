@@ -14,14 +14,15 @@ it via the main agent, they do not edit it themselves).
 |---|---|---|
 | 1. Architecture (`vharch`) | COMPLETE | `doc/cnn_accel_arch.md`, `doc/cnn_accel_req.md`, per-module `modules/cnn_accel/doc/*_req.md` (13 files) |
 | 2/3. Design + TDD, leaf modules | COMPLETE | `cnn_accel_bias_requant`, `cnn_accel_pool`, `cnn_accel_window_gen`, `cnn_accel_weight_buffer` — all green, real `vunit-mcp` regression, see below |
-| 2/3. Design + TDD, tiled dataflow (`window_gen` rework, `pe_array`, `weight_buffer`) | IN PROGRESS | Round 2. Blocking flaw found + fixed at interface level, see below |
-| 3b. `conv_core` bit-exact vs `cnn_accel_model.py` | PENDING | **the real correctness milestone** (decision D5) |
+| 2/3. Design + TDD, tiled dataflow (`window_gen` rework, `pe_array`, `weight_buffer`) | COMPLETE | Round 2, M3-M5. Blocking flaw found + fixed, see below |
+| 3b. `conv_core` bit-exact vs `cnn_accel_model.py` | COMPLETE | M6b, commit `52adb45`. 73/73 VUnit, bit-exact vs Python vectors (decision D5) |
+| 7a. `window_gen` block-RAM inference (M7, Option 3a) | COMPLETE | 23950 LUTs / 0 BRAM -> 2753 LUTs / 3 RAMB36. See "M7" below |
 | 2/3. Design + TDD, AXI-facing engines (`cnn_accel_axi_read_dma`, `cnn_accel_ofmap_dma`, `cnn_accel_csr`) | PENDING | |
 | 2/3. Design + TDD, `cnn_accel_layer_ctrl` | PENDING | |
 | 2/3. Design + TDD, `cnn_accel_sequencer` | PENDING | |
 | 4. IP-level integration test | PENDING | full-program golden-model comparison vs. `cnn_accel_model.py` |
 | 5. Regression | PENDING | full project regression via `vunit-mcp` once all modules green |
-| 7. Synthesis | PENDING | target ratified: **Xilinx Artix-7** (`chip='xilinx'`, `family='xc7'`). Per-module gate after each module goes green |
+| 7. Synthesis | IN PROGRESS | target ratified: **Xilinx Artix-7** (`chip='xilinx'`, `family='xc7'`). All 6 netlist builds pass; LUT limits still PROVISIONAL until a CI run |
 | 8. Documentation | PENDING | `vhdoc` aggregation once modules are green |
 
 ## Affected modules (this round)
@@ -139,9 +140,76 @@ checked against the actual RTL.
   **pre-existing and unrelated** (module untouched, last commit `a929171`).
   Tracked, not blocking.
 
-### Next recommended action
+### Next recommended action (superseded — see M7 below)
 Tiled-dataflow design proposal spanning `window_gen`/`pe_array`/
 `weight_buffer`, then parallel implementation, then `conv_core`.
 Note: `W*C` is roughly invariant across the target network (stride-2 halves W
 and doubles C), so full-channel line buffers cost only ~2.5 KB/row — full
 input-channel tiling per output pixel is cheap on Artix-7.
+
+## M7 — `window_gen` block-RAM inference (Option 3a), 2026-09-06
+
+Ratified in `doc/cnn_accel_window_gen_bram_proposal.md` §6 (Option 3a,
+overriding the document's own Option 1 recommendation); implemented per its
+§7.1. Uncommitted at time of writing.
+
+### RTL change
+`src/cnn_accel_window_gen.vhd`: row banks are now `g_max_kernel_size`
+**physically separate** `bank_mem` signals, one per `gen_banks` generate
+branch, each with a single decoded write (`wr_decode` process) and a single
+**registered** read — the `memory_block` idiom already used by
+`cnn_accel_weight_buffer.vhd`. Read side walks a registered `kc` column
+counter over `cfg_kernel_w` cycles, reading all banks in parallel, packing
+into a tap-assembly register; the window is still presented as ONE
+`m_window_m2s` beat, so `cnn_accel_pkg` and `cnn_accel_pe_array` are
+untouched. `window_valid` is now a registered valid-delay trailing the walk,
+not a same-cycle function of `row_ready`.
+
+Key finding: a single shared 2D array signal is ONE memory object to Yosys's
+`memory_collect` once several banks' data must be live in the same cycle,
+however statically-indexed each access site looks — it emitted zero `$mem_v2`
+cells. Per-bank separate signals fixed that structurally.
+
+Correctness follow-up found by the existing tests: the slower read side lets
+the write side outrun the reader by `g_max_kernel_size` physical rows and
+alias a bank still pending read. Fixed with a `write_freeze_i` backpressure
+gate on `s_stream_s2m.ready` (not the out-of-scope double-buffering
+mitigation).
+
+### Measured (real tool results)
+- VUnit GHDL, clean, `num_threads=12`: **73/73 PASS** (19.5 s).
+- VUnit NVC, clean, `cnn_accel.*`: **40/40 PASS** (5.8 s).
+- Netlist builds (local dev Yosys v0.68+182, `synth_xilinx -family xc7`),
+  all 6 cnn_accel projects PASS against the new checkers:
+
+  | Entity | LUTs | FFs | BRAM | DSP |
+  |---|---|---|---|---|
+  | `window_gen` (was 23950 CI / 0 BRAM) | 2 753 | 789 | 3 (3xRAMB36) | 9 |
+  | `weight_buffer` | 181 | 59 | 72 (8xRAMB36 + 64xRAMB18) | 0 |
+  | `pe_array` | 2 888 | 1 119 | 0 | 65 |
+  | `bias_requant` | 4 658 | 66 | 0 | 32 |
+  | **`conv_core`** (was 35056 CI / 72 BRAM) | **10 323** | **2 033** | **75** | **106** |
+
+  FFs/BRAM/DSP are exactly additive over the four leaves (2033/75/106),
+  confirming the numbers; LUTs come out 157 below the sum of the leaves
+  (cross-boundary optimization).
+- Throughput cost (accepted in DP3): +5 cycles/window within a row
+  (standalone `test_full_throughput` 585 ns -> 2135 ns, 27% of old in
+  isolation); integrated behind `pe_array`'s 12-cycle/window budget that
+  dilutes to ~70%, i.e. the upper end of the ratified 70-75% band.
+
+### Open
+- LUT checker limits (`window_gen` <12000, `conv_core` <24000) are
+  **PROVISIONAL** local-Yosys guard rails. Project standing rule: LUT limits
+  must be re-baselined from a real CI run. FFs/BRAM/DSP are trusted directly
+  (version-insensitive); `window_gen`'s BRAM checker is `EqualTo(3)` so a
+  silent regression back to 0 BRAM fails CI.
+- `.maki/mcp.toml`: `TSFPGA_MCP_PROJECT_PYTHON` repointed at this repo's own
+  `.venv` — tsfpga-mcp's venv no longer has tsfpga installed, which made
+  every `tsfpga_project_build` fail with `No module named
+  tsfpga.build_project_list`. Takes effect after an MCP restart; this
+  session's builds were run by invoking `build_fpga.py` directly.
+
+### Next recommended action
+M8 `cnn_accel_layer_ctrl` (incl. the D6 output-channel tile loop), then M9
+DMAs, per the milestone table in `~/.local/state/maki/plans/cosmic-hip-cod.md`.

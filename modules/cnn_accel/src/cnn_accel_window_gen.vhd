@@ -46,6 +46,19 @@ use cnn_accel.cnn_accel_pkg.all;
 -- final tile's unused channel lanes are driven to '0' at write time
 -- (D11) -- deterministically, not left as whatever garbage
 -- 's_stream_m2s.data' happens to carry above the valid byte range.
+--
+-- M7 (doc/cnn_accel_window_gen_bram_proposal.md, ratified Option 3a):
+-- the row banks are read through a *registered* single-read-port
+-- 'memory_block' idiom (matches cnn_accel_weight_buffer.vhd), one read
+-- per bank per cycle. Since a window needs up to 'g_max_kernel_size'
+-- columns per row, the read side walks a registered 'kc' column counter
+-- over 'cfg_kernel_w' cycles, reading all 'g_max_kernel_size' banks in
+-- parallel each cycle and packing the results into a tap-assembly
+-- register; the complete window is then presented as one 'm_window_m2s'
+-- beat, same as before. This trades throughput (an extra ~'kw + 1' to
+-- 'kw + 2' cycles/window, see the proposal doc's DP3) for block-RAM
+-- inference (the combinational random-access read this replaces forced
+-- distributed RAM -- see the proposal doc section 1).
 entity cnn_accel_window_gen is
   generic (
     -- Upper bound on 'cfg_kernel_h'/'cfg_kernel_w'; sizes the row-bank
@@ -125,11 +138,11 @@ architecture a of cnn_accel_window_gen is
   constant c_window_data_length : positive := window_data_length(g_max_kernel_size, g_tile_channels);
 
   ------------------------------------------------------------------------
-  -- Row banks: 'g_max_kernel_size' full-row buffers (BRAM-inference
-  -- intent), each 'g_max_row_tile_words' channel-tile cells wide -- cell
-  -- 'col * n_tiles + tile' holds column 'col''s tile 'tile' (one
-  -- channel-tile of int8 activations, 'c_lane_width' bits), not one cell
-  -- per column -- see the entity-level comment on channel tiling and
+  -- Row banks: 'g_max_kernel_size' full-row buffers, each
+  -- 'g_max_row_tile_words' channel-tile cells wide -- cell 'col * n_tiles
+  -- + tile' holds column 'col''s tile 'tile' (one channel-tile of int8
+  -- activations, 'c_lane_width' bits), not one cell per column -- see
+  -- the entity-level comment on channel tiling and
   -- cnn_accel_tiled_dataflow_proposal.md section 1. Physical input row
   -- number 'r' always lives in bank 'r mod g_max_kernel_size'; since
   -- 'cfg_kernel_h <= g_max_kernel_size' (asserted at 'start'), at most
@@ -139,28 +152,136 @@ architecture a of cnn_accel_window_gen is
   -- forces an unread row to be evicted -- see the entity-level comment
   -- above and cnn_accel_window_gen_proposal.md section 4.
   --
-  -- Unlike a FIFO (popped once, in strict order) or a shallow column-tap
-  -- shift register (only the last few columns of a row), a bank is a
-  -- plain read/write array: writes go to 'row_banks(cur_row mod
-  -- g_max_kernel_size)(cur_col * n_tiles + wr_tile)' as pixel-tiles
-  -- arrive, and 'assemble_window' below reads 'row_banks(input_row mod
-  -- g_max_kernel_size)(input_col * n_tiles + rd_tile)' directly, for
-  -- whichever '(input_row, input_col, tile)' a given tap needs, however
-  -- many output positions end up needing that same already-written cell
-  -- (padding-induced replay, see entity-level comment).
+  -- M7: each bank is the 'memory_block' idiom already used by
+  -- cnn_accel_weight_buffer.vhd (:108-116, :245-251) -- one array signal,
+  -- one decoded single write per cycle, and a *registered* single read
+  -- per cycle, no reset on the array itself.
+  --
+  -- Correction (post-M7 measurement): a *single* 'row_banks' signal
+  -- indexed by a runtime bank number, even when every write/read site
+  -- only ever touches one *statically*-numbered element per unrolled
+  -- loop iteration, is still one combined multi-dimensional object to
+  -- GHDL/Yosys once more than one of those per-iteration accesses is
+  -- live simultaneously (this module's read side needs all
+  -- 'g_max_kernel_size' banks' data every cycle, in parallel, to feed
+  -- the tap-assembly register) -- 'memory_collect' never turned it into
+  -- '$mem' cells at all (0 found), and the whole array fell back to
+  -- plain flip-flops + mux trees, i.e. exactly the distributed-RAM
+  -- blowup this rework was meant to fix. Confirmed with a standalone
+  -- 'ghdl ...; proc; memory_collect; stat' probe on this entity: 0
+  -- '$mem_v2' cells either way.
+  --
+  -- Fix: 'g_max_kernel_size' *physically separate* signals, one per
+  -- 'gen_banks' generate branch below -- each branch's 'bank_mem' is a
+  -- distinct elaborated object (not a slice of a shared array), so each
+  -- is its own trivial one-write-port/one-read-port memory candidate,
+  -- structurally identical to cnn_accel_weight_buffer.vhd's single
+  -- 'weight_mem'/'bias_mem' pair, just replicated by generate instead of
+  -- selected by a runtime index. The write enable/address/data feeding
+  -- every branch are computed once, combinationally, by 'wr_decode'
+  -- below (see its comment for why that logic moved out of 'control').
   ------------------------------------------------------------------------
 
   type row_bank_t is array (0 to g_max_row_tile_words - 1) of
     std_ulogic_vector(c_lane_width - 1 downto 0);
-  type row_bank_arr_t is array (0 to g_max_kernel_size - 1) of row_bank_t;
 
-  signal row_banks : row_bank_arr_t;
+  -- Registered read output, one word per bank, one cycle after 'rd_addr'
+  -- is presented -- the BRAM-inference-critical registered read port
+  -- (proposal doc section 2 rule 1). No reset: read-data content has no
+  -- completeness contract of its own, same as cnn_accel_weight_buffer.vhd.
+  type bank_word_arr_t is array (0 to g_max_kernel_size - 1) of
+    std_ulogic_vector(c_lane_width - 1 downto 0);
+  signal bank_rd_data : bank_word_arr_t;
+
+  -- Per-bank read address and in-frame flag, driven combinationally by
+  -- 'addr_gen' below from the current 'kc_q' column-walk position; 'kr_of'
+  -- records which kernel-row tap (if any) that bank currently represents,
+  -- for the capture stage's tap-index decode.
+  type addr_arr_t is array (0 to g_max_kernel_size - 1) of
+    integer range 0 to g_max_row_tile_words - 1;
+  signal rd_addr : addr_arr_t := (others => 0);
+
+  -- Write-side decode (combinational, 'wr_decode' below): which single
+  -- bank 'fire' writes this cycle, at which cell, with which (D11
+  -- zero-padded) data -- shared by every 'gen_banks' branch's write
+  -- process.
+  signal wr_bank_idx_c : natural range 0 to g_max_kernel_size - 1;
+  signal wr_addr_c : integer range 0 to g_max_row_tile_words - 1;
+  signal wr_data_c : std_ulogic_vector(c_lane_width - 1 downto 0);
+
+  type flag_arr_t is array (0 to g_max_kernel_size - 1) of std_ulogic;
+  signal in_frame_now : flag_arr_t := (others => '0');
+
+  type kr_arr_t is array (0 to g_max_kernel_size - 1) of
+    integer range 0 to g_max_kernel_size - 1;
+  signal kr_of : kr_arr_t := (others => 0);
+
+  -- One cycle behind 'in_frame_now'/'kr_of'/'kc_q' -- aligned with
+  -- 'bank_rd_data', which lags the address by one registered read.
+  signal in_frame_capture_q : flag_arr_t := (others => '0');
+  signal kr_capture_q : kr_arr_t := (others => 0);
+  signal kc_capture_q : unsigned(7 downto 0) := (others => '0');
+  -- '1' the cycle after any cycle 'reading_q' was high -- i.e. this
+  -- cycle's 'bank_rd_data' is meaningful and should be captured.
+  signal capture_valid_q : std_ulogic := '0';
+
+  -- Column walk position, 0 .. kernel_w_q (inclusive: 'kernel_w_q' itself
+  -- is the one extra cycle needed to let the last column's registered
+  -- read land -- see 'walk_control's comment). Bounded by a *registered*
+  -- 'kernel_w_q' compare, not a variable-bound 'for' loop (the latter
+  -- crashes GHDL's synthesis backend -- see the 'control' process' D11
+  -- comment for the identical, already-hit issue).
+  signal kc_q : unsigned(7 downto 0) := (others => '0');
+  -- '1' while a column walk (read side) is in progress for the window at
+  -- 'out_row_q'/'out_col_q'/'rd_tile_q'.
+  signal reading_q : std_ulogic := '0';
+
+  -- Tap-assembly register: accumulates one full window's taps across the
+  -- 'kc' walk, then is presented as 'm_window_m2s.data' once
+  -- 'window_valid' is asserted. Cleared to all-zero at the start of every
+  -- walk, so taps that are out-of-frame (padding) or beyond the runtime
+  -- 'kh'/'kw' simply stay '0' without being written -- same semantics as
+  -- the predecessor combinational 'data_i'.
+  signal assembly_q : tap_array_t(0 to c_window_data_length - 1) :=
+    (others => (others => '0'));
 
   signal fire : std_ulogic;
-  signal window_valid : std_ulogic;
+  -- Registered: '1' once the 'kc' walk for the current window has fully
+  -- landed. Unlike the predecessor design this is *not* a same-cycle
+  -- function of 'row_ready' -- it trails it by the walk's pipeline
+  -- latency (proposal doc section 7.1 item 4). Nothing downstream
+  -- ('cnn_accel_pe_array', the testbench's scoreboard) depends on the
+  -- old same-cycle timing; both only ever look for
+  -- 'window_valid = 1 and m_window_s2m.ready = 1'.
+  signal window_valid : std_ulogic := '0';
   signal consume : std_ulogic;
   signal last_pixel : std_ulogic;
   signal first_tile_flag, last_tile_flag : std_ulogic;
+  -- Combinational: '1' once every real (unpadded) row/column this window
+  -- needs has been fully written -- unchanged formula from the
+  -- predecessor design (cnn_accel_window_gen_proposal.md section 4), just
+  -- no longer wired directly to 'window_valid'. Only ever sampled from
+  -- the 'idle' state below (registered state only, so no combinational
+  -- loop through 's_stream_m2s.valid'/'m_window_s2m.ready').
+  signal row_ready_i : std_ulogic;
+
+  -- M7 correctness fix: combinational, '1' once the write side is about
+  -- to advance into a physical row that would alias (same 'mod
+  -- g_max_kernel_size' bank) the earliest real row 'out_row_q''s window
+  -- still needs, before that whole output row (every 'out_col'/tile) has
+  -- been consumed. Gates 's_stream_s2m.ready' below. Without this, the
+  -- registered-read walk's lower read throughput (proposal doc section
+  -- 7.1 item 4: ~'kw + 1' cycles/window versus the predecessor's
+  -- same-cycle read) lets the write side, unblocked between 'reading_q'/
+  -- 'window_valid' pulses, race more than 'g_max_kernel_size' physical
+  -- rows ahead of 'out_row_q' -- wrapping the bank index back onto a row
+  -- still pending read and silently corrupting it (caught by
+  -- 'test_kernel_stride_shapes' et al: a slow 1x1-kernel consumer lets
+  -- the writer outrun the reader by exactly 'g_max_kernel_size' rows).
+  -- This is plain backpressure (freezes 's_stream_s2m.ready', the same
+  -- knob the predecessor already used), not the out-of-scope
+  -- double-buffering mitigation -- see the proposal doc section 8 risk 3.
+  signal write_freeze_i : std_ulogic;
 
   -- '1' once a frame is in progress (between 'start' and the final
   -- window's acceptance); gates 's_stream_s2m.ready'/'window_valid' so
@@ -229,12 +350,95 @@ begin
   fire <= s_stream_m2s.valid and s_stream_s2m.ready;
   consume <= window_valid and m_window_s2m.ready;
 
-  -- Freeze further input acceptance whenever a window is pending and not
-  -- yet consumed (a row bank must not be overwritten until every tap that
-  -- still needs it has been read out). 'window_valid' depends only on
-  -- registered state (never on 's_stream_m2s.valid'/'m_window_s2m.ready'),
-  -- so this has no combinational loop.
-  s_stream_s2m.ready <= active_q and (not window_valid or m_window_s2m.ready);
+  ------------------------------------------------------------------------
+  -- Row-bank write decode (combinational): which bank 'fire' writes this
+  -- cycle ('wr_bank_idx_c', 'physical row mod g_max_kernel_size'), at
+  -- which cell ('wr_addr_c', 'col * n_tiles + tile'), with which data
+  -- ('wr_data_c'). Moved out of 'control' (still current-cycle,
+  -- pre-increment 'cur_row_q'/'cur_col_q'/'wr_tile_q') so the
+  -- 'gen_banks' branches below -- not 'control' -- own the actual
+  -- 'bank_mem' writes; see the 'row_banks' comment above for why.
+  --
+  -- D11: zero-pad the unused high channel lanes of a partial final tile,
+  -- deterministically -- not whatever 's_stream_m2s.data' happens to
+  -- carry there. Non-final tiles, and an exactly-dividing final tile
+  -- ('last_tile_channels_q = g_tile_channels', making this a null loop
+  -- range), are written verbatim. The loop range is constant
+  -- (0 .. g_tile_channels - 1) with the runtime bound applied as a
+  -- per-lane condition inside, rather than the more direct 'for c in
+  -- last_tile_channels_q to ...'. Both are identical in simulation, but a
+  -- variable loop range is not synthesizable: it crashes GHDL's synthesis
+  -- backend ("limits of range are not constant", then an Ada assertion in
+  -- synth-vhdl_expr.adb). Caught by this module's netlist build -- see
+  -- module_cnn_accel.py get_build_projects().
+  --
+  -- NOTE: explicit sensitivity list, not 'process(all)' -- see
+  -- canny_window3x3.vhd's identical note on GHDL 7.0.0-dev's 'all'
+  -- inference not reliably tracking signals read only through nested
+  -- loops/array indexing.
+  ------------------------------------------------------------------------
+  wr_decode : process(
+    cur_row_q, cur_col_q, wr_tile_q, n_tiles_q, last_tile_channels_q,
+    s_stream_m2s.data
+  )
+    variable v_write_data : std_ulogic_vector(c_lane_width - 1 downto 0);
+  begin
+    wr_bank_idx_c <= to_integer(cur_row_q) mod g_max_kernel_size;
+    wr_addr_c <= to_integer(cur_col_q) * to_integer(n_tiles_q) + to_integer(wr_tile_q);
+
+    v_write_data := s_stream_m2s.data(c_lane_width - 1 downto 0);
+    if wr_tile_q = n_tiles_q - 1 then
+      for c in 0 to g_tile_channels - 1 loop
+        if c >= last_tile_channels_q then
+          v_write_data(8 * (c + 1) - 1 downto 8 * c) := (others => '0');
+        end if;
+      end loop;
+    end if;
+    wr_data_c <= v_write_data;
+  end process;
+
+  ------------------------------------------------------------------------
+  -- Row banks: 'g_max_kernel_size' physically independent memories (see
+  -- the 'row_banks' comment above), one 'bank_mem' per generate branch.
+  -- Each branch is the exact same shape as
+  -- cnn_accel_weight_buffer.vhd's 'weight_mem'/'read_ports' pair: one
+  -- statically-addressed write process (write enable = 'fire' and this
+  -- branch's bank number matching 'wr_bank_idx_c'), and one registered,
+  -- unconditional, single read process ('rd_addr(b)' is only meaningful
+  -- while 'in_frame_now(b)' is set, checked at capture time, not here) --
+  -- no reset on 'bank_mem' itself, same as cnn_accel_weight_buffer.vhd.
+  ------------------------------------------------------------------------
+  gen_banks : for b in 0 to g_max_kernel_size - 1 generate
+    signal bank_mem : row_bank_t;
+  begin
+
+    write_port : process(clk)
+    begin
+      if rising_edge(clk) then
+        if fire = '1' and wr_bank_idx_c = b then
+          bank_mem(wr_addr_c) <= wr_data_c;
+        end if;
+      end if;
+    end process;
+
+    read_port : process(clk)
+    begin
+      if rising_edge(clk) then
+        bank_rd_data(b) <= bank_mem(rd_addr(b));
+      end if;
+    end process;
+
+  end generate;
+
+  -- Freeze further input acceptance whenever a window is pending (its
+  -- 'kc' walk in progress, 'reading_q') or has landed and not yet been
+  -- consumed ('window_valid') -- a row bank must not be overwritten until
+  -- every tap that still needs it has been read out. Both 'reading_q'
+  -- and 'window_valid' depend only on registered state (never on
+  -- 's_stream_m2s.valid'/'m_window_s2m.ready'), so this has no
+  -- combinational loop.
+  s_stream_s2m.ready <= active_q and not write_freeze_i and
+    (not (window_valid or reading_q) or (window_valid and m_window_s2m.ready));
 
   ------------------------------------------------------------------------
   -- Configuration latch, position counters, and row-bank writes.
@@ -242,7 +446,6 @@ begin
   control : process(clk)
     variable v_num_w, v_num_h : integer;
     variable v_in_channels, v_n_tiles : integer;
-    variable v_write_data : std_ulogic_vector(c_lane_width - 1 downto 0);
   begin
     if rising_edge(clk) then
       if reset = '1' then
@@ -304,33 +507,11 @@ begin
 
       else
         if fire = '1' then
-          -- D11: zero-pad the unused high channel lanes of a partial
-          -- final tile, deterministically -- not whatever
-          -- 's_stream_m2s.data' happens to carry there. Non-final tiles,
-          -- and an exactly-dividing final tile ('last_tile_channels_q =
-          -- g_tile_channels', making this a null loop range), are
-          -- written verbatim.
-          -- The loop range is constant (0 .. g_tile_channels - 1) with the
-          -- runtime bound applied as a per-lane condition inside, rather
-          -- than the more direct 'for c in last_tile_channels_q to ...'.
-          -- Both are identical in simulation, but a variable loop range is
-          -- not synthesizable: it crashes GHDL's synthesis backend
-          -- ("limits of range are not constant", then an Ada assertion in
-          -- synth-vhdl_expr.adb). Caught by this module's netlist build --
-          -- see module_cnn_accel.py get_build_projects().
-          v_write_data := s_stream_m2s.data(c_lane_width - 1 downto 0);
-          if wr_tile_q = n_tiles_q - 1 then
-            for c in 0 to g_tile_channels - 1 loop
-              if c >= last_tile_channels_q then
-                v_write_data(8 * (c + 1) - 1 downto 8 * c) := (others => '0');
-              end if;
-            end loop;
-          end if;
-
-          row_banks(to_integer(cur_row_q) mod g_max_kernel_size)(
-            to_integer(cur_col_q) * to_integer(n_tiles_q) + to_integer(wr_tile_q)
-          ) <= v_write_data;
-
+          -- Row-bank write itself ('wr_bank_idx_c'/'wr_addr_c'/'wr_data_c',
+          -- decoded combinationally by 'wr_decode' below) now happens in
+          -- the 'gen_banks' generate block below, not here -- see the
+          -- 'row_banks' comment above for why. This process only still
+          -- advances the write-side position counters.
           if wr_tile_q = n_tiles_q - 1 then
             wr_tile_q <= (others => '0');
             if cur_col_q = in_width_q - 1 then
@@ -378,42 +559,49 @@ begin
   m_window_m2s.last <= last_pixel and last_tile_flag;
   m_window_m2s.first_tile <= first_tile_flag;
   m_window_m2s.last_tile <= last_tile_flag;
+  m_window_m2s.data <= assembly_q;
 
   ------------------------------------------------------------------------
-  -- Window readiness + assembly. 'window_valid' is a pure function of
-  -- registered state (never of 's_stream_m2s.valid'/'m_window_s2m.ready'),
-  -- per cnn_accel_window_gen_proposal.md section 4/Axi4.md. The
-  -- 'row_ready' spatial test is channel/tile-agnostic (unchanged from the
-  -- pre-tiling design) -- every tile of a given output pixel reads the
-  -- same row/column range, tiling only changes which row-bank cell
-  -- ('input_col * n_tiles_q + rd_tile_q') supplies each tap -- see
-  -- cnn_accel_tiled_dataflow_proposal.md section 2's orthogonality
-  -- argument.
+  -- Read-side address generation (combinational). 'row_ready_i' is the
+  -- unchanged spatial readiness test from the predecessor design
+  -- (cnn_accel_window_gen_proposal.md section 4): every tile of a given
+  -- output pixel reads the same row/column range, tiling only changes
+  -- which row-bank cell ('input_col * n_tiles_q + rd_tile_q') supplies
+  -- each tap -- see cnn_accel_tiled_dataflow_proposal.md section 2's
+  -- orthogonality argument.
+  --
+  -- Per bank 'b' (0 .. g_max_kernel_size - 1, the *physical* bank index,
+  -- not a kernel-row index): 'kr_of(b)' is the kernel-row tap that bank
+  -- currently represents for the window at 'out_row_q' -- the inverse of
+  -- the write side's 'physical row mod g_max_kernel_size' mapping,
+  -- 'kr_of(b) = (b - row_top) mod g_max_kernel_size' (VHDL's 'mod' has
+  -- the sign of its right operand, so this always lands in
+  -- '0 .. g_max_kernel_size - 1' regardless of how negative 'row_top'
+  -- is under top padding). 'in_frame_now(b)' is '1' only while a walk is
+  -- in progress ('reading_q'), the current 'kc_q' is still a real column
+  -- ('kc_q < kernel_w_q'), 'kr_of(b) < kernel_h_q' (this bank's tap is
+  -- within the runtime kernel height), and the resulting
+  -- '(input_row, input_col)' is inside the real (unpadded) frame.
   --
   -- NOTE: explicit sensitivity list, not 'process(all)' -- see
   -- canny_window3x3.vhd's identical note on GHDL 7.0.0-dev's 'all'
   -- inference not reliably tracking signals read only through nested
   -- loops/array indexing.
   ------------------------------------------------------------------------
-  assemble_window : process(
+  addr_gen : process(
     kernel_h_q, kernel_w_q, stride_h_q, stride_w_q, pad_top_q, pad_left_q,
     in_width_q, in_height_q, cur_row_q, cur_col_q,
-    out_row_q, out_col_q, out_width_q, out_height_q,
-    row_banks, active_q, n_tiles_q, rd_tile_q
+    out_row_q, out_col_q, n_tiles_q, rd_tile_q, kc_q, reading_q
   )
     variable kh, kw, sh, sw, pt, pl, inh, inw : integer;
     variable orow, ocol : integer;
     variable row_top, row_bot, real_row_bot : integer;
     variable col_left, col_right, real_col_right : integer;
     variable has_real_row, has_real_col : boolean;
-    variable row_ready : boolean;
-    variable input_row, input_col : integer;
-    variable in_frame : boolean;
-    variable data_i : tap_array_t(0 to c_window_data_length - 1);
-    variable tap : std_ulogic_vector(c_lane_width - 1 downto 0);
-    variable tap_idx : integer;
-    variable bank_idx : integer;
+    variable input_col, kc_i : integer;
     variable n_tiles_i, rd_tile_i : integer;
+    variable kr_b, input_row_b : integer;
+    variable anchor_row : integer;
   begin
     kh := to_integer(kernel_h_q);
     kw := to_integer(kernel_w_q);
@@ -427,6 +615,7 @@ begin
     ocol := to_integer(out_col_q);
     n_tiles_i := to_integer(n_tiles_q);
     rd_tile_i := to_integer(rd_tile_q);
+    kc_i := to_integer(kc_q);
 
     -- Row range needed by this window: [row_top, row_bot] (may extend
     -- outside [0, inh-1) -- top/bottom padding).
@@ -448,65 +637,156 @@ begin
     -- still writing that exact row -> also need its columns caught up
     -- (or no real column at all) -- see cnn_accel_window_gen_proposal.md
     -- section 4.
-    row_ready :=
-      (not has_real_row)
+    if (not has_real_row)
       or (to_integer(cur_row_q) > real_row_bot)
       or (
         to_integer(cur_row_q) = real_row_bot
         and ((not has_real_col) or (to_integer(cur_col_q) > real_col_right))
-      );
+      )
+    then
+      row_ready_i <= '1';
+    else
+      row_ready_i <= '0';
+    end if;
 
-    window_valid <= '1' when (active_q = '1' and row_ready) else '0';
+    -- The earliest real (unpadded) physical row this window's row range
+    -- covers -- 'row_top' clamped up to 0, since a negative 'row_top'
+    -- (top padding) reserves no bank at all: there is no row -2 to
+    -- protect, so the first bank actually in use starts at row 0.
+    if row_top < 0 then
+      anchor_row := 0;
+    else
+      anchor_row := row_top;
+    end if;
 
-    data_i := (others => (others => '0'));
+    -- See 'write_freeze_i's declaration comment. No real row at all ->
+    -- nothing to protect (this out_row's window has no row dependency to
+    -- outlive).
+    if has_real_row and to_integer(cur_row_q) >= anchor_row + g_max_kernel_size then
+      write_freeze_i <= '1';
+    else
+      write_freeze_i <= '0';
+    end if;
 
-    for kr in 0 to g_max_kernel_size - 1 loop
-      for kc in 0 to g_max_kernel_size - 1 loop
-        if kr < kh and kc < kw then
-          input_row := orow * sh + kr - pt;
-          input_col := ocol * sw + kc - pl;
-          in_frame := input_row >= 0 and input_row <= inh - 1
-            and input_col >= 0 and input_col <= inw - 1;
+    input_col := ocol * sw + kc_i - pl;
 
-          if in_frame then
-            -- Direct random-access read of the row bank holding physical
-            -- row 'input_row', channel-tile 'rd_tile_q' of column
-            -- 'input_col' -- no pop/shift ordering constraint, so this
-            -- is correct however many output positions end up reading
-            -- the same already-written cell (see the row-bank comment
-            -- above). Partial-final-tile zero-padding (D11) already
-            -- happened at write time, so no extra masking is needed here.
-            bank_idx := input_row mod g_max_kernel_size;
-            tap := row_banks(bank_idx)(input_col * n_tiles_i + rd_tile_i);
+    for b in 0 to g_max_kernel_size - 1 loop
+      kr_b := (b - row_top) mod g_max_kernel_size;
+      input_row_b := row_top + kr_b;
+      kr_of(b) <= kr_b;
 
-            -- 'tap_idx' depends on the runtime 'kw', so it cannot index
-            -- 'data_i' directly here: 'data_i' is a variable being built
-            -- combinationally, and a runtime-indexed *write* still has to
-            -- become a decoder. Select the destination tap slot with a
-            -- constant-bound loop -- identical in simulation, a mux in
-            -- hardware. 'tap_idx' can only ever land in
-            -- 0 .. g_max_kernel_size**2 - 1, since
-            -- 'kr, kc < kh, kw <= g_max_kernel_size'.
-            --
-            -- The inner channel loop unpacks one row-bank cell (all
-            -- 'g_tile_channels' channels of one column, 'c_lane_width'
-            -- bits) into its individual int8 elements, per
-            -- cnn_accel_pkg's element layout: tap 't', channel 'c' is
-            -- element 't * g_tile_channels + c'.
-            tap_idx := kr * kw + kc;
-            for t in 0 to g_max_kernel_size * g_max_kernel_size - 1 loop
-              if t = tap_idx then
-                for c in 0 to g_tile_channels - 1 loop
-                  data_i(t * g_tile_channels + c) := tap(8 * (c + 1) - 1 downto 8 * c);
-                end loop;
-              end if;
-            end loop;
+      if reading_q = '1' and kc_i < kw and kr_b < kh
+        and input_row_b >= 0 and input_row_b <= inh - 1
+        and input_col >= 0 and input_col <= inw - 1
+      then
+        in_frame_now(b) <= '1';
+        rd_addr(b) <= input_col * n_tiles_i + rd_tile_i;
+      else
+        in_frame_now(b) <= '0';
+        rd_addr(b) <= 0;
+      end if;
+    end loop;
+  end process;
+
+  ------------------------------------------------------------------------
+  -- Column walk (read side) + tap-assembly capture. Every cycle:
+  --
+  -- 1. Capture stage: if 'capture_valid_q' (last cycle issued a real
+  --    read address), pack 'bank_rd_data' -- now valid, one cycle after
+  --    that address -- into 'assembly_q' at tap slot
+  --    'kr_capture_q(b) * kernel_w_q + kc_capture_q', for whichever banks
+  --    were actually in-frame. 'tap_idx' depends on the runtime 'kw', so
+  --    it cannot index 'assembly_q' directly here without becoming a
+  --    decoder anyway; the destination slot is selected with a
+  --    constant-bound loop, identical in simulation, a mux in hardware --
+  --    the same technique the predecessor combinational process used
+  --    for the same reason (runtime tap index into a fixed-size
+  --    aggregate).
+  -- 2. Walk/valid state machine: 'window_valid' (idle) -> 'reading_q'
+  --    (kc = 0 .. kernel_w_q, one column issued per cycle) ->
+  --    'window_valid' again once the last column's registered read has
+  --    landed (kc_q = kernel_w_q is one extra "drain" cycle: the
+  --    address for column 'kernel_w_q - 1' was issued the cycle before,
+  --    its data is captured this cycle). 'window_valid' only asserts
+  --    from 'idle' when 'row_ready_i' is true, i.e. every input pixel
+  --    the window needs has already been written -- unchanged invariant
+  --    from the predecessor design, just no longer same-cycle (proposal
+  --    doc section 7.1 item 4 / section 8 risk 3).
+  ------------------------------------------------------------------------
+  walk_control : process(clk)
+  begin
+    if rising_edge(clk) then
+      if reset = '1' then
+        reading_q <= '0';
+        window_valid <= '0';
+        kc_q <= (others => '0');
+        capture_valid_q <= '0';
+        kc_capture_q <= (others => '0');
+        in_frame_capture_q <= (others => '0');
+        kr_capture_q <= (others => 0);
+        assembly_q <= (others => (others => '0'));
+
+      elsif start = '1' then
+        reading_q <= '0';
+        window_valid <= '0';
+        kc_q <= (others => '0');
+        capture_valid_q <= '0';
+        kc_capture_q <= (others => '0');
+        in_frame_capture_q <= (others => '0');
+        kr_capture_q <= (others => 0);
+        assembly_q <= (others => (others => '0'));
+
+      else
+        -- Delay pipeline: always shifts by one cycle, so the capture
+        -- stage below sees last cycle's issued column/in-frame/bank
+        -- mapping alongside this cycle's now-valid 'bank_rd_data'.
+        capture_valid_q <= reading_q;
+        kc_capture_q <= kc_q;
+        kr_capture_q <= kr_of;
+        in_frame_capture_q <= in_frame_now;
+
+        if capture_valid_q = '1' then
+          for b in 0 to g_max_kernel_size - 1 loop
+            if in_frame_capture_q(b) = '1' then
+              for t in 0 to g_max_kernel_size * g_max_kernel_size - 1 loop
+                if t = kr_capture_q(b) * to_integer(kernel_w_q) + to_integer(kc_capture_q) then
+                  for c in 0 to g_tile_channels - 1 loop
+                    assembly_q(t * g_tile_channels + c) <= bank_rd_data(b)(8 * (c + 1) - 1 downto 8 * c);
+                  end loop;
+                end if;
+              end loop;
+            end if;
+          end loop;
+        end if;
+
+        if window_valid = '1' then
+          if consume = '1' then
+            window_valid <= '0';
+          end if;
+
+        elsif reading_q = '1' then
+          if kc_q = kernel_w_q then
+            reading_q <= '0';
+            window_valid <= '1';
+          else
+            kc_q <= kc_q + 1;
+          end if;
+
+        else
+          -- Idle: start a new walk once this window's inputs are fully
+          -- written. 'assembly_q' is cleared here (not just relying on
+          -- its reset value) so a tap left out-of-frame this window
+          -- (fewer real rows/columns than 'g_max_kernel_size', or
+          -- padding) reads back '0' rather than a previous window's
+          -- stale value.
+          if active_q = '1' and row_ready_i = '1' then
+            reading_q <= '1';
+            kc_q <= (others => '0');
+            assembly_q <= (others => (others => '0'));
           end if;
         end if;
-      end loop;
-    end loop;
-
-    m_window_m2s.data <= data_i;
+      end if;
+    end if;
   end process;
 
 end architecture a;

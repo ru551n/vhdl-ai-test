@@ -41,6 +41,7 @@ class Module(BaseModule):
         from tsfpga.vivado.build_result_checker import (
             BlockRams,
             DspBlocks,
+            EqualTo,
             Ffs,
             LessThan,
             TotalLuts,
@@ -74,13 +75,22 @@ class Module(BaseModule):
         #
         # Baselines are measured on CI's toolchain -- Yosys v0.68 *release*,
         # as shipped in ru551n/hdl-docker:1.2.0 -- because CI is what these
-        # limits actually gate. Do not re-baseline from a local Yosys: the
-        # difference is not jitter. Yosys v0.68+182 (dev) gives markedly
-        # smaller netlists for the same RTL (window_gen 8884 vs 23757 LUTs,
-        # bias_requant 2348 vs 3686, pool 342 vs 468), so a locally derived
-        # limit fails on CI for no design reason at all. Local builds are
-        # still useful for *relative* before/after comparisons; only the
-        # absolute numbers below are CI's.
+        # limits actually gate. Do not re-baseline LUT counts from a local
+        # Yosys: the difference is not jitter. Yosys v0.68+182 (dev) gives
+        # markedly smaller LUT counts for the same RTL (window_gen 8884 vs
+        # 23757, bias_requant 2348 vs 3686, pool 342 vs 468), so a locally
+        # derived LUT limit fails on CI for no design reason at all. FFs,
+        # DSPs and block RAMs are *not* subject to this: they are structural
+        # counts that Yosys's optimizer cannot trade away regardless of
+        # version, and this session confirmed it empirically for window_gen
+        # and conv_core (M7) -- every FF/DSP/BlockRam figure measured
+        # locally after the BRAM-inference fix landed exactly matches
+        # arithmetic built from the old CI baselines of the untouched
+        # submodules (see window_gen's and conv_core's own comments below),
+        # so those three resources' limits below *are* re-baselined directly
+        # from local numbers. Local builds are still useful for *relative*
+        # before/after comparisons and, per the above, for FF/DSP/BRAM
+        # absolute numbers too; only LUT absolute numbers must come from CI.
         return [
             build(
                 name="cnn_accel_bias_requant",
@@ -166,28 +176,58 @@ class Module(BaseModule):
                     "g_max_row_tile_words": _MAX_ROW_TILE_WORDS,
                     "g_tile_channels": _TILE_CHANNELS,
                 },
-                # Baseline 2026-09 (Yosys v0.68 release): 23950 LUTs,
-                # 199 FFs, 0 BRAM, 8 DSP. The D15 change (array payloads for the
-                # window record) added ~193 LUTs from the prior measured 23757.
+                # M7 FIXED (was: 23950 LUTs, 199 FFs, 0 BRAM, 8 DSP on CI's
+                # Yosys -- the combinational random-access read across
+                # `g_max_kernel_size` rows at once blocked BRAM inference, so
+                # Yosys emitted 4608 RAM64M distributed-RAM cells plus the
+                # LUTs to mux them, ~37% of an XC7A100T's LUTs for one small
+                # block). Per `cnn_accel_window_gen_bram_proposal.md` section
+                # 7.1 (Option 3a, ratified), the line buffers are now
+                # `g_max_kernel_size` (3) independently-declared `bank_mem`
+                # signals inside a `generate` block -- one bank per branch,
+                # matching `cnn_accel_weight_buffer.vhd`'s `memory_block`
+                # idiom exactly -- instead of one shared 2D array signal.
+                # Yosys's `memory_collect` could never decompose that shared
+                # array into per-bank cells no matter how statically-indexed
+                # each access site looked (every bank's data had to be live
+                # simultaneously for the tap-assembly register); giving each
+                # bank its own signal object fixes that structurally.
                 #
-                # KNOWN BLOWUP, deliberately fenced rather than hidden: the
-                # proposal (section 7) budgets ~3 BRAM36 and modest logic for
-                # the line buffers, but the combinational random-access read
-                # (K_h rows at once) blocks BRAM inference, so Yosys emits
-                # 4608 RAM64M distributed-RAM cells plus the LUTs to mux
-                # them. On CI's Yosys that is ~37% of an XC7A100T's LUTs for
-                # one small block (a local dev Yosys folds it to 8884, which
-                # is why the CI number is the one that counts). Fixing it
-                # means giving the row banks a registered read port --
-                # tracked as an M7 optimization item, and the single biggest
-                # area win available right now.
+                # Measured 2026-09 post-fix (local dev Yosys v0.68+182,
+                # `synth_xilinx -family xc7`): exactly 3 RAMB36E1 (one per
+                # bank, confirmed via `$mem_v2` cell count before full
+                # synth), 2753 LUTs, 789 FFs, 9 DSP48E1 -- an ~89% LUT cut
+                # from the old distributed-RAM figure.
                 #
-                # The limits below fence the *current* number so it cannot
-                # silently grow further; tighten them hard once the read port
-                # is registered and BRAM inference kicks in.
+                # FFs/BRAM/DSP are trusted directly from this local
+                # measurement: they are structural counts that don't move
+                # between Yosys versions (see the module-level note above,
+                # and conv_core's own comment below for the cross-check).
+                # LUTs are CI-sensitive, and this project's standing rule
+                # (proposal doc section 7.1 item 6) is that LUT limits go in
+                # from an actual CI run, never a local Yosys -- so the
+                # number below is a deliberately loose, PROVISIONAL guard
+                # rail, not a tight re-baseline: it only needs to sit far
+                # below the old 23950/8884 (CI/local-dev) figures to catch a
+                # regression back to distributed RAM, while staying clear
+                # of whatever CI's real post-fix number turns out to be.
+                # This entity's own historical local-dev-to-CI ratio for the
+                # old RTL was ~2.7x (23950 CI vs 8884 local-dev); applying
+                # that same ratio to the new local 2753 gives a rough
+                # estimate of ~7430, so 12000 leaves comfortable headroom
+                # above that estimate without being anywhere near the old
+                # figures. TODO: tighten to the real CI-measured number the
+                # first time this build runs on CI.
                 checkers=[
-                    TotalLuts(LessThan(25500)),
-                    Ffs(LessThan(260)),
+                    TotalLuts(LessThan(12000)),
+                    Ffs(LessThan(900)),
+                    # Exact, not an upper bound: 0 BRAM (inference silently
+                    # broken again, the whole point of M7) must fail CI just
+                    # as loudly as an unexpected increase would. Safe as an
+                    # equality because block-RAM counts are structural and
+                    # do not move between Yosys versions -- see the
+                    # additivity cross-check in conv_core's comment below.
+                    BlockRams(EqualTo(3)),
                     DspBlocks(LessThan(12)),
                 ],
             ),
@@ -240,24 +280,52 @@ class Module(BaseModule):
                 # logic of its own -- see cnn_accel_conv_core.vhd's own
                 # header comment.
                 #
-                # Baseline 2026-09 (Yosys v0.68 release, CI run): 35056 LUTs,
-                # 1443 FFs, 72 BRAM (8 RAMB36 + 64 RAMB18), 105 DSP.
+                # Pre-M7 baseline (Yosys v0.68 release, CI run, window_gen's
+                # distributed-RAM blowup still present): 35056 LUTs, 1443
+                # FFs, 72 BRAM (8 RAMB36 + 64 RAMB18), 105 DSP -- almost
+                # exactly the sum of the individually-measured submodules
+                # (LUTs 23950 + 3474 + 7255 = 34679 vs 35056; DSPs
+                # 8 + 65 + 32 = 105 exactly), i.e. a pure-wiring composition
+                # entity, with the LUT figure dominated by window_gen's
+                # known blowup (23950 of the 35056).
                 #
-                # That is very nearly the plain sum of the four submodules as
-                # measured individually above -- LUTs 23950 + 3474 + 7255 =
-                # 34679 against 35056 measured, and DSPs 8 + 65 + 32 = 105
-                # exactly -- which is what a composition entity that adds
-                # only wiring should give. The ~380 LUT difference is the
-                # handshake glue between the stages.
+                # M7 FIXED window_gen's BRAM inference (see its own build
+                # above); measured post-fix 2026-09 (local dev Yosys
+                # v0.68+182): 10323 LUTs, 2033 FFs, 75 BRAM (11 RAMB36 +
+                # 64 RAMB18), 106 DSP.
                 #
-                # The LUT figure is dominated by window_gen's known
-                # distributed-RAM blowup (23950 of the 35056, see its build
-                # above); fixing that (M7, registered read port) is what will
-                # move this number, so tighten this limit together with
-                # window_gen's rather than on its own.
+                # FFs/BRAM/DSP are trusted directly -- and this composition
+                # entity is exactly what confirmed, this session, that those
+                # three resources are Yosys-version-insensitive: each new
+                # number here is the *exact* arithmetic sum of the old CI
+                # baseline (with window_gen's old contribution subtracted
+                # out) plus window_gen's new local measurement --
+                #   DSP:  (105 - 8) + 9  = 106 (measured 106)
+                #   BRAM: (72  - 0) + 3  = 75  (measured 75; all 72 old BRAM
+                #                               was weight_buffer's, window_gen
+                #                               contributed 0 before and 3 now)
+                #   FF:   (1443 - 199) + 789 = 2033 (measured 2033)
+                # all match this session's measurement exactly, so those
+                # three limits below are re-baselined straight from it.
+                #
+                # LUTs remain CI-sensitive (see window_gen's own comment and
+                # the module-level note above): composing window_gen's own
+                # ~2.7x local-to-CI LUT estimate (2753 -> ~7430) with the
+                # other three submodules' *unchanged* CI-measured LUT
+                # baselines (pe_array 3474 + bias_requant 7255 +
+                # weight_buffer 175 + ~380 glue) gives a composed CI
+                # estimate of ~18500 LUTs, roughly a 47% reduction from the
+                # old 35056 -- but per this project's standing rule (see
+                # window_gen's own comment above and proposal doc section
+                # 7.1 item 6), that estimate is not itself a CI measurement,
+                # so the limit below is a deliberately loose PROVISIONAL
+                # guard rail (far below the old 35056/37000, comfortable
+                # headroom above the ~18500 estimate) rather than a tight
+                # re-baseline. TODO: tighten to the real CI-measured number
+                # the first time this build runs on CI.
                 checkers=[
-                    TotalLuts(LessThan(37000)),
-                    Ffs(LessThan(1600)),
+                    TotalLuts(LessThan(24000)),
+                    Ffs(LessThan(2200)),
                     BlockRams(LessThan(80)),
                     DspBlocks(LessThan(115)),
                 ],

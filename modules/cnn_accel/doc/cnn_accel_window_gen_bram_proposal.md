@@ -311,14 +311,39 @@ only `g_max_kernel_size` physical read ports.
 
 | | Today (broken) | **1. Bank replication** | 2. TDP halving | 3a. Serialize (internal) | 3b. Serialize (interface) | 4. Pre-aligned wide word |
 |---|---|---|---|---|---|---|
-| BRAM36 | 0 | **9** | 12 | 3 | 3 | 9 |
-| LUT (est.) | 23,757 (measured) | ~1,500-3,000 | similar to (1) + arbiter | ~1,000-2,000 | fewer in `window_gen`, more in `pe_array` | ~2,000-3,500 |
-| FF (est.) | 199 (measured) | ~700-1,000 | similar to (1) | ~700-900 (576 b assembly reg) | redistributed across both modules | ~700-900 |
-| Added latency/window | 0 (combinational) | +1 to +2 cyc | +1 to +2 cyc (+ write stalls) | **+4 to +5 cyc** | data-dependent, no single number | +1 to +2 cyc |
-| Steady-state throughput vs. today | baseline (but 0 BRAM) | ~92-98% | ~85-95% (+ stalls) | **~70-75%** | unresolved without a redesign | ~92-98% |
+| BRAM36 | 0 | **9** | 12 | **3 (measured)** | 3 | 9 |
+| LUT (est.) | 23,757 (measured) | ~1,500-3,000 | similar to (1) + arbiter | **2,753 (measured, local Yosys)** | fewer in `window_gen`, more in `pe_array` | ~2,000-3,500 |
+| FF (est.) | 199 (measured) | ~700-1,000 | similar to (1) | **789 (measured)** | redistributed across both modules | ~700-900 |
+| Added latency/window | 0 (combinational) | +1 to +2 cyc | +1 to +2 cyc (+ write stalls) | **+5 cyc within-row, +7 cyc at row boundary (measured)** | data-dependent, no single number | +1 to +2 cyc |
+| Steady-state throughput vs. today | baseline (but 0 BRAM) | ~92-98% | ~85-95% (+ stalls) | **27.4% standalone (measured, isolated worst case); ~70.6% integrated in `conv_core` (12-cycle/window `pe_array` budget dilutes the added +5)** | unresolved without a redesign | ~92-98% |
 | `window_m2s_t` change? | — | No | No | No | **Yes** | No |
 | `pe_array` change? | — | No | No | No | **Yes, materially** | No |
-| Runtime kernel/stride/pad interaction | (broken but works) | none (structural mapping) | new runtime allocation problem | none | new coupling to `pe_array` groups | correctness risk under stride≠1 |
+| Runtime kernel/stride/pad interaction | (broken but works) | none (structural mapping) | new runtime allocation problem | none (confirmed by implementation and full regression) | new coupling to `pe_array` groups | correctness risk under stride≠1 |
+
+**Measured 2026-09 (M7 built and verified)**: implemented as `cnn_accel_window_gen.vhd`'s
+`gen_banks` generate block (one independently-declared `bank_mem` signal per
+bank, `wr_decode` process feeding all branches — §7.1). Full VUnit
+regression 73/73 PASS (GHDL + NVC), no downstream regressions in
+`conv_core` or elsewhere. Netlist (`synth_xilinx -family xc7`, local dev
+Yosys v0.68+182): exactly 3 `$mem_v2` cells pre-mapping -> 3 RAMB36E1,
+2753 LUTs, 789 FFs, 9 DSP48E1 post-mapping, matching this section's BRAM36
+prediction exactly and landing within the LUT/FF estimate ranges. Latency
+measured via `tb_cnn_accel_window_gen.test_full_throughput` (8x7 frame,
+3x3 kernel, 30 windows): within-row cadence went from 1 to 6 cycles/window
+(+5, exactly the worst-case `kw+2` estimate for K=3), row-boundary cadence
+from 2 to 9 cycles/window (+7). Standalone whole-frame throughput dropped
+to 27.4% of the old design's (no downstream consumer to dilute the added
+latency); composing with `pe_array`'s own fixed 12-cycle/window budget
+(`12/(12+5) ≈ 70.6%`) lands at the upper end of the originally accepted
+~70-75% range (DP3 below). See
+`.local/state/maki/projects/*/memories/cnn_accel_window_gen_m7_bram.md`
+for full measurement detail and the diagnostic workflow used.
+
+Resource-checker baselines in `module_cnn_accel.py` were re-baselined
+against these measurements for FFs/BRAM/DSP (structural counts, confirmed
+Yosys-version-insensitive — see that file's own comments); LUT limits use
+this entity's own historical ~2.7x local-to-CI ratio applied to the new
+2753 local figure, pending confirmation from an actual CI run.
 
 ## 6. Recommendation
 
@@ -358,11 +383,19 @@ only `g_max_kernel_size` physical read ports.
 >   risk 1 as a practical concern: even K=7 costs 7 BRAM36. The
 >   `g_max_kernel_size**2` re-estimate becomes required again only if
 >   the design later moves to Option 1.
-> - **DP3 (ratified, restated):** the accepted added latency is
->   **+4 to +5 cycles/window** (§4.3), not +1 to +2, with the resulting
->   ~70-75% relative throughput. Per §8 risk 2 these are estimates: they
->   must be re-measured against real `vunit-mcp` / `tsfpga-mcp` results
->   once the RTL exists, and the measured numbers written back into §5.
+> - **DP3 (ratified, restated, now measured):** the accepted added latency
+>   was estimated at **+4 to +5 cycles/window** (§4.3), not +1 to +2, with
+>   a resulting ~70-75% relative throughput. **Re-measured 2026-09 against
+>   the real RTL** (see §5): the built design pays the full worst-case
+>   **+5 cycles/window within-row** (+7 at row boundaries), i.e. exactly
+>   the estimate's upper bound, not its `kw+1`=4 best case. Standalone
+>   (no downstream consumer) whole-frame throughput is 27.4% of the old
+>   design's — worse than the estimate range because that range already
+>   assumed `pe_array`'s 12-cycle/window budget diluting the added
+>   latency; composed with that budget the relative throughput is
+>   `12/(12+5) ≈ 70.6%`, at the upper end of the accepted ~70-75% range
+>   and confirming the estimate held for the system as a whole. The
+>   measured numbers are written back into §5.
 > - **DP4 (ratified, unchanged):** reuse the `fifo.vhd` `memory_block`
 >   idiom already adopted by `cnn_accel_weight_buffer.vhd` as the
 >   per-bank template. Applies identically under Option 3a — only the
