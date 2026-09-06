@@ -1,6 +1,6 @@
 [submodule "tsfpga"]
 	path = tsfpga
-	url = https://github.com/tsfpga/tsfpga.git
+	url = https://github.com/ru551n/tsfpga.git
 [submodule "hdl-modules"]
 	path = hdl-modules
 	url = https://github.com/hdl-modules/hdl-modules.git

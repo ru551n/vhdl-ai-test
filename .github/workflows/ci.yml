@@ -1,0 +1,229 @@
+name: CI
+
+# Continuous feedback on three things that can each break independently:
+#   1. the Python golden models (pure software, no HDL toolchain),
+#   2. simulation of the RTL against them (GHDL and NVC),
+#   3. *synthesis* of the RTL (Yosys + GHDL), with resource guard rails.
+#
+# (3) is not redundant with (2). A design can be perfectly green in simulation
+# and still be unsynthesizable, or silently blow up in area:
+#   - variable loop ranges and dynamically-bounded slices simulate fine, then
+#     crash GHDL's synthesis backend outright;
+#   - a combinational memory read simulates fine, then infers thousands of
+#     distributed-RAM cells instead of a block RAM.
+# Both have already happened in this repo, which is why the netlist job exists
+# and why every synthesizable entity carries BuildResultCheckers.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  model:
+    name: Golden models (pytest)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        # Both models are deliberately pure-stdlib (no numpy), so the
+        # reference implementation the RTL is checked against has no
+        # third-party numerics in its trust path.
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run golden-model test suites
+        # The RTL is verified bit-exactly against these models, so a broken
+        # model silently invalidates every simulation result downstream.
+        #
+        # Paths are listed explicitly rather than letting pytest discover from
+        # the repo root, which would descend into the tsfpga/vunit/hdl-modules
+        # submodules and try to collect their suites too.
+        run: >
+          python -m pytest -q
+          test_canny_model.py
+          modules/cnn_accel/test_cnn_accel_model.py
+
+  simulate:
+    name: Simulate (${{ matrix.simulator }})
+    runs-on: ubuntu-24.04
+    container:
+      # Pinned, never a floating tag: the toolchain version is part of the
+      # reproducibility contract.
+      image: ru551n/hdl-docker:1.2.0
+      # The image's final stage ends with `USER hdl`, so anything that needs
+      # apt-get (installing git/python below) must run as root.
+      options: --user root
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - simulator: ghdl
+            # GHDL is the reference simulator: everything must pass.
+            patterns: "*"
+          - simulator: nvc
+            # Everything except axi_stream_join's zero-stall full-throughput
+            # test, which is covered by the `nvc-known-issue` job below.
+            # VUnit has no `--exclude`, so the complement is spelled out;
+            # `stall_probability_percent_0` contains only that one test.
+            patterns: >-
+              canny.*
+              cnn_accel.*
+              lib.*
+              axi_stream_join.tb_axi_stream_join.stall_probability_percent_20.*
+    steps:
+      # Must precede actions/checkout: the image is deliberately minimal and
+      # ships neither git nor python, and checkout needs git for the
+      # submodules (tsfpga, hdl-modules, vunit).
+      - name: Install git and Python
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git python3 python3-venv
+          rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Trust the workspace
+        # The container UID differs from the checkout's owner, which
+        # otherwise trips git's "dubious ownership" guard.
+        run: git config --global --add safe.directory '*'
+
+      - name: Install Python dependencies
+        # Both from the pinned submodules rather than PyPI, so the exact
+        # VUnit and tsfpga revisions are recorded in this repo's history.
+        # VUnit comes from the `vunit` submodule (ru551n's fork) because that
+        # is what the testbenches and vunit-mcp are developed against.
+        run: |
+          python3 -m venv /opt/venv
+          /opt/venv/bin/pip install --upgrade pip
+          /opt/venv/bin/pip install ./vunit ./tsfpga
+
+      - name: Run VUnit regression
+        env:
+          VUNIT_SIMULATOR: ${{ matrix.simulator }}
+        run: /opt/venv/bin/python run.py --num-threads 4 ${{ matrix.patterns }}
+
+  nvc-known-issue:
+    name: Simulate (nvc, known issue)
+    runs-on: ubuntu-24.04
+    # Informational only, deliberately not gating.
+    #
+    # axi_stream_join's zero-stall test asserts the join sustains one beat per
+    # clock with only a 5-cycle margin over 500 beats. That holds on GHDL but
+    # not on NVC, where VUnit's AXI-Stream verification components need ~1.4
+    # clocks per beat because of how the `net` message queue is serviced. It
+    # is a testbench/VC scheduling difference, not a defect in the (purely
+    # combinational) DUT, and the `simulate` job still runs this test on GHDL
+    # where the timing claim is actually meaningful.
+    #
+    # Kept as its own visible job rather than deleted or silently skipped, so
+    # the discrepancy stays on the dashboard and gets revisited if NVC or
+    # VUnit changes.
+    continue-on-error: true
+    container:
+      image: ru551n/hdl-docker:1.2.0
+      options: --user root
+    steps:
+      - name: Install git and Python
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git python3 python3-venv
+          rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Trust the workspace
+        run: git config --global --add safe.directory '*'
+
+      - name: Install Python dependencies
+        run: |
+          python3 -m venv /opt/venv
+          /opt/venv/bin/pip install --upgrade pip
+          /opt/venv/bin/pip install ./vunit ./tsfpga
+
+      - name: Run the known-issue test on NVC
+        env:
+          VUNIT_SIMULATOR: nvc
+        run: >
+          /opt/venv/bin/python run.py --num-threads 1
+          "axi_stream_join.tb_axi_stream_join.stall_probability_percent_0.*"
+
+  synthesize:
+    name: Synthesize (Yosys + GHDL, Artix-7)
+    runs-on: ubuntu-24.04
+    container:
+      image: ru551n/hdl-docker:1.2.0
+      options: --user root
+    env:
+      # Where hdl-docker installs the ghdl-yosys-plugin. Consumed by
+      # ghdl_yosys_env.resolve_ghdl_plugin_path(), whose fallback is this
+      # machine's local install path and therefore wrong inside the image.
+      GHDL_YOSYS_PLUGIN: /opt/yosys/share/yosys/plugins/ghdl.so
+    steps:
+      - name: Install git and Python
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git python3 python3-venv
+          rm -rf /var/lib/apt/lists/*
+
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Trust the workspace
+        run: git config --global --add safe.directory '*'
+
+      - name: Install Python dependencies
+        # The `tsfpga` submodule tracks ru551n/tsfpga, which carries the Yosys
+        # netlist-build support (`tsfpga.yosys.project`) that upstream has not
+        # released yet; `build_fpga.py` does not work without it.
+        #
+        # VUnit here is the *released* 4.7.1 from PyPI, NOT the `vunit`
+        # submodule used by the simulate jobs. tsfpga only uses VUnit
+        # internally to assemble the source-file list for a netlist build (no
+        # testbench is ever run), and its build runner targets VUnit's
+        # released API. Against the VUnit 5.0.0.dev in the submodule it dies
+        # with "TestResult.__init__() missing 3 required keyword-only
+        # arguments". Revisit once tsfpga supports the 5.x API.
+        run: |
+          python3 -m venv /opt/venv
+          /opt/venv/bin/pip install --upgrade pip
+          /opt/venv/bin/pip install "vunit_hdl==4.7.1" ./tsfpga
+
+      - name: Check the toolchain is wired up
+        # Fails loudly and early if a future image drops or moves the plugin,
+        # instead of surfacing as a confusing per-project synthesis error.
+        run: |
+          test -f "$GHDL_YOSYS_PLUGIN"
+          ghdl --version
+          yosys -m ghdl -p 'help ghdl' > /dev/null
+
+      - name: Build all netlist projects
+        # Every synthesizable entity has BuildResultCheckers attached (see
+        # each module's `get_build_projects()`), so this fails not only on a
+        # synthesis error but also when an entity's LUT/FF/BRAM/DSP count
+        # grows past its recorded baseline.
+        run: /opt/venv/bin/python build_fpga.py --netlist-builds --num-parallel-builds 4
+
+      - name: Upload synthesis reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: netlist-utilization-reports
+          path: |
+            generated/projects/*/*_utilization.txt
+            generated/projects/*/output.txt
+          if-no-files-found: warn
