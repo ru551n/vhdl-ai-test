@@ -18,6 +18,8 @@ import struct
 
 import pytest
 
+import itertools
+
 from cnn_accel_model import (
     AccumulatorOverflow,
     INSTR_WORD_BYTES,
@@ -65,6 +67,8 @@ from cnn_accel_model import (
     encode_instruction,
     encode_program,
     fc,
+    pack_bias_for_hw,
+    pack_weights_for_hw,
     pool_avg,
     pool_max,
     round_shift_right_signed,
@@ -1367,3 +1371,297 @@ def test_run_program_chains_conv_then_pool_and_halts() -> None:
     pool_expected = pool_max(conv_expected, pool_desc)
     final_actual = _from_signed_bytes(bytes(mem[final_addr : final_addr + len(pool_expected)]))
     assert final_actual == pool_expected
+
+
+# ---------------------------------------------------------------------------
+# pack_weights_for_hw / pack_bias_for_hw (D10/D11): compile-time weight
+# repack for the tiled PE array, ratified in
+# doc/cnn_accel_tiled_dataflow_proposal.md section 4. Two kinds of tests:
+# (1) a static equivalence sweep against the logical OHWI array (this
+# section), and (2) a full hardware-order consumption simulation that
+# closes the loop against conv2d() (next section, the acceptance gate).
+# ---------------------------------------------------------------------------
+
+# in_channels/out_channels sweep values: 1 (degenerate), 3 (the target
+# network's real layer-1 partial-tile case, D11), a small prime (7/9,
+# non-multiples of both 4 and 8), the tile/lane widths themselves (8),
+# a multiple-of-both (16), and 20 (a large partial tile for every swept
+# tile_channels/pe_rows). out_channels additionally includes 12 (a
+# partial tile only at pe_rows=8, exact at pe_rows=4).
+_PACK_IN_CHANNELS_SWEEP = [1, 3, 7, 8, 9, 16, 20]
+_PACK_OUT_CHANNELS_SWEEP = [1, 3, 8, 9, 12, 16, 20]
+_PACK_KERNELS_SWEEP = [1, 3]
+_PACK_TILE_CHANNELS_SWEEP = [4, 8]
+_PACK_PE_ROWS_SWEEP = [4, 8]
+
+
+def test_pack_weights_for_hw_matches_logical_ohwi_and_pads_zero() -> None:
+    """D10/D11 equivalence property: for every (oc, kr, kc, ic) with
+    oc < out_channels and ic < in_channels, `pack_weights_for_hw`'s
+    packed image holds the same weight value as the logical OHWI array
+    at the offset its own docstring computes; every padded lane
+    (oc >= out_channels or ic >= in_channels) is exactly 0; and the
+    total packed length matches the documented
+    `OT*T*kernel_h*kernel_w*tile_channels*pe_rows` formula. Swept over
+    kernel 1 and 3, in_channels/out_channels spanning 1..20 (including 3
+    and non-multiples of 8), and tile_channels/pe_rows in {4, 8}."""
+    rng = random.Random(0xD10)
+    for in_c, out_c, kernel, tile_channels, pe_rows in itertools.product(
+        _PACK_IN_CHANNELS_SWEEP,
+        _PACK_OUT_CHANNELS_SWEEP,
+        _PACK_KERNELS_SWEEP,
+        _PACK_TILE_CHANNELS_SWEEP,
+        _PACK_PE_ROWS_SWEEP,
+    ):
+        desc = _desc(in_channels=in_c, out_channels=out_c, kernel_h=kernel, kernel_w=kernel)
+        weights = [rng.randint(-128, 127) for _ in range(out_c * kernel * kernel * in_c)]
+        packed = pack_weights_for_hw(weights, desc, tile_channels, pe_rows)
+
+        n_in_tiles = -(-in_c // tile_channels)  # ceil
+        n_out_tiles = -(-out_c // pe_rows)  # ceil
+        expected_len = n_out_tiles * n_in_tiles * kernel * kernel * tile_channels * pe_rows
+        assert len(packed) == expected_len
+
+        idx = 0
+        for ot in range(n_out_tiles):
+            for t in range(n_in_tiles):
+                for kr in range(kernel):
+                    for kc in range(kernel):
+                        for c in range(tile_channels):
+                            ic = t * tile_channels + c
+                            for r in range(pe_rows):
+                                oc = ot * pe_rows + r
+                                if ic < in_c and oc < out_c:
+                                    expected = weights[
+                                        ((oc * kernel + kr) * kernel + kc) * in_c + ic
+                                    ]
+                                else:
+                                    expected = 0  # D11: padded lane must be zero
+                                assert packed[idx] == expected, (
+                                    f"in_c={in_c} out_c={out_c} kernel={kernel} "
+                                    f"tile_channels={tile_channels} pe_rows={pe_rows} "
+                                    f"ot={ot} t={t} kr={kr} kc={kc} c={c} r={r} "
+                                    f"ic={ic} oc={oc}"
+                                )
+                                idx += 1
+
+
+def test_pack_weights_for_hw_rejects_dwconv2d() -> None:
+    """DWCONV2D's `(channels, kernel_h, kernel_w)` layout has no
+    cross-channel reduction to gather -- out of D10's ratified scope."""
+    desc = _desc(opcode=OPCODE_DWCONV2D, in_channels=4, out_channels=4, kernel_h=3, kernel_w=3)
+    weights = [0] * (4 * 3 * 3)
+    with pytest.raises(ValueError):
+        pack_weights_for_hw(weights, desc, tile_channels=8, pe_rows=8)
+
+
+def test_pack_bias_for_hw_matches_and_pads_zero() -> None:
+    """Bias padding must line up with `pack_weights_for_hw`'s `ot -> r`
+    output-channel tiling exactly (`oc = ot*pe_rows + r`); total length
+    is always `ceil(out_channels/pe_rows) * pe_rows`."""
+    rng = random.Random(0xB1A5)
+    for out_c, pe_rows in itertools.product(_PACK_OUT_CHANNELS_SWEEP, _PACK_PE_ROWS_SWEEP):
+        desc = _desc(out_channels=out_c)
+        bias = [rng.randint(-100_000, 100_000) for _ in range(out_c)]
+        packed = pack_bias_for_hw(bias, desc, pe_rows)
+
+        n_out_tiles = -(-out_c // pe_rows)
+        assert len(packed) == n_out_tiles * pe_rows
+
+        idx = 0
+        for ot in range(n_out_tiles):
+            for r in range(pe_rows):
+                oc = ot * pe_rows + r
+                expected = bias[oc] if oc < out_c else 0
+                assert packed[idx] == expected
+                idx += 1
+
+
+# ---------------------------------------------------------------------------
+# Hardware-order PE array simulation (the acceptance gate): proves the
+# packed weight order (D10/D11) and the tiled dataflow (proposal §2/§3/
+# §4) are mutually consistent BEFORE any RTL is written, by walking the
+# packed image strictly sequentially -- exactly the order
+# `weight_rd_addr` increments in `cnn_accel_weight_buffer.vhd` -- against
+# an independently-simulated tiled window generator, and checking the
+# int32-accumulated, bias/requant/relu'd result against conv2d() itself.
+# ---------------------------------------------------------------------------
+
+
+def _tap(
+    input_values: list[int], row: int, col: int, channel: int, width: int, height: int, channels: int
+) -> int:
+    """Same zero-padding convention as `cnn_accel_model._at`, reimplemented
+    independently here (this file avoids reaching into the model's
+    private helpers, matching its own naive-reference-implementation
+    convention elsewhere in this file)."""
+    if row < 0 or row >= height or col < 0 or col >= width:
+        return 0
+    return input_values[(row * width + col) * channels + channel]
+
+
+def _simulate_pe_array_tiled_dataflow(
+    input_values: list[int],
+    weights: list[int],
+    bias: list[int],
+    desc: LayerDesc,
+    *,
+    tile_channels: int,
+    pe_rows: int,
+) -> list[int]:
+    """Simulates the RTL's own weight/window consumption order for
+    `OPCODE_CONV2D`, ratified by D10:
+
+    - Packs `weights` with `pack_weights_for_hw` (compile-time gather,
+      never in hardware) and reads it back strictly sequentially, one
+      `tile_channels * pe_rows`-lane row at a time -- mirroring
+      `weight_rd_addr`, reset to 0 only when a new output-channel tile's
+      sweep starts over a pixel, then incrementing once per `(t, kr,
+      kc)` group (`cnn_accel_weight_buffer.vhd` addressing, proposal §4).
+    - Independently generates the tiled window taps per `(t, kr, kc)`
+      (mirrors `cnn_accel_window_gen`'s new tile loop, proposal §2),
+      using the same zero-padding convention as the golden model
+      (`_tap` above) and treating channels `>= in_channels` in a
+      partial input tile as the zero activation D11 relies on.
+    - Accumulates int32 per output lane across all `T` tiles of a pixel
+      before ever calling `bias_requantize_relu` (mirrors the
+      `first_tile`-clears/`last_tile`-commits accumulator carry, §3).
+
+    Returns output in the same `(out_row, out_col, out_channel)` raster
+    order as `conv2d()`, so a direct list equality checks the whole
+    pipeline (packing order + tiled accumulation + quantization) end to
+    end for every in-range output pixel/channel.
+    """
+    in_w, in_h, in_c = desc.in_width, desc.in_height, desc.in_channels
+    out_c = desc.out_channels
+    k_h, k_w = desc.kernel_h, desc.kernel_w
+    s_h, s_w = desc.stride_h, desc.stride_w
+    pad_top = desc.pad_top if desc.pad_en else 0
+    pad_left = desc.pad_left if desc.pad_en else 0
+    pad_bottom = desc.pad_bottom if desc.pad_en else 0
+    pad_right = desc.pad_right if desc.pad_en else 0
+    padded_h = in_h + pad_top + pad_bottom
+    padded_w = in_w + pad_left + pad_right
+    out_h = (padded_h - k_h) // s_h + 1
+    out_w = (padded_w - k_w) // s_w + 1
+
+    n_in_tiles = -(-in_c // tile_channels)  # ceil: T
+    n_out_tiles = -(-out_c // pe_rows)  # ceil: OT
+    groups_per_out_tile = n_in_tiles * k_h * k_w
+    row_len = tile_channels * pe_rows
+
+    packed = pack_weights_for_hw(weights, desc, tile_channels, pe_rows)
+    assert len(packed) == n_out_tiles * groups_per_out_tile * row_len
+
+    output = [0] * (out_h * out_w * out_c)
+    for out_row in range(out_h):
+        for out_col in range(out_w):
+            base_row = out_row * s_h - pad_top
+            base_col = out_col * s_w - pad_left
+            for ot in range(n_out_tiles):
+                acc = [0] * pe_rows  # first_tile: clear all pe_rows accumulators
+                weight_rd_addr = ot * groups_per_out_tile
+                for t in range(n_in_tiles):
+                    for kr in range(k_h):
+                        for kc in range(k_w):
+                            row = packed[
+                                weight_rd_addr * row_len : (weight_rd_addr + 1) * row_len
+                            ]
+                            weight_rd_addr += 1
+                            for c in range(tile_channels):
+                                ic = t * tile_channels + c
+                                tap = (
+                                    _tap(
+                                        input_values,
+                                        base_row + kr,
+                                        base_col + kc,
+                                        ic,
+                                        in_w,
+                                        in_h,
+                                        in_c,
+                                    )
+                                    if ic < in_c
+                                    else 0  # D11: partial-tile channel, zero activation
+                                )
+                                if tap == 0:
+                                    continue  # zero tap contributes zero to every lane
+                                for r in range(pe_rows):
+                                    acc[r] += tap * row[c * pe_rows + r]
+                # last_tile: commit accumulators to the quantized output.
+                for r in range(pe_rows):
+                    oc = ot * pe_rows + r
+                    if oc >= out_c:
+                        continue
+                    bias_value = bias[oc] if desc.bias_en else 0
+                    output[(out_row * out_w + out_col) * out_c + oc] = bias_requantize_relu(
+                        acc[r],
+                        bias_value,
+                        bias_en=desc.bias_en,
+                        requant_en=desc.requant_en,
+                        relu_en=desc.relu_en,
+                        requant_scale=desc.requant_scale,
+                        requant_shift=desc.requant_shift,
+                    )
+    return output
+
+
+# in_channels: 3 (target network's real layer-1 partial tile, D11), 8
+# (exact fit, no padding at all), 20 (partial at every swept
+# tile_channels). out_channels: 8 (exact at pe_rows=8), 12 (partial at
+# pe_rows=8, exact at pe_rows=4). kernel 1x1 and 3x3. stride 1 and 2.
+# padding on/off. tile_channels/pe_rows both the recommended (8, 8)
+# default and a second (4, 4) pair to prove the simulation/packing is
+# not accidentally hard-coded to one width.
+_PE_SIM_IN_W = _PE_SIM_IN_H = 5  # smallest size giving a positive out_h/out_w for every combo below
+_PE_SIM_SHAPES = list(
+    itertools.product(
+        [3, 8, 20],  # in_channels
+        [8, 12],  # out_channels
+        [1, 3],  # kernel
+        [1, 2],  # stride
+        [False, True],  # padding on/off
+        [(8, 8), (4, 4)],  # (tile_channels, pe_rows)
+    )
+)
+
+
+@pytest.mark.parametrize(
+    "in_c, out_c, kernel, stride, pad_on, tile_pe",
+    _PE_SIM_SHAPES,
+    ids=[
+        f"ic{ic}_oc{oc}_k{k}_s{s}_pad{int(p)}_t{tc}pe{pr}"
+        for ic, oc, k, s, p, (tc, pr) in _PE_SIM_SHAPES
+    ],
+)
+def test_pe_array_tiled_dataflow_matches_conv2d(in_c, out_c, kernel, stride, pad_on, tile_pe) -> None:
+    """THE acceptance gate (per task): the hardware-order simulation
+    must reproduce conv2d() exactly for every swept shape, BEFORE any
+    RTL is written."""
+    tile_channels, pe_rows = tile_pe
+    seed = f"pe_sim-{in_c}-{out_c}-{kernel}-{stride}-{pad_on}-{tile_channels}-{pe_rows}"
+    rng = random.Random(seed)
+
+    in_w, in_h = _PE_SIM_IN_W, _PE_SIM_IN_H
+    pad = 1 if pad_on else 0
+    desc = LayerDesc(
+        opcode=OPCODE_CONV2D,
+        flags=(
+            (1 << FLAG_BIAS_EN)
+            | (1 << FLAG_RELU_EN)
+            | (1 << FLAG_REQUANT_EN)
+            | ((1 << FLAG_PAD_EN) if pad_on else 0)
+        ),
+        in_width=in_w, in_height=in_h, in_channels=in_c, out_channels=out_c,
+        kernel_h=kernel, kernel_w=kernel, stride_h=stride, stride_w=stride,
+        pad_top=pad, pad_bottom=pad, pad_left=pad, pad_right=pad,
+        requant_scale=1 << 13, requant_shift=1,
+    )
+    input_values = [rng.randint(-128, 127) for _ in range(in_w * in_h * in_c)]
+    weights = [rng.randint(-128, 127) for _ in range(out_c * kernel * kernel * in_c)]
+    bias = [rng.randint(-1000, 1000) for _ in range(out_c)]
+
+    golden = conv2d(input_values, weights, bias, desc)
+    simulated = _simulate_pe_array_tiled_dataflow(
+        input_values, weights, bias, desc, tile_channels=tile_channels, pe_rows=pe_rows
+    )
+    assert simulated == golden

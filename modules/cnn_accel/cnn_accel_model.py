@@ -458,6 +458,123 @@ def fc(input_values: list[int], weights: list[int], bias: list[int], desc: Layer
     return conv2d(input_values, weights, bias, fc_desc)
 
 
+def pack_weights_for_hw(
+    weights: list[int], desc: LayerDesc, tile_channels: int, pe_rows: int
+) -> list[int]:
+    """Compile-time repack of `CONV2D`/`FC` weights (logical OHWI, see the
+    module docstring) into the accelerator-NATIVE byte image the RTL
+    weight buffer/`pe_array` actually stream sequentially -- ratified
+    D10 (`doc/cnn_accel_tiled_dataflow_proposal.md` §4): the PE array
+    sweeps input channels TILE-MAJOR (`tile_idx` hoisted above
+    `kr,kc`, §4/§2), which disagrees with OHWI's `ic` fastest-varying
+    *inside* `kr,kc` -- so the gather happens once, here, in Python,
+    never in hardware.
+
+    LAYOUT (outermost to innermost; every leaf is one `int8` weight):
+
+        for ot in 0 .. OT-1:                      # output-channel tile
+          for t in 0 .. T-1:                       # input-channel tile
+            for kr in 0 .. kernel_h-1:
+              for kc in 0 .. kernel_w-1:
+                for c in 0 .. tile_channels-1:      # channel within input tile
+                  for r in 0 .. pe_rows-1:          # output lane within output tile
+                    ic = t*tile_channels + c
+                    oc = ot*pe_rows + r
+                    yield weights[((oc*kernel_h+kr)*kernel_w+kc)*in_channels+ic]
+                          if ic < in_channels and oc < out_channels else 0   # D11
+
+    where `OT = ceil(out_channels/pe_rows)`, `T =
+    ceil(in_channels/tile_channels)`. This is exactly the order
+    `weight_rd_addr` walks in `cnn_accel_weight_buffer.vhd`: one flat
+    row address, reset to 0 only on `first_tile` of a new pixel (§4),
+    incrementing once per `(t, kr, kc)` group thereafter, wrapping to
+    the next output-channel tile only when the whole ifmap is
+    re-streamed (D6, §5) -- so within one `pe_array` pass over one
+    output-channel tile, the row sweep is `t -> kr -> kc`, and each row
+    holds `tile_channels * pe_rows` int8 lanes (`c` fastest inside the
+    row is a don't-care for storage -- both `c` and `r` are consumed
+    combinationally by the same row read -- but `c` outer / `r` inner
+    is the convention fixed here so VHDL testbenches can address a
+    single lane at `row*tile_channels*pe_rows + c*pe_rows + r`).
+
+    D11 (zero padding for partial tiles): whenever `in_channels` is not
+    a multiple of `tile_channels` or `out_channels` is not a multiple
+    of `pe_rows`, every lane whose `ic >= in_channels` or `oc >=
+    out_channels` is written as weight `0` -- never omitted, never
+    garbage. This is what lets the hardware skip masking logic entirely
+    (garbage activation x zero weight = 0 accumulates as a no-op).
+    Layer 1 of the target network (`in_channels=3`, recommended
+    `tile_channels=8`) is exactly this case.
+
+    Total length is always exactly
+    `OT * T * kernel_h * kernel_w * tile_channels * pe_rows`
+    int8 values, regardless of padding.
+
+    Only `OPCODE_CONV2D`/`OPCODE_FC`'s OHWI weight layout is in scope
+    (per the ratifying proposal's own scoping, §4/§8 risk 1);
+    `OPCODE_DWCONV2D`'s `(channels, kernel_h, kernel_w)` layout has no
+    cross-channel reduction to gather -- each output channel already
+    depends on exactly one input channel -- so it needs no repacking
+    and this function rejects it rather than silently producing a
+    layout no `vhdesign` has ratified.
+    """
+    if desc.opcode not in (OPCODE_CONV2D, OPCODE_FC):
+        raise ValueError(
+            "pack_weights_for_hw only supports OPCODE_CONV2D/OPCODE_FC's OHWI "
+            f"weight layout (ratified D10 scope), got opcode=0x{desc.opcode:02x}"
+        )
+    if tile_channels <= 0 or pe_rows <= 0:
+        raise ValueError(
+            f"tile_channels and pe_rows must be positive, got tile_channels={tile_channels} "
+            f"pe_rows={pe_rows}"
+        )
+    in_c, out_c = desc.in_channels, desc.out_channels
+    k_h, k_w = desc.kernel_h, desc.kernel_w
+    n_in_tiles = -(-in_c // tile_channels)  # ceil(in_c / tile_channels)
+    n_out_tiles = -(-out_c // pe_rows)  # ceil(out_c / pe_rows)
+
+    packed: list[int] = []
+    for ot in range(n_out_tiles):
+        for t in range(n_in_tiles):
+            for kr in range(k_h):
+                for kc in range(k_w):
+                    for c in range(tile_channels):
+                        ic = t * tile_channels + c
+                        for r in range(pe_rows):
+                            oc = ot * pe_rows + r
+                            if ic < in_c and oc < out_c:
+                                packed.append(
+                                    weights[((oc * k_h + kr) * k_w + kc) * in_c + ic]
+                                )
+                            else:
+                                packed.append(0)
+    return packed
+
+
+def pack_bias_for_hw(bias: list[int], desc: LayerDesc, pe_rows: int) -> list[int]:
+    """Zero-pad `bias` (one int32 per output channel, see the module
+    docstring) to a whole number of `pe_rows`-wide output-channel tiles,
+    matching `pack_weights_for_hw`'s `ot -> r` (`oc = ot*pe_rows + r`)
+    tiling exactly -- `cnn_accel_bias_requant`'s lane `l` reads bias row
+    `ot` lane `l`, so the padded lanes (`oc >= out_channels`) must be
+    present (as `0`) for the addressing to line up, even though those
+    lanes' MAC results are already `0` from D11's zero weight padding.
+
+    Total length is always exactly `OT * pe_rows` int32 values, where
+    `OT = ceil(out_channels / pe_rows)`.
+    """
+    if pe_rows <= 0:
+        raise ValueError(f"pe_rows must be positive, got pe_rows={pe_rows}")
+    out_c = desc.out_channels
+    n_out_tiles = -(-out_c // pe_rows)  # ceil(out_c / pe_rows)
+    packed: list[int] = []
+    for ot in range(n_out_tiles):
+        for r in range(pe_rows):
+            oc = ot * pe_rows + r
+            packed.append(bias[oc] if oc < out_c else 0)
+    return packed
+
+
 def _pool_windows(input_values: list[int], desc: LayerDesc) -> list[list[int]]:
     """Per-channel pooling windows in output-raster order, one list of
     `pool_kernel_h * pool_kernel_w` int8 taps per (output position,

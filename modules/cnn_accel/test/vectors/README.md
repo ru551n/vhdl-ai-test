@@ -17,16 +17,44 @@ Each `<case>/` directory contains:
   `in_width`, `kernel_h`, `requant_scale`, ...). Address fields
   (`in_addr`/`out_addr`/`weight_addr`/`bias_addr`/`next_instr_addr`) are
   always `0` -- these vectors are consumed as bare tensors, not through
-  `run_layer`/a memory image.
+  `run_layer`/a memory image. `CONV2D`/`FC` cases additionally have two
+  appended lines, `tile_channels <n>` and `pe_rows <n>` -- NOT `LayerDesc`
+  fields, the host-compiler-time packing parameters
+  `weights_packed.txt` (below) was built with (ratified D10, see
+  `doc/cnn_accel_tiled_dataflow_proposal.md` section 4). `DWCONV2D`/
+  `POOL_MAX`/`POOL_AVG` cases have no such lines (see `weights_packed.txt`
+  below).
 - `input.txt` -- input activations, flat HWC (`(row*width+col)*channels
   + channel`), one signed decimal int8 per line.
 - `weights.txt` -- OHWI (`((oc*k_h+kr)*k_w+kc)*in_c+ic`) for `CONV2D`/`FC`,
   `(channels, k_h, k_w)` for `DWCONV2D`, or empty for `POOL_MAX`/`POOL_AVG`
-  (pooling has no weight tensor), one signed decimal int8 per line.
+  (pooling has no weight tensor), one signed decimal int8 per line. This
+  is the LOGICAL layout (`cnn_accel_model.conv2d`/`dwconv2d`/`fc`'s own
+  input); see `weights_packed.txt` for the accelerator-native order.
+- `weights_packed.txt` -- **`CONV2D`/`FC` cases only.** The same weights
+  as `weights.txt`, repacked into accelerator-native order by
+  `cnn_accel_model.pack_weights_for_hw(weights, desc, tile_channels=8,
+  pe_rows=8)` (ratified D10 -- the host-compiler-time gather that lets
+  `cnn_accel_weight_buffer`/`pe_array` read this image strictly
+  sequentially, never reordering in hardware). One signed decimal int8
+  per line; exact nesting/zero-padding rule (D11) is documented in that
+  function's docstring in `../../cnn_accel_model.py`. Length is always
+  `ceil(out_channels/8) * ceil(in_channels/8) * kernel_h * kernel_w * 64`.
+  Not present for `DWCONV2D` -- its `(channels, kernel_h, kernel_w)`
+  layout has no cross-channel reduction to gather (D10 is scoped to
+  `CONV2D`'s tile-major weight_buffer addressing only; `DWCONV2D` uses a
+  different, `pe_cols`-grouped row layout per
+  `doc/cnn_accel_pe_array_proposal.md` section 3.5, not implemented by
+  `pack_weights_for_hw`) -- or for `POOL_MAX`/`POOL_AVG` (no weights).
 - `bias.txt` -- one signed decimal int32 per output channel, per line
   (all zero when `bias_en=0`, or when the opcode is `POOL_MAX`/`POOL_AVG`
   which has no bias tensor -- one zero per input/output channel, still
-  present for a uniform reader).
+  present for a uniform reader). LOGICAL layout, unpadded; the
+  accelerator-native, zero-padded-to-`pe_rows` equivalent is
+  `cnn_accel_model.pack_bias_for_hw(bias, desc, pe_rows=8)` (not
+  exported to a file here -- no vector case currently needs it, unlike
+  weights which every `CONV2D`/`FC` RTL testbench needs in hardware
+  order).
 - `expected.txt` -- output activations, flat HWC, one signed decimal int8
   per line, produced directly by `cnn_accel_model.conv2d`/`dwconv2d`/
   `pool_max`/`pool_avg`/`fc`.
@@ -37,18 +65,25 @@ integer per line -- directly readable with VHDL `std.textio`
 
 ## Cases
 
-| Case | Op | Shape | Notes |
-|---|---|---|---|
-| `conv1x1_c4_o4` | CONV2D | 4x4x4 -> 4x4x4, k=1 s=1 | pointwise, bias+relu+requant on |
-| `conv3x3_s1_c3_o8_pad1` | CONV2D | 6x6x3 -> 6x6x8, k=3 s=1 pad=1 | first-layer-shaped, same-padding |
-| `conv3x3_s2_c8_o8_pad1` | CONV2D | 7x7x8 -> 4x4x8, k=3 s=2 pad=1 | odd input dims, downsampling |
-| `conv3x3_s1_extremes` | CONV2D | 4x4x2 -> 4x4x2, k=3 s=1 pad=1 | int8-extreme input/weight taps, `requant_en=0` bypass-saturate path |
-| `dwconv3x3_c8` | DWCONV2D | 8x8x8 -> 8x8x8, k=3 s=1 pad=1 | depthwise, largest spatial dims kept (<=8x8 for fast sim) |
-| `conv3x3_asymmetric_pad` | CONV2D | 7x7x3 (padded) -> 5x5x4, k=3 s=1 | `pad_top=1,pad_bottom=0,pad_left=0,pad_right=1` (all 4 pad fields independent, none symmetric) |
-| `conv3x3_negative_requant_scale` | CONV2D | 7x7x2 (padded) -> 5x5x3, k=3 s=1 pad=1 | `requant_scale` is negative (the one signed ISA field) |
-| `pool_max_4x4` | POOL_MAX | 8x8x2 -> 4x4x2, pool k=2 s=2 | max pool, no weights/bias/requant |
-| `pool_avg_4x4` | POOL_AVG | 8x8x2 -> 4x4x2, pool k=2 s=2 | average pool, `requant_en=1` scale=1/4 (pool area) + relu |
-| `fc_in6_out4` | FC | 6 -> 4 (degenerate 1x1 spatial) | `in_width=in_height=kernel_h=kernel_w=1`, bias+relu+requant on |
+| Case | Op | Shape | `weights_packed.txt`? | Notes |
+|---|---|---|---|---|
+| `conv1x1_c4_o4` | CONV2D | 4x4x4 -> 4x4x4, k=1 s=1 | yes | pointwise, bias+relu+requant on |
+| `conv3x3_s1_c3_o8_pad1` | CONV2D | 6x6x3 -> 6x6x8, k=3 s=1 pad=1 | yes | first-layer-shaped, same-padding; `in_channels=3` also exercises D11's partial-input-tile zero padding at `tile_channels=8` |
+| `conv3x3_s2_c8_o8_pad1` | CONV2D | 7x7x8 -> 4x4x8, k=3 s=2 pad=1 | yes | odd input dims, downsampling; `in_channels=out_channels=8` is the exact-tile (no padding) case |
+| `conv3x3_s1_extremes` | CONV2D | 4x4x2 -> 4x4x2, k=3 s=1 pad=1 | yes | int8-extreme input/weight taps, `requant_en=0` bypass-saturate path |
+| `dwconv3x3_c8` | DWCONV2D | 8x8x8 -> 8x8x8, k=3 s=1 pad=1 | no (see `weights_packed.txt` note above) | depthwise, largest spatial dims kept (<=8x8 for fast sim) |
+| `conv3x3_asymmetric_pad` | CONV2D | 7x7x3 (padded) -> 5x5x4, k=3 s=1 | yes | `pad_top=1,pad_bottom=0,pad_left=0,pad_right=1` (all 4 pad fields independent, none symmetric) |
+| `conv3x3_negative_requant_scale` | CONV2D | 7x7x2 (padded) -> 5x5x3, k=3 s=1 pad=1 | yes | `requant_scale` is negative (the one signed ISA field) |
+| `pool_max_4x4` | POOL_MAX | 8x8x2 -> 4x4x2, pool k=2 s=2 | no (no weights) | max pool, no weights/bias/requant |
+| `pool_avg_4x4` | POOL_AVG | 8x8x2 -> 4x4x2, pool k=2 s=2 | no (no weights) | average pool, `requant_en=1` scale=1/4 (pool area) + relu |
+| `fc_in6_out4` | FC | 6 -> 4 (degenerate 1x1 spatial) | yes | `in_width=in_height=kernel_h=kernel_w=1`, bias+relu+requant on |
+
+The hardware-order consistency of `weights_packed.txt`'s layout (i.e.
+that consuming it strictly sequentially against a tiled window
+generator reproduces `expected.txt`) is proven independently, over a
+much wider shape sweep than these 7 fixed cases, by
+`test_pe_array_tiled_dataflow_matches_conv2d` in
+`../../test_cnn_accel_model.py`.
 
 Regenerate with:
 

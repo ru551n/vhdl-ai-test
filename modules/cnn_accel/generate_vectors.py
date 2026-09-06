@@ -32,11 +32,19 @@ from cnn_accel_model import (
     conv2d,
     dwconv2d,
     fc,
+    pack_weights_for_hw,
     pool_avg,
     pool_max,
 )
 
 VECTORS_DIR = Path(__file__).resolve().parent / "test" / "vectors"
+
+# D10 (doc/cnn_accel_tiled_dataflow_proposal.md section 4): the
+# accelerator-native weight image's tile/lane widths used for every
+# `weights_packed.txt` export below. Matches the proposal's own
+# recommended defaults (g_tile_channels = g_pe_cols = g_pe_rows = 8).
+HW_TILE_CHANNELS = 8
+HW_PE_ROWS = 8
 
 
 def _flags(*, relu_en: bool, bias_en: bool, requant_en: bool, pad_en: bool) -> int:
@@ -52,10 +60,17 @@ def _write_int_lines(path: Path, values: list[int]) -> None:
     path.write_text("".join(f"{v}\n" for v in values))
 
 
-def _write_desc(path: Path, desc: LayerDesc) -> None:
+def _write_desc(path: Path, desc: LayerDesc, *, extra: dict[str, int] | None = None) -> None:
     lines = []
     for field in dataclasses.fields(desc):
         lines.append(f"{field.name} {getattr(desc, field.name)}\n")
+    # `extra` (D10): tile_channels/pe_rows are not LayerDesc/ISA fields --
+    # they are the host-compiler-time packing parameters used to produce
+    # this case's weights_packed.txt, appended after the standard
+    # `LayerDesc` fields so existing readers that stop after the known
+    # field count are unaffected.
+    for key, value in (extra or {}).items():
+        lines.append(f"{key} {value}\n")
     path.write_text("".join(lines))
 
 
@@ -136,7 +151,24 @@ def _build_case(
 
     case_dir = VECTORS_DIR / name
     case_dir.mkdir(parents=True, exist_ok=True)
-    _write_desc(case_dir / "desc.txt", desc)
+    # D10: DWCONV2D's (channels, kernel_h, kernel_w) weight layout has no
+    # cross-channel reduction to gather -- it is out of the tiled-conv
+    # weight_buffer addressing this repack ratifies (see
+    # cnn_accel_model.pack_weights_for_hw's docstring) and uses a
+    # different pe_cols-grouped row layout per
+    # doc/cnn_accel_pe_array_proposal.md section 3.5, not implemented
+    # here. Only CONV2D/FC (OHWI) cases get a desc.txt tile_channels/
+    # pe_rows record and a weights_packed.txt export.
+    if depthwise:
+        _write_desc(case_dir / "desc.txt", desc)
+    else:
+        packed_weights = pack_weights_for_hw(weights, desc, HW_TILE_CHANNELS, HW_PE_ROWS)
+        _write_desc(
+            case_dir / "desc.txt",
+            desc,
+            extra={"tile_channels": HW_TILE_CHANNELS, "pe_rows": HW_PE_ROWS},
+        )
+        _write_int_lines(case_dir / "weights_packed.txt", packed_weights)
     _write_int_lines(case_dir / "input.txt", input_values)
     _write_int_lines(case_dir / "weights.txt", weights)
     _write_int_lines(case_dir / "bias.txt", bias)
@@ -235,7 +267,15 @@ def _build_fc_case(
 
     case_dir = VECTORS_DIR / name
     case_dir.mkdir(parents=True, exist_ok=True)
-    _write_desc(case_dir / "desc.txt", desc)
+    # FC's weight layout is OHWI with a degenerate 1x1 kernel -- same D10
+    # scope as CONV2D.
+    packed_weights = pack_weights_for_hw(weights, desc, HW_TILE_CHANNELS, HW_PE_ROWS)
+    _write_desc(
+        case_dir / "desc.txt",
+        desc,
+        extra={"tile_channels": HW_TILE_CHANNELS, "pe_rows": HW_PE_ROWS},
+    )
+    _write_int_lines(case_dir / "weights_packed.txt", packed_weights)
     _write_int_lines(case_dir / "input.txt", input_values)
     _write_int_lines(case_dir / "weights.txt", weights)
     _write_int_lines(case_dir / "bias.txt", bias)

@@ -23,3 +23,5 @@ pool_kernel_w 1
 pool_stride_h 1
 pool_stride_w 1
 next_instr_addr 0
+tile_channels 8
+pe_rows 8
