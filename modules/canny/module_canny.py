@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import csv
-import os
 import random
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -9,6 +8,7 @@ from typing import TYPE_CHECKING
 from tsfpga.module import BaseModule, get_modules
 
 from canny_model import canny_pipeline
+from ghdl_yosys_env import resolve_ghdl_plugin_path, resolve_ghdl_prefix
 
 if TYPE_CHECKING:
     from vunit.ui import VUnit
@@ -64,9 +64,6 @@ class Module(BaseModule):
             modules_folder=self.path / "synth_workaround",
             names_include={"axi_stream"},
         )
-        ghdl_plugin_path = os.environ.get("TSFPGA_MCP_GHDL_PLUGIN")
-        ghdl_prefix = os.environ.get("TSFPGA_MCP_GHDL_PREFIX")
-
         return [
             YosysNetlistBuild(
                 name="canny_top",
@@ -78,8 +75,8 @@ class Module(BaseModule):
                     "thresh_low": _THRESH_LOW,
                     "thresh_high": _THRESH_HIGH,
                 },
-                ghdl_plugin_path=Path(ghdl_plugin_path) if ghdl_plugin_path else None,
-                ghdl_prefix=Path(ghdl_prefix) if ghdl_prefix else None,
+                ghdl_plugin_path=resolve_ghdl_plugin_path(),
+                ghdl_prefix=resolve_ghdl_prefix(),
                 defined_at=Path(__file__),
             )
         ]

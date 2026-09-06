@@ -42,6 +42,6 @@ command = ["uv", "--directory", "/home/sebbe/git/tsfpga-mcp", "run", "tsfpga-mcp
 # run.py/VUnit flow uses (see VUNIT_MCP_PYTHON below), so this points at
 # tsfpga-mcp's own venv (built from the dev tsfpga checkout that added
 # YosysNetlistBuild/BuildProjectList support) instead.
-environment = { TSFPGA_MCP_GHDL_PLUGIN = "/home/sebbe/git/ghdl-yosys-plugin/ghdl.so", TSFPGA_MCP_PROJECT_DIR = "/home/sebbe/git/vhdl-ai-test", TSFPGA_MCP_BUILD_SCRIPT = "build_fpga.py", TSFPGA_MCP_PROJECT_PYTHON = "/home/sebbe/git/tsfpga-mcp/.venv/bin/python3" }
+environment = { GHDL_YOSYS_PLUGIN = "/home/sebbe/git/ghdl-yosys-plugin/ghdl.so", TSFPGA_MCP_PROJECT_DIR = "/home/sebbe/git/vhdl-ai-test", TSFPGA_MCP_BUILD_SCRIPT = "build_fpga.py", TSFPGA_MCP_PROJECT_PYTHON = "/home/sebbe/git/tsfpga-mcp/.venv/bin/python3" }
 timeout = 300000
 enabled = true
