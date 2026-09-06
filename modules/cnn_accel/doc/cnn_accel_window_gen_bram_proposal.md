@@ -322,6 +322,57 @@ only `g_max_kernel_size` physical read ports.
 
 ## 6. Recommendation
 
+> ### RATIFIED 2026-09: **Option 3a**, not the recommended Option 1.
+>
+> The architect ratified **Option 3a — serialize internally, keep the
+> beat contract** (§4.3), overriding the recommendation below, and
+> **retained Option 1 (bank replication, §4.1) as the designated
+> speed-optimization path** to be taken when throughput, rather than
+> area, becomes the binding constraint.
+>
+> Rationale for the override: area is the binding constraint now. Option
+> 3a costs **3 BRAM36** against Option 1's 9 (2.2% vs 6.7% of an
+> `xc7a100t`) and has the lowest LUT estimate of any option, and it is
+> what `cnn_accel_tiled_dataflow_proposal.md` §1 already assumed the RTL
+> did. The accepted price is the **~25-30% steady-state throughput
+> regression** quantified in §4.3 (reference network ~17.4 FPS ->
+> ~12.5-13 FPS). That price is explicitly accepted, not overlooked.
+>
+> Because Option 1 is now a planned future step rather than a rejected
+> alternative, §4.1 and the §5 comparison table must be kept accurate;
+> do not delete them once 3a is built. The upgrade path is: swap the
+> `g_max_kernel_size` single-port banks for `g_max_kernel_size**2`
+> replicated copies and drop the `kc` walk. Option 3a's own
+> double-buffering mitigation (§4.3, §8 risk 6) is the intermediate step
+> if partial throughput recovery is wanted without paying the 9 BRAM36.
+>
+> **Decision points as ratified.** DP2, DP3 and DP4 were all accepted,
+> but DP2 and DP3 were written in Option 1's terms; under Option 3a they
+> read:
+>
+> - **DP1 (ratified, overridden):** Option 3a. Option 1 retained as the
+>   speed path. Option 2, 3b and 4 remain rejected.
+> - **DP2 (ratified, restated):** BRAM scaling is
+>   `g_max_kernel_size` (**3**, linear), not `g_max_kernel_size**2`.
+>   This is strictly better than the accepted bound and removes §8
+>   risk 1 as a practical concern: even K=7 costs 7 BRAM36. The
+>   `g_max_kernel_size**2` re-estimate becomes required again only if
+>   the design later moves to Option 1.
+> - **DP3 (ratified, restated):** the accepted added latency is
+>   **+4 to +5 cycles/window** (§4.3), not +1 to +2, with the resulting
+>   ~70-75% relative throughput. Per §8 risk 2 these are estimates: they
+>   must be re-measured against real `vunit-mcp` / `tsfpga-mcp` results
+>   once the RTL exists, and the measured numbers written back into §5.
+> - **DP4 (ratified, unchanged):** reuse the `fifo.vhd` `memory_block`
+>   idiom already adopted by `cnn_accel_weight_buffer.vhd` as the
+>   per-bank template. Applies identically under Option 3a — only the
+>   number of instances differs.
+>
+> The §7 implementation sketch is written for Option 1 and is therefore
+> **not** directly applicable; see §7.1 for the Option 3a scope note.
+> In particular, §7 item 5's "fence expected BRAM36 (~9)" becomes
+> **exactly 3** under 3a.
+
 **Recommend Option 1 (bank replication, §4.1).** It reuses a template
 already proven twice in this codebase (§3), costs 9 BRAM36 (6.7% of
 `xc7a100t`), adds only 1-2 cycles of latency, requires **zero** change
@@ -383,6 +434,44 @@ Not RTL — a scope note for whoever fills this in:
    `module_cnn_accel.py`'s build project for this module, so a future
    regression back to combinational reads fails CI instead of being
    found at place-and-route.
+
+### 7.1 Implementation sketch — Option 3a (the ratified one)
+
+Supersedes §7 for the `vhfill` round. Also a scope note, not RTL:
+
+1. Keep **`g_max_kernel_size` row banks** (not `**2`). Rebuild each as
+   the `weight_mem`/`memory_block` idiom
+   (`cnn_accel_weight_buffer.vhd:108-116`, `:245-251`) with **one
+   registered read port** — `signal <= array(to_integer(addr));` on
+   `rising_edge(clk)`, no reset. The registered read is the entire point:
+   it is what §2's inference rules need and what today's combinational
+   read denies them.
+2. Add a **`kc` column counter**, `0 .. kw_q - 1`, bounded by a
+   *registered* `kw_q` compare — the same discipline as the existing
+   `out_width_q` counters, and explicitly **not** a variable-bound `for`
+   loop (that is the GHDL synth crash already hit on this project).
+   Each cycle it issues one read address to **all `K_h` banks in
+   parallel**; one read per bank per cycle is exactly what the single
+   port supports.
+3. Accumulate the results into a
+   `g_max_kernel_size**2 * c_lane_width`-bit (576 b) **tap-assembly
+   register**, then present the full window as one `m_window_m2s` beat.
+   `window_m2s_t` is unchanged, and `pe_array` is untouched — preserving
+   that is the whole reason 3a was chosen over 3b.
+4. `window_valid` becomes a **valid-delay/shift register** trailing the
+   read pipeline plus the `kc` walk, not a same-cycle function of
+   `row_ready` (§7 item 3, §8 risk 3 — confirm nothing else depends on
+   the same-cycle behavior).
+5. Do **not** implement the double-buffering mitigation (§4.3) in this
+   milestone. It is the designated intermediate step if throughput needs
+   partial recovery later; building it now would obscure whether plain
+   3a's measured numbers match the §5 estimates.
+6. Fence the result in `module_cnn_accel.py`: BRAM36 **exactly 3**
+   (non-zero is the point — 0 means inference silently failed again) and
+   a LUT ceiling far below today's 23,950. Per this project's standing
+   rule, the limits go in **from a CI run**, never from a local Yosys.
+   `cnn_accel_conv_core`'s limits must be re-baselined in the same pass,
+   since window_gen contributes 23,950 of its 35,056 LUTs.
 
 ## 8. Open questions / risks for the architect
 
