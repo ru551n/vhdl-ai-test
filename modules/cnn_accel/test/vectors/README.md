@@ -77,6 +77,7 @@ integer per line -- directly readable with VHDL `std.textio`
 | `pool_max_4x4` | POOL_MAX | 8x8x2 -> 4x4x2, pool k=2 s=2 | no (no weights) | max pool, no weights/bias/requant |
 | `pool_avg_4x4` | POOL_AVG | 8x8x2 -> 4x4x2, pool k=2 s=2 | no (no weights) | average pool, `requant_en=1` scale=1/4 (pool area) + relu |
 | `fc_in6_out4` | FC | 6 -> 4 (degenerate 1x1 spatial) | yes | `in_width=in_height=kernel_h=kernel_w=1`, bias+relu+requant on |
+| `conv3x3_c20_o6_multitile` | CONV2D | 5x5x20 -> 5x5x6, k=3 s=1 pad=1 | yes | `in_channels=20 > tile_channels=8` -> `T=3` input-channel tiles/pixel; exercises the `window_gen`->`pe_array` `first_tile`/`last_tile` partial-sum-carry path end to end (added for `tb_cnn_accel_conv_core.vhd`, M6b) |
 
 The hardware-order consistency of `weights_packed.txt`'s layout (i.e.
 that consuming it strictly sequentially against a tiled window

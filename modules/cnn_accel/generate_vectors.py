@@ -562,6 +562,25 @@ def generate_all() -> None:
         requant_scale=1 << 14, requant_shift=0,
     )
 
+    # conv3x3_c20_o6_multitile: in_channels=20 > HW_TILE_CHANNELS=8, so
+    # T=ceil(20/8)=3 input-channel tiles/pixel -- exercises the
+    # window_gen->pe_array first_tile/last_tile partial-sum-carry path
+    # (doc/cnn_accel_tiled_dataflow_proposal.md section 2/3) end to end,
+    # which none of the CONV2D cases above do (they all have
+    # in_channels<=8, T=1). Added for tb_cnn_accel_conv_core.vhd (M6b) --
+    # see that testbench's header comment. out_c=6 stays <=
+    # HW_PE_ROWS=8 (single output-channel tile, the only shape this
+    # composition supports standalone, D6 section 5).
+    _build_case(
+        "conv3x3_c20_o6_multitile",
+        seed=12012,
+        depthwise=False,
+        in_w=5, in_h=5, in_c=20, out_c=6,
+        kernel=3, stride=1, pad=1,
+        bias_en=True, relu_en=True, requant_en=True,
+        requant_scale=1 << 13, requant_shift=1,
+    )
+
     # pe_array_xlang_check: cross-language (Python packer -> real RTL)
     # bit-exactness guard for cnn_accel_pe_array, see
     # tb_cnn_accel_pe_array_from_vectors.vhd and

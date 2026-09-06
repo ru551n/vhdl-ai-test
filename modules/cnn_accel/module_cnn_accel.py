@@ -220,6 +220,33 @@ class Module(BaseModule):
                     DspBlocks(LessThan(70)),
                 ],
             ),
+            build(
+                name="cnn_accel_conv_core",
+                generics={
+                    "g_pe_rows": _PE_ROWS,
+                    "g_pe_cols": _PE_COLS,
+                    "g_accum_width": _ACCUM_WIDTH,
+                    "g_max_kernel_size": _MAX_KERNEL_SIZE,
+                    "g_tile_channels": _TILE_CHANNELS,
+                    "g_max_row_tile_words": _MAX_ROW_TILE_WORDS,
+                    "g_weight_buffer_depth": _WEIGHT_BUFFER_DEPTH,
+                },
+                # M6b composition entity (window_gen -> pe_array ->
+                # bias_requant, weight_buffer -> pe_array), no new datapath
+                # logic of its own -- see cnn_accel_conv_core.vhd's own
+                # header comment. Not yet measured on CI's Yosys v0.68
+                # release; limits below are provisional, set generously
+                # above the sum of the four submodules' own individual
+                # baselines above (with window_gen's already-known 23950
+                # LUTs dominating), pending a real CI run.
+                # TODO: re-baseline from CI once this project has run there.
+                checkers=[
+                    TotalLuts(LessThan(35000)),
+                    Ffs(LessThan(1800)),
+                    BlockRams(LessThan(80)),
+                    DspBlocks(LessThan(140)),
+                ],
+            ),
         ]
 
     def setup_vunit(self, vunit_proj: VUnit, **kwargs) -> None:
@@ -229,6 +256,7 @@ class Module(BaseModule):
         self._setup_cnn_accel_pool(library)
         self._setup_cnn_accel_pe_array(library)
         self._setup_cnn_accel_pe_array_from_vectors(library)
+        self._setup_cnn_accel_conv_core(library)
 
     def _setup_cnn_accel_bias_requant(self, library) -> None:
         tb = library.test_bench("tb_cnn_accel_bias_requant")
@@ -285,6 +313,34 @@ class Module(BaseModule):
             self.add_vunit_config(
                 test=test,
                 generics={"vectors_path": str(vectors_path)},
+            )
+
+    def _setup_cnn_accel_conv_core(self, library) -> None:
+        # Cross-language (Python golden model -> composed RTL) bit-exactness
+        # guard for the full window_gen -> pe_array -> bias_requant
+        # composition, see tb_cnn_accel_conv_core.vhd's own header comment.
+        # 'vectors_root' must be an absolute path (the simulator's own
+        # working directory is not this module's concern) -- self.path is
+        # tsfpga's own per-module root, so this is correct regardless of
+        # where run.py/vunit-mcp actually invokes the simulator from.
+        tb = library.test_bench("tb_cnn_accel_conv_core")
+        vectors_root = self.path / "test" / "vectors"
+
+        for test in tb.get_tests():
+            # Zero stall on both links only for the dedicated
+            # full-throughput test (proves sustained back-to-back
+            # operation); randomized independent per-link backpressure
+            # otherwise. Matches every other cnn_accel testbench's
+            # identical `_setup_*` precedent.
+            stall = 0 if "full_throughput" in test.name else 20
+
+            self.add_vunit_config(
+                test=test,
+                generics={
+                    "stall_probability_percent_in": stall,
+                    "stall_probability_percent_out": stall,
+                    "vectors_root": str(vectors_root),
+                },
             )
 
     def _setup_cnn_accel_pool(self, library) -> None:
