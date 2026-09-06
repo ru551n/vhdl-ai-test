@@ -71,6 +71,16 @@ class Module(BaseModule):
         # measured baseline, not exact targets: they exist to make CI shout
         # when a change unexpectedly blows up an entity's size, while
         # tolerating the small jitter that comes with Yosys version bumps.
+        #
+        # Baselines are measured on CI's toolchain -- Yosys v0.68 *release*,
+        # as shipped in ru551n/hdl-docker:1.2.0 -- because CI is what these
+        # limits actually gate. Do not re-baseline from a local Yosys: the
+        # difference is not jitter. Yosys v0.68+182 (dev) gives markedly
+        # smaller netlists for the same RTL (window_gen 8884 vs 23757 LUTs,
+        # bias_requant 2348 vs 3686, pool 342 vs 468), so a locally derived
+        # limit fails on CI for no design reason at all. Local builds are
+        # still useful for *relative* before/after comparisons; only the
+        # absolute numbers below are CI's.
         return [
             build(
                 name="cnn_accel_bias_requant",
@@ -91,10 +101,12 @@ class Module(BaseModule):
                     "g_pe_rows": 4,
                     "g_bias_addr_width": 9,
                 },
-                # Baseline 2026-09: 2348 LUTs, 34 FFs, 0 BRAM, 16 DSP.
-                # The DSPs are the 4 lanes' requant multiplies.
+                # Baseline 2026-09 (Yosys v0.68 release): 3686 LUTs, 34 FFs,
+                # 0 BRAM, 16 DSP. The DSPs are the 4 lanes' requant
+                # multiplies. Expect the LUT count to roughly double when
+                # `g_pe_rows` goes to 8 after the M6 record retrofit.
                 checkers=[
-                    TotalLuts(LessThan(2900)),
+                    TotalLuts(LessThan(4300)),
                     Ffs(LessThan(60)),
                     BlockRams(LessThan(1)),
                     DspBlocks(LessThan(20)),
@@ -106,10 +118,11 @@ class Module(BaseModule):
                     "g_max_kernel_size": _POOL_MAX_KERNEL_SIZE,
                     "g_accum_width": _POOL_ACCUM_WIDTH,
                 },
-                # Baseline 2026-09: 342 LUTs, 27 FFs, 0 BRAM, 0 DSP.
+                # Baseline 2026-09 (Yosys v0.68 release): 468 LUTs, 27 FFs,
+                # 0 BRAM, 0 DSP.
                 # Pure combinational reduction network, must stay tiny.
                 checkers=[
-                    TotalLuts(LessThan(450)),
+                    TotalLuts(LessThan(550)),
                     Ffs(LessThan(60)),
                     BlockRams(LessThan(1)),
                     DspBlocks(LessThan(1)),
@@ -123,8 +136,11 @@ class Module(BaseModule):
                     "g_pe_cols": _PE_COLS,
                     "g_accum_width": _ACCUM_WIDTH,
                 },
-                # Baseline 2026-09: 181 LUTs, 59 FFs, 72 block RAMs
-                # (8 RAMB36 + 64 RAMB18), 0 DSP. The memories are meant to
+                # Baseline 2026-09 (Yosys v0.68 release): 175 LUTs, 59 FFs,
+                # 72 block RAMs (8 RAMB36 + 64 RAMB18), 0 DSP. This is the
+                # one entity whose size barely moved between Yosys versions,
+                # because it is almost entirely hard BRAM rather than
+                # optimizable logic. The memories are meant to
                 # be BRAM, so `BlockRams` here is a floor-ish sanity bound
                 # rather than a "keep it small" one -- if this ever drops to
                 # 0 the memories have silently fallen back to distributed
@@ -143,22 +159,26 @@ class Module(BaseModule):
                     "g_max_row_tile_words": _MAX_ROW_TILE_WORDS,
                     "g_tile_channels": _TILE_CHANNELS,
                 },
-                # Baseline 2026-09: 8884 LUTs, 199 FFs, 0 BRAM, 8 DSP.
+                # Baseline 2026-09 (Yosys v0.68 release): 23757 LUTs,
+                # 199 FFs, 0 BRAM, 8 DSP.
                 #
                 # KNOWN BLOWUP, deliberately fenced rather than hidden: the
                 # proposal (section 7) budgets ~3 BRAM36 and modest logic for
                 # the line buffers, but the combinational random-access read
                 # (K_h rows at once) blocks BRAM inference, so Yosys emits
                 # 4608 RAM64M distributed-RAM cells plus the LUTs to mux
-                # them. That is ~14% of an XC7A100T's LUTs for one small
-                # block. Fixing it means giving the row banks a registered
-                # read port -- tracked as an M7 optimization item.
+                # them. On CI's Yosys that is ~37% of an XC7A100T's LUTs for
+                # one small block (a local dev Yosys folds it to 8884, which
+                # is why the CI number is the one that counts). Fixing it
+                # means giving the row banks a registered read port --
+                # tracked as an M7 optimization item, and the single biggest
+                # area win available right now.
                 #
                 # The limits below fence the *current* number so it cannot
                 # silently grow further; tighten them hard once the read port
                 # is registered and BRAM inference kicks in.
                 checkers=[
-                    TotalLuts(LessThan(9500)),
+                    TotalLuts(LessThan(25500)),
                     Ffs(LessThan(260)),
                     DspBlocks(LessThan(12)),
                 ],
