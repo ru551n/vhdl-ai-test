@@ -30,7 +30,7 @@ use cnn_accel.cnn_accel_pkg.all;
 --     through this entity once per output-channel tile, each pass filling
 --     cnn_accel_weight_buffer with that tile's own weight/bias slice of
 --     'weights_packed.txt'/'pack_bias_for_hw' (cnn_accel_model.py) via
---     'fill_bank_sel'/'fill_is_bias' before pulsing 'start' again. This
+--     'fill_start'/'fill_is_bias' before pulsing 'start' again. This
 --     entity does not build that loop, and (inherited unavoidably from
 --     cnn_accel_bias_requant's own v1 design, see its entity-level comment)
 --     cannot itself be driven with more than one output-channel tile's
@@ -81,8 +81,9 @@ use cnn_accel.cnn_accel_pkg.all;
 --
 -- Cross-module generic contracts: every generic that must be IDENTICAL
 -- across two submodule instances (g_max_kernel_size, g_tile_channels,
--- g_pe_rows, g_pe_cols, g_accum_width, g_weight_buffer_depth) is a single
--- generic on THIS entity, fed unmodified to every instance that needs it --
+-- g_pe_rows, g_pe_cols, g_accum_width, g_weight_buffer_depth,
+-- g_bias_buffer_depth) is a single generic on THIS entity, fed unmodified
+-- to every instance that needs it --
 -- so those contracts are structurally enforced (a single source of truth),
 -- not merely asserted. 'g_bias_addr_width' (cnn_accel_bias_requant) is not
 -- a separate generic here at all: it is derived locally from
@@ -118,12 +119,17 @@ entity cnn_accel_conv_core is
     -- Upper bound on 'cfg_in_width * ceil(cfg_in_channels/g_tile_channels)'
     -- (cnn_accel_window_gen's own 'g_max_row_tile_words').
     g_max_row_tile_words : positive;
-    -- Rows per cnn_accel_weight_buffer bank/region (cnn_accel_weight_
+    -- Rows per cnn_accel_weight_buffer weight region (cnn_accel_weight_
     -- buffer/cnn_accel_pe_array's own 'g_weight_buffer_depth'). Must cover
     -- the whole layer's rows ('T * groups_per_tile'), per
     -- doc/cnn_accel_tiled_dataflow_proposal.md section 4 -- checked at
     -- runtime by cnn_accel_pe_array's own 'severity failure' assert.
     g_weight_buffer_depth : positive;
+    -- Rows in cnn_accel_weight_buffer's (separate, much shallower) bias
+    -- region -- cnn_accel_weight_buffer's own 'g_bias_buffer_depth',
+    -- forwarded unmodified so 'bias_rd_addr''s width here matches that
+    -- entity's actual bias-region address width by construction.
+    g_bias_buffer_depth : positive := 8;
     -- Upper bound on the runtime-variable 'cfg_requant_shift'
     -- (cnn_accel_bias_requant's own 'g_max_requant_shift').
     g_max_requant_shift : natural := 31
@@ -181,14 +187,13 @@ entity cnn_accel_conv_core is
     s_stream_s2m : out axi_stream_s2m_t;
     --# {{}}
     -- Weight/bias preload fill port, unmodified pass-through of
-    -- cnn_accel_weight_buffer's own 's_stream'/'fill_bank_sel'/
-    -- 'fill_is_bias'/'read_bank_sel' ports -- see that entity's own
-    -- entity-level comment. Exposed so a testbench (this milestone) or a
-    -- future cnn_accel_axi_read_dma instance (a later milestone) can
-    -- preload weights/biases; no fill sequencer is built here.
-    fill_bank_sel : in std_ulogic;
+    -- cnn_accel_weight_buffer's own 's_stream'/'fill_start'/
+    -- 'fill_is_bias' ports -- see that entity's own entity-level comment.
+    -- Exposed so a testbench (this milestone) or a future
+    -- cnn_accel_axi_read_dma instance (a later milestone) can preload
+    -- weights/biases; no fill sequencer is built here.
+    fill_start : in std_ulogic := '0';
     fill_is_bias : in std_ulogic;
-    read_bank_sel : in std_ulogic;
     s_weight_m2s : in axi_stream_m2s_t;
     s_weight_s2m : out axi_stream_s2m_t;
     --# {{}}
@@ -208,6 +213,7 @@ architecture a of cnn_accel_conv_core is
 
   constant c_window_len : positive := window_data_length(g_max_kernel_size, g_tile_channels);
   constant c_addr_width : positive := num_bits_needed(g_weight_buffer_depth - 1);
+  constant c_bias_addr_width : positive := num_bits_needed(g_bias_buffer_depth - 1);
   constant c_weight_lanes : positive := g_pe_rows * g_pe_cols;
 
   ------------------------------------------------------------------------
@@ -219,7 +225,7 @@ architecture a of cnn_accel_conv_core is
 
   signal weight_rd_addr : std_ulogic_vector(c_addr_width - 1 downto 0);
   signal weight_rd_data : std_ulogic_vector(8 * c_weight_lanes - 1 downto 0);
-  signal bias_rd_addr : std_ulogic_vector(c_addr_width - 1 downto 0);
+  signal bias_rd_addr : std_ulogic_vector(c_bias_addr_width - 1 downto 0);
   signal bias_rd_data : std_ulogic_vector(g_accum_width * g_pe_rows - 1 downto 0);
 
   signal accum_m2s : accum_m2s_t(data(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0));
@@ -315,14 +321,16 @@ begin
     );
 
   ------------------------------------------------------------------------
-  -- cnn_accel_weight_buffer: double-buffered on-chip weight/bias cache.
-  -- Fill side exposed on this entity's own ports; read side feeds
-  -- pe_array's/bias_requant's read-only ports directly (no handshake).
+  -- cnn_accel_weight_buffer: single-buffered on-chip weight/bias cache
+  -- (with a shallow prefetch FIFO on the fill stream). Fill side exposed
+  -- on this entity's own ports; read side feeds pe_array's/bias_requant's
+  -- read-only ports directly (no handshake).
   ------------------------------------------------------------------------
 
   weight_buffer_inst : entity cnn_accel.cnn_accel_weight_buffer
     generic map (
       g_weight_buffer_depth => g_weight_buffer_depth,
+      g_bias_buffer_depth => g_bias_buffer_depth,
       g_pe_rows => g_pe_rows,
       g_pe_cols => g_pe_cols,
       g_accum_width => g_accum_width
@@ -334,10 +342,8 @@ begin
       s_stream_m2s => s_weight_m2s,
       s_stream_s2m => s_weight_s2m,
 
-      fill_bank_sel => fill_bank_sel,
+      fill_start => fill_start,
       fill_is_bias => fill_is_bias,
-
-      read_bank_sel => read_bank_sel,
 
       weight_rd_addr => weight_rd_addr,
       weight_rd_data => weight_rd_data,
@@ -355,7 +361,7 @@ begin
     generic map (
       g_accum_width => g_accum_width,
       g_pe_rows => g_pe_rows,
-      g_bias_addr_width => c_addr_width,
+      g_bias_addr_width => c_bias_addr_width,
       g_max_requant_shift => g_max_requant_shift
     )
     port map (

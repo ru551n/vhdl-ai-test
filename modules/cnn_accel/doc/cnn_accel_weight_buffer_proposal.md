@@ -229,6 +229,88 @@ directly (no BFM needed, they are plain synchronous ports). Test cases:
 `test_backpressure_weight_region_full`, `test_backpressure_bias_region_full`,
 `test_reset_mid_fill_does_not_leak_partial_bank`.
 
+## 11. 2026-09 rework: single-buffering, decoupled bias depth, prefetch FIFO
+
+Supersedes the double-buffering (ping-pong) decisions above (§3.2, §3.4,
+§4, §5, §9, §10) for the *current* RTL/testbench — kept historical above
+rather than rewritten, since they document why ping-pong was chosen in
+the first place; this section documents why it was later dropped and
+what replaced it. `doc/cnn_accel_weight_buffer.md` reflects only the
+current (post-rework) behavior.
+
+**Motivation.** The weight/bias fill path was never meant to be
+continuously fed from an always-resident DDR4 image: `cnn_accel_layer_ctrl`
+streams one output-channel pass's weight+bias set in per pass, from a
+`cnn_accel_axi_read_dma` instance, ahead of that pass's compute. Once that
+is the model, DDR4/AXI bandwidth is not the constraint — a modern DDR4
+interface can stream a whole pass's weights in a small fraction of that
+pass's compute time — so hiding the *whole* fetch behind compute (the
+ping-pong bank's reason to exist) buys little, while paying for it in
+on-chip block RAM twice over (two full banks) is a real, fixed cost on a
+resource-constrained Artix-7. Single-buffering plus a *shallow* prefetch
+FIFO (`g_fill_fifo_depth`, default 32) gets the same practical benefit —
+absorbing DMA burst/request latency so the fill stream doesn't have to be
+cycle-accurate with compute — without paying for a second copy of the
+(much larger) weight region.
+
+**Depth sizing (`g_weight_buffer_depth`, replaces the old arbitrary
+512).** A layer's packed weight image is `OT*T*kernel_h*kernel_w` rows
+(`pack_weights_for_hw()`'s own contract, §3.2/`doc/cnn_accel_weight_buffer.md`).
+Across the target network's backbone, the worst case is layer 9:
+`kernel_h=kernel_w=3`, `in_channels=256`, `g_tile_channels=8` ⇒
+`T=ceil(256/8)=32` tiles, giving `3*3*32 = 288` rows — independent of
+`OT` (the `g_weight_buffer_depth` contract only needs to hold *one*
+output-channel-tile pass's rows at a time, since a new `fill_start`
+begins the next pass's fill). `_WEIGHT_BUFFER_DEPTH` in
+`module_cnn_accel.py` is set to exactly 288, not padded for headroom: with
+weights now streamed per pass rather than resident for the whole run,
+there is no "might need more later" case to pad against — a future layer
+needing more rows would need a value bump here, an explicit, reviewable
+change, not silent headroom.
+
+**Depth sizing (`g_bias_buffer_depth`, new, independent of
+`g_weight_buffer_depth`).** The bias region only ever needs
+`ceil(out_channels/g_pe_rows)` rows — for `g_pe_rows=8` and the target
+network's largest `out_channels` (64), that is 8 rows, orders of
+magnitude shallower than the weight region. Under the old shared-depth
+scheme (§3.2) the bias region was sized identically to the weight region
+(512, later 288, rows) and sat at ~99.9% dead — Yosys still had to infer
+a full block RAM for it. Decoupling the two generics lets
+`g_bias_buffer_depth` default to 8, small enough that Yosys can map it to
+LUTRAM/registers instead of a block RAM (`doc/cnn_accel_weight_buffer.md`'s
+Generics table).
+
+**Whole-row write (row-assembly register).** The pre-rework fill path
+wrote one lane per accepted beat directly into the region memory with a
+per-lane decoded write enable — semantically a wide memory word, but
+structurally forcing Yosys's `memory_collect` to treat every lane as an
+independently-writable sub-memory, since no evidence in the netlist ties
+the per-lane writes back together into one wide write. That fragmented
+the weight region into one RAMB18 per lane (64 lanes ⇒ 64 RAMB18, plus a
+mostly-dead 8-RAMB36 bias region ⇒ measured 72 block RAMs pre-rework).
+The rework instead accumulates incoming lanes into a `c_weight_row_width`/
+`c_bias_row_width`-bit row-assembly register
+(`weight_row_assemble_q`/`bias_row_assemble_q`,
+`cnn_accel_weight_buffer.vhd:174-180`) and issues exactly ONE wide write
+to the region memory per completed row (`:287-333`) — the same
+`memory_block` idiom `cnn_accel_window_gen.vhd`'s M7 rework later reused
+(`doc/cnn_accel_window_gen_bram_proposal.md`).
+
+**Measured 2026-09 (weight_buffer-only netlist build, local dev Yosys,
+`synth_xilinx -family xc7`, default generics incl. `g_fill_fifo_depth=32`):**
+881 LUTs, 1093 FFs, 15 block RAMs (15 RAMB18, 0 RAMB36), 0 DSP. Block RAMs
+dropped 72 → 15 as intended. LUTs/FFs went *up* from the pre-rework
+baseline (175 LUTs, 59 FFs) rather than down: the two whole-row
+assembly registers (512 + 256 = 768 bits between them) plus the
+depth-32 prefetch FIFO's distributed-RAM storage (too shallow for Yosys
+to prefer a block RAM over LUT-mapped `RAM32M` primitives) now cost
+register/LUT area the old per-lane design didn't pay. This is an accepted
+trade — BRAM was the scarce/fragmented resource this rework targeted;
+LUTs/FFs are comparatively abundant on the target XC7A100T — not a
+regression to chase down further in this round. See
+`module_cnn_accel.py`'s `cnn_accel_weight_buffer` build project comment
+for the checker thresholds this measurement was re-baselined against.
+
 ## Implementation Notes (vhfill)
 
 (filled in during/after implementation)

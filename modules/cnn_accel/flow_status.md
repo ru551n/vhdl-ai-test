@@ -17,6 +17,7 @@ it via the main agent, they do not edit it themselves).
 | 2/3. Design + TDD, tiled dataflow (`window_gen` rework, `pe_array`, `weight_buffer`) | COMPLETE | Round 2, M3-M5. Blocking flaw found + fixed, see below |
 | 3b. `conv_core` bit-exact vs `cnn_accel_model.py` | COMPLETE | M6b, commit `52adb45`. 73/73 VUnit, bit-exact vs Python vectors (decision D5) |
 | 7a. `window_gen` block-RAM inference (M7, Option 3a) | COMPLETE | 23950 LUTs / 0 BRAM -> 2753 LUTs / 3 RAMB36. See "M7" below |
+| 7b. `weight_buffer` single-buffer + streaming rework | COMPLETE | 72 BRAM -> 15 BRAM. See "M7b" below |
 | 2/3. Design + TDD, AXI-facing engines (`cnn_accel_axi_read_dma`, `cnn_accel_ofmap_dma`, `cnn_accel_csr`) | PENDING | |
 | 2/3. Design + TDD, `cnn_accel_layer_ctrl` | PENDING | |
 | 2/3. Design + TDD, `cnn_accel_sequencer` | PENDING | |
@@ -210,6 +211,81 @@ mitigation).
   tsfpga.build_project_list`. Takes effect after an MCP restart; this
   session's builds were run by invoking `build_fpga.py` directly.
 
-### Next recommended action
+### Next recommended action (superseded — see M7b below)
 M8 `cnn_accel_layer_ctrl` (incl. the D6 output-channel tile loop), then M9
 DMAs, per the milestone table in `~/.local/state/maki/plans/cosmic-hip-cod.md`.
+
+## M7b — `weight_buffer` single-buffer + streaming rework, 2026-09-06
+
+With `window_gen` fixed (M7), `cnn_accel_weight_buffer` became the entire
+remaining block-RAM cost of `conv_core`: 72 of its 75 BRAM. Root causes,
+both structural rather than sizing:
+
+1. **Per-lane byte write enables.** The fill path decoded a write enable per
+   8-bit lane over `g_pe_rows * g_pe_cols` = 64 lanes. Yosys could not keep
+   that as one wide memory, so it fragmented the weight region into 64
+   separate 1024x8 memories — one RAMB18 each.
+2. **A bias memory sized like the weight memory.** The bias region inherited
+   `g_weight_buffer_depth`, costing 8 RAMB36 of which
+   `cnn_accel_bias_requant` only ever reads row 0.
+3. **Double buffering.** Two A/B banks doubled a region that, per decision
+   D6, does not need to be resident at all: weights are streamed from DDR4
+   once per output-channel pass, and DDR4 bandwidth is not the constraint —
+   on-chip footprint is.
+
+### RTL change
+`src/cnn_accel_weight_buffer.vhd`:
+- **Single-buffered.** `fill_bank_sel`/`read_bank_sel` are gone, replaced by
+  a `fill_start` pulse that rewinds the fill address. One region, filled per
+  output-channel pass.
+- **Whole-row writes.** The fill stream is accumulated in a row-assembly
+  register (`weight_row_assemble_q` / `bias_row_assemble_q`) and committed as
+  a single full-width write, so each region is one memory object to Yosys
+  instead of 64.
+- **Prefetch FIFO.** A shallow `fifo.fifo` (hdl-modules, `g_fill_fifo_depth`
+  default 32) decouples the fill stream from the row-assembly commit so the
+  producer is not stalled mid-row.
+- **Separate bias depth.** New `g_bias_buffer_depth` generic (default 8,
+  forwarded unmodified by `cnn_accel_conv_core`), sized by
+  `ceil(out_channels/g_pe_rows)` rather than by the weight region.
+
+`_WEIGHT_BUFFER_DEPTH` is now pinned to **288** = `K^2 * ceil(C_max/8)` =
+`9*32`, the target backbone's worst layer (3x3x256, layer 9), replacing the
+old arbitrary 512.
+
+### Measured (real tool results)
+- VUnit GHDL, full project: **73/73 PASS**. NVC: **40/40 PASS**
+  (`cnn_accel.*`; the one project-wide NVC failure is
+  `axi_stream_join.tb_axi_stream_join`'s full-throughput check, pre-existing
+  and unrelated — that module is untouched and passes on GHDL).
+- `weight_buffer` netlist build (local dev Yosys v0.68+182):
+
+  | | LUTs | FFs | BRAM | DSP |
+  |---|---|---|---|---|
+  | before | 175 | 59 | 72 (8xRAMB36 + 64xRAMB18) | 0 |
+  | after | 881 | 1093 | **15** (15xRAMB18) | 0 |
+
+  The FF/LUT increase is the accepted trade: 768 bits of row-assembly
+  registers plus the depth-32 prefetch FIFO's distributed RAM (RAM32M, too
+  shallow for Yosys to pick block RAM) buy the 57-BRAM reduction.
+
+### Open
+- **`conv_core` has not been re-measured since this change.** Its checkers
+  and comments still carry the M7 figures (75 BRAM). By leaf additivity the
+  expected new figure is `15 + 3 = 18` BRAM; `BlockRams(LessThan(80))` still
+  passes, so this is stale rather than wrong, but it must be re-measured.
+  Standing decision: run that one on **Vivado** (`xc7a200t`), not Yosys —
+  `conv_core` takes ~14 min on Yosys and Vivado gives vendor-accurate
+  numbers.
+- **Requirement doc conflict, deliberately left for the user.**
+  `doc/cnn_accel_weight_buffer_req.md`'s Responsibility/Generics/Ports/
+  Protocols sections are updated, but its hand-owned Functional Description
+  still describes the old double-buffered A/B design. That section is
+  user-owned; it is flagged here rather than rewritten.
+
+### Next recommended action
+1. Re-measure `conv_core` on Vivado (`xc7a200t`) and tighten its
+   FF/BRAM/DSP checkers to the measured numbers.
+2. M8 `cnn_accel_layer_ctrl` (incl. the D6 output-channel tile loop), then
+   M9 DMAs, per the milestone table in
+   `~/.local/state/maki/plans/cosmic-hip-cod.md`.

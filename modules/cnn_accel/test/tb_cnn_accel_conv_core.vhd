@@ -48,7 +48,7 @@ use cnn_accel.cnn_accel_pkg.all;
 --
 -- Weight/bias preload: this testbench IS the "future cnn_accel_axi_read_
 -- dma instance" cnn_accel_conv_core.vhd's own header comment anticipates
--- for driving 'fill_bank_sel'/'fill_is_bias'/'s_weight' -- 'weights_
+-- for driving 'fill_start'/'fill_is_bias'/'s_weight' -- 'weights_
 -- packed.txt' is streamed one int8 lane per fill beat (cnn_accel_weight_
 -- buffer.vhd's own contract: one lane per accepted beat, auto-advancing),
 -- in the exact flat order cnn_accel_model.pack_weights_for_hw already
@@ -60,13 +60,12 @@ use cnn_accel.cnn_accel_pkg.all;
 -- this is the one place this testbench does its own trivial,
 -- shape-only, zero-padding, not conv math).
 --
--- Bank alternation: successive cases alternate 'fill_bank_sel'/
--- 'read_bank_sel' between bank 0 and bank 1 (see run_case's own 'bank'
--- parameter), which is what makes cnn_accel_weight_buffer's "new fill
--- session" edge (fill_bank_sel_q compare) actually fire between cases --
--- exercising the real ping-pong double-buffering property, not just
--- always refilling bank 0 from a state a previous case already left it
--- in.
+-- Fill sessions: every case pulses 'fill_start' once before streaming its
+-- own weight/bias set (see run_case), which is what makes
+-- cnn_accel_weight_buffer's "new fill session" (write pointers reset to
+-- 0) actually fire between cases -- single-buffered now, so there is no
+-- bank to alternate any more; each case's fill fully overwrites the
+-- previous case's weight/bias set before that case's own 'start' pulse.
 entity tb_cnn_accel_conv_core is
   generic (
     -- Independent per-link randomized-backpressure generics, swept per
@@ -106,6 +105,10 @@ architecture tb of tb_cnn_accel_conv_core is
   constant c_accum_width : positive := 32;
   constant c_max_row_tile_words : positive := 64;
   constant c_weight_buffer_depth : positive := 64;
+  -- Independent of 'c_weight_buffer_depth' -- every checked-in case has
+  -- 'out_channels <= g_pe_rows' (run_case's own assert), so only bias row
+  -- 0 is ever read; a handful of rows is generous headroom.
+  constant c_bias_buffer_depth : positive := 4;
 
   constant c_weight_lanes : positive := c_pe_rows * c_pe_cols;
 
@@ -141,9 +144,8 @@ architecture tb of tb_cnn_accel_conv_core is
   signal s_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
   signal s_stream_s2m : axi_stream_s2m_t;
 
-  signal fill_bank_sel : std_ulogic := '0';
+  signal fill_start : std_ulogic := '0';
   signal fill_is_bias : std_ulogic := '0';
-  signal read_bank_sel : std_ulogic := '0';
   signal s_weight_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
   signal s_weight_s2m : axi_stream_s2m_t;
 
@@ -248,7 +250,8 @@ begin
       g_max_kernel_size => c_max_kernel_size,
       g_tile_channels => c_tile_channels,
       g_max_row_tile_words => c_max_row_tile_words,
-      g_weight_buffer_depth => c_weight_buffer_depth
+      g_weight_buffer_depth => c_weight_buffer_depth,
+      g_bias_buffer_depth => c_bias_buffer_depth
     )
     port map (
       clk => clk,
@@ -278,9 +281,8 @@ begin
       s_stream_m2s => s_stream_m2s,
       s_stream_s2m => s_stream_s2m,
 
-      fill_bank_sel => fill_bank_sel,
+      fill_start => fill_start,
       fill_is_bias => fill_is_bias,
-      read_bank_sel => read_bank_sel,
       s_weight_m2s => s_weight_m2s,
       s_weight_s2m => s_weight_s2m,
 
@@ -351,11 +353,11 @@ begin
     end procedure;
 
     -- Runs one checked-in vector case end to end: preload weight_buffer
-    -- bank 'bank' (weights then bias), configure and start the DUT, push
-    -- every pixel's expected output, stream every input beat with
-    -- randomized backpressure, then drain and check. See this file's own
-    -- header comment for the full rationale of each step.
-    procedure run_case(case_dir : string; bank : std_ulogic) is
+    -- (weights then bias) after a fresh 'fill_start' pulse, configure and
+    -- start the DUT, push every pixel's expected output, stream every
+    -- input beat with randomized backpressure, then drain and check. See
+    -- this file's own header comment for the full rationale of each step.
+    procedure run_case(case_dir : string) is
       variable opcode : integer := get_desc_field(case_dir, "opcode");
       variable flags : integer := get_desc_field(case_dir, "flags");
       variable v_in_width : integer := get_desc_field(case_dir, "in_width");
@@ -409,12 +411,14 @@ begin
       read_int_file(case_dir & "/input.txt", input_flat);
       read_int_file(case_dir & "/expected.txt", expected_flat);
 
-      -- Select this case's bank and let the "new fill session" edge
-      -- (cnn_accel_weight_buffer.vhd's own 'fill_bank_sel_q' compare)
-      -- land before streaming any fill beat -- see this file's header
-      -- comment on bank alternation.
-      fill_bank_sel <= bank;
-      read_bank_sel <= bank;
+      -- Start a new fill session (write pointers reset to 0) before
+      -- streaming any fill beat -- see this file's header comment. One
+      -- idle cycle after the pulse keeps it unambiguous with respect to
+      -- the first fill beat below (a beat presented the same cycle as
+      -- 'fill_start' is not accepted).
+      fill_start <= '1';
+      wait until rising_edge(clk);
+      fill_start <= '0';
       wait until rising_edge(clk);
 
       -- Fill weights: one int8 lane per beat, 'fill_is_bias'='0', in
@@ -522,20 +526,20 @@ begin
     end procedure;
 
     -- Runs every checked-in CONV2D/FC vector case (test/vectors/README.md's
-    -- table), alternating the weight_buffer bank case-to-case -- see this
+    -- table), each with its own fresh 'fill_start' session -- see this
     -- file's header comment. Called identically by both tests below;
     -- only the stall generics (module_cnn_accel.py's per-test config)
     -- differ between them.
     procedure run_all_cases is
     begin
-      run_case(vectors_root & "/conv1x1_c4_o4", '0');
-      run_case(vectors_root & "/conv3x3_s1_c3_o8_pad1", '1');
-      run_case(vectors_root & "/conv3x3_s2_c8_o8_pad1", '0');
-      run_case(vectors_root & "/conv3x3_s1_extremes", '1');
-      run_case(vectors_root & "/conv3x3_asymmetric_pad", '0');
-      run_case(vectors_root & "/conv3x3_negative_requant_scale", '1');
-      run_case(vectors_root & "/fc_in6_out4", '0');
-      run_case(vectors_root & "/conv3x3_c20_o6_multitile", '1');
+      run_case(vectors_root & "/conv1x1_c4_o4");
+      run_case(vectors_root & "/conv3x3_s1_c3_o8_pad1");
+      run_case(vectors_root & "/conv3x3_s2_c8_o8_pad1");
+      run_case(vectors_root & "/conv3x3_s1_extremes");
+      run_case(vectors_root & "/conv3x3_asymmetric_pad");
+      run_case(vectors_root & "/conv3x3_negative_requant_scale");
+      run_case(vectors_root & "/fc_in6_out4");
+      run_case(vectors_root & "/conv3x3_c20_o6_multitile");
     end procedure;
 
   begin

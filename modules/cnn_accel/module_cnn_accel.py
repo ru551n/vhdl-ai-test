@@ -20,7 +20,14 @@ _PE_COLS = 8
 _TILE_CHANNELS = 8  # = _PE_COLS, see proposal section 3.
 _MAX_KERNEL_SIZE = 3
 _MAX_ROW_TILE_WORDS = 512
-_WEIGHT_BUFFER_DEPTH = 512
+# = K^2 * ceil(C_max/8) = 9*32 for the target backbone's worst layer
+# (3x3x256, layer 9) -- replaces the old arbitrary 512 now that weights are
+# streamed per output-channel pass from DDR4 instead of double-buffered
+# on-chip (see doc/cnn_accel_weight_buffer.md's depth-sizing note).
+_WEIGHT_BUFFER_DEPTH = 288
+# Independent of _WEIGHT_BUFFER_DEPTH: a real layer only ever needs
+# ceil(out_channels/g_pe_rows) bias rows, far fewer than the weight region.
+_BIAS_BUFFER_DEPTH = 8
 _ACCUM_WIDTH = 32
 
 # Pooling is a separate, much smaller kernel bound: the target network only
@@ -52,7 +59,10 @@ class Module(BaseModule):
             modules_folder=self.path.parent, names_include={self.name}
         ) + get_modules(
             modules_folder=self.path.parent.parent / "hdl-modules" / "modules",
-            names_include={"axi_stream", "common", "math"},
+            # "fifo" added for cnn_accel_weight_buffer's reused
+            # hdl-modules 'fifo.fifo' prefetch FIFO (g_fill_fifo_depth > 0
+            # by default -- see cnn_accel_weight_buffer.vhd).
+            names_include={"axi_stream", "common", "math", "fifo"},
         )
 
         def build(name: str, generics: dict, checkers: list) -> YosysXilinxNetlistBuild:
@@ -149,23 +159,40 @@ class Module(BaseModule):
                 name="cnn_accel_weight_buffer",
                 generics={
                     "g_weight_buffer_depth": _WEIGHT_BUFFER_DEPTH,
+                    "g_bias_buffer_depth": _BIAS_BUFFER_DEPTH,
                     "g_pe_rows": _PE_ROWS,
                     "g_pe_cols": _PE_COLS,
                     "g_accum_width": _ACCUM_WIDTH,
                 },
-                # Baseline 2026-09 (Yosys v0.68 release): 175 LUTs, 59 FFs,
-                # 72 block RAMs (8 RAMB36 + 64 RAMB18), 0 DSP. This is the
-                # one entity whose size barely moved between Yosys versions,
-                # because it is almost entirely hard BRAM rather than
-                # optimizable logic. The memories are meant to
-                # be BRAM, so `BlockRams` here is a floor-ish sanity bound
-                # rather than a "keep it small" one -- if this ever drops to
-                # 0 the memories have silently fallen back to distributed
-                # LUT RAM and `TotalLuts` will blow up instead.
+                # Pre-rework baseline (Yosys v0.68 release, CI run): 175
+                # LUTs, 59 FFs, 72 block RAMs (8 RAMB36 + 64 RAMB18), 0 DSP
+                # -- the old 2-bank, per-lane-byte-write-enable weight
+                # region fragmented into 64 separate 1024x8 memories (one
+                # RAMB18 each), plus an 8-RAMB36 bias memory that was 99.9%
+                # dead (cnn_accel_bias_requant always reads row 0).
+                #
+                # Single-buffer + whole-row-write + separate small bias
+                # depth rework (see cnn_accel_weight_buffer.vhd's own
+                # header comment and doc/cnn_accel_weight_buffer.md):
+                # measured 2026-09 (local dev Yosys, weight_buffer-only
+                # netlist build, default g_fill_fifo_depth=32): 881 LUTs,
+                # 1093 FFs, 15 block RAMs (0 RAMB36 + 15 RAMB18), 0 DSP --
+                # BRAM count dropped 72 -> 15 as expected (one wide weight
+                # region + a tiny bias region instead of 64 per-lane
+                # RAMB18s), but FFs/LUTs went *up* from the pre-rework
+                # baseline: the two whole-row assembly registers
+                # ('weight_row_assemble_q'/'bias_row_assemble_q', 512 +
+                # 256 = 768 bits between them) plus the depth-32 prefetch
+                # FIFO's distributed-RAM storage (RAM32M primitives, LUT-
+                # mapped since 32 entries is too shallow for Yosys to pick
+                # a block RAM) now cost register/LUT area that the old
+                # per-lane-byte-write design didn't pay -- an accepted
+                # trade of BRAM fragmentation for FF/LUT (see proposal doc
+                # section 5 / doc/cnn_accel_weight_buffer.md).
                 checkers=[
-                    TotalLuts(LessThan(300)),
-                    Ffs(LessThan(80)),
-                    BlockRams(LessThan(80)),
+                    TotalLuts(LessThan(1000)),
+                    Ffs(LessThan(1200)),
+                    BlockRams(LessThan(20)),
                     DspBlocks(LessThan(1)),
                 ],
             ),
@@ -274,6 +301,7 @@ class Module(BaseModule):
                     "g_tile_channels": _TILE_CHANNELS,
                     "g_max_row_tile_words": _MAX_ROW_TILE_WORDS,
                     "g_weight_buffer_depth": _WEIGHT_BUFFER_DEPTH,
+                    "g_bias_buffer_depth": _BIAS_BUFFER_DEPTH,
                 },
                 # M6b composition entity (window_gen -> pe_array ->
                 # bias_requant, weight_buffer -> pe_array), no new datapath

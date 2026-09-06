@@ -8,24 +8,40 @@ use axi_stream.axi_stream_pkg.all;
 library math;
 use math.math_pkg.all;
 
--- Double-buffered (ping-pong) on-chip weight/bias cache. See
+library fifo;
+
+-- Single-buffered on-chip weight/bias cache. See
 -- modules/cnn_accel/doc/cnn_accel_weight_buffer_req.md and
 -- modules/cnn_accel/doc/cnn_accel_weight_buffer_proposal.md.
 --
--- Two banks (A = index 0, B = index 1), each holding a weight region
--- (rows of 'g_pe_rows*g_pe_cols' int8 lanes) and a bias region (rows of
--- 'g_pe_rows' 'g_accum_width'-bit lanes). 'fill_bank_sel' selects which
--- bank the AXI4-Stream fill port targets; 'fill_is_bias' selects which
--- region within that bank a fill beat targets (one lane per accepted
--- beat, auto-advancing a lane index and, once a row's lanes are all
--- written, a row/tile pointer). 'read_bank_sel' selects which bank the
--- two simple synchronous read ports (registered, 1 cycle latency) serve,
--- independently of the fill side -- the ping-pong property.
+-- Weights are streamed from DDR4 by a (future) DMA, one output-channel
+-- pass at a time: 'fill_start' pulses once to reset the fill write
+-- pointers, the whole weight set (weight region, then/interleaved with the
+-- bias region, selected by 'fill_is_bias') is streamed in over 's_stream',
+-- the pass runs (reading through 'weight_rd_addr'/'bias_rd_addr'), then the
+-- next pass's 'fill_start' pulse begins the next refill. There is no
+-- second bank to hide the refill behind compute any more -- an optional
+-- shallow prefetch FIFO on the fill stream ('g_fill_fifo_depth') is the
+-- mechanism that absorbs DDR4/DMA burst latency instead.
+--
+-- One weight region (rows of 'g_pe_rows*g_pe_cols' int8 lanes,
+-- 'g_weight_buffer_depth' rows) and one, independently-sized, bias region
+-- (rows of 'g_pe_rows' 'g_accum_width'-bit lanes, 'g_bias_buffer_depth'
+-- rows -- far shallower, since a real layer only ever needs
+-- 'ceil(out_channels/g_pe_rows)' bias rows). Fill beats arrive one int8/
+-- int32 lane at a time; lanes are assembled into a row-wide register and
+-- committed to memory with a single wide write once a row's last lane
+-- arrives (see the fill process below) -- this, not the double buffering,
+-- is what lets Yosys infer one wide block RAM per region instead of
+-- splitting the weight memory into one RAMB18 per lane.
 entity cnn_accel_weight_buffer is
   generic (
-    -- Rows per bank, per region (weight region and bias region both use
-    -- this same depth -- see proposal doc section 3.2).
+    -- Rows in the weight region.
     g_weight_buffer_depth : positive;
+    -- Rows in the (separate, much shallower) bias region -- independent of
+    -- 'g_weight_buffer_depth' so it can fall out of block RAM into
+    -- LUTRAM/registers (see proposal doc section 3.2).
+    g_bias_buffer_depth : positive := 8;
     -- Output-channel parallelism: rows per read tile, and bias lanes per
     -- read tile.
     g_pe_rows : positive;
@@ -35,7 +51,14 @@ entity cnn_accel_weight_buffer is
     -- Bit width of one bias lane (int32 accumulator width elsewhere in
     -- this IP). Added by vhdesign to give 'bias_rd_data' a well-typed
     -- width -- see proposal doc section 3.1.
-    g_accum_width : positive := 32
+    g_accum_width : positive := 32;
+    -- Depth of the shallow prefetch FIFO placed on the fill stream, ahead
+    -- of the row-assembly/write logic, to absorb DDR4/DMA burst latency.
+    -- '0' means no FIFO is instantiated at all (the fill stream connects
+    -- straight through, exactly the old single-bank timing). Reuses
+    -- hdl-modules' 'fifo.fifo' (shared/ReusableRTL.md) -- must be a power
+    -- of two whenever nonzero (that entity's own constraint).
+    g_fill_fifo_depth : natural := 32
   );
   port (
     clk : in std_ulogic;
@@ -43,31 +66,32 @@ entity cnn_accel_weight_buffer is
     reset : in std_ulogic := '0';
     --# {{}}
     -- AXI4-Stream fill port, from the weight/bias 'cnn_accel_axi_read_dma'
-    -- instance. One accepted beat writes one lane (one weight byte on
+    -- instance (optionally through the internal prefetch FIFO). One
+    -- accepted beat carries one lane (one weight byte on
     -- 'data(7 downto 0)', or one bias lane on
-    -- 'data(g_accum_width - 1 downto 0)') into the bank/region selected by
-    -- 'fill_bank_sel'/'fill_is_bias'. 'last'/'user' are not used.
+    -- 'data(g_accum_width - 1 downto 0)') into the region selected by
+    -- 'fill_is_bias'. 'last'/'user' are not used.
     s_stream_m2s : in axi_stream_m2s_t;
     s_stream_s2m : out axi_stream_s2m_t;
     --# {{}}
-    -- Bank filled by 's_stream' ('0' = bank A, '1' = bank B).
-    fill_bank_sel : in std_ulogic;
-    -- '0' routes fill beats to the weight region, '1' to the bias region,
-    -- of the bank selected by 'fill_bank_sel'.
+    -- Pulse: starts a new fill session -- resets the weight and bias
+    -- write row pointers/lane indices/row-assembly registers to 0. Must be
+    -- pulsed once before streaming a new output-channel pass's weight/bias
+    -- set (replaces the old 'fill_bank_sel'-edge-triggered "new fill
+    -- session" detector -- see proposal doc section 3.4). A beat presented
+    -- on the same cycle as 'fill_start' is not accepted.
+    fill_start : in std_ulogic := '0';
+    -- '0' routes fill beats to the weight region, '1' to the bias region.
     fill_is_bias : in std_ulogic;
     --# {{}}
-    -- Bank served by 'weight_rd_addr'/'weight_rd_data' and
-    -- 'bias_rd_addr'/'bias_rd_data' ('0' = bank A, '1' = bank B).
-    read_bank_sel : in std_ulogic;
-    --# {{}}
-    -- Row (tile) address into the selected bank's weight region.
+    -- Row (tile) address into the weight region.
     weight_rd_addr : in std_ulogic_vector(num_bits_needed(g_weight_buffer_depth - 1) - 1 downto 0);
     -- One int8 weight per active PE ('g_pe_rows*g_pe_cols' lanes),
     -- registered, 1 cycle read latency.
     weight_rd_data : out std_ulogic_vector(8 * g_pe_rows * g_pe_cols - 1 downto 0);
     --# {{}}
-    -- Row (tile) address into the selected bank's bias region.
-    bias_rd_addr : in std_ulogic_vector(num_bits_needed(g_weight_buffer_depth - 1) - 1 downto 0);
+    -- Row (tile) address into the bias region.
+    bias_rd_addr : in std_ulogic_vector(num_bits_needed(g_bias_buffer_depth - 1) - 1 downto 0);
     -- One int32 (g_accum_width-bit) bias per output channel lane
     -- ('g_pe_rows' lanes), registered, 1 cycle read latency.
     bias_rd_data : out std_ulogic_vector(g_accum_width * g_pe_rows - 1 downto 0)
@@ -87,166 +111,240 @@ architecture a of cnn_accel_weight_buffer is
   constant c_bias_row_width : positive := g_accum_width * c_bias_lanes;
 
   -- Read-address width: enough to represent row indices 0 .. depth - 1.
-  constant c_addr_width : positive := num_bits_needed(g_weight_buffer_depth - 1);
+  constant c_weight_addr_width : positive := num_bits_needed(g_weight_buffer_depth - 1);
+  constant c_bias_addr_width : positive := num_bits_needed(g_bias_buffer_depth - 1);
   -- Row-pointer width: enough to represent 0 .. depth *inclusive*, so the
   -- "reached depth" backpressure comparison never wraps around.
-  constant c_ptr_width : positive := num_bits_needed(g_weight_buffer_depth);
-  constant c_depth : unsigned(c_ptr_width - 1 downto 0) :=
-    to_unsigned(g_weight_buffer_depth, c_ptr_width);
+  constant c_weight_ptr_width : positive := num_bits_needed(g_weight_buffer_depth);
+  constant c_bias_ptr_width : positive := num_bits_needed(g_bias_buffer_depth);
+  constant c_weight_depth : unsigned(c_weight_ptr_width - 1 downto 0) :=
+    to_unsigned(g_weight_buffer_depth, c_weight_ptr_width);
+  constant c_bias_depth : unsigned(c_bias_ptr_width - 1 downto 0) :=
+    to_unsigned(g_bias_buffer_depth, c_bias_ptr_width);
 
   constant c_weight_lane_width : positive := num_bits_needed(c_weight_lanes - 1);
   constant c_bias_lane_width : positive := num_bits_needed(c_bias_lanes - 1);
 
+  -- Number of fill-stream payload bits actually consumed (a weight lane
+  -- needs 8 bits, a bias lane needs 'g_accum_width' -- the wider of the
+  -- two is what has to survive a trip through the optional prefetch FIFO).
+  function max_pos(a, b : positive) return positive is
+  begin
+    if a > b then
+      return a;
+    else
+      return b;
+    end if;
+  end function;
+
+  constant c_payload_width : positive := max_pos(8, g_accum_width);
+  -- Payload bits, plus one bit carrying 'fill_is_bias' alongside the data
+  -- through the FIFO so a beat is always routed to the region it was
+  -- destined for at accept time, regardless of any 'fill_is_bias' change
+  -- while earlier beats are still buffered.
+  constant c_fifo_width : positive := c_payload_width + 1;
+
   ------------------------------------------------------------------------
-  -- Bank memories: 2 banks (0 = A, 1 = B), each 'g_weight_buffer_depth'
-  -- rows of one full read tile per region. Inferred simple-dual-port RAM
-  -- idiom (hand-written array + one write process + one read process),
-  -- following hdl-modules/modules/fifo/src/fifo.vhd's 'memory_block'
-  -- pattern -- see proposal doc section 6.
+  -- Region memories: one weight region, one (independently-sized) bias
+  -- region. Inferred simple-dual-port RAM idiom (hand-written array + one
+  -- write process + one read process), following
+  -- hdl-modules/modules/fifo/src/fifo.vhd's 'memory_block' pattern -- see
+  -- proposal doc section 6. Each region is written with ONE wide row write
+  -- per completed row (row-assembly register below), not a per-lane
+  -- decoded byte-write-enable loop -- this is what lets Yosys infer one
+  -- block RAM per region instead of one RAMB18 per lane.
   ------------------------------------------------------------------------
 
-  type weight_row_t is array (0 to g_weight_buffer_depth - 1)
+  type weight_mem_t is array (0 to g_weight_buffer_depth - 1)
     of std_ulogic_vector(c_weight_row_width - 1 downto 0);
-  type weight_bank_arr_t is array (0 to 1) of weight_row_t;
-  signal weight_mem : weight_bank_arr_t;
+  signal weight_mem : weight_mem_t;
 
-  type bias_row_t is array (0 to g_weight_buffer_depth - 1)
+  type bias_mem_t is array (0 to g_bias_buffer_depth - 1)
     of std_ulogic_vector(c_bias_row_width - 1 downto 0);
-  type bias_bank_arr_t is array (0 to 1) of bias_row_t;
-  signal bias_mem : bias_bank_arr_t;
+  signal bias_mem : bias_mem_t;
 
   ------------------------------------------------------------------------
-  -- Per-bank fill state: one row pointer + lane index per region, per
-  -- bank. Reset to 0 by 'reset' or by a 'fill_bank_sel' edge selecting
-  -- that bank (a new fill session) -- see proposal doc section 3.4.
+  -- Fill state: one row pointer + lane index + row-assembly register per
+  -- region. Reset to 0/empty by 'reset' or by a 'fill_start' pulse (a new
+  -- fill session) -- see proposal doc section 3.4.
   ------------------------------------------------------------------------
 
-  type ptr_arr_t is array (0 to 1) of unsigned(c_ptr_width - 1 downto 0);
-  signal weight_wr_row_q : ptr_arr_t := (others => (others => '0'));
-  signal bias_wr_row_q : ptr_arr_t := (others => (others => '0'));
+  signal weight_wr_row_q : unsigned(c_weight_ptr_width - 1 downto 0) := (others => '0');
+  signal weight_lane_q : unsigned(c_weight_lane_width - 1 downto 0) := (others => '0');
+  signal weight_row_assemble_q : std_ulogic_vector(c_weight_row_width - 1 downto 0) :=
+    (others => '0');
 
-  type weight_lane_arr_t is array (0 to 1) of unsigned(c_weight_lane_width - 1 downto 0);
-  signal weight_lane_q : weight_lane_arr_t := (others => (others => '0'));
-
-  type bias_lane_arr_t is array (0 to 1) of unsigned(c_bias_lane_width - 1 downto 0);
-  signal bias_lane_q : bias_lane_arr_t := (others => (others => '0'));
-
-  -- Previous-cycle 'fill_bank_sel', to detect a "new fill session" edge.
-  signal fill_bank_sel_q : std_ulogic := '0';
+  signal bias_wr_row_q : unsigned(c_bias_ptr_width - 1 downto 0) := (others => '0');
+  signal bias_lane_q : unsigned(c_bias_lane_width - 1 downto 0) := (others => '0');
+  signal bias_row_assemble_q : std_ulogic_vector(c_bias_row_width - 1 downto 0) :=
+    (others => '0');
 
   signal ready_i : std_ulogic;
 
   ------------------------------------------------------------------------
-  function bank_index(sel : std_ulogic) return natural is
-  begin
-    if sel = '1' then
-      return 1;
-    else
-      return 0;
-    end if;
-  end function;
+  -- Internal (post-FIFO, or straight-through when 'g_fill_fifo_depth=0')
+  -- fill-accept signals: a beat's data and the 'fill_is_bias' value it was
+  -- accepted with, bundled together so region routing is always correct
+  -- even when a beat has been sitting in the prefetch FIFO across a
+  -- 'fill_is_bias' change.
+  ------------------------------------------------------------------------
+
+  signal valid_i : std_ulogic;
+  signal data_i : std_ulogic_vector(c_payload_width - 1 downto 0);
+  signal is_bias_i : std_ulogic;
+
+  signal fifo_write_valid : std_ulogic;
+  signal fifo_write_ready : std_ulogic;
+  signal fifo_write_data : std_ulogic_vector(c_fifo_width - 1 downto 0);
+  signal fifo_read_valid : std_ulogic;
+  signal fifo_read_ready : std_ulogic;
+  signal fifo_read_data : std_ulogic_vector(c_fifo_width - 1 downto 0);
 
 begin
 
   ------------------------------------------------------------------------
-  -- Backpressure: ready deasserts once the selected bank's (region-
-  -- selected) row pointer has reached 'g_weight_buffer_depth'.
+  -- Backpressure: ready deasserts once the selected region's row pointer
+  -- has reached its own depth.
   ------------------------------------------------------------------------
 
   ready_i <=
-    '0' when (fill_is_bias = '0' and weight_wr_row_q(bank_index(fill_bank_sel)) >= c_depth) else
-    '0' when (fill_is_bias = '1' and bias_wr_row_q(bank_index(fill_bank_sel)) >= c_depth) else
+    '0' when (is_bias_i = '0' and weight_wr_row_q >= c_weight_depth) else
+    '0' when (is_bias_i = '1' and bias_wr_row_q >= c_bias_depth) else
     '1';
 
-  s_stream_s2m.ready <= ready_i;
+  ------------------------------------------------------------------------
+  -- Optional shallow prefetch FIFO on the fill stream (proposal doc
+  -- section on the prefetch FIFO / doc/cnn_accel_weight_buffer.md):
+  -- absorbs DDR4/DMA burst latency now that there is no second bank to
+  -- hide it behind. Reuses hdl-modules' 'fifo.fifo' unmodified
+  -- (shared/ReusableRTL.md) rather than a hand-rolled memory.
+  ------------------------------------------------------------------------
+
+  no_fifo_gen : if g_fill_fifo_depth = 0 generate
+    valid_i <= s_stream_m2s.valid;
+    data_i <= s_stream_m2s.data(c_payload_width - 1 downto 0);
+    is_bias_i <= fill_is_bias;
+    s_stream_s2m.ready <= ready_i;
+  end generate;
+
+  fill_fifo_gen : if g_fill_fifo_depth > 0 generate
+    fifo_write_valid <= s_stream_m2s.valid;
+    fifo_write_data <= fill_is_bias & s_stream_m2s.data(c_payload_width - 1 downto 0);
+    s_stream_s2m.ready <= fifo_write_ready;
+
+    valid_i <= fifo_read_valid;
+    data_i <= fifo_read_data(c_payload_width - 1 downto 0);
+    is_bias_i <= fifo_read_data(c_payload_width);
+    fifo_read_ready <= ready_i;
+
+    fill_fifo_inst : entity fifo.fifo
+      generic map (
+        width => c_fifo_width,
+        depth => g_fill_fifo_depth
+      )
+      port map (
+        clk => clk,
+        write_ready => fifo_write_ready,
+        write_valid => fifo_write_valid,
+        write_data => fifo_write_data,
+        read_ready => fifo_read_ready,
+        read_valid => fifo_read_valid,
+        read_data => fifo_read_data
+      );
+  end generate;
 
   ------------------------------------------------------------------------
-  -- Fill path: one lane per accepted beat, into the bank/region selected
-  -- by 'fill_bank_sel'/'fill_is_bias'.
+  -- Fill path: one lane per accepted beat, assembled into a row-wide
+  -- register; the region's memory only receives ONE wide write per row,
+  -- issued when the row's final lane arrives.
   ------------------------------------------------------------------------
 
   fill : process(clk)
-    variable bank : natural range 0 to 1;
     variable accepted : boolean;
+    variable weight_row_next : std_ulogic_vector(c_weight_row_width - 1 downto 0);
+    variable bias_row_next : std_ulogic_vector(c_bias_row_width - 1 downto 0);
   begin
     if rising_edge(clk) then
-      bank := bank_index(fill_bank_sel);
-      accepted := s_stream_m2s.valid = '1' and ready_i = '1';
+      accepted := valid_i = '1' and ready_i = '1';
 
       if reset then
-        weight_wr_row_q <= (others => (others => '0'));
-        bias_wr_row_q <= (others => (others => '0'));
-        weight_lane_q <= (others => (others => '0'));
-        bias_lane_q <= (others => (others => '0'));
-        fill_bank_sel_q <= fill_bank_sel;
-      else
-        -- New fill session for the newly-selected bank: both regions'
-        -- pointers/lane indices reset to 0 together.
-        if fill_bank_sel /= fill_bank_sel_q then
-          weight_wr_row_q(bank) <= (others => '0');
-          bias_wr_row_q(bank) <= (others => '0');
-          weight_lane_q(bank) <= (others => '0');
-          bias_lane_q(bank) <= (others => '0');
-        elsif accepted then
-          if fill_is_bias = '0' then
-            -- Constant-bound loop with the lane select as a per-lane
-            -- enable, rather than a dynamically-bounded slice
-            -- '(8*(to_integer(lane)+1)-1 downto 8*to_integer(lane))'.
-            -- Identical in simulation, but GHDL's synthesis backend
-            -- rejects the latter ("cannot extract same variable part for
-            -- dynamic slice", the same limitation as ghdl/ghdl#2658). This
-            -- is the standard wide-word byte-write-enable form anyway.
-            -- Caught by this module's netlist build -- see
-            -- module_cnn_accel.py get_build_projects().
-            for lane in 0 to c_weight_lanes - 1 loop
-              if to_integer(weight_lane_q(bank)) = lane then
-                weight_mem(bank)(to_integer(weight_wr_row_q(bank)))
-                  (8 * (lane + 1) - 1 downto 8 * lane)
-                  <= s_stream_m2s.data(7 downto 0);
-              end if;
-            end loop;
-
-            if to_integer(weight_lane_q(bank)) = c_weight_lanes - 1 then
-              weight_lane_q(bank) <= (others => '0');
-              weight_wr_row_q(bank) <= weight_wr_row_q(bank) + 1;
-            else
-              weight_lane_q(bank) <= weight_lane_q(bank) + 1;
+        weight_wr_row_q <= (others => '0');
+        weight_lane_q <= (others => '0');
+        weight_row_assemble_q <= (others => '0');
+        bias_wr_row_q <= (others => '0');
+        bias_lane_q <= (others => '0');
+        bias_row_assemble_q <= (others => '0');
+      elsif fill_start = '1' then
+        -- New fill session: both regions' pointers/lane indices/row-
+        -- assembly registers reset to 0 together (a beat presented this
+        -- same cycle is not accepted).
+        weight_wr_row_q <= (others => '0');
+        weight_lane_q <= (others => '0');
+        weight_row_assemble_q <= (others => '0');
+        bias_wr_row_q <= (others => '0');
+        bias_lane_q <= (others => '0');
+        bias_row_assemble_q <= (others => '0');
+      elsif accepted then
+        if is_bias_i = '0' then
+          -- Constant-bound loop with the lane select as a per-lane
+          -- enable, rather than a dynamically-bounded slice
+          -- '(8*(to_integer(lane)+1)-1 downto 8*to_integer(lane))'.
+          -- Identical in simulation, but GHDL's synthesis backend rejects
+          -- the latter ("cannot extract same variable part for dynamic
+          -- slice", the same limitation as ghdl/ghdl#2658). This only
+          -- updates a plain register (not a memory), so it costs no BRAM
+          -- fragmentation either way -- the actual memory write below is
+          -- one whole-row write, no per-lane enables at all.
+          weight_row_next := weight_row_assemble_q;
+          for lane in 0 to c_weight_lanes - 1 loop
+            if to_integer(weight_lane_q) = lane then
+              weight_row_next(8 * (lane + 1) - 1 downto 8 * lane) := data_i(7 downto 0);
             end if;
+          end loop;
+          weight_row_assemble_q <= weight_row_next;
+
+          if to_integer(weight_lane_q) = c_weight_lanes - 1 then
+            -- Final lane of the row: ONE wide write, all lanes at once.
+            weight_mem(to_integer(weight_wr_row_q)) <= weight_row_next;
+            weight_lane_q <= (others => '0');
+            weight_wr_row_q <= weight_wr_row_q + 1;
           else
-            -- Constant-bound loop, same reason as the weight region above.
-            for lane in 0 to c_bias_lanes - 1 loop
-              if to_integer(bias_lane_q(bank)) = lane then
-                bias_mem(bank)(to_integer(bias_wr_row_q(bank)))
-                  (g_accum_width * (lane + 1) - 1 downto g_accum_width * lane)
-                  <= s_stream_m2s.data(g_accum_width - 1 downto 0);
-              end if;
-            end loop;
-
-            if to_integer(bias_lane_q(bank)) = c_bias_lanes - 1 then
-              bias_lane_q(bank) <= (others => '0');
-              bias_wr_row_q(bank) <= bias_wr_row_q(bank) + 1;
-            else
-              bias_lane_q(bank) <= bias_lane_q(bank) + 1;
+            weight_lane_q <= weight_lane_q + 1;
+          end if;
+        else
+          -- Constant-bound loop, same reason as the weight region above.
+          bias_row_next := bias_row_assemble_q;
+          for lane in 0 to c_bias_lanes - 1 loop
+            if to_integer(bias_lane_q) = lane then
+              bias_row_next(g_accum_width * (lane + 1) - 1 downto g_accum_width * lane) :=
+                data_i(g_accum_width - 1 downto 0);
             end if;
+          end loop;
+          bias_row_assemble_q <= bias_row_next;
+
+          if to_integer(bias_lane_q) = c_bias_lanes - 1 then
+            -- Final lane of the row: ONE wide write, all lanes at once.
+            bias_mem(to_integer(bias_wr_row_q)) <= bias_row_next;
+            bias_lane_q <= (others => '0');
+            bias_wr_row_q <= bias_wr_row_q + 1;
+          else
+            bias_lane_q <= bias_lane_q + 1;
           end if;
         end if;
-
-        fill_bank_sel_q <= fill_bank_sel;
       end if;
     end if;
   end process;
 
   ------------------------------------------------------------------------
-  -- Read path: registered, 1 cycle latency, from the bank selected by
-  -- 'read_bank_sel'. No reset -- read-data content has no completeness
-  -- contract of its own (see proposal doc section 4).
+  -- Read path: registered, 1 cycle latency. No reset -- read-data content
+  -- has no completeness contract of its own (see proposal doc section 4).
   ------------------------------------------------------------------------
 
   read_ports : process(clk)
   begin
     if rising_edge(clk) then
-      weight_rd_data <= weight_mem(bank_index(read_bank_sel))(to_integer(unsigned(weight_rd_addr)));
-      bias_rd_data <= bias_mem(bank_index(read_bank_sel))(to_integer(unsigned(bias_rd_addr)));
+      weight_rd_data <= weight_mem(to_integer(unsigned(weight_rd_addr)));
+      bias_rd_data <= bias_mem(to_integer(unsigned(bias_rd_addr)));
     end if;
   end process;
 
