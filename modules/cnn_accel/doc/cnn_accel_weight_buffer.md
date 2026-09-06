@@ -20,7 +20,7 @@ Entity `cnn_accel_weight_buffer`, architecture `a`
 
 | Name | Type | Meaning |
 |---|---|---|
-| `g_weight_buffer_depth` | positive | Rows per bank, per region (weight region and bias region both use this same depth — see proposal doc §3.2). |
+| `g_weight_buffer_depth` | positive | Rows per bank, per region (weight region and bias region both use this same depth — see proposal doc §3.2). **Depth contract (proposal doc §4, D10):** must hold a whole layer's weight rows, `ceil(kernel_h*kernel_w*in_channels/g_pe_cols)` — not just one input-channel tile's `groups_per_tile` — because `cnn_accel_pe_array.weight_rd_addr` rebases to 0 only on `first_tile` of a new output pixel and then runs continuously, one row per group, across every input-channel tile of that pixel (never wrapping mid-pixel). Minimum across the target network: 288 rows (layer 9); `module_cnn_accel.py`'s `_WEIGHT_BUFFER_DEPTH` build-time generic uses the recommended 512. The address width (`weight_rd_addr`/`bias_rd_addr`, and the internal row-pointer width) is always derived from this generic via `num_bits_needed`, never hard-coded, so raising the depth needs no other RTL change. |
 | `g_pe_rows` | positive | Output-channel parallelism: rows per read tile, and bias lanes per read tile. |
 | `g_pe_cols` | positive | Input-channel/MAC parallelism: weight lanes per read tile, together with `g_pe_rows`. |
 | `g_accum_width` | positive := 32 | Bit width of one bias lane (int32 accumulator width elsewhere in this IP); added by `vhdesign` to give `bias_rd_data` a well-typed width not resolvable from the requirement alone (proposal doc §3.1). |
@@ -119,6 +119,58 @@ are fully independent selectors into the same two-bank memory array).
   `bias_rd_addr` are registered synchronous read addresses into bank Y,
   one cycle of read latency (`:227-233`), matching `cnn_accel_pe_array`'s
   expected weight-fetch latency.
+
+## Weight row layout contract (D10, proposal doc §4)
+
+This module is layout-agnostic — it stores/returns whatever
+`c_weight_row_width`-bit rows it is fed, addressed by a flat
+`weight_rd_addr`. It has no opinion on what a row *means*. But the
+depth sizing above and the fill content are only correct if the fill
+source and `cnn_accel_pe_array`'s read sequencing agree on that meaning,
+so the contract is pinned here rather than left implicit:
+
+- **Row order is TILE-MAJOR**, not the golden model's native layout:
+  `cnn_accel_pe_array` walks `weight_rd_addr` as `t -> kr -> kc` (input-
+  channel tile index hoisted *above* kernel position) within one output-
+  pixel/output-channel-tile pass, resetting only on that pass's
+  `first_tile`. The golden model (`cnn_accel_model.py`'s `conv2d`/OHWI
+  weights) is `ic` fastest-varying *inside* `kr,kc`
+  (`cnn_accel_model.py:401,416`) — the opposite nesting. For
+  `in_channels=32`, `g_tile_channels=8` (`Ct=8`), tile 1's rows need
+  `ic in 8..15` at *every* `(kr,kc)`: a strided gather across the whole
+  `kr,kc` range of the OHWI array, not a contiguous slice.
+- **The gather happens outside this module, in software, once** —
+  `cnn_accel_model.pack_weights_for_hw()` performs exactly this repack at
+  compile time into the byte image the weight DMA fill path streams in;
+  it is not, and must never be, implemented in this RTL (no runtime-
+  variable-bound loop or dynamic slice could do it without breaking the
+  GHDL-synthesis constraints this module's fill path already works
+  around — see `cnn_accel_weight_buffer.vhd:190-207`'s comment). If this
+  module's row width, `g_pe_rows`/`g_pe_cols` shape, or row order
+  contract ever changes, `pack_weights_for_hw()` must change with it —
+  the two are not independently versioned.
+- **Open risk, flagged not fixed here (out of this module's/this
+  round's scope):** *within* one row, `pack_weights_for_hw()`'s own
+  docstring fixes lane `c*g_pe_rows + r` (`c` outer, `r` inner —
+  `cnn_accel_model.py:494-498`), but `cnn_accel_pe_array.vhd:258`
+  extracts `weight_lane := r*g_pe_cols + c` (`r` outer, `c` inner) — the
+  transpose of that convention, and not the same lane index whenever
+  `r /= c`. Nothing currently catches this: there is no `cnn_accel_top`/
+  DMA/`layer_ctrl` RTL yet and no test drives `pack_weights_for_hw()`'s
+  output through real `cnn_accel_pe_array`/`cnn_accel_weight_buffer`
+  hardware end-to-end. Needs a ratified decision (which side is
+  authoritative) before `cnn_accel_top` integration; not addressed here
+  since fixing it means either editing `cnn_accel_pe_array.vhd` (out of
+  scope for this change) or `cnn_accel_model.py` (not this module's
+  contract to redefine unilaterally).
+- **Depth**: see the `g_weight_buffer_depth` generic entry above. A
+  layer's packed image is always exactly
+  `OT*T*kernel_h*kernel_w*g_tile_channels*g_pe_rows` int8 values
+  (`pack_weights_for_hw()`'s own contract), i.e. `OT*T*kernel_h*kernel_w`
+  rows; `g_weight_buffer_depth` must be at least the largest such row
+  count across every layer/output-channel-tile pass in the target
+  network (288, layer 9) — configured at 512 for headroom
+  (`module_cnn_accel.py`'s `_WEIGHT_BUFFER_DEPTH`).
 
 ## Timing/latency
 
