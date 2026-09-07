@@ -55,3 +55,11 @@ class VerifyError(CompilerError):
 # (e.g. `CapabilityError` for HIR capability checks -- already present in
 # `cnnc.target.contract` for target/backend concerns; schedule/memplan
 # errors for M7). Not added here: out of scope for M2.
+
+
+class LegalizeError(CompilerError):
+    """Raised by `passes.legalize_rescale.LegalizeRescalePass` (M4) when a
+    `rescale` cannot be rewritten onto the target's rescale capability:
+    multiplier overflow after the `shift < shift_min` rewrite, `shift`
+    left above `shift_max`, or a rounding mode (`DOUBLE_ROUND`) with no
+    target-expressible equivalent."""
