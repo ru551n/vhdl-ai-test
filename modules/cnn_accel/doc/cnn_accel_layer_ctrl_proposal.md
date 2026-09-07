@@ -135,50 +135,56 @@ neither currently exposes to `cnn_accel_layer_ctrl`. Flagged, not
 resolved here (same open-item style as `doc/cnn_accel_weight_buffer.md`'s
 D10 lane-order risk).
 
-### 3.4 Ofmap per-tile write-back is NOT a contiguous byte range — flagged conflict, not resolved here
+### 3.4 Ofmap per-tile write-back — RESOLVED by decision S6 (channel-tiled ofmap planes)
 
-**This is a real gap, surfaced rather than papered over.** Activations are
-HWC (`cnn_accel_model.py` module docstring, line 29): one output pixel's
-`out_channels` bytes are contiguous, and pixels are contiguous after that
-— `out_h * out_w * out_channels` bytes total, channel fastest-varying.
-Under D6, one tile pass produces only `g_pe_rows` of those `out_channels`
-channels, for *every* pixel. Writing just those `g_pe_rows` bytes per
-pixel into the correct HWC positions is **not** a single contiguous
-`addr`+`length` range at any granularity (not per-layer, not per-row, not
-even per-pixel-run): the *other* `out_channels - g_pe_rows` bytes of
-every single pixel sit between one tile's bytes and the next, so any
-contiguous burst either includes bytes this tile does not own or produces
-gaps `cnn_accel_ofmap_dma` cannot express.
+**Historical note (the conflict this section used to flag).** Activations
+were HWC (`out_h * out_w * out_channels` bytes, channel fastest-varying).
+Under D6 one tile pass produces only `g_pe_rows` of those `out_channels`
+channels, for *every* pixel, so writing just those bytes into their HWC
+positions was **not** a contiguous `addr`+`length` range at any
+granularity — the other `out_channels - g_pe_rows` bytes of every pixel
+sit between one tile's bytes and the next. `dma_req_t` (`addr`, `length`
+only) and the wrapped `dma_axi_write_simple` (a plain sequential burst
+writer) have no stride/pitch field, and falling back to `out_h * out_w`
+single-pixel requests (up to 25,600 for layer 1) would have defeated the
+point of bursting. Three fixes were put to the architect: (a) add a real
+strided-write capability to `dma_req_t`/`cnn_accel_ofmap_dma`, (b) make
+the ofmap DDR layout tile-major and push a repack to the host, or (c)
+accept per-pixel request granularity.
 
-- `cnn_accel_pkg.dma_req_t` (`addr`, `length` only) and
-  `doc/cnn_accel_ofmap_dma_req.md`'s Functional Description ("latch
-  `addr`/`length`... forward them to the wrapped `dma_axi_write_simple`
-  instance's control interface") give this module exactly one contiguous
-  request shape — no stride/pitch field, no per-element gather.
-- `hdl-modules`' wrapped `dma_axi_write_simple` (per that requirement's
-  Responsibility line) is a plain sequential burst writer; nothing in its
-  own documentation or `cnn_accel_ofmap_dma`'s wrapper adds striding.
-- Issuing `out_h * out_w` separate one-`g_pe_rows`-byte requests (one per
-  pixel, `addr = out_addr + pixel_idx*out_channels + ot*g_pe_rows`) would
-  technically use only the existing `addr`+`length` shape, but at
-  per-pixel request granularity (up to 25,600 requests for this network's
-  layer 1) it defeats the entire point of "issue bursts", is not what
-  "one or more AXI4 write bursts" in that module's Responsibility line
-  describes, and is not something this proposal recommends adopting
-  silently.
+**Resolution: option (b), ratified as decision S6** (see
+`doc/cnn_accel_arch.md`, "Off-chip activation layout", and
+`modules/cnn_accel/flow_status.md`'s S1-S7 table). Activations in DDR are
+**channel-tiled planes**:
 
-**Not resolved here** because the fix is a `vharch`-level decision, not a
-`layer_ctrl`-internal one: either (a) give `cnn_accel_ofmap_dma`/
-`dma_req_t` a genuine strided-write capability (new field(s), new RTL in
-that module, out of this module's scope), or (b) make the *ofmap* DDR
-layout tile-major (mirroring the *weight* image's own tile-major
-repacking, `pack_weights_for_hw()`) and push a final HWC-repack pass to
-the host/compiler side, or (c) accept per-pixel request granularity as a
-deliberate, reviewed trade. This proposal's FSM (§6) issues one
-`ofmap_dma_req` per tile in `WRITE_OFMAP` with `length` sized for that
-tile's channel slice only (§7), leaving the *address pattern* within that
-byte range as the open item above — `vhfill` must not silently pick one
-of (a)/(b)/(c) without this being ratified first.
+```
+ofmap[c_tile][y][x][t]        c_tile = 0 .. ceil(C/T) - 1,  t = 0 .. T-1
+byte offset = ((c_tile * out_height + y) * out_width + x) * T + t
+```
+
+with **`T` fixed at 8, independent of `g_pe_rows`**. Consequences for this
+module:
+
+- **One plane is one contiguous range**, so `WRITE_OFMAP` issues ordinary
+  `addr`+`length` `ofmap_dma_req`s. `dma_req_t` is **unchanged** and
+  `cnn_accel_ofmap_dma` stays a thin `dma_axi_write_simple` wrapper — (a)
+  is not needed, and (c)'s per-pixel granularity is avoided.
+- **A pass emits `g_pe_rows / T` planes, hence that many requests.** At the
+  shipped default (`g_pe_rows = 8 = T`) that is exactly one request per
+  tile pass, as before. At `g_pe_rows = 16` (decision S4) it is **two
+  ordinary requests**, not one double-length request — `T` must not track
+  `g_pe_rows`, or the DDR layout and the host-side packing would depend on
+  which bitstream is loaded (decision S1 makes `g_pe_rows` the only knob).
+- **The ifmap is stored the same way**, so `STREAM_IFMAP` issues
+  `ceil(in_channels / T)` requests per ifmap row rather than one whole-frame
+  request (see §7). This is extra bookkeeping in this FSM — the price of
+  removing the stride problem — and no new module.
+- **The host repacks the network's final output once.** Intermediate
+  layers never need repacking: every layer both writes and reads this
+  layout.
+
+`vhfill` implements the formulas in §7 directly; there is no longer an
+open address-pattern item here.
 
 ### 3.5 Mid-layer host ABORT
 
@@ -265,10 +271,10 @@ widths), `drain_cnt_q` (fixed pipeline-depth countdown).
 | `IDLE` | On `layer_desc_m2s.valid='1'`: latch descriptor into `layer_desc_q`; assert `layer_desc_s2m.ready` for one cycle; compute `ot_last_q` (§3.1/§7); `ot_q <= 0`; configure `wgen_cfg`/`requant_cfg` from the latched fields; set `route_sel` from `opcode`. No DMA issued. | -> `LOAD_WEIGHTS` | `opcode` is `CONV2D`/`DWCONV2D`/`FC` |
 | | (same latch/configure actions) | -> `STREAM_IFMAP` | `opcode` is `POOL_MAX`/`POOL_AVG` (tiling skipped, §3.1) |
 | `LOAD_WEIGHTS` | On entry: pulse `wbuf_fill_start` for one cycle; issue `weight_dma_req_m2s` (`addr = weight_addr + ot_q*c_weight_tile_bytes`, `length = c_weight_tile_bytes`, §7) with `wbuf_fill_is_bias='0'`. When `weight_dma_s2m`'s `dma_done` fires: if `bias_en='1'`, issue `bias_dma_req` (reusing `weight_dma_req_m2s`/the same weight `cnn_accel_axi_read_dma` instance per `doc/cnn_accel_arch.md`'s submodule table — one instance serves both weight and bias sub-requests sequentially) with `addr = bias_addr + ot_q*c_bias_tile_bytes`, `length = c_bias_tile_bytes`, `wbuf_fill_is_bias='1'`. | -> `STREAM_IFMAP` | weight sub-request's `dma_done` seen, and (if `bias_en='1'`) bias sub-request's `dma_done` also seen |
-| `STREAM_IFMAP` | Issue `ifmap_dma_req_m2s` (`addr = in_addr`, `length = in_width*in_height*in_channels` bytes — **identical on every tile pass**, per D6: the ifmap is not sliced by output-channel tile); pulse `wgen_start`. | -> `WAIT_DRAIN` | `wgen_done='1'` |
+| `STREAM_IFMAP` | Issue `n_ifmap_planes = ceil(in_channels/8)` successive `ifmap_dma_req_m2s` requests (`addr = in_addr + ct*c_ifmap_plane_len`, `length = c_ifmap_plane_len`, §7 — the S6 channel-tiled layout makes each input-channel tile its own contiguous plane), advancing a plane counter `ct_q` on each `dma_done`; pulse `wgen_start` on entry. The set of requests is **identical on every tile pass**, per D6: the ifmap is not sliced by output-channel tile. | -> `WAIT_DRAIN` | `wgen_done='1'` (all planes streamed) |
 | `WAIT_DRAIN` | No DMA issued; `drain_cnt_q` counts down from a fixed pipeline-depth constant (`vhdesign`-time, covers `cnn_accel_pe_array`/`cnn_accel_pool`/`cnn_accel_bias_requant`'s combined pipeline latency) each cycle. | -> `WRITE_OFMAP` | `drain_cnt_q = 0` |
-| `WRITE_OFMAP` | Issue `ofmap_dma_req_m2s` (`addr`, `length` per this tile's channel slice — address *pattern* within that range is the open item, §3.4). | -> `LOAD_WEIGHTS`, with `ot_q <= ot_q + 1` | `ofmap_dma_done`, and `ot_q < ot_last_q` |
-| | (same DMA) | -> `DONE` | `ofmap_dma_done`, and `ot_q = ot_last_q` |
+| `WRITE_OFMAP` | Issue `c_planes_per_pass = g_pe_rows/8` successive `ofmap_dma_req_m2s` requests (`addr = ofmap_addr + plane_idx*c_ofmap_plane_len`, `length = c_ofmap_plane_len`, §7) — one at the shipped `g_pe_rows = 8`, two at 16 (S6/S4). Each is an ordinary contiguous `addr`+`length` request; `dma_req_t` is unchanged. | -> `LOAD_WEIGHTS`, with `ot_q <= ot_q + 1` | last plane's `ofmap_dma_done`, and `ot_q < ot_last_q` |
+| | (same DMA) | -> `DONE` | last plane's `ofmap_dma_done`, and `ot_q = ot_last_q` |
 | `DONE` | Pulse `layer_done` for one cycle; `ot_q <= 0`. No DMA issued. | -> `IDLE` | unconditional (next cycle) |
 | *any state* | Latch and pulse `layer_error` for one cycle; `ot_q <= 0`; deassert all `*_dma_req_m2s.valid`/`wgen_start`/`wbuf_fill_start`. | -> `IDLE` | any of `weight_dma_s2m.resp_error`, `ifmap_dma_s2m.resp_error`, `ofmap_dma_s2m.resp_error` pulses |
 
@@ -307,11 +313,21 @@ block size and `doc/cnn_accel_weight_buffer.md`'s own
 n_in_tiles          = ceil(in_channels_q / g_pe_cols)
 c_weight_tile_bytes = kernel_h_q * kernel_w_q * n_in_tiles * g_pe_cols * g_pe_rows   -- CONV2D/FC
 ```
-`DWCONV2D`'s per-tile weight byte length is **not fully specified by any
-existing document** (depthwise has no cross-input-channel accumulation,
-so whether/how `n_in_tiles` applies to it is undefined in
-`cnn_accel_pe_array`'s own requirement/proposal) — flagged as an open
-corner case (§10), not guessed at here.
+`DWCONV2D`'s per-tile weight byte length is **not specified by any
+existing document** (depthwise has no cross-input-channel accumulation, so
+whether/how `n_in_tiles` applies to it is undefined in
+`cnn_accel_pe_array`'s own requirement/proposal, and
+`cnn_accel_model.py`'s `pack_weights_for_hw()` rejects the opcode rather
+than invent a layout).
+
+**Decision D2 (2026-09-07) removes this from the module's scope**: the
+compiler rejects unsupported operations, so `DWCONV2D` never reaches the
+accelerator. This module therefore computes **no** `DWCONV2D` weight
+length, and — deliberately — adds no opcode-legality check, no
+`layer_error` cause and no defensive decode for it either: the hardware is
+not shaped around ops it does not implement. See `doc/cnn_accel_arch.md`,
+"Opcode support status, and who rejects the unsupported ones". `vhfill`
+implements the `CONV2D`/`FC` formula above and nothing else.
 
 **Per-tile bias byte length** (§3.3, `pack_bias_for_hw()`'s per-tile block
 is always exactly `g_pe_rows` int32 values):
@@ -325,11 +341,33 @@ weight_dma_req.addr = layer_desc_q.weight_addr + ot_q * c_weight_tile_bytes
 bias_dma_req.addr   = layer_desc_q.bias_addr   + ot_q * c_bias_tile_bytes
 ```
 
-**Ifmap byte length** (unchanged from the pre-D6 requirement text,
-identical every tile pass, §6):
+**Ifmap requests** (§3.4 / decision S6, identical every tile pass, §6).
+The ifmap is stored as channel-tiled planes with `T = 8`, so the frame is
+`ceil(in_channels / T)` separate contiguous planes rather than one
+contiguous HWC frame. Per plane `ct = 0 .. n_ifmap_planes - 1`:
 ```
-ifmap_dma_req.length = in_width_q * in_height_q * in_channels_q
+c_plane_channels  = 8                                   -- T, fixed (S6)
+n_ifmap_planes    = ceil(in_channels_q / c_plane_channels)
+c_ifmap_plane_len = in_width_q * in_height_q * c_plane_channels
+
+ifmap_dma_req.addr   = layer_desc_q.ifmap_addr + ct * c_ifmap_plane_len
+ifmap_dma_req.length = c_ifmap_plane_len
 ```
+Total bytes streamed per tile pass are unchanged
+(`in_width * in_height * in_channels`, modulo the zero-padding of a
+partial final plane per D11); only the *number of requests* changes, from
+1 to `n_ifmap_planes`. `STREAM_IFMAP` therefore carries a plane counter
+alongside its existing per-pass logic and does not advance to
+`WAIT_DRAIN` until the last plane's `dma_done`.
+
+> Ordering note: `cnn_accel_window_gen` needs all `T` channels of a pixel
+> in one beat, so planes are streamed **plane-major** (all of plane 0,
+> then all of plane 1, ...) only when `in_channels <= T`; for
+> `in_channels > T` the planes are consumed as the `T`-sized input-channel
+> tiles the datapath already iterates over (`n_in_tiles` in the weight
+> formula below), one plane per input-channel tile. That is the same loop
+> the pre-S6 design ran; S6 only makes each tile's bytes contiguous.
+
 
 **Ofmap output spatial size** (unchanged from the requirement's own
 "standard conv output-size formula" note, needed for `WRITE_OFMAP`'s
@@ -338,19 +376,35 @@ per-tile `length`, §3.4):
 out_width  = floor((in_width  + pad_left + pad_right  - kernel_w) / stride_w) + 1
 out_height = floor((in_height + pad_top  + pad_bottom - kernel_h) / stride_h) + 1
 ```
-`WRITE_OFMAP`'s `length` for tile `ot` is sized for that tile's channel
-slice only — `out_width * out_height * g_pe_rows` bytes for
-`CONV2D`/`DWCONV2D`/`FC` (`out_channels` bytes, i.e. the full-layer
-formula the current requirement gives, only on the final tile if
-`out_channels` is not a multiple of `g_pe_rows`, per D11's zero-padding —
-this module does not special-case that: it always requests `g_pe_rows`
-bytes/pixel and relies on `cnn_accel_bias_requant`'s already-existing
-zero-padded lanes, per `doc/cnn_accel_weight_buffer.md`'s D11 note, to
-supply well-defined (zero-weighted, so computed but discardable) data for
-any padded lanes on the last tile) — and `out_width * out_height *
-out_channels` bytes, unchanged, for `POOL_MAX`/`POOL_AVG` (`OT = 1`, no
-tiling). The **address pattern** within that byte count is the open item
-of §3.4, not resolved by this formula.
+**Ofmap write-back requests** (§3.4 / decision S6). Tile `ot` covers
+output channels `ot*g_pe_rows .. ot*g_pe_rows + g_pe_rows - 1`, i.e.
+`g_pe_rows / c_plane_channels` whole planes starting at plane index
+`ot * g_pe_rows / c_plane_channels`. Per plane `p` of that pass:
+```
+c_ofmap_plane_len   = out_width * out_height * c_plane_channels
+c_planes_per_pass   = g_pe_rows / c_plane_channels        -- 1 at 8 rows, 2 at 16
+plane_idx           = ot_q * c_planes_per_pass + p
+
+ofmap_dma_req.addr   = layer_desc_q.ofmap_addr + plane_idx * c_ofmap_plane_len
+ofmap_dma_req.length = c_ofmap_plane_len
+```
+Both `c_plane_channels` (8) and `g_pe_rows` (8 or 16, decision S4) are
+powers of two, so `c_planes_per_pass` is an elaboration-time constant and
+`plane_idx` is a shift-and-add, not a divide. `WRITE_OFMAP` issues
+`c_planes_per_pass` requests and only takes the `-> LOAD_WEIGHTS` back-edge
+(or `-> DONE`) after the last one's `dma_done`.
+
+This module does **not** special-case a final tile whose channel slice
+overruns `out_channels` (`out_channels` not a multiple of `g_pe_rows`,
+D11): it always writes full planes and relies on
+`cnn_accel_bias_requant`'s already-existing zero-padded lanes (see
+`doc/cnn_accel_weight_buffer.md`'s D11 note) to supply well-defined
+(zero-weighted, computed but discardable) data for the padded lanes. The
+host's one-off final repack (§3.4) drops them.
+
+`POOL_MAX`/`POOL_AVG` are untiled (`OT = 1`) but still write the same
+layout: `ceil(out_channels / c_plane_channels)` plane requests, since a
+pool preserves channel count and therefore plane count.
 
 ## 8. Numeric types and widths
 
@@ -405,11 +459,22 @@ un-tiled requirement's own per-state cost model.
 - **`bias_en='0'`**: `LOAD_WEIGHTS` issues only the weight sub-request per
   tile, not the bias one — unchanged from the pre-D6 requirement, just
   now repeated `OT` times instead of once.
-- **DWCONV2D's per-tile weight length**: flagged, not resolved (§7) —
-  needs `cnn_accel_pe_array`'s own depthwise-tiling contract, which does
-  not yet exist in any requirement/proposal read for this design.
-- **Ofmap per-tile write-back address pattern**: flagged, not resolved
-  (§3.4) — the single most consequential open item in this proposal.
+- **DWCONV2D's per-tile weight length**: **out of scope** per decision D2
+  (2026-09-07) — the compiler rejects unsupported operations, so the
+  opcode never reaches this module. No formula, no opcode-legality check
+  and no `layer_error` cause is implemented for it (§3.3/§7).
+  *Previously*: flagged as unresolved, since it needs
+  `cnn_accel_pe_array`'s own depthwise-tiling contract, which does not
+  exist in any requirement/proposal. That contract is still absent — D2
+  makes its absence harmless rather than blocking.
+- **Ofmap per-tile write-back address pattern**: **RESOLVED** by decision
+  S6 (§3.4, formulas in §7). Was the single most consequential open item in
+  this proposal; the channel-tiled `[C/8][H][W][8]` layout makes every
+  write-back contiguous, so `dma_req_t` and `cnn_accel_ofmap_dma` are
+  unchanged. New verification obligation instead of a blocker: cover both
+  `c_planes_per_pass = 1` (`g_pe_rows = 8`) and `= 2` (`g_pe_rows = 16`),
+  and an `in_channels` that is not a multiple of 8 (partial final ifmap
+  plane, D11).
 - **DMA `resp_error` from any of the three DMAs, at any FSM state**:
   handled uniformly (§6's "any state" row) — `layer_error` pulses and the
   FSM returns to `IDLE` regardless of which tile or which state it was in,
@@ -465,11 +530,14 @@ responsibility of `cnn_accel_axi_read_dma` (x2, weight and ifmap) and
 `resp_error` control-plane, exactly per their own requirements
 (`doc/cnn_accel_axi_read_dma_req.md`, `doc/cnn_accel_ofmap_dma_req.md`) —
 this proposal introduces no new AXI4-adjacent signal and makes no new
-AXI4 protocol decision. The one place this module's design *does* bear on
-an AXI4-Stream-adjacent concern is §3.4's flagged ofmap addressing gap,
-which is a `dma_req_t`/`cnn_accel_ofmap_dma` capability question, not an
-AXI4 handshake-correctness question — `shared/Axi4.md`'s handshake-
-stability/burst-boundary/ordering rules are unaffected either way.
+AXI4 protocol decision. §3.4's ofmap addressing question, which used to be
+the one AXI4-adjacent open concern here, is resolved by decision S6 without
+touching `dma_req_t` or `cnn_accel_ofmap_dma`: it turned into "issue more
+ordinary requests", not "issue a different kind of request". Multiple
+successive requests per state change nothing about `shared/Axi4.md`'s
+handshake-stability/burst-boundary/ordering rules — each request is an
+independent, fully-handshaken `dma_req` and this module never has more than
+one outstanding.
 
 ## 13. Verification plan
 
@@ -525,6 +593,12 @@ separate" bullet).
 the user has said they will paste `cnn_accel_layer_ctrl_req.md`'s edits in
 themselves — **`cnn_accel_layer_ctrl_req.md` is not edited by this
 proposal.** The two blocks below are ready to paste as-is.
+
+**Status: applied (decision D3).** The user authorized applying both
+blocks; `cnn_accel_layer_ctrl_req.md` now carries them (the Ports table
+gained both replacement rows, and the Functional Description additionally
+carries a closing note that `DWCONV2D` is out of scope per decision D2).
+The blocks are kept here as the record of what was pasted.
 
 ### (a) Ports table: delete the `weight_buffer_bank_sel` row
 

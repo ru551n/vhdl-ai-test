@@ -396,13 +396,47 @@ per-state logic, it is unconditional.
    requires it (inherent to `dma_axi_write_simple`, not an extra
    constraint invented here — see §3.3) and has no way to detect or
    report a violation (an unaligned tail would simply never complete —
-   `dma_done` would never fire, silently hanging the layer). Given the
-   already-flagged, unresolved strided-ofmap-write conflict recorded in
-   `flow_status.md` ("M8" entry — per-tile write-back is not a
-   contiguous byte range under HWC layout, and `dma_req_t` cannot
-   express the resulting stride), this module's own alignment
-   requirement should be folded into whatever resolution that
-   conflict receives, rather than resolved independently here.
+   `dma_done` would never fire, silently hanging the layer).
+
+   **Update, decision S6** (see `doc/cnn_accel_arch.md`, "Off-chip
+   activation layout"): the strided-ofmap-write conflict this item was
+   waiting on is resolved — the ofmap layout is channel-tiled planes
+   `[C/8][H][W][8]`, so every `cnn_accel_layer_ctrl` write-back is one
+   contiguous plane and `dma_req_t` is unchanged. That also *mostly*
+   answers this alignment question, since both the plane length and every
+   plane's start offset are multiples of `T = 8` bytes:
+   ```
+   addr   = ofmap_addr + plane_idx * (out_width * out_height * 8)
+   length =                          out_width * out_height * 8
+   ```
+   So the request is inherently 8-byte aligned. At `g_axi_data_width = 64`
+   (8 bytes/beat) the requirement is therefore satisfied unconditionally.
+   At a wider bus it is *not* automatic: e.g. at 128 bits (16 bytes/beat)
+   `out_width * out_height` must additionally be even, and the base
+   `ofmap_addr` the host programs must be 16-byte aligned.
+
+   **RESOLVED by decision D1 (2026-09-07): bound the bus width.** Of the
+   three candidate enforcements — (i) elaboration assert capping
+   `g_axi_data_width`, (ii) a runtime check in `cnn_accel_layer_ctrl`
+   raising `layer_error`, (iii) a documented host/compiler contract with no
+   hardware check — (i) was ratified. `cnn_accel_constants.py` now declares
+   `ACTIVATION_PLANE_CHANNELS = 8` (T, a memory-layout constant kept
+   deliberately distinct from the datapath's `TILE_CHANNELS`) and
+   `MAX_AXI_DATA_WIDTH = 8 * ACTIVATION_PLANE_CHANNELS`; both are
+   propagated by `hdl-registers` and asserted concurrently, at
+   `severity failure`, in **`cnn_accel_ofmap_dma`** and
+   **`cnn_accel_axi_read_dma`** (the latter because S6 makes its ifmap
+   instance plane-granular too).
+
+   Rationale for (i) over (ii)/(iii): the guarantee becomes independent of
+   runtime layer geometry, costs no logic, needs no new error cause, and
+   cannot be violated by a host that programs a legal-looking descriptor.
+   `out_width`/`out_height` are runtime descriptor fields, so the general
+   alignment predicate is *not* statically checkable — only the bus-width
+   bound is. Accepted cost: 128-bit AXI is forbidden, capping ofmap write
+   and ifmap read burst bandwidth. Revisit only if a real measurement shows
+   the 64-bit bus is the bottleneck, and note that lifting the bound means
+   adopting (ii), not simply widening the generic.
 2. **Burst efficiency vs. robustness trade-off** (§3.3): this proposal
    deliberately picks the smallest legal `packet_length_beats` (single-
    AXI-beat bursts) to make the "no partial packet" limitation

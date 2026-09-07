@@ -165,12 +165,51 @@ convolution over the full input-channel vector, reusing the same
 datapath rather than a separate matrix-vector engine. This is the
 architecture's main "avoid a second datapath" decision.
 
+### Opcode support status, and who rejects the unsupported ones (decision D2)
+
+`DWCONV2D` (`0x02`) has an allocated opcode but **no ratified weight
+layout**. Depthwise has no cross-channel reduction — each output channel
+depends on exactly one input channel — so the OHWI tile-major repacking
+that `CONV2D`/`FC` use does not apply, and `cnn_accel_model.py`'s
+`pack_weights_for_hw()` explicitly *rejects* the opcode rather than invent
+an unratified layout. Consequently no per-tile weight byte length is
+defined for it, and `cnn_accel_layer_ctrl` cannot compute one.
+
+**Decision D2 (2026-09-07): rejecting unsupported operations is the
+compiler's job, not the hardware's.** The compiler is the only component
+that sees the whole network before anything executes, so it is where an
+unsupported op can be reported against a source-level location instead of
+as a runtime fault with no context. The accelerator therefore adds **no
+`layer_error` path, no opcode-legality check and no defensive decode** for
+this class of problem, and the RTL is not shaped around ops it does not
+implement.
+
+| Opcode | Status | Notes |
+|---|---|---|
+| `0x00 HALT` | supported | program terminator |
+| `0x01 CONV2D` | supported | OHWI tile-major weights, `pack_weights_for_hw()` |
+| `0x02 DWCONV2D` | **not supported** | opcode allocated, weight layout unratified; compiler must reject |
+| `0x03 POOL_MAX` | supported | untiled (`OT = 1`) |
+| `0x04 POOL_AVG` | supported | untiled; reuses `cnn_accel_bias_requant` for the divide |
+| `0x05 FC` | supported | degenerate 1x1 `CONV2D`, see above |
+
+**Contract for the compiler** (implemented in a separate repository):
+emit only the opcodes marked supported above, and fail the build with a
+diagnostic for anything else. The target backbone is all `CONV2D`, so
+nothing in the current network is affected. If a future network needs
+depthwise, ratifying its weight layout is a `vharch`/`vhdesign` task —
+the open sub-question being whether to accept the simple
+`(channels, K_h, K_w)` layout (per-tile length `K_h*K_w*g_pe_rows`, which
+leaves the `g_pe_cols` dimension idle at roughly 1/8 MAC utilisation) or
+to design a packing that maps spatial taps onto `g_pe_cols` (awkward for
+3x3: 9 taps against 8 columns).
+
 ## Top-level generics
 
 | Generic | Type | Default | Meaning |
 |---|---|---|---|
 | `g_axi_addr_width` | positive | 32 | `m_axi` address width |
-| `g_axi_data_width` | positive | 64 | `m_axi` data width |
+| `g_axi_data_width` | positive | 64 | `m_axi` data width. **Bounded at 64 by decision D1** — see "Bus-width bound" below; asserted at elaboration in both DMA engines |
 | `g_axi_id_width` | natural | 4 | `m_axi` ID width (>= ceil(log2(3)) for the 3 read requesters) |
 | `g_axi_lite_addr_width` | positive | 8 | `s_axi_lite` register address width |
 | `g_max_kernel_size` | positive | 7 | max supported conv/pool `K` (both dims) |
@@ -179,7 +218,8 @@ architecture's main "avoid a second datapath" decision.
 | `g_pe_rows` | positive | 8 | `cnn_accel_pe_array` output-channel parallelism |
 | `g_pe_cols` | positive | 8 | `cnn_accel_pe_array` input-channel/MAC parallelism per cycle |
 | `g_accum_width` | positive | 32 | accumulator width |
-| `g_weight_buffer_depth` | positive | 4096 | elements per weight-buffer bank (2 banks, ping-pong) |
+| `g_weight_buffer_depth` | positive | 288 | elements in the (single, not ping-pong) weight region; `K^2 * ceil(C_max/8)` = `9*32` for the target backbone's worst layer (M7b) |
+| `g_bias_buffer_depth` | positive | 8 | elements in the bias region, sized by `ceil(out_channels/g_pe_rows)` independently of the weight region (M7b) |
 | `g_instr_word_bytes` | positive | 64 | instruction descriptor size (must match the ISA table above) |
 
 ## Top-level ports
@@ -206,10 +246,10 @@ architecture's main "avoid a second datapath" decision.
 | `cnn_accel_axi_read_dma` | Generic AXI4 read master -> internal AXI4-Stream; byte address + length in, stream of fixed-width beats out. Instantiated x3 (instruction fetch, weight/bias fetch, ifmap fetch) | new, built from reused AXI4 read-channel building blocks | new; internals reuse `axi.axi_read_pipeline`, `axi.axi_read_throttle` (`hdl-modules/modules/axi`) |
 | `cnn_accel_ofmap_dma` | Output activation write-back: internal AXI4-Stream in -> AXI4 write master out | new, thin wrapper | `hdl-modules/modules/dma_axi_write_simple` |
 | `cnn_accel_window_gen` | Configurable K_h x K_w / stride / zero-padding sliding-window generator over line buffers; generalizes the fixed-3x3 `canny_window3x3` pattern to arbitrary kernel/stride; used both for conv/dwconv/fc (feeding `cnn_accel_pe_array`) and pooling (feeding `cnn_accel_pool`), one instance per active use | new (architecturally informed by `modules/canny/src/canny_window3x3.vhd`, not reusable as-is: fixed 3x3, fixed border-dilation semantics specific to Canny) | this IP |
-| `cnn_accel_weight_buffer` | Double-buffered (ping-pong) on-chip weight/bias cache; filled by the weight `cnn_accel_axi_read_dma` instance, read by `cnn_accel_pe_array`/`cnn_accel_bias_requant` | new | this IP |
-| `cnn_accel_pe_array` | int8 x int8 MAC array (parallelism `g_pe_rows` x `g_pe_cols`), int32 accumulation; executes `CONV2D`/`DWCONV2D`/`FC` | new | this IP |
+| `cnn_accel_weight_buffer` | **Single-buffered** streaming on-chip weight/bias cache (separate weight and bias regions, whole-row writes behind a shallow prefetch FIFO); filled once per output-channel pass by the weight `cnn_accel_axi_read_dma` instance, read by `cnn_accel_pe_array`/`cnn_accel_bias_requant`. Ping-pong was removed in M7b: per decision D6 weights are re-streamed from DDR4 per pass, and DDR4 bandwidth is not the constraint — on-chip footprint is (72 -> 15 BRAM) | new | this IP |
+| `cnn_accel_pe_array` | int8 x int8 MAC array (parallelism `g_pe_rows` x `g_pe_cols`), int32 accumulation; executes `CONV2D`/`DWCONV2D`/`FC`. **Self-timed MAC pipeline** (S7): `c_mac_latency = 2 + c_tree_levels` cycles (5 at `g_pe_cols = 8`) from a group's address issue to its landing in `accum_q`, one adder-tree level per register stage; the latency costs once per output pixel, not once per MAC | new | this IP |
 | `cnn_accel_pool` | Max/avg spatial reduction over `cnn_accel_window_gen` output; max path emits int8 directly, avg path emits an int32 sum for `cnn_accel_bias_requant` to scale/round | new | this IP |
-| `cnn_accel_bias_requant` | int32 accumulator -> add bias -> multiply by `requant_scale` -> arithmetic shift by `requant_shift` -> saturate to int8 -> optional ReLU clamp; also used (bias=0) to round/scale `POOL_AVG` sums | new, generic wrapper composing reused primitives | `math.saturate_signed`, `math.truncate_round_signed` (`hdl-modules/modules/math`) |
+| `cnn_accel_bias_requant` | int32 accumulator -> add bias -> multiply by `requant_scale` -> arithmetic shift by `requant_shift` -> saturate to int8 -> optional ReLU clamp; also used (bias=0) to round/scale `POOL_AVG` sums. **7-stage pipeline** (S7), one output beat per accepted input beat | new, generic wrapper composing reused primitives | `math.saturate_signed` (`hdl-modules/modules/math`); `math.truncate_round_signed` is *not* instantiated — the shift amount is a runtime value, so round-to-even is done inline with guard/sticky (see `modules/cnn_accel/doc/cnn_accel_bias_requant.md`) |
 
 Reused directly at `cnn_accel_top` (no new wrapper, no new requirement
 file — cited here per `shared/ReusableRTL.md`'s reuse-table convention):
@@ -297,13 +337,97 @@ flowchart TB
 | `cnn_accel_layer_ctrl <-> cnn_accel_ofmap_dma` | `dma_req_m2s_t`/`s2m_t` + AXI4-Stream | always used |
 | `cnn_accel_axi_read_dma x3 -> axi.axi_simple_read_crossbar -> m_axi` | AXI4 (read channels only) | 3:1 arbitration, hdl-modules primitive |
 | `cnn_accel_ofmap_dma -> m_axi` | AXI4 (write channels only) | direct, no arbitration (single writer) |
-| `cnn_accel_axi_read_dma (weight) -> cnn_accel_weight_buffer` | AXI4-Stream | fills the inactive ping-pong bank |
+| `cnn_accel_axi_read_dma (weight) -> cnn_accel_weight_buffer` | AXI4-Stream | fills the single weight region; a `fill_start` pulse rewinds the fill address at the start of each output-channel pass |
 | `cnn_accel_axi_read_dma (ifmap) -> cnn_accel_window_gen` | AXI4-Stream | raster-order int8 pixels, 1 (or `g_line_buffer_channels`) channel(s)/beat |
 | `cnn_accel_window_gen -> cnn_accel_pe_array` / `cnn_accel_pool` | AXI4-Stream, `handshake_mux`-selected by opcode | one `K_h x K_w` window per beat |
 | `cnn_accel_weight_buffer -> cnn_accel_pe_array` | simple read port (not AXI4-Stream: random-access within the active bank) | weights + bias |
 | `cnn_accel_pe_array -> cnn_accel_bias_requant` | AXI4-Stream, `data` = int32 accumulator | |
 | `cnn_accel_pool -> cnn_accel_bias_requant` (avg) / `-> cnn_accel_ofmap_dma` (max, via `handshake_mux`) | AXI4-Stream | mode-dependent width (int32 sum vs int8 max) |
 | `cnn_accel_bias_requant -> cnn_accel_ofmap_dma` (via `handshake_mux` converging with pool-max) | AXI4-Stream, `data` = int8 | |
+
+## Off-chip activation layout (decision S6)
+
+Activations in DDR are stored as **channel-tiled planes**:
+
+```
+ofmap[c_tile][y][x][t]      c_tile = 0 .. ceil(C/T) - 1,  t = 0 .. T-1
+byte offset = ((c_tile * H + y) * W + x) * T + t
+```
+
+with **`T` fixed at 8**, *independent of `g_pe_rows`*. A "plane" is one
+`c_tile`: a complete `H x W x 8` HWC-ordered block covering channels
+`8*c_tile .. 8*c_tile + 7`.
+
+Why this layout, and what it costs:
+
+- **Every write-back is contiguous.** This is the point. Under a flat HWC
+  layout (`[H][W][C]`) a per-output-channel-tile pass produces only
+  `g_pe_rows` of `C` channels at a time, which is a *strided* byte pattern;
+  `dma_req_t` carries `addr` + `length` only, and neither it nor
+  `cnn_accel_ofmap_dma`'s requirement can express a stride. This layout
+  removes the need to: one pass over `T = 8` channels writes exactly one
+  plane, start to finish, as a single contiguous range.
+  **This resolves the strided-write-back blocker raised in the M8 entry of
+  `modules/cnn_accel/flow_status.md`** — with no change to `dma_req_t` and
+  with `cnn_accel_ofmap_dma` staying a thin `dma_axi_write_simple` wrapper.
+- **`T` is decoupled from `g_pe_rows` on purpose.** Decision S1 makes
+  `g_pe_rows` the only scaling knob (8 or 16, decision S4), and the memory
+  layout must not change when it moves — otherwise every ofmap in DDR, and
+  the host-side packing, would depend on which bitstream is loaded. A
+  16-row pass therefore produces **two** planes and issues them as **two
+  ordinary `dma_req`s**, not one double-length request.
+- **Cost 1 (read side):** because the ifmap is stored the same way, and
+  because the ifmap is always re-streamed per output-channel pass (decision
+  D6, no on-chip ifmap buffer), `cnn_accel_layer_ctrl` must issue
+  `ceil(C_in / 8)` read requests per ifmap row instead of one — the row's
+  channels are spread across `ceil(C_in/8)` planes. This is bookkeeping in
+  the layer FSM, not a new module.
+- **Cost 2 (host side):** the network's final output is channel-tiled and
+  the host repacks it once, at the end of a program. A one-off repack of
+  the last tensor is cheap compared with either a strided DMA engine or a
+  layout that changes with `g_pe_rows`.
+
+`cnn_accel_window_gen`'s existing contract is unaffected: it still receives
+raster-order beats of `g_tile_channels` channels, which is exactly one
+plane's worth per beat when `g_tile_channels = T = 8`.
+
+### Bus-width bound (decision D1)
+
+Both DMA engines require `req.addr` and `req.length` to be multiples of
+`g_axi_data_width / 8`, and **a violation is not reported** — the
+under-length final chunk never completes, `dma_done` never fires, and the
+layer hangs silently.
+
+Because every activation request is a whole plane, `addr` and `length` are
+always multiples of `T = 8` bytes. An AXI bus of at most 8 bytes per beat
+is therefore aligned *unconditionally, for every layer geometry*. That is
+enforced as a hard bound:
+
+```
+ACTIVATION_PLANE_CHANNELS = 8            -- T, cnn_accel_constants.py
+MAX_AXI_DATA_WIDTH        = 8 * T = 64   -- bits
+```
+
+both propagated by `hdl-registers` into `cnn_accel_regs_pkg` and asserted
+concurrently at `severity failure` in `cnn_accel_ofmap_dma` and
+`cnn_accel_axi_read_dma` (the latter because the ifmap instance reads
+planes too; the instruction and weight/bias instances would be safe at any
+width, but all three share one top-level generic).
+
+`ACTIVATION_PLANE_CHANNELS` is numerically equal to `g_tile_channels` and
+deliberately a **separate constant**: `tile_channels` is a datapath
+property (channels consumed per beat), `T` is a memory-layout property
+(how host and DMA agree to pack DDR). Code meaning "the DDR layout" must
+not read the datapath constant, so that a future decoupling fails to
+compile rather than silently corrupting addresses.
+
+The alternatives — a runtime alignment check in `cnn_accel_layer_ctrl`
+raising `layer_error`, or a documented host contract with no hardware
+check — were rejected: the general alignment predicate depends on runtime
+descriptor fields (`out_width * out_height`) and so is not statically
+checkable at all, whereas the bus-width bound is. **Accepted cost: 128-bit
+AXI is forbidden**, capping burst bandwidth. Lifting the bound later means
+adopting the runtime check, not merely widening the generic.
 
 ## Generic propagation map
 
@@ -315,7 +439,8 @@ flowchart TB
   `cnn_accel_window_gen` (both conv-path and pool-path instances).
 - `g_pe_rows`, `g_pe_cols`, `g_accum_width` -> `cnn_accel_pe_array`,
   `cnn_accel_bias_requant` (accumulator width).
-- `g_weight_buffer_depth` -> `cnn_accel_weight_buffer`.
+- `g_weight_buffer_depth`, `g_bias_buffer_depth` -> `cnn_accel_weight_buffer`
+  (forwarded unmodified through `cnn_accel_conv_core`).
 - `g_instr_word_bytes` -> `cnn_accel_sequencer` (must equal the fixed ISA
   descriptor size), the instruction `cnn_accel_axi_read_dma` instance
   (default burst-length hint).
@@ -325,10 +450,10 @@ flowchart TB
 Single domain: `clk` / `reset_internal` (see reset policy above) for every
 module in `modules/cnn_accel/`, including all `cnn_accel_axi_read_dma` and
 `cnn_accel_ofmap_dma` instances and the reused `hdl-modules` primitives
-(`axi_simple_read_crossbar`, `axi_stream_fifo`, `handshake_mux`,
+(`axi_simple_read_crossbar`, `axi_stream_fifo`, `fifo`, `handshake_mux`,
 `handshake_splitter`, `axi_lite_register_file`, `dma_axi_write_simple`,
-`saturate_signed`, `truncate_round_signed`) — none of those reused
-primitives cross a clock domain in this integration.
+`saturate_signed`) — none of those reused primitives cross a clock domain
+in this integration.
 
 ## Non-obvious boundary rationale
 

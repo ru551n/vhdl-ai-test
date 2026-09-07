@@ -119,6 +119,45 @@ architecture a of cnn_accel_ofmap_dma is
 begin
 
   ------------------------------------------------------------------------------
+  -- Elaboration-time bus-width bound (decision S6 + decision D1, 2026-09-07).
+  --
+  -- The wrapped 'dma_axi_write_simple' core drives a full-width 'WSTRB' and
+  -- has no partial-packet flush at any 'packet_length_beats', so it requires
+  -- 'req.addr' and 'req.length' to be exact multiples of
+  -- 'g_axi_data_width/8'. A violation does NOT report an error: the
+  -- under-length final chunk is simply never issued, 'dma_done' never fires,
+  -- and the layer hangs silently. That is the worst possible failure mode for
+  -- a contract nothing else checks.
+  --
+  -- Decision S6 closes it statically rather than with a runtime check. Every
+  -- activation DMA request is one whole channel-tiled plane
+  -- ('[C/T][H][W][T]', T = 'cnn_accel_constant_activation_plane_channels'),
+  -- so both 'addr' and 'length' are always multiples of T bytes. A bus of at
+  -- most T bytes per beat is therefore aligned unconditionally, for every
+  -- layer geometry, with no runtime comparison and no host-side contract to
+  -- get wrong. Above that width alignment would depend on runtime descriptor
+  -- fields ('out_width * out_height' even, base address aligned), which
+  -- cannot be checked at elaboration at all -- hence a hard bound here
+  -- instead of a weaker guarantee later.
+  --
+  -- 'severity failure' (not 'warning', unlike the recommendation-style assert
+  -- in cnn_accel_conv_core): exceeding this bound is not a suboptimal
+  -- configuration, it is a hang.
+  ------------------------------------------------------------------------------
+
+  assert g_axi_data_width <= cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_max_axi_data_width
+    report "cnn_accel_ofmap_dma: g_axi_data_width (" & positive'image(g_axi_data_width) &
+      ") exceeds the S6 activation-plane bound (" &
+      integer'image(cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_max_axi_data_width) &
+      " bits = " &
+      integer'image(cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_activation_plane_channels) &
+      " bytes/beat). Activation planes are T-byte granular, so a wider bus " &
+      "makes addr/length alignment depend on runtime layer geometry, and an " &
+      "unaligned request hangs (dma_done never fires) instead of erroring. " &
+      "See doc/cnn_accel_arch.md 'Off-chip activation layout (decision S6)'."
+    severity failure;
+
+  ------------------------------------------------------------------------------
   -- Data-plane passthrough: stream in, AXI write channels out. No logic is
   -- added on either path beyond the field fan-out/fan-in itself -- see
   -- proposal doc section 5.

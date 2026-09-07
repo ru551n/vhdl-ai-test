@@ -214,6 +214,44 @@ architecture a of cnn_accel_axi_read_dma is
 begin
 
   ------------------------------------------------------------------------
+  -- Elaboration-time bus-width bound (decision S6 + decision D1, 2026-09-07).
+  --
+  -- This entity's word-aligned assumption ('req.addr'/'.length' both
+  -- multiples of 'g_axi_data_width/8') fails silently, not loudly: an
+  -- under-length final chunk simply never completes and 'dma_done' never
+  -- fires, hanging the layer.
+  --
+  -- Of this entity's three instances in the IP, the instruction fetch
+  -- (64-byte descriptors) and the weight/bias fetch
+  -- ('K^2 * n_in_tiles * 64' and 'g_pe_rows * 4' bytes) satisfy the
+  -- assumption at any AXI-legal width. The IFMAP instance does not: under
+  -- decision S6 it reads whole channel-tiled planes
+  -- ('in_width * in_height * T' bytes at 'ifmap_addr + ct * plane_len'), so
+  -- its requests are T-byte granular and nothing more. The bound below is
+  -- therefore what makes the ifmap path aligned unconditionally, for every
+  -- layer geometry, with no runtime check.
+  --
+  -- It is asserted for all three instances rather than only the ifmap one:
+  -- all three take 'g_axi_data_width' from a single top-level generic, so a
+  -- per-instance distinction could not be configured independently anyway,
+  -- and over-constraining here fails loudly at elaboration -- the safe
+  -- direction for a contract whose violation is otherwise a silent hang.
+  ------------------------------------------------------------------------
+
+  assert g_axi_data_width <= cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_max_axi_data_width
+    report "cnn_accel_axi_read_dma: g_axi_data_width (" & positive'image(g_axi_data_width) &
+      ") exceeds the S6 activation-plane bound (" &
+      integer'image(cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_max_axi_data_width) &
+      " bits = " &
+      integer'image(cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_activation_plane_channels) &
+      " bytes/beat). The ifmap instance reads whole S6 activation planes, " &
+      "which are only T-byte granular, so a wider bus makes addr/length " &
+      "alignment depend on runtime layer geometry, and an unaligned request " &
+      "hangs (dma_done never fires) instead of erroring. See " &
+      "doc/cnn_accel_arch.md 'Off-chip activation layout (decision S6)'."
+    severity failure;
+
+  ------------------------------------------------------------------------
   -- AR-issue sub-logic (proposal doc section 6.2): burst split against the
   -- 4 KiB boundary and the 256-beat ARLEN limit, computed combinationally
   -- from the currently latched 'addr_q'/'bytes_remaining_q'.

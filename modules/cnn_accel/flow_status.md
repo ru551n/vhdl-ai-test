@@ -408,7 +408,7 @@ Basis: `doc/cnn_accel_sizing_proposal.md` (8x8 = 34.9 fps at 150 MHz on
 | S4 | **Legal values {8, 16}**, asserted in VHDL and Python: must divide every layer's `out_channels` (layer 1 has 16). |
 | S5 | **Frame budget is a failing test.** `CLOCK_HZ`, `TARGET_FPS`, `INPUT_W/H` in `cnn_accel_constants.py`; the section-6 cycle model becomes Python and pytest asserts the budget with the exact shortfall. |
 | S6 | **Ofmap layout = channel-tiled planes `[C/8][H][W][8]`, T fixed at 8, independent of `g_pe_rows`.** Every write is contiguous; a 16-row pass writes two planes as two ordinary `dma_req`s. `dma_req_t` unchanged, `ofmap_dma` stays thin. **Resolves the strided-write-back blocker** from the M8 entry. Costs: `layer_ctrl` issues `ceil(C/8)` read requests per ifmap row; host repacks the final output once. Must be written into `cnn_accel_arch.md` and the `layer_ctrl` proposal's section-7 request formulas. |
-| S7 | **150 MHz timing constrained after the 16-row build exists**, not before. Until then no fps figure is timing-backed. Option 1 (synthesis-only estimate) done 2026-09-07 — see "S7 progress" below: `pe_array`/`conv_core` do **not** meet 150 MHz, timing fix in progress. Option 2 (real place-and-route closure) stays deferred until `cnn_accel_top` exists (M10-M13). |
+| S7 | **150 MHz timing constrained after the 16-row build exists**, not before. Until then no fps figure is timing-backed. Option 1 (synthesis-only estimate) **done and closed 2026-09-07** — see "S7 progress" and "S7 result" below: after four RTL reworks `conv_core` estimates **159.95 MHz at both 8 and 16 rows**, target met. Option 2 (real place-and-route closure) stays deferred until `cnn_accel_top` exists (M10-M13). |
 
 ### S1/S2/S4 progress, 2026-09-07
 
@@ -473,6 +473,7 @@ Basis: `doc/cnn_accel_sizing_proposal.md` (8x8 = 34.9 fps at 150 MHz on
 Also committed this date: M9a `cnn_accel_axi_read_dma` (`efc96e6`), M9b
 `cnn_accel_ofmap_dma` (`4c5953e`), dual Vivado/Yosys backend (`d513958`),
 hdl-registers single-source-of-truth constants (`967562b`). Phase table
+row "AXI-facing engines" is now two-thirds complete; `cnn_accel_csr` remains.
 
 ### S7 progress, 2026-09-07 — option 1 done, timing fix delegated
 
@@ -521,4 +522,291 @@ mechanical measurement. Per the project's standing rule (now in the
 a strong model"), this is handed to a strong-tier subagent rather than done
 inline by the orchestrating agent. Track its outcome in a follow-up entry
 here once done.
-row "AXI-facing engines" is now two-thirds complete; `cnn_accel_csr` remains.
+
+### S7 result, 2026-09-07 — 150 MHz met, and the gotcha that cost three passes
+
+**Outcome: `conv_core` 46.77 -> 159.95 MHz at both 8 and 16 rows.** All 16
+netlist builds (6 Vivado + 8 Yosys + 2 scaled) pass, 91/91 VUnit and 195/195
+pytest green.
+
+#### The gotcha: an out-of-context leaf Fmax is blind to input-port cones
+
+`bias_requant` reported **520.02 MHz standalone** (table above) while being
+the **46.77 MHz critical path of `conv_core`**. Synthesis-only timing on an
+out-of-context netlist reports register-to-register paths only; it never
+times a combinational cone that *starts at an input port*. `bias_requant`'s
+entire ~21 ns cone (bias-add, multiply, rounded shift, saturate) hung off
+`s_accum_m2s.data` / `bias_rd_data`, so the standalone build timed a 1-LUT
+`out_valid_q -> out_data_q/CE` path and reported 520 MHz. Inside `conv_core`,
+with that cone fed by `weight_buffer`'s registers, it was the bottleneck.
+
+**Rule: a leaf entity's out-of-context Fmax is an upper bound and nothing
+more. Only a composition entity gives a trustworthy number. Never optimise a
+leaf against its standalone figure.** Added to the `vivado-gotchas` skill.
+
+#### Four reworks, each one exposing the next hidden path
+
+Progression: 46.77 -> 46.77 -> 47.66 -> **159.72** -> 159.95 MHz. Each fix
+moved one critical path; only once it was fixed did the next comparable one
+surface.
+
+1. **`cnn_accel_pe_array` — self-timed 5-stage MAC pipeline**
+   (56.52 -> 232.67 MHz standalone). Stage 0 latches activation taps, stage 1
+   multiplies, stages 2-3 are a balanced adder tree (one level per register
+   stage), stage 4 the final accumulate. Cost 1118 -> 3212 FF at both row
+   counts. **No `conv_core` gain (still 46.77 MHz)** — it only exposed #2.
+2. **`cnn_accel_bias_requant` — 7-stage pipeline** (21.3 ns cone off the
+   critical path, 206.40 MHz standalone). Per-beat `cfg_*` values are
+   registered and travel *with* each beat rather than being read live.
+   `round_shift_right`'s re-multiply/subtract/compare rounding was replaced
+   with guard/sticky round-half-to-even
+   (`round_up = guard and (sticky or quotient(0))`), removing a second
+   variable shift, a 65-bit subtract and two 66-bit comparators — most of the
+   25 CARRY4 and ~1700 LUT. FF 66 -> 2817, DSP 32 unchanged.
+   `conv_core` moved only to **47.66 MHz**; exposed #3.
+3. **`cnn_accel_window_gen` — address pipeline** (20.4 ns / 21 CARRY4 off the
+   critical path, 244.28 MHz standalone). Per-cycle address arithmetic (two
+   runtime multiplies + modulo + range compares driving BRAM pins directly)
+   became per-pixel geometry (`row_top`, `col_left`, `has_real_row`, ...)
+   computed once when `out_row_q`/`out_col_q` change, plus registered
+   accumulators: `input_col` increments by 1 per cycle, so `input_col *
+   n_tiles` increments by exactly `n_tiles_q` — an accumulator, not a
+   multiply. Crucially the geometry registers are updated **in the same
+   clocked branch that advances `out_row_q`/`out_col_q`/`rd_tile_q`**, so
+   they are always coherent with those counters and never one cycle stale:
+   this is not a pipeline stage and the read path gains **no latency**. The
+   `kc_capture_q`/`kr_capture_q`/`capture_valid_q` delay pipeline stays one
+   deep, `walk_control`'s single `kc_q = kernel_w_q` drain cycle is
+   unchanged, and `row_ready_i`/`write_freeze_i` keep cycle-accurate
+   semantics so the M7 bank-aliasing interlock argument carries over
+   verbatim. LUT 2857 (-400), FF 808 (+200), **DSP 4 -> 0**. `conv_core`
+   reached **159.72 MHz**.
+4. **`bias_requant` stage 6/7 split** (6.215 ns). At 159.72 MHz this was the
+   critical path again: incrementer carry chain + saturate cone in one cycle.
+   Split into stage 6 (incrementer) and stage 7 (ReLU/saturate/pack). Top
+   level gained only +0.23 MHz (159.72 -> 159.95) because `conv_core` has a
+   *plateau* of ~6 ns paths and `window_gen`'s tap-index decode simply took
+   over — kept anyway, since 522 FFs is cheap insurance ahead of real P&R.
+
+#### Final measured numbers (Vivado 2026.1, xc7a200tfbg484-2)
+
+| Entity | Fmax | LUT | FF | BRAM | DSP |
+|---|---|---|---|---|---|
+| `bias_requant` | 206.40 MHz | 3163 | 2817 | 0 | 32 |
+| `weight_buffer` | 357.92 MHz | — | — | — | — |
+| `window_gen` | 244.28 MHz | 2857 | 808 | 3 RAMB36 | 0 |
+| `pe_array` (8-row) | 232.67 MHz | 6297 | 3212 | 0 | 0 |
+| `pe_array` (16-row) | 232.47 MHz | 13696 | 3212 | 0 | 0 |
+| **`conv_core` (8-row)** | **159.95 MHz** | 12951 | 7760 | 14 RAMB36 + 2 RAMB18 | 32 |
+| **`conv_core` (16-row)** | **159.95 MHz** | 29027 | 8925 | 17 RAMB36 + 2 RAMB18 | 68 |
+
+`analyze_synthesis_timing=True` added to `window_gen` (it was not in the
+original six). All 16 `build_result_checkers` in `module_cnn_accel.py`
+re-pinned against these measurements, with the rationale for each change
+in comments. DSP checkers stay strict (they encode structural invariants);
+FF checkers carry ~1.5x headroom on the Yosys side.
+
+Leaf-additive integrity check on the 8-row `conv_core` holds:
+32 DSP = 32 (`bias_requant`, 2/lane x 16) + 0 (`window_gen`, was 4);
+14 RAMB36 = 11 (`weight_buffer`) + 3 (`window_gen`). Note RAMB36 went
+10 -> 14 from the `bias_requant` change alone: with `bias_rd_data` landing on
+a clean stage-1 register instead of feeding a 21 ns cone, Vivado stopped
+partially dissolving `weight_buffer`'s bias memory into fabric. The old 10
+was the anomaly.
+
+**Latency note**: `window_gen` gained no latency at all (above). `pe_array`
+(`c_mac_latency = 2 + c_tree_levels`, 5 cycles at 8 columns) and
+`bias_requant` (7 cycles) did, but both cost only once per output pixel /
+once per pipeline fill, not once per MAC — so the S5 frame-budget model
+(`cnn_accel_model.py`) and its pytest assertions needed no change, and the
+`conv_core` testbench is scoreboard-based and stayed latency-agnostic.
+
+### S6 progress, 2026-09-07 — channel-tiled ofmap layout written into the docs
+
+S6 was ratified but existed only as a table row. It is now specified where
+`vhfill` will actually read it, and the M8 blocker it resolves is closed
+everywhere it was recorded.
+
+- **`doc/cnn_accel_arch.md`**: new section **"Off-chip activation layout
+  (decision S6)"** with the addressing formula
+  (`byte offset = ((c_tile*H + y)*W + x)*T + t`, `T = 8` fixed), why `T` is
+  decoupled from `g_pe_rows` (S1 makes `g_pe_rows` the only knob, so the DDR
+  layout and host packing must not depend on which bitstream is loaded), and
+  both costs (`ceil(C_in/8)` ifmap read requests per pass; one host-side
+  repack of the *final* tensor only — intermediate layers both write and
+  read this layout).
+- **`doc/cnn_accel_layer_ctrl_proposal.md`**:
+  - §3.4 rewritten from "flagged conflict, not resolved here" to
+    **RESOLVED via option (b)**, keeping the original three-option analysis
+    as a historical note so the reasoning is not lost.
+  - §7 now carries the real request formulas: ifmap becomes
+    `n_ifmap_planes = ceil(in_channels/8)` requests of
+    `in_width*in_height*8` bytes each (same total bytes as before, more
+    requests); ofmap becomes `c_planes_per_pass = g_pe_rows/8` requests of
+    `out_width*out_height*8` bytes at
+    `plane_idx = ot*c_planes_per_pass + p`. Both divisors are powers of two,
+    so `c_planes_per_pass` is an elaboration-time constant and `plane_idx`
+    is a shift-and-add, not a divide.
+  - §6's `STREAM_IFMAP` / `WRITE_OFMAP` rows updated to issue N successive
+    requests with a plane counter, transitioning on the *last* `dma_done`.
+  - §10's "single most consequential open item" flipped to RESOLVED, and
+    replaced with a verification obligation: cover `c_planes_per_pass` = 1
+    *and* 2, plus an `in_channels` that is not a multiple of 8 (partial
+    final plane, D11).
+  - §12's AXI4 note corrected: the resolution turned into "issue more
+    ordinary requests", not "a different kind of request", so no
+    `shared/Axi4.md` rule is affected.
+- **`doc/cnn_accel_ofmap_dma_proposal.md`** open item 1 (byte-length
+  alignment, which was explicitly deferred to "whatever resolution the M8
+  conflict receives") narrowed rather than just closed: S6 makes every
+  `addr`/`length` a multiple of `T = 8` bytes, so alignment is automatic at
+  `g_axi_data_width = 64` — but **not** at wider buses (at 128 bits,
+  `out_width*out_height` must be even and `ofmap_addr` 16-byte aligned).
+  Since `out_width`/`out_height` are runtime descriptor fields this cannot
+  be an elaboration-time assert; it must be a documented host contract or a
+  runtime `layer_error`. Still open, now precisely.
+
+Also fixed in the same pass (stale text found while editing, all verified
+against the RTL rather than assumed):
+
+- `doc/cnn_accel_arch.md` still described `cnn_accel_weight_buffer` as
+  **double-buffered (ping-pong)** in the submodule table, the generic table
+  (`g_weight_buffer_depth` = "4096 elements per bank, 2 banks") and the link
+  table ("fills the inactive ping-pong bank") — all three predate M7b's
+  single-buffer rework. Corrected, `g_bias_buffer_depth` added, depth
+  re-pinned to 288, and the generic-propagation map updated.
+- `doc/cnn_accel_arch.md`'s `bias_requant`/`pe_array` submodule rows now
+  state their S7 pipeline depths, and `math.truncate_round_signed` was
+  removed from both that row and the clock-domain map's reused-primitive
+  list — it is not instantiated (runtime shift amount; see that module's
+  doc).
+- `modules/cnn_accel/doc/cnn_accel_bias_requant.md` claimed **"one cycle
+  latency ... flow-through single-stage output register"**. Replaced with
+  the real 7-stage table, the shared-`pipe_en` backpressure rule, the
+  capture-`cfg_*`-with-the-beat requirement, and a warning that this
+  module's out-of-context Fmax is not usable. Its implementation notes now
+  describe guard/sticky rounding instead of the removed
+  re-multiply/subtract/compare `round_shift_right`.
+- `src/cnn_accel_bias_requant.vhd`'s header comment still said **"6-stage
+  pipeline ... 6 cycles of latency"** after the stage 6/7 split
+  (`c_stages = 7`). Fixed.
+
+**Correction to the S7 entry above**: an earlier draft of it claimed
+`window_gen`'s capture-delay pipeline was deepened from 1 to 3 stages and
+the walk FSM's drain cycle extended. That is wrong — the shipped
+implementation updates the geometry registers *in the same clocked branch*
+that advances `out_row_q`/`out_col_q`/`rd_tile_q`, so they are always
+coherent with those counters and the read path gains **no** latency. The
+delay pipeline is still one deep and the drain cycle is unchanged (see the
+`-- S7: per-output-position geometry` comment block in
+`src/cnn_accel_window_gen.vhd`). The S7 entry has been corrected in place.
+
+---
+
+## Decisions D1, D2, D3 — the three items S6/S7 left open (2026-09-07)
+
+The S6/S7 documentation pass above ended with three open items. All three
+are now decided and implemented; nothing from that pass is left open.
+
+### D1 — DMA byte-length/address alignment: bounded by elaboration assert
+
+**Decision: bound the bus width in hardware (option A, "elaboration
+assert").** Both DMA engines (`dma_axi_write_simple` inside
+`cnn_accel_ofmap_dma`, and `cnn_accel_axi_read_dma`) require `addr` and
+`length` to be multiples of `g_axi_data_width/8`, and **neither detects a
+violation**: the last partial beat is never issued, `dma_done` never
+fires, and the layer hangs silently. That made the alignment question a
+hang-class blocker rather than a documentation nit.
+
+S6's channel-tiled layout makes every activation plane's `addr` and
+`length` a multiple of `T = 8` bytes, so **any bus of 8 bytes/beat or
+narrower is aligned unconditionally, for every runtime descriptor**. The
+alignment problem therefore only exists above 64 bits, and the fix is to
+forbid that statically rather than to add a runtime `layer_error` path for
+a configuration the project does not use.
+
+Implemented as:
+
+- `cnn_accel_constants.py`: `ACTIVATION_PLANE_CHANNELS = 8` (S6's `T`, a
+  *memory-layout* constant, deliberately a separate name from the
+  datapath's `TILE_CHANNELS` even though both are 8 today) and
+  `MAX_AXI_DATA_WIDTH = 64`. Both carry load-bearing docstrings saying
+  why, because both look like arbitrary numbers otherwise.
+- `module_cnn_accel.py`: two `regs.add_constant()` calls propagate them
+  into `cnn_accel_regs_pkg` (verified present in the regenerated
+  `regs_src/cnn_accel_regs_pkg.vhd`).
+- `src/cnn_accel_ofmap_dma.vhd` and `src/cnn_accel_axi_read_dma.vhd`:
+  elaboration `assert g_axi_data_width <= MAX_AXI_DATA_WIDTH severity
+  failure`. The read DMA gets it too — not just the ifmap instance — since
+  all three instances share one `g_axi_data_width` and the failure mode is
+  a hang, not a wrong result.
+- Docs: `cnn_accel_ofmap_dma.md` and `cnn_accel_axi_read_dma.md`'s
+  alignment sections rewritten from "open question" to "guaranteed
+  statically"; `cnn_accel_ofmap_dma_proposal.md` open item 1 flipped from
+  "narrowed" to **RESOLVED**; `doc/cnn_accel_arch.md` gained a "Bus-width
+  bound (decision D1)" section.
+
+Consequence to remember: **going past a 64-bit AXI data bus is now a
+design change, not a generic change.** It requires either widening `T` or
+adding a real runtime alignment check with a `layer_error` cause.
+
+### D2 — DWCONV2D: rejected by the compiler, not by the hardware
+
+**Decision: defer (option A).** `DWCONV2D` has an allocated opcode but no
+ratified weight layout, and `pack_weights_for_hw()` already refuses it.
+The compiler is the right place to reject an unsupported op — it has
+source-level diagnostic context and can name the offending layer — so the
+hardware adds **no opcode-legality check, no new error cause, and no
+defensive decode**. No `layer_desc` carrying that opcode can reach
+`cnn_accel_layer_ctrl`, so a check there would be dead logic guarding an
+unreachable state.
+
+Implemented as: a new "Opcode support status, and who rejects the
+unsupported ones (decision D2)" section in `doc/cnn_accel_arch.md` (support
+table + rationale + the open sub-question of simple layout vs. spatial-tap
+packing on `g_pe_cols`), plus `cnn_accel_layer_ctrl_proposal.md` §3.3
+rewritten from "unratified, flagged" to "out of scope per D2" and §10's
+per-tile DWCONV2D weight-length item marked out of scope with the
+superseded text struck through.
+
+### D3 — the two stale hand-owned requirement sections: applied
+
+**Decision: authorize the agent to apply them (option B).** `AGENTS.md`
+requires hand-owned requirement sections to be preserved, so both
+`_req.md` Functional Descriptions had gone stale after M7b's
+single-buffer rework and D6's output-channel tiling, and the corrected
+text had been parked in the proposals waiting for a human paste. Both
+ready-to-paste blocks are now applied verbatim:
+
+- `cnn_accel_weight_buffer_req.md`: ping-pong text (`fill_bank_sel`,
+  `read_bank_sel`) replaced with the single-buffer description —
+  `fill_start` session semantics, independent weight/bias region pointers,
+  the `g_fill_fifo_depth` prefetch FIFO that took over the ping-pong
+  bank's latency-hiding job, and why a read can never see a
+  partially-written row.
+- `cnn_accel_layer_ctrl_req.md`: Functional Description replaced with the
+  per-output-channel-tile FSM (`WRITE_OFMAP` loops back to `LOAD_WEIGHTS`
+  `OT = ceil(out_channels/g_pe_rows)` times), and the dead
+  `weight_buffer_bank_sel` port row replaced by `wbuf_fill_start` /
+  `wbuf_fill_is_bias`. One addition beyond the parked text: a closing note
+  recording that the `DWCONV2D` mentions are D2-out-of-scope, so the
+  requirement is not read as a claim that the op works.
+
+Both proposals now carry a "Status: applied (decision D3)" marker so the
+parked blocks are not pasted a second time.
+
+### Verification
+
+Full regression after all three, on this worktree:
+
+- registers regenerated by `run.py`; `cnn_accel_constant_activation_plane_channels`
+  and `cnn_accel_constant_max_axi_data_width` confirmed in the generated package
+- `vunit_compile`: passed
+- `vunit_run_tests`: **91/91 passed** (48.8 s) — the D1 asserts hold at the
+  testbenches' `g_axi_data_width`, i.e. the bound is not accidentally
+  tighter than the design
+- `pytest modules/ test_canny_model.py`: **211 passed**
+
+(Whole-repo `pytest` from the root does not work: the untracked `vunit/`
+and `tsfpga/` source clones sitting in the worktree get collected and error
+out. Scope pytest to `modules/` plus the root-level model tests.)

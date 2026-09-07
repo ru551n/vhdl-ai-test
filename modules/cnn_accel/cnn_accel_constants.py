@@ -60,6 +60,39 @@ TILE_CHANNELS = 8  # = PE_COLS, see doc/cnn_accel_tiled_dataflow_proposal.md sec
 assert PE_ROWS in PE_ROWS_LEGAL, f"PE_ROWS={PE_ROWS} not in {PE_ROWS_LEGAL}"
 assert PE_ROWS_SCALED in PE_ROWS_LEGAL, f"PE_ROWS_SCALED={PE_ROWS_SCALED} not in {PE_ROWS_LEGAL}"
 assert PE_ROWS_SCALED != PE_ROWS, "PE_ROWS_SCALED must be a second, distinct legal point"
+# ACTIVATION_PLANE_CHANNELS is `T` from decision S6: activations live in DDR
+# as channel-tiled planes `[C/T][H][W][T]`, so one pixel occupies exactly T
+# contiguous int8 bytes and every plane's byte address and byte length is a
+# multiple of T. Numerically equal to TILE_CHANNELS, and deliberately a
+# SEPARATE name: TILE_CHANNELS is a datapath property (how many input
+# channels the PE array consumes per beat), T is a memory-layout property
+# (how the host and the DMA engines agree to pack DDR). They happen to
+# coincide at 8 and are both fixed forever, but code that means "the DDR
+# layout" must not read the datapath constant, or a future decoupling would
+# silently corrupt addresses rather than fail to compile.
+#
+# The alignment consequence is load-bearing, not cosmetic. Both
+# cnn_accel_ofmap_dma (via hdl-modules' dma_axi_write_simple) and
+# cnn_accel_axi_read_dma require req.addr and req.length to be multiples of
+# g_axi_data_width/8; a violation does not error, it simply never completes
+# (dma_done never fires) and silently hangs the layer. Because every
+# activation request is a whole plane, addr/length are always multiples of
+# ACTIVATION_PLANE_CHANNELS bytes -- so any AXI bus of at most that many
+# bytes per beat is aligned unconditionally, with no runtime check and no
+# host-side contract. That is the bound MAX_AXI_DATA_WIDTH encodes, and both
+# DMA entities assert it at elaboration.
+ACTIVATION_PLANE_CHANNELS = 8
+MAX_AXI_DATA_WIDTH = 8 * ACTIVATION_PLANE_CHANNELS
+
+assert ACTIVATION_PLANE_CHANNELS == TILE_CHANNELS, (
+    "T and TILE_CHANNELS are conceptually distinct but must coincide while "
+    "cnn_accel_window_gen consumes exactly one plane per beat"
+)
+assert ACTIVATION_PLANE_CHANNELS & (ACTIVATION_PLANE_CHANNELS - 1) == 0, (
+    "T must be a power of two: plane indexing is a shift-and-add, and the "
+    "MAX_AXI_DATA_WIDTH alignment argument assumes an AXI-legal width"
+)
+
 MAX_KERNEL_SIZE = 3
 MAX_ROW_TILE_WORDS = 512
 WEIGHT_BUFFER_DEPTH = 288

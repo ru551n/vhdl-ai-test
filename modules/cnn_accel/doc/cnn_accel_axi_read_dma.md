@@ -89,9 +89,27 @@ back-to-back aborts. Exercised by `test_reset_mid_transfer`.
 - **Word-aligned assumption**: `req_m2s.req.addr`/`.length` must both be
   multiples of `g_axi_data_width / 8`. Honored by every caller
   (`cnn_accel_sequencer`, `cnn_accel_layer_ctrl`); no narrow/unaligned
-  first/last-beat handling is implemented. `length = 0` is accepted as a
-  degenerate case: no `AR` is issued at all, and `dma_done` pulses the
-  cycle after accept (`resp_error` stays `'0'`).
+  first/last-beat handling is implemented, and a violation is **not
+  detected** — the under-length final chunk never completes and `dma_done`
+  never fires, hanging the layer.
+
+  **Guaranteed statically since decision D1 (2026-09-07).** A concurrent
+  elaboration assert bounds `g_axi_data_width` at
+  `cnn_accel_constant_max_axi_data_width` (64 bits = 8 bytes/beat).
+  Of the three instances, instruction fetch (64-byte descriptors) and
+  weight/bias fetch (`K^2 * n_in_tiles * 64` and `g_pe_rows * 4` bytes)
+  satisfy the assumption at any AXI-legal width; the **ifmap** instance
+  does not, because under decision S6 it reads whole channel-tiled planes
+  (`in_width * in_height * T` bytes at `ifmap_addr + ct * plane_len`) and
+  is therefore only `T = 8`-byte granular. The bound is what makes that
+  path aligned unconditionally. It is asserted for all three instances
+  rather than only the ifmap one: all three take `g_axi_data_width` from a
+  single top-level generic, so a per-instance distinction could not be
+  configured independently anyway, and over-constraining fails loudly at
+  elaboration — the safe direction when the alternative is a silent hang.
+
+  `length = 0` is accepted as a degenerate case: no `AR` is issued at all,
+  and `dma_done` pulses the cycle after accept (`resp_error` stays `'0'`).
 
 ## Functional behavior
 

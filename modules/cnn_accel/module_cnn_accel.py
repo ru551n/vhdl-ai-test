@@ -310,6 +310,30 @@ class Module(BaseModule):
             description="Input-channel tile group size (= pe_cols).",
         )
         regs.add_constant(
+            name="activation_plane_channels",
+            value=cnn_accel_constants.ACTIVATION_PLANE_CHANNELS,
+            description=(
+                "T from decision S6: activations are stored in DDR as channel-tiled "
+                "planes [C/T][H][W][T], so one pixel is T contiguous int8 bytes and "
+                "every plane's byte address/length is a multiple of T. Numerically "
+                "equal to tile_channels but a distinct concept (memory layout, not "
+                "datapath width)."
+            ),
+        )
+        regs.add_constant(
+            name="max_axi_data_width",
+            value=cnn_accel_constants.MAX_AXI_DATA_WIDTH,
+            description=(
+                "Largest legal g_axi_data_width, in bits. Every activation DMA "
+                "request is a whole S6 plane, hence a multiple of "
+                "activation_plane_channels bytes, so any bus at or below this width "
+                "satisfies the DMA engines' word-aligned addr/length requirement "
+                "unconditionally. Asserted at elaboration in cnn_accel_ofmap_dma and "
+                "cnn_accel_axi_read_dma, where a violation would not error but "
+                "silently hang (dma_done never fires)."
+            ),
+        )
+        regs.add_constant(
             name="max_kernel_size",
             value=cnn_accel_constants.MAX_KERNEL_SIZE,
             description="Largest K_h/K_w this accelerator's datapath supports.",

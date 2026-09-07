@@ -56,11 +56,39 @@ layer is never read as if complete.
 
 ## Functional Description
 
-Fill path: while `fill_bank_sel` selects bank X, incoming `s_stream`
-bytes auto-increment a write pointer into bank X's weight region (or
-bias region when `fill_is_bias='1'`); the pointer resets to 0 whenever
-`cnn_accel_layer_ctrl` starts a new fill for that bank. Read path: while
-`read_bank_sel` selects bank Y, `weight_rd_addr`/`bias_rd_addr` are
-registered synchronous read addresses into bank Y, one cycle of read
-latency, matching `cnn_accel_pe_array`'s expected weight-fetch latency
-(a `vhdesign`-time pipeline-alignment detail).
+Single-buffered: one weight region and one, independently-sized, bias
+region, each written by its own fill path and read through its own
+synchronous read port. There is no bank select of any kind and no second
+copy of either region.
+
+Fill path: a `fill_start` pulse begins a new fill session, resetting both
+regions' write row pointers, lane indices and row-assembly registers to 0
+together (a beat presented the same cycle as `fill_start` is not
+accepted). Incoming `s_stream` bytes then auto-increment a lane index into
+a row-assembly register for the region selected by `fill_is_bias` (`'0'`
+weight, `'1'` bias); once a row's lanes are all written, the assembled row
+is committed to that region's memory with a single wide write, the lane
+index wraps to 0, and the row pointer advances. Weight-region and
+bias-region row pointers, lane indices and row-assembly registers are
+fully independent of each other, so weight-then-bias, bias-then-weight, or
+interleaved fill order all work identically, and one region reaching its
+own depth (asserting backpressure on `s_stream_s2m.ready` for that region
+only) never affects the other region's fill.
+
+`cnn_accel_layer_ctrl` pulses `fill_start` once per output-channel-tile
+pass (not once per layer): weights and bias for the pass currently
+executing are streamed in fresh from DDR4 ahead of that pass, read
+through `weight_rd_addr`/`bias_rd_addr` while the pass runs, and then
+overwritten in place by the next pass's `fill_start`/fill stream. An
+optional shallow prefetch FIFO on the fill stream (`g_fill_fifo_depth`,
+default 32, `0` disables it) absorbs DDR4/DMA burst latency in place of
+the ping-pong bank this module previously used for that purpose.
+
+Read path: `weight_rd_addr`/`bias_rd_addr` are registered synchronous read
+addresses into their respective region (no bank selection), one cycle of
+read latency, matching `cnn_accel_pe_array`'s expected weight-fetch
+latency. Reads of already-committed rows are correct while a fill of
+later rows in the same region is still in progress — single-buffering
+means there is no second copy to read from, but the row-assembly register
+never touches memory until a row is complete, so a read can never observe
+a partially-written row.
