@@ -43,9 +43,23 @@ command = ["uv", "--directory", "/home/sebbe/git/tsfpga-mcp", "run", "tsfpga-mcp
 # 2026-09-06: this used to point at tsfpga-mcp's own venv, but that venv no
 # longer has tsfpga installed at all (`import tsfpga` -> ModuleNotFoundError,
 # so every tsfpga_project_build failed with "No module named
-# tsfpga.build_project_list"). This repo's own .venv does have the dev
-# tsfpga (tsfpga.build_project_list + tsfpga.yosys.project) plus vunit_hdl,
-# and is what a human running ./build_fpga.py here would use, so point at it.
+# tsfpga.build_project_list").
+#
+# It now points at this checkout's .venv, which as it happens carries the
+# *synthesis* pins -- vunit_hdl 4.7.1 plus the dev tsfpga
+# (tsfpga.build_project_list + tsfpga.yosys.project) -- i.e. exactly what
+# requirements-synth.txt specifies for build_fpga.py. Verified 2026-09-07.
+#
+# CAVEAT, do not "clean this up" without reading it: AGENTS.md documents a
+# different layout, where .venv holds the *simulation* pins (the VUnit
+# 5.0.0.dev fork, for run.py) and a separate .venv-synth holds the synthesis
+# pins. On this machine .venv-synth does not exist and the simulation pins
+# are installed user-wide instead, so .venv ended up being the synth env
+# despite its name. That mismatch is known and deliberately left alone.
+# The trap: if anyone ever rebuilds .venv from requirements.txt to match
+# AGENTS.md, this pointer silently starts feeding VUnit 5.0.0.dev to
+# build_fpga.py -- the one combination requirements-synth.txt says cannot
+# work. Repoint this at .venv-synth in the same commit that does so.
 environment = { GHDL_YOSYS_PLUGIN = "/home/sebbe/git/ghdl-yosys-plugin/ghdl.so", TSFPGA_MCP_PROJECT_DIR = "/home/sebbe/git/vhdl-ai-test", TSFPGA_MCP_BUILD_SCRIPT = "build_fpga.py", TSFPGA_MCP_PROJECT_PYTHON = "/home/sebbe/git/vhdl-ai-test/.venv/bin/python3", TSFPGA_MCP_VIVADO = "/opt/xilinx/2026.1/Vivado/bin/vivado" }
 timeout = 300000
 enabled = true
