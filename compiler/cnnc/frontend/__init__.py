@@ -26,6 +26,7 @@ from cnnc.frontend.mlir_generic import (
     parse_module,
     print_generic,
 )
+from cnnc.frontend.tosa_import import import_tosa, load_tosa_file
 
 __all__ = [
     "Attr",
@@ -49,6 +50,8 @@ __all__ = [
     "UndefinedValue",
     "UnsupportedConstruct",
     "UnsupportedLiteral",
+    "import_tosa",
+    "load_tosa_file",
     "parse_file",
     "parse_module",
     "print_generic",
