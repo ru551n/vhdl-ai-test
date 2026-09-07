@@ -4,6 +4,9 @@ use ieee.numeric_std.all;
 
 library vunit_lib;
 context vunit_lib.vunit_context;
+context vunit_lib.com_context;
+use vunit_lib.memory_pkg.all;
+use vunit_lib.axi_slave_pkg.all;
 
 library cnn_accel;
 use cnn_accel.cnn_accel_pkg.all;
@@ -14,20 +17,29 @@ use axi.axi_pkg.all;
 library axi_stream;
 use axi_stream.axi_stream_pkg.all;
 
+library bfm;
+
 -- VUnit-5 testbench for cnn_accel_ofmap_dma. See
 -- modules/cnn_accel/doc/cnn_accel_ofmap_dma_req.md and
 -- modules/cnn_accel/doc/cnn_accel_ofmap_dma_proposal.md section 8 for the
 -- verification plan.
 --
--- No VUnit AXI4/AXI4-Stream VC is used for the AXI write master boundary:
--- this testbench needs exact, directed control over 'BRESP' values and
--- timing (to exercise 'resp_error' latching and the reset/'s_drain' abort
--- path -- proposal doc section 4/8), which the standard 'bfm.axi_write_slave'
--- VC does not expose. A small hand-written AXI write slave process plays
--- that role instead, following the same "hand-written non-blocking helper"
--- precedent as tb_cnn_accel_weight_buffer's fill-side driver. The producer
--- stream side is likewise driven directly with a small procedure, honoring
--- 'ready' backpressure.
+-- The AXI write master boundary is served by bfm.axi_write_slave (hdl-modules
+-- wrapper around VUnit's axi_write_slave verification component + memory
+-- model). Written data is checked byte-exactly by pre-declaring the expected
+-- word at each target address ('set_expected_word') and asserting
+-- 'check_expected_was_written' at the end of every test. Directed AXI
+-- backpressure and held-back BRESPs are produced by switching the BFM's
+-- per-channel stall probabilities between 0.0 and 1.0 at runtime.
+--
+-- VUnit's slave always answers BRESP=OKAY (vunit/vhdl/verification_components/
+-- src/axi_write_slave.vhd), so the 'resp_error' test uses a passive
+-- wire-level override of the BRESP field between the BFM and the DUT for one
+-- chosen B beat -- the BFM still owns every handshake and data byte.
+--
+-- The producer stream side is driven directly with a small procedure honoring
+-- 'ready' backpressure, since several tests interleave cycle-exact checks
+-- between individual beats.
 entity tb_cnn_accel_ofmap_dma is
   generic (runner_cfg : string);
 end entity tb_cnn_accel_ofmap_dma;
@@ -62,51 +74,34 @@ architecture tb of tb_cnn_accel_ofmap_dma is
   signal m_axi_b_m2s : axi_m2s_b_t;
   signal m_axi_b_s2m : axi_s2m_b_t := axi_s2m_b_init;
 
-  ------------------------------------------------------------------------
-  -- Hand-written AXI write slave state -- see header comment above.
-  ------------------------------------------------------------------------
+  -- Bundled view of the DUT's AW+W+B ports for the BFM, and the BFM's own
+  -- (always-OKAY) S2M response before the BRESP override below.
+  signal axi_write_m2s : axi_write_m2s_t := axi_write_m2s_init;
+  signal axi_write_s2m_bfm : axi_write_s2m_t := axi_write_s2m_init;
 
-  -- Both AW and W are always presented (and therefore accepted) on the
-  -- same cycle here: the wrapped 'dma_axi_write_simple' core's single-
-  -- beat-packet implementation merges 'segment_valid'/'axi_valid' into one
-  -- combined handshake before splitting it back out to 'aw'/'w'
-  -- (hdl-modules 'common.handshake_merger'/'handshake_splitter'), so tying
-  -- both readies to the same control signal is sufficient and keeps this
-  -- slave simple.
-  signal slave_ready_ctrl : std_ulogic := '1';
+  -- One flat region covering every address any test below touches (highest
+  -- is 2048 + 2 beats). The first allocation in a fresh memory_t starts at
+  -- address 0, so DUT addresses map 1:1 onto memory addresses.
+  constant c_memory_bytes : positive := 8 * 1024;
+  constant memory : memory_t := new_memory;
+  -- No randomized stalling by default: several tests make cycle-exact
+  -- claims (dma_done not before the last BRESP, ready back the next cycle).
+  -- Backpressure is switched on per test via the set_*_stall_probability
+  -- procedures. Response FIFO depth > 1 lets more than one AW/W beat be
+  -- accepted while their BRESPs are deliberately held back.
+  constant axi_slave : axi_slave_t := new_axi_slave(
+    memory => memory,
+    address_fifo_depth => 4,
+    write_response_fifo_depth => 4
+  );
 
-  constant c_max_pending_b : positive := 64;
-  type resp_array_t is array (0 to c_max_pending_b - 1) of axi_resp_t;
-
-  signal aw_capture_addr : unsigned(c_axi_addr_width - 1 downto 0);
-  signal aw_capture_valid : std_ulogic := '0';
-  signal w_capture_data : std_ulogic_vector(c_axi_data_width - 1 downto 0);
-
-  -- Per-beat trace of the accepted AW address / W data, indexed by the
-  -- (pre-increment) 'captured_beat_count' at accept time, so tests can
-  -- assert byte-exact addresses/data rather than only handshake timing.
-  -- Driven by 'b_bfm' alongside 'captured_beat_count' -- single driver.
-  type addr_trace_t is array (0 to c_max_pending_b - 1) of unsigned(c_axi_addr_width - 1 downto 0);
-  type data_trace_t is array (0 to c_max_pending_b - 1) of std_ulogic_vector(c_axi_data_width - 1 downto 0);
-
-  signal captured_addr_trace : addr_trace_t;
-  signal captured_data_trace : data_trace_t;
-
-  -- Test-controlled: forces the resp value of the Nth accepted beat
-  -- (0-indexed, counting from the last 'reset_capture_counters' call) to
-  -- 'axi_resp_slverr' instead of 'axi_resp_okay'. -1 = never.
-  signal inject_error_on_beat : integer := -1;
-  -- Test-controlled: number of idle cycles between a beat's AW/W accept
-  -- and its BRESP becoming valid. 0 = same cycle.
-  signal b_response_delay_cycles : natural := 0;
-  -- Test-controlled: pulsed for one cycle by 'reset_capture_counters' to
-  -- reset 'captured_beat_count' back to zero. Kept as a separate signal
-  -- (rather than driving 'captured_beat_count' directly from the 'main'
-  -- process) so that 'captured_beat_count' has a single driver: the
-  -- 'b_bfm' process below.
-  signal capture_reset_req : std_ulogic := '0';
-
-  signal captured_beat_count : natural := 0;
+  -- Test-controlled: forces the resp value of the Nth B beat (0-indexed,
+  -- counted over the whole test) to 'axi_resp_slverr' instead of
+  -- 'axi_resp_okay'. BRESPs are returned in order, so B beat N is the
+  -- response to the Nth accepted AW/W beat. -1 = never.
+  signal inject_error_on_b_beat : integer := -1;
+  signal num_b_beats_served : natural := 0;
+  signal num_aw_beats_accepted : natural := 0;
 
   ------------------------------------------------------------------------
   -- Stream-side helper: push one beat onto 's_stream', honoring 'ready'.
@@ -155,100 +150,63 @@ begin
       m_axi_b_s2m => m_axi_b_s2m
     );
 
-  m_axi_aw_s2m.ready <= slave_ready_ctrl;
-  m_axi_w_s2m.ready <= slave_ready_ctrl;
+  ------------------------------------------------------------------------
+  -- AXI4 write slave BFM, backed by the VUnit memory model.
+  ------------------------------------------------------------------------
+  axi_write_m2s <= (aw => m_axi_aw_m2s, w => m_axi_w_m2s, b => m_axi_b_m2s);
+  m_axi_aw_s2m <= axi_write_s2m_bfm.aw;
+  m_axi_w_s2m <= axi_write_s2m_bfm.w;
 
-  aw_capture_addr <= m_axi_aw_m2s.addr(c_axi_addr_width - 1 downto 0);
-  w_capture_data <= m_axi_w_m2s.data(c_axi_data_width - 1 downto 0);
-  aw_capture_valid <=
-    '1' when slave_ready_ctrl = '1' and m_axi_aw_m2s.valid = '1' and m_axi_w_m2s.valid = '1' else
-    '0';
+  axi_write_slave_inst : entity bfm.axi_write_slave
+    generic map (
+      axi_slave => axi_slave,
+      data_width => c_axi_data_width,
+      id_width => 0,
+      address_width => c_axi_addr_width
+    )
+    port map (
+      clk => clk,
+      --
+      axi_write_m2s => axi_write_m2s,
+      axi_write_s2m => axi_write_s2m_bfm
+    );
 
   ------------------------------------------------------------------------
-  -- B-response state machine: one pending-response FIFO entry pushed per
-  -- accepted AW/W beat, popped (after 'b_response_delay_cycles' idle
-  -- cycles) one at a time, in order -- matches the single-outstanding-ID
-  -- ordering rule this module's own design relies on (proposal doc
-  -- section 4, point 6).
+  -- Passive BRESP override: forwards the BFM's B channel untouched except
+  -- for the resp field on the single beat whose index equals
+  -- 'inject_error_on_b_beat'. 'num_b_beats_served' only advances on a
+  -- completed handshake, so the presented resp is stable while valid is
+  -- high and not yet accepted.
   ------------------------------------------------------------------------
-
-  b_bfm : process(clk)
-    variable jobs : resp_array_t;
-    variable head : natural := 0;
-    variable tail : natural := 0;
-    variable count : natural := 0;
-    variable delay_remaining : natural := 0;
-    variable b_active : boolean := false;
-    variable current_resp : axi_resp_t := axi_resp_okay;
+  bresp_override : process(all)
   begin
-    if rising_edge(clk) then
-      if aw_capture_valid = '1' then
-        if count = 0 then
-          -- Queue was empty (drained, or this is the very first beat):
-          -- seed the delay for this newly-arriving beat too, not just
-          -- for beats popped after an earlier one -- otherwise a
-          -- 'b_response_delay_cycles' set up before the first beat of a
-          -- request is silently ignored for that first beat.
-          delay_remaining := b_response_delay_cycles;
-        end if;
-        if captured_beat_count = inject_error_on_beat then
-          jobs(tail) := axi_resp_slverr;
-        else
-          jobs(tail) := axi_resp_okay;
-        end if;
-        tail := (tail + 1) mod c_max_pending_b;
-        count := count + 1;
-        captured_addr_trace(captured_beat_count) <= aw_capture_addr;
-        captured_data_trace(captured_beat_count) <= w_capture_data;
-        captured_beat_count <= captured_beat_count + 1;
-      end if;
+    m_axi_b_s2m <= axi_write_s2m_bfm.b;
+    if num_b_beats_served = inject_error_on_b_beat then
+      m_axi_b_s2m.resp <= axi_resp_slverr;
+    end if;
+  end process;
 
-      if capture_reset_req = '1' then
-        captured_beat_count <= 0;
-      end if;
-
-      if not b_active then
-        m_axi_b_s2m.valid <= '0';
-
-        if count > 0 then
-          if delay_remaining = 0 then
-            b_active := true;
-            current_resp := jobs(head);
-            m_axi_b_s2m.valid <= '1';
-            m_axi_b_s2m.resp <= jobs(head);
-          else
-            delay_remaining := delay_remaining - 1;
-          end if;
-        end if;
-      else
-        if m_axi_b_m2s.ready = '1' then
-          head := (head + 1) mod c_max_pending_b;
-          count := count - 1;
-          b_active := false;
-          delay_remaining := b_response_delay_cycles;
-          m_axi_b_s2m.valid <= '0';
-        end if;
-      end if;
+  bus_monitor : process
+  begin
+    wait until rising_edge(clk);
+    if m_axi_aw_m2s.valid = '1' and m_axi_aw_s2m.ready = '1' then
+      num_aw_beats_accepted <= num_aw_beats_accepted + 1;
+    end if;
+    if m_axi_b_s2m.valid = '1' and m_axi_b_m2s.ready = '1' then
+      num_b_beats_served <= num_b_beats_served + 1;
     end if;
   end process;
 
   ------------------------------------------------------------------------
   main : process
+    variable buf : buffer_t;
+
     procedure do_reset is
     begin
       reset <= '1';
       wait until rising_edge(clk);
       wait for c_settle;
       reset <= '0';
-    end procedure;
-
-    procedure reset_capture_counters is
-    begin
-      capture_reset_req <= '1';
-      inject_error_on_beat <= -1;
-      wait until rising_edge(clk);
-      wait for c_settle;
-      capture_reset_req <= '0';
     end procedure;
 
     procedure issue_request(addr_val : natural; length_val : natural) is
@@ -259,6 +217,22 @@ begin
       wait until rising_edge(clk) and req_s2m.ready = '1';
       wait for c_settle;
       req_m2s.valid <= '0';
+    end procedure;
+
+    -- Declares, in the memory model, the exact words the DUT must write:
+    -- 'num_beats' consecutive words from 'base_addr' carrying the counter
+    -- pattern starting at 'salt' (the same pattern 'push_beats' produces).
+    -- Any write with a different value or to an undeclared address fails
+    -- at write time; a missing write fails at 'check_expected_was_written'.
+    procedure expect_beats(base_addr : natural; num_beats : natural; salt : natural) is
+    begin
+      for i in 0 to num_beats - 1 loop
+        set_expected_word(
+          memory => memory,
+          address => base_addr + i * c_bytes_per_beat,
+          expected => std_ulogic_vector(to_unsigned(salt + i, c_axi_data_width))
+        );
+      end loop;
     end procedure;
 
     -- Pushes 'num_beats' stream beats with a simple counter pattern,
@@ -278,26 +252,34 @@ begin
       wait until rising_edge(clk) and dma_done = '1';
     end procedure;
 
-    -- Byte-exact check of the 'idx'th (0-indexed, since the last
-    -- 'reset_capture_counters' call) accepted AW address / W data
-    -- against the values this request/producer must have driven.
-    procedure check_capture(idx : natural; expected_addr_val : natural; expected_data_val : natural) is
+    -- Hold the slave's AW and W channels (stall probability 1.0 = never
+    -- ready) or release them (0.0 = always ready).
+    function stall_probability(stalled : boolean) return real is
     begin
-      check_equal(
-        captured_addr_trace(idx), to_unsigned(expected_addr_val, c_axi_addr_width),
-        "beat " & to_string(idx) & " AW address mismatch"
-      );
-      check_equal(
-        captured_data_trace(idx), std_ulogic_vector(to_unsigned(expected_data_val, c_axi_data_width)),
-        "beat " & to_string(idx) & " W data mismatch"
-      );
+      if stalled then
+        return 1.0;
+      end if;
+      return 0.0;
+    end function;
+
+    procedure set_aw_w_stalled(stalled : boolean) is
+    begin
+      set_address_stall_probability(net, axi_slave, stall_probability(stalled));
+      set_data_stall_probability(net, axi_slave, stall_probability(stalled));
+    end procedure;
+
+    procedure set_b_stalled(stalled : boolean) is
+    begin
+      set_write_response_stall_probability(net, axi_slave, stall_probability(stalled));
     end procedure;
 
   begin
     test_runner_setup(runner, runner_cfg);
 
+    buf := allocate(memory, num_bytes => c_memory_bytes, name => "ofmap_sink");
+    check_equal(base_address(buf), 0, "memory region must start at address 0 so DUT addresses map 1:1");
+
     do_reset;
-    reset_capture_counters;
 
     if run("test_single_beat_request") then
       -- length = 1 beat: verify AW address, one BRESP=OKAY accepted,
@@ -306,10 +288,10 @@ begin
       issue_request(16, c_bytes_per_beat);
       check_equal(req_s2m.ready, '0', "ready drops the cycle a request is accepted");
 
+      expect_beats(16, 1, 100);
       push_beats(1, 100);
       wait_for_dma_done;
       check_equal(resp_error, '0', "no error on a clean single-beat request");
-      check_capture(0, 16, 100);
       wait for c_settle;
       check_equal(req_s2m.ready, '1', "ready returns high the cycle after dma_done");
 
@@ -317,6 +299,7 @@ begin
       -- length = several beats: verify beat count / dma_done timing
       -- (exactly on the last BRESP, not before).
       issue_request(32, 4 * c_bytes_per_beat);
+      expect_beats(32, 4, 200);
 
       for i in 0 to 2 loop
         push_beats(1, 200 + i);
@@ -326,10 +309,6 @@ begin
       push_beats(1, 203);
       wait_for_dma_done;
       check_equal(resp_error, '0', "no error on a clean multi-beat request");
-      check_capture(0, 32, 200);
-      check_capture(1, 36, 201);
-      check_capture(2, 40, 202);
-      check_capture(3, 44, 203);
 
     elsif run("test_back_to_back_requests") then
       -- Second request issued immediately after the first's dma_done:
@@ -337,27 +316,25 @@ begin
       -- reinit actually takes effect) and its own beat count is
       -- independent of the first.
       issue_request(0, 2 * c_bytes_per_beat);
+      expect_beats(0, 2, 10);
       push_beats(2, 10);
       wait_for_dma_done;
-      check_capture(0, 0, 10);
-      check_capture(1, 4, 11);
       wait for c_settle;
       check_equal(req_s2m.ready, '1', "ready high before issuing the second request");
 
       issue_request(1000, 3 * c_bytes_per_beat);
+      expect_beats(1000, 3, 20);
       push_beats(3, 20);
       wait_for_dma_done;
       check_equal(resp_error, '0', "second request completes cleanly");
-      check_capture(2, 1000, 20);
-      check_capture(3, 1004, 21);
-      check_capture(4, 1008, 22);
 
     elsif run("test_resp_error_latched_and_reported_at_completion") then
       -- BRESP = SLVERR on the second beat of a 3-beat request: dma_done
       -- must still pulse (full length attempted) and resp_error must
       -- pulse on that same cycle, not immediately when the error occurs.
-      inject_error_on_beat <= 1;
+      inject_error_on_b_beat <= 1;
       issue_request(64, 3 * c_bytes_per_beat);
+      expect_beats(64, 3, 300);
 
       push_beats(1, 300);
       check_equal(resp_error, '0', "resp_error not asserted before request completion");
@@ -367,15 +344,13 @@ begin
 
       wait until rising_edge(clk) and dma_done = '1';
       check_equal(resp_error, '1', "resp_error pulses on the same cycle as the completing dma_done");
-      check_capture(0, 64, 300);
-      check_capture(1, 68, 301);
-      check_capture(2, 72, 302);
 
     elsif run("test_stream_backpressure") then
       -- Idle cycles on the producer stream between beats: request must
       -- still complete once the stream resumes, with no protocol
       -- violation in between.
       issue_request(96, 3 * c_bytes_per_beat);
+      expect_beats(96, 3, 400);
 
       push_beats(1, 400);
       for i in 0 to 4 loop
@@ -389,17 +364,15 @@ begin
 
       wait_for_dma_done;
       check_equal(resp_error, '0', "stream-stalled request still completes cleanly");
-      check_capture(0, 96, 400);
-      check_capture(1, 100, 401);
-      check_capture(2, 104, 402);
 
     elsif run("test_axi_backpressure") then
-      -- Slave AW/W ready held low for a few cycles: no protocol
-      -- violation (AWVALID held stable while not accepted), request
-      -- eventually completes.
+      -- Slave AW/W ready held low for a few cycles: no protocol violation
+      -- (AWVALID held stable while not accepted -- also enforced by the
+      -- BFM's own AW/W protocol checkers), request eventually completes.
       issue_request(128, 2 * c_bytes_per_beat);
+      expect_beats(128, 2, 500);
 
-      slave_ready_ctrl <= '0';
+      set_aw_w_stalled(true);
       -- Present the beat directly (not via 'push_stream_beat', which
       -- blocks until 's_stream_s2m.ready' -- exactly what must *not*
       -- happen yet here) and hold it at the AXI boundary.
@@ -414,7 +387,8 @@ begin
         wait for c_settle;
         check_equal(m_axi_aw_m2s.valid, '1', "AWVALID must stay high while not accepted");
       end loop;
-      slave_ready_ctrl <= '1';
+      check_equal(num_aw_beats_accepted, 0, "no AW beat may be accepted while the slave is stalled");
+      set_aw_w_stalled(false);
 
       -- Now let the held beat actually complete its handshake before
       -- moving on -- matches what 'push_stream_beat' does internally.
@@ -424,8 +398,6 @@ begin
       push_beats(1, 501);
       wait_for_dma_done;
       check_equal(resp_error, '0', "AXI-backpressured request still completes cleanly");
-      check_capture(0, 128, 500);
-      check_capture(1, 132, 501);
 
     elsif run("test_abort_mid_request_drains_before_ready_returns") then
       -- Assert reset while at least one BRESP is still outstanding:
@@ -433,22 +405,22 @@ begin
       -- the pending BRESP(s) have been observed, never before. A fresh
       -- request issued afterwards must behave identically to any other
       -- first request.
-      b_response_delay_cycles <= 5;
+      set_b_stalled(true);
       issue_request(256, 2 * c_bytes_per_beat);
+      expect_beats(256, 2, 600);
       push_beats(2, 600);
 
       -- The stream-side handshake completing (above) does not itself mean
       -- the AXI-side AW/W beat has been accepted yet -- there is pipeline
       -- latency between the two inside the wrapped core. Wait for both
-      -- beats to actually be captured before asserting reset, so the
+      -- beats to actually be accepted before asserting reset, so the
       -- "both accepted, BRESPs still outstanding" premise below actually
       -- holds.
-      wait until rising_edge(clk) and captured_beat_count = 2;
-      check_capture(0, 256, 600);
-      check_capture(1, 260, 601);
+      wait until rising_edge(clk) and num_aw_beats_accepted = 2;
+      check_equal(num_b_beats_served, 0, "both BRESPs must still be outstanding");
 
       -- Both AW/W beats have been accepted (outstanding_q = 2) but their
-      -- BRESPs are still delayed -- reset now.
+      -- BRESPs are still held back -- reset now.
       reset <= '1';
       wait until rising_edge(clk);
       wait for c_settle;
@@ -462,17 +434,17 @@ begin
         check_equal(req_s2m.ready, '0', "ready must not return before pending BRESPs are observed");
       end loop;
 
+      set_b_stalled(false);
       wait until rising_edge(clk) and req_s2m.ready = '1';
-      b_response_delay_cycles <= 0;
+      check_equal(num_b_beats_served, 2, "ready returns only after both pending BRESPs were observed");
 
       -- A fresh request behaves identically to any other first request
       -- -- no corruption from the aborted one.
       issue_request(2048, 2 * c_bytes_per_beat);
+      expect_beats(2048, 2, 700);
       push_beats(2, 700);
       wait_for_dma_done;
       check_equal(resp_error, '0', "post-abort request completes cleanly");
-      check_capture(2, 2048, 700);
-      check_capture(3, 2052, 701);
 
     elsif run("test_abort_with_zero_outstanding_returns_ready_next_cycle") then
       -- Reset while idle (no outstanding transactions): ready returns
@@ -495,6 +467,10 @@ begin
       wait for c_settle;
       check_equal(req_s2m.ready, '1', "ready returns high the cycle after the zero-length dma_done");
     end if;
+
+    -- Every word declared with 'expect_beats' must have been written with
+    -- exactly that value; nothing else may have been written.
+    check_expected_was_written(memory);
 
     test_runner_cleanup(runner);
     wait;

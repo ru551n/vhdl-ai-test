@@ -316,13 +316,11 @@ cnn_accel_arch.md`).
 VUnit-5 self-checking testbench, `tb_cnn_accel_axi_read_dma.vhd`,
 `bfm.axi_read_slave` terminating `m_axi_ar`/`m_axi_r` against the VUnit
 memory model (random `address_stall_probability`/`data_stall_probability`
-and randomized `RRESP` injection for the error case), a `queue_t`-driven
-reference-data checker process on `m_stream_m2s`/`s2m` (manual
-push/check rather than `check_axi_stream` — see the narrow-`TDATA`
-gotcha when `g_axi_data_width` is not tested at exactly a multiple of 8
-per beat is a non-issue here since `g_axi_data_width` is always a byte
-multiple, but the checker is still hand-rolled to keep `last`-position
-and per-beat data checks in one place), and a `run.py` test per §9's
+and response latency; VUnit's slave always answers `RRESP=OKAY`, so the
+error case uses a passive wire-level override of the `resp` field between
+BFM and DUT for one chosen beat index), `bfm.axi_stream_slave` with a
+`queue_t` of reference packets on `m_stream_m2s`/`s2m` (one DMA request =
+one packet; randomized `ready` stalling), and a `run.py` test per §9's
 corner case plus the mandatory list from the task brief (single short
 burst; >256-beat request; 4 KiB-straddling request; randomized consumer
 backpressure; one non-`OKAY` `RRESP` per request producing exactly one

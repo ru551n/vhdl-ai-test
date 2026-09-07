@@ -432,6 +432,17 @@ per-state logic, it is unconditional.
 
 ## 8. Verification plan
 
+Bench: `tb_cnn_accel_ofmap_dma.vhd`, `bfm.axi_write_slave` terminating
+`m_axi_aw`/`w`/`b` against the VUnit memory model. Written data is checked
+byte-exactly with `set_expected_word` + `check_expected_was_written`;
+directed AXI backpressure and held-back `BRESP`s come from switching the
+slave's per-channel stall probabilities between 0.0 and 1.0 at runtime.
+VUnit's slave always answers `BRESP=OKAY`, so the `resp_error` case uses a
+passive wire-level override of the `resp` field between BFM and DUT for one
+chosen B beat. The producer stream is driven by a small `ready`-honoring
+procedure because several cases interleave cycle-exact checks between
+individual beats.
+
 - **Single request, single beat**: `length = g_axi_data_width/8` bytes,
   one AXI beat, verify `AW`/`W` issued once with the right `addr`, one
   `BRESP = OKAY` accepted, `dma_done` pulses exactly once, `resp_error`

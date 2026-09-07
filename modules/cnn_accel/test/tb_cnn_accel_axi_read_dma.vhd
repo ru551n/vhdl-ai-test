@@ -6,9 +6,8 @@ library vunit_lib;
 context vunit_lib.vunit_context;
 use vunit_lib.queue_pkg.all;
 use vunit_lib.integer_array_pkg.all;
-
-library osvvm;
-use osvvm.RandomPkg.RandomPType;
+use vunit_lib.memory_pkg.all;
+use vunit_lib.axi_slave_pkg.all;
 
 library axi;
 use axi.axi_pkg.all;
@@ -27,10 +26,13 @@ use cnn_accel.cnn_accel_pkg.all;
 -- modules/cnn_accel/doc/cnn_accel_axi_read_dma_proposal.md section 10 for
 -- the verification plan.
 --
--- The AXI4 read slave side is a small hand-rolled responder (not
--- bfm.axi_read_slave / the VUnit memory model) because this testbench
--- needs a controllable non-OKAY RRESP injection point (see the
--- 'resp_error' test), which the memory-model-backed BFM does not expose.
+-- The AXI4 read slave side is bfm.axi_read_slave (hdl-modules wrapper
+-- around VUnit's axi_read_slave verification component + memory model),
+-- with randomized AR/R stalling and response latency. VUnit's slave always
+-- answers RRESP=OKAY (vunit/vhdl/verification_components/src/
+-- axi_read_slave.vhd), so the 'resp_error' test uses a passive wire-level
+-- override of the RRESP field between the BFM and the DUT for one chosen
+-- beat -- the BFM still owns every handshake and data byte.
 -- The AXI4-Stream consumer side reuses bfm.axi_stream_slave (packet-level
 -- data/last checking plus randomized backpressure), since one whole DMA
 -- request maps to exactly one AXI4-Stream packet.
@@ -61,10 +63,27 @@ architecture tb of tb_cnn_accel_axi_read_dma is
   signal m_axi_r_m2s : axi_m2s_r_t := axi_m2s_r_init;
   signal m_axi_r_s2m : axi_s2m_r_t := axi_s2m_r_init;
 
+  -- Bundled view of the DUT's AR+R ports for the BFM, and the BFM's own
+  -- (always-OKAY) S2M response before the RRESP override below.
+  signal axi_read_m2s : axi_read_m2s_t := axi_read_m2s_init;
+  signal axi_read_s2m_bfm : axi_read_s2m_t := axi_read_s2m_init;
+
+  -- One flat region covering every address any test below touches (highest
+  -- is 16#5000# + 32 beats). The first allocation in a fresh memory_t
+  -- starts at address 0, so DUT addresses map 1:1 onto memory addresses.
+  constant c_memory_bytes : positive := 32 * 1024;
+  constant memory : memory_t := new_memory;
+  constant axi_slave : axi_slave_t := new_axi_slave(
+    memory => memory,
+    address_fifo_depth => 4,
+    address_stall_probability => 0.3,
+    data_stall_probability => 0.3,
+    min_response_latency => 0 ns,
+    max_response_latency => 3 * c_clk_period
+  );
+
   signal m_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
   signal m_stream_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
-
-  shared variable rnd : RandomPType;
 
   constant reference_data_queue : queue_t := new_queue;
   signal num_packets_checked : natural := 0;
@@ -72,19 +91,19 @@ architecture tb of tb_cnn_accel_axi_read_dma is
 
   -- Set (by the request-issuing procedure) to the absolute, monotonically
   -- increasing R-beat index (across the whole testbench run) at which the
-  -- hand-rolled AXI slave below should return a non-OKAY RRESP. -1 means
-  -- "never".
+  -- RRESP override below should present a non-OKAY RRESP to the DUT. -1
+  -- means "never".
   signal inject_error_at_beat : integer := -1;
   signal total_r_beats_served : natural := 0;
 
   signal num_requests_completed : natural := 0;
 
   ------------------------------------------------------------------------------
-  -- Deterministic word pattern shared between the hand-rolled AXI slave
-  -- (drives RDATA) and the reference bytes pushed for the AXI4-Stream
-  -- checker -- both index by absolute byte address so a request's stream
-  -- content is fully predictable regardless of how it got split into
-  -- bursts.
+  -- Deterministic word pattern shared between the memory model backing the
+  -- AXI slave BFM (RDATA source) and the reference bytes pushed for the
+  -- AXI4-Stream checker -- both index by absolute byte address so a
+  -- request's stream content is fully predictable regardless of how it got
+  -- split into bursts.
   ------------------------------------------------------------------------------
   function word_pattern(byte_addr : natural) return unsigned is
     -- Knuth multiplicative hash constant (0x9E3779B1 = 2654435761). Computed
@@ -123,6 +142,17 @@ architecture tb of tb_cnn_accel_axi_read_dma is
     push_ref(reference_data_queue, ref);
   end procedure;
 
+  procedure fill_memory_pattern(base_addr : natural; length_bytes : natural) is
+  begin
+    for word_offset in 0 to length_bytes / c_bytes_per_beat - 1 loop
+      write_word(
+        memory => memory,
+        address => base_addr + word_offset * c_bytes_per_beat,
+        word => std_ulogic_vector(word_pattern(base_addr + word_offset * c_bytes_per_beat))
+      );
+    end loop;
+  end procedure;
+
 begin
 
   clk <= not clk after c_clk_period / 2;
@@ -131,6 +161,7 @@ begin
 
   ------------------------------------------------------------------------------
   main : process
+    variable buf : buffer_t;
     variable num_requests_expected : natural := 0;
     -- A 'length_bytes = 0' request produces no AXI4-Stream packet at all (no
     -- data to send -- see 'cnn_accel_axi_read_dma.vhd's header comment on
@@ -145,6 +176,7 @@ begin
       expect_resp_error : boolean := false
     ) is
     begin
+      fill_memory_pattern(base_addr => addr, length_bytes => length_bytes);
       if push_reference then
         push_reference_bytes(base_addr => addr, length_bytes => length_bytes);
       end if;
@@ -168,7 +200,9 @@ begin
 
   begin
     test_runner_setup(runner, runner_cfg);
-    rnd.InitSeed(get_string_seed(runner_cfg));
+
+    buf := allocate(memory, num_bytes => c_memory_bytes, name => "dma_source");
+    check_equal(base_address(buf), 0, "memory region must start at address 0 so DUT addresses map 1:1");
 
     wait until rising_edge(clk) and reset = '0';
 
@@ -203,6 +237,7 @@ begin
       -- proposal doc section 4 and the module doc's "Verification notes"
       -- for the scoping of what a mid-transfer reset does and does not
       -- guarantee for the already-resetless hdl-modules submodules).
+      fill_memory_pattern(base_addr => 16#3000#, length_bytes => 64 * c_bytes_per_beat);
       req_m2s.req.addr <= to_unsigned(16#3000#, 32);
       req_m2s.req.length <= to_unsigned(64 * c_bytes_per_beat, 32);
       req_m2s.valid <= '1';
@@ -265,63 +300,48 @@ begin
 
 
   ------------------------------------------------------------------------------
-  -- Hand-rolled AXI4 read slave: accepts one AR at a time, drives back
-  -- 'len + 1' R beats of deterministic data (word_pattern), OKAY unless
-  -- this beat's absolute index matches 'inject_error_at_beat'. Light random
-  -- stalling on both AR acceptance and R beats for protocol coverage.
+  -- AXI4 read slave BFM, backed by the VUnit memory model pre-filled with
+  -- 'word_pattern' by each request.
   ------------------------------------------------------------------------------
-  axi_slave_proc : process
-    variable base_addr : natural;
-    variable len_beats : natural;
-    variable beat_word : unsigned(31 downto 0);
+  axi_read_m2s <= (ar => m_axi_ar_m2s, r => m_axi_r_m2s);
+  m_axi_ar_s2m <= axi_read_s2m_bfm.ar;
+
+  axi_read_slave_inst : entity bfm.axi_read_slave
+    generic map (
+      axi_slave => axi_slave,
+      data_width => c_axi_data_width,
+      id_width => c_axi_id_width,
+      address_width => c_axi_addr_width
+    )
+    port map (
+      clk => clk,
+      --
+      axi_read_m2s => axi_read_m2s,
+      axi_read_s2m => axi_read_s2m_bfm
+    );
+
+
+  ------------------------------------------------------------------------------
+  -- Passive RRESP override: forwards the BFM's R channel untouched except
+  -- for the resp field on the single beat whose absolute index equals
+  -- 'inject_error_at_beat'. 'total_r_beats_served' only advances on a
+  -- completed handshake, so the presented resp is stable while valid is
+  -- high and not yet accepted.
+  ------------------------------------------------------------------------------
+  rresp_override : process(all)
   begin
-    m_axi_ar_s2m.ready <= '0';
-    m_axi_r_s2m.valid <= '0';
-    m_axi_r_s2m.last <= '0';
-    m_axi_r_s2m.resp <= axi_resp_okay;
-    m_axi_r_s2m.id <= (others => '0');
+    m_axi_r_s2m <= axi_read_s2m_bfm.r;
+    if total_r_beats_served = inject_error_at_beat then
+      m_axi_r_s2m.resp <= axi_resp_slverr;
+    end if;
+  end process;
 
-    -- 'wait until reset = '0'' alone would never resume in tests where
-    -- 'reset' never toggles (it only wakes on an event on 'reset' itself);
-    -- combine with 'rising_edge(clk)' -- which always keeps ticking -- so
-    -- this reliably proceeds immediately when reset is already low.
-    wait until rising_edge(clk) and reset = '0';
-
-    loop
-      m_axi_ar_s2m.ready <= '0';
-      if rnd.Uniform(0.0, 1.0) < 0.3 then
-        wait for rnd.RandInt(1, 3) * c_clk_period;
-      end if;
-      wait until rising_edge(clk);
-      m_axi_ar_s2m.ready <= '1';
-      wait until rising_edge(clk) and m_axi_ar_m2s.valid = '1';
-      base_addr := to_integer(m_axi_ar_m2s.addr(31 downto 0));
-      len_beats := to_integer(m_axi_ar_m2s.len) + 1;
-      m_axi_ar_s2m.ready <= '0';
-
-      for beat in 0 to len_beats - 1 loop
-        m_axi_r_s2m.valid <= '0';
-        if rnd.Uniform(0.0, 1.0) < 0.3 then
-          wait for rnd.RandInt(1, 3) * c_clk_period;
-        end if;
-        wait until rising_edge(clk);
-
-        beat_word := word_pattern(base_addr + beat * c_bytes_per_beat);
-        m_axi_r_s2m.data <= (others => '0');
-        m_axi_r_s2m.data(31 downto 0) <= std_ulogic_vector(beat_word);
-        if total_r_beats_served = inject_error_at_beat then
-          m_axi_r_s2m.resp <= axi_resp_slverr;
-        else
-          m_axi_r_s2m.resp <= axi_resp_okay;
-        end if;
-        m_axi_r_s2m.last <= '1' when beat = len_beats - 1 else '0';
-        m_axi_r_s2m.valid <= '1';
-
-        wait until rising_edge(clk) and m_axi_r_m2s.ready = '1';
-        total_r_beats_served <= total_r_beats_served + 1;
-      end loop;
-      m_axi_r_s2m.valid <= '0';
-    end loop;
+  r_beat_counter : process
+  begin
+    wait until rising_edge(clk);
+    if m_axi_r_s2m.valid = '1' and m_axi_r_m2s.ready = '1' then
+      total_r_beats_served <= total_r_beats_served + 1;
+    end if;
   end process;
 
 

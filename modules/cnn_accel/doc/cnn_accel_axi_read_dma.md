@@ -185,8 +185,11 @@ See `modules/cnn_accel/test/tb_cnn_accel_axi_read_dma.vhd`
 `doc/cnn_accel_axi_read_dma_proposal.md` section 9/10 for the full test
 list. `bfm.axi_read_slave` terminates `m_axi_ar`/`m_axi_r` against the
 VUnit memory model (randomized address/data stall probabilities and
-`RRESP` injection); `bfm.axi_stream_slave`/a hand-rolled `queue_t`-driven
-checker validates `m_stream_m2s`/`s2m` against reference data.
+response latency). VUnit's slave always answers `RRESP=OKAY`, so the
+error test overrides the `resp` field on the wire between BFM and DUT for
+one chosen beat index; the BFM still owns every handshake and data byte.
+`bfm.axi_stream_slave` validates `m_stream_m2s`/`s2m` packet-by-packet
+against a `queue_t` of reference data.
 
 Test cases (all pass, GHDL, VUnit 5): `test_single_short_burst`,
 `test_multi_burst_over_256_beats` (> 256 beats, forces the
