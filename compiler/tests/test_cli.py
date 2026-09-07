@@ -16,7 +16,6 @@ import pytest
 
 from cnnc.gir import interp
 from cnnc.frontend.tosa_import import load_tosa_file
-from cnnc.testing.accel_variants import load_half_up_target
 
 COMPILER_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "conv_rescale_clamp.mlir"
@@ -49,17 +48,16 @@ def _run_cli(*args: str) -> subprocess.CompletedProcess:
 
 
 @pytest.fixture
-def half_up_target_json(tmp_path):
-    target = load_half_up_target(tmp_path / "accel")
+def target_json(target, tmp_path):
     path = tmp_path / "target.json"
     path.write_text(target.to_json())
     return path
 
 
-def test_cli_compile_writes_all_dumps_and_artifacts(half_up_target_json, tmp_path):
+def test_cli_compile_writes_all_dumps_and_artifacts(target_json, tmp_path):
     out_dir = tmp_path / "out"
     result = _run_cli(
-        "compile", str(FIXTURE_PATH), "--target", str(half_up_target_json), "--out", str(out_dir),
+        "compile", str(FIXTURE_PATH), "--target", str(target_json), "--out", str(out_dir),
         "--dump-after-all",
     )
     assert result.returncode == 0, result.stderr
@@ -72,19 +70,19 @@ def test_cli_compile_writes_all_dumps_and_artifacts(half_up_target_json, tmp_pat
         assert artifact in names, f"missing artifact {artifact}; got {sorted(names)}"
 
 
-def test_cli_compile_without_dump_after_all_only_writes_artifacts(half_up_target_json, tmp_path):
+def test_cli_compile_without_dump_after_all_only_writes_artifacts(target_json, tmp_path):
     out_dir = tmp_path / "out"
-    result = _run_cli("compile", str(FIXTURE_PATH), "--target", str(half_up_target_json), "--out", str(out_dir))
+    result = _run_cli("compile", str(FIXTURE_PATH), "--target", str(target_json), "--out", str(out_dir))
     assert result.returncode == 0, result.stderr
 
     names = {p.name for p in out_dir.iterdir()}
     assert names == set(_ARTIFACTS)
 
 
-def test_cli_run_matches_interp(half_up_target_json, tmp_path):
+def test_cli_run_matches_interp(target_json, tmp_path):
     out_dir = tmp_path / "out"
     compile_result = _run_cli(
-        "compile", str(FIXTURE_PATH), "--target", str(half_up_target_json), "--out", str(out_dir)
+        "compile", str(FIXTURE_PATH), "--target", str(target_json), "--out", str(out_dir)
     )
     assert compile_result.returncode == 0, compile_result.stderr
 
@@ -109,9 +107,9 @@ def test_cli_run_matches_interp(half_up_target_json, tmp_path):
     np.testing.assert_array_equal(cli_out, interp_out)
 
 
-def test_cli_compile_missing_file_reports_error(half_up_target_json, tmp_path):
+def test_cli_compile_missing_file_reports_error(target_json, tmp_path):
     result = _run_cli(
-        "compile", str(tmp_path / "does_not_exist.mlir"), "--target", str(half_up_target_json),
+        "compile", str(tmp_path / "does_not_exist.mlir"), "--target", str(target_json),
         "--out", str(tmp_path / "out"),
     )
     assert result.returncode == 1

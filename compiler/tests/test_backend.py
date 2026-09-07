@@ -5,9 +5,10 @@ row 08, §13 M8.
 MVP acceptance (§13 M8): the fixture compiles; `run_program` output ==
 `gir.interp` output == IREE output (byte-exact) for 3 seeds; decoded
 descriptors match the emitted ones and the HIR params; `08_program.txt`
-shows `CONV2D` + `HALT`. That last part only holds once H0 (half-up
-rounding) lands on the real target -- until then `test_e2e_real_target`
-below stays `xfail(strict=True)` so the gate is visible, not hidden.
+shows `CONV2D` + `HALT`. HW milestone H0 (half-up rounding) has landed
+on the real target, so these run directly against `cnn_accel_v1`
+(the `target` fixture from `tests/conftest.py`), no rounding-gate
+workaround needed.
 """
 
 from __future__ import annotations
@@ -24,18 +25,11 @@ from cnnc.backend.cnn_accel_v1 import decode_program, emit_program, print_progra
 from cnnc.driver import compile_tosa
 from cnnc.errors import CapabilityError, CompilerError
 from cnnc.gir import interp
-from cnnc.target.load import load_target
-from cnnc.testing.accel_variants import load_half_up_target
 from cnnc.testing.iree_oracle import iree_available, run_iree
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "conv_rescale_clamp.mlir"
 GOLDEN_PROGRAM_PATH = Path(__file__).parent / "golden" / "conv_rescale_clamp.program.txt"
-
-
-@pytest.fixture
-def half_up_target(tmp_path):
-    return load_half_up_target(tmp_path / "accel")
 
 
 def _compile(target, tmp_path, *, dump_after_all: bool = False):
@@ -63,35 +57,35 @@ def _load_module_from(root: Path, name: str):
 # ---------------------------------------------------------------------------
 
 
-def test_fixture_matches_golden_program(half_up_target, tmp_path):
-    result = _compile(half_up_target, tmp_path)
+def test_fixture_matches_golden_program(target, tmp_path):
+    result = _compile(target, tmp_path)
     program_addr = result.hir_planned.buffer(result.hir_planned.program).addr
-    descriptors = decode_program(result.program.program_bytes, half_up_target, program_addr=program_addr)
-    text = print_program(descriptors, half_up_target, program_addr=program_addr)
+    descriptors = decode_program(result.program.program_bytes, target, program_addr=program_addr)
+    text = print_program(descriptors, target, program_addr=program_addr)
     assert text == GOLDEN_PROGRAM_PATH.read_text()
 
 
-def test_decode_round_trip_matches_emitted_descriptors(half_up_target, tmp_path):
-    result = _compile(half_up_target, tmp_path)
+def test_decode_round_trip_matches_emitted_descriptors(target, tmp_path):
+    result = _compile(target, tmp_path)
     program_addr = result.hir_planned.buffer(result.hir_planned.program).addr
-    decoded = decode_program(result.program.program_bytes, half_up_target, program_addr=program_addr)
+    decoded = decode_program(result.program.program_bytes, target, program_addr=program_addr)
     assert decoded == result.program.descriptors
 
 
-def test_decode_cross_checks_against_cnn_accel_model(half_up_target, tmp_path):
+def test_decode_cross_checks_against_cnn_accel_model(target, tmp_path):
     """The compiler's own `decode_descriptor` and the RTL golden model's
     `decode_instruction` must agree field-for-field on the exact bytes
     `emit_program` produced (same `accel_root` the target was discovered
     from, so this is a same-checkout comparison)."""
-    result = _compile(half_up_target, tmp_path)
-    accel_root = Path(half_up_target.provenance["accel_root"])
+    result = _compile(target, tmp_path)
+    accel_root = Path(target.provenance["accel_root"])
     _load_module_from(accel_root, "cnn_accel_constants")
     model = _load_module_from(accel_root, "cnn_accel_model")
 
     program_addr = result.hir_planned.buffer(result.hir_planned.program).addr
-    ours = decode_program(result.program.program_bytes, half_up_target, program_addr=program_addr)
+    ours = decode_program(result.program.program_bytes, target, program_addr=program_addr)
 
-    word = half_up_target.isa.instr_word_bytes
+    word = target.isa.instr_word_bytes
     for i, our_desc in enumerate(ours):
         chunk = result.program.program_bytes[i * word : (i + 1) * word]
         model_desc = model.decode_instruction(chunk)
@@ -106,10 +100,10 @@ def test_decode_cross_checks_against_cnn_accel_model(half_up_target, tmp_path):
             )
 
 
-def test_descriptor_params_match_hir(half_up_target, tmp_path):
-    result = _compile(half_up_target, tmp_path)
+def test_descriptor_params_match_hir(target, tmp_path):
+    result = _compile(target, tmp_path)
     program_addr = result.hir_planned.buffer(result.hir_planned.program).addr
-    conv_desc = decode_program(result.program.program_bytes, half_up_target, program_addr=program_addr)[0]
+    conv_desc = decode_program(result.program.program_bytes, target, program_addr=program_addr)[0]
 
     assert conv_desc.requant_scale == 1073741824
     assert conv_desc.requant_shift == 23
@@ -119,15 +113,15 @@ def test_descriptor_params_match_hir(half_up_target, tmp_path):
     assert (conv_desc.stride_h, conv_desc.stride_w) == (1, 1)
     assert (conv_desc.pad_top, conv_desc.pad_bottom, conv_desc.pad_left, conv_desc.pad_right) == (1, 1, 1, 1)
 
-    set_flags = {name for name, bit in half_up_target.isa.flags.items() if (conv_desc.flags >> bit) & 1}
+    set_flags = {name for name, bit in target.isa.flags.items() if (conv_desc.flags >> bit) & 1}
     assert set_flags == {"RELU_EN", "BIAS_EN", "REQUANT_EN", "PAD_EN"}
 
 
-def test_program_bytes_end_with_halt(half_up_target, tmp_path):
-    result = _compile(half_up_target, tmp_path)
+def test_program_bytes_end_with_halt(target, tmp_path):
+    result = _compile(target, tmp_path)
     program_addr = result.hir_planned.buffer(result.hir_planned.program).addr
-    descriptors = decode_program(result.program.program_bytes, half_up_target, program_addr=program_addr)
-    opcode_name = {v: k for k, v in half_up_target.isa.opcodes.items()}
+    descriptors = decode_program(result.program.program_bytes, target, program_addr=program_addr)
+    opcode_name = {v: k for k, v in target.isa.opcodes.items()}
     assert [opcode_name[d.opcode] for d in descriptors] == ["CONV2D", "HALT"]
 
 
@@ -137,8 +131,8 @@ def test_program_bytes_end_with_halt(half_up_target, tmp_path):
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
-def test_e2e_run_program_matches_interp(half_up_target, tmp_path, seed):
-    result = _compile(half_up_target, tmp_path)
+def test_e2e_run_program_matches_interp(target, tmp_path, seed):
+    result = _compile(target, tmp_path)
     x = _seed_input(seed)
 
     interp_out = interp.run(result.fused_graph, {"arg0": x})["10"]
@@ -151,11 +145,11 @@ def test_e2e_run_program_matches_interp(half_up_target, tmp_path, seed):
 
 @pytest.mark.iree
 @pytest.mark.parametrize("seed", [0, 1, 2])
-def test_e2e_run_program_matches_interp_and_iree(half_up_target, tmp_path, seed):
+def test_e2e_run_program_matches_interp_and_iree(target, tmp_path, seed):
     if not iree_available():
         pytest.skip("iree-compile/iree-run-module not found next to the interpreter")
 
-    result = _compile(half_up_target, tmp_path)
+    result = _compile(target, tmp_path)
     x = _seed_input(seed)
 
     interp_out = interp.run(result.fused_graph, {"arg0": x})["10"]
@@ -166,51 +160,40 @@ def test_e2e_run_program_matches_interp_and_iree(half_up_target, tmp_path, seed)
     np.testing.assert_array_equal(iree_out, interp_out)
 
 
-@pytest.mark.xfail(strict=True, reason="H0 pending: real target is half_even; to_hir rejects it until H0 lands")
-def test_e2e_real_target():
-    target = load_target("cnn_accel")
-    result = compile_tosa(FIXTURE_PATH, target)
-    x = _seed_input(0)
-
-    interp_out = interp.run(result.fused_graph, {"arg0": x})["10"]
-    run_out = run_program(result.program, {"arg0": x})["10"]
-    np.testing.assert_array_equal(run_out, interp_out)
-
-
 # ---------------------------------------------------------------------------
 # emit_program error paths
 # ---------------------------------------------------------------------------
 
 
-def test_emit_requires_planned_stage(half_up_target, tmp_path):
-    result = _compile(half_up_target, tmp_path)
+def test_emit_requires_planned_stage(target, tmp_path):
+    result = _compile(target, tmp_path)
     with pytest.raises(CompilerError, match="planned"):
-        emit_program(result.hir_scheduled, half_up_target)
+        emit_program(result.hir_scheduled, target)
 
 
-def test_emit_rejects_field_overflow(half_up_target, tmp_path):
-    result = _compile(half_up_target, tmp_path)
+def test_emit_rejects_field_overflow(target, tmp_path):
+    result = _compile(target, tmp_path)
     op = result.hir_planned.ops[0]
     bad_op = op.replace(params={**op.params, "stride_h": 1000})  # ISA field is 1 byte
     bad_module = result.hir_planned.with_ops([bad_op])
     with pytest.raises(CompilerError, match="stride_h"):
-        emit_program(bad_module, half_up_target)
+        emit_program(bad_module, target)
 
 
-def test_emit_rejects_unknown_param(half_up_target, tmp_path):
-    result = _compile(half_up_target, tmp_path)
+def test_emit_rejects_unknown_param(target, tmp_path):
+    result = _compile(target, tmp_path)
     op = result.hir_planned.ops[0]
     bad_op = op.replace(params={**op.params, "mystery_param": 1})
     bad_module = result.hir_planned.with_ops([bad_op])
     with pytest.raises(CapabilityError, match="mystery_param"):
-        emit_program(bad_module, half_up_target)
+        emit_program(bad_module, target)
 
 
-def test_emit_rejects_missing_program_buffer(half_up_target, tmp_path):
-    result = _compile(half_up_target, tmp_path)
+def test_emit_rejects_missing_program_buffer(target, tmp_path):
+    result = _compile(target, tmp_path)
     no_program = result.hir_planned.replace(program=None)
     with pytest.raises(CompilerError, match="program"):
-        emit_program(no_program, half_up_target)
+        emit_program(no_program, target)
 
 
 # ---------------------------------------------------------------------------
@@ -218,14 +201,14 @@ def test_emit_rejects_missing_program_buffer(half_up_target, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_run_program_rejects_missing_input(half_up_target, tmp_path):
-    result = _compile(half_up_target, tmp_path)
+def test_run_program_rejects_missing_input(target, tmp_path):
+    result = _compile(target, tmp_path)
     with pytest.raises(CompilerError, match="missing input"):
         run_program(result.program, {})
 
 
-def test_run_program_rejects_wrong_shape(half_up_target, tmp_path):
-    result = _compile(half_up_target, tmp_path)
+def test_run_program_rejects_wrong_shape(target, tmp_path):
+    result = _compile(target, tmp_path)
     bad_input = np.zeros((1, 4, 4, 4), dtype=np.int8)
     with pytest.raises(CompilerError, match="shape"):
         run_program(result.program, {"arg0": bad_input})

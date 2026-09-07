@@ -87,8 +87,7 @@ def _rounding_gate(target: Target) -> Unit:
     rounding = conv_unit.epilogue.rescale.rounding
     if rounding != "half_up":
         raise CapabilityError(
-            f"target {target.name} rounds {rounding}; TOSA rescale requires half_up "
-            "(HW milestone H0 pending)",
+            f"target {target.name} rounds {rounding}; TOSA rescale requires half_up",
             stage=_STAGE,
             unit=conv_unit.name,
             constraint="rounding",

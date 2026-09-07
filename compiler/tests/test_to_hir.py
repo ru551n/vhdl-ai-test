@@ -16,15 +16,8 @@ from cnnc.hir.printer import print_hir
 from cnnc.lower.to_hir import layer_env, select_unit, to_hir
 from cnnc.passes import PassContext, default_pipeline, run_pipeline
 from cnnc.target.constraints import check
-from cnnc.target.load import load_target
-from cnnc.testing.accel_variants import load_half_up_target
 
 GOLDEN_PATH = Path(__file__).parent / "golden" / "conv_rescale_clamp.hir.txt"
-
-
-@pytest.fixture
-def half_up_target(tmp_path):
-    return load_half_up_target(tmp_path)
 
 
 def _conv_op_shape(in_h: int, in_w: int, pad: tuple[int, int, int, int], k: int, stride: tuple[int, int]) -> tuple[int, int]:
@@ -132,13 +125,13 @@ def _fixture_graph() -> Graph:
 # --------------------------------------------------------------------------
 
 
-def test_fixture_matches_golden_hir(half_up_target):
-    module = _to_hir(half_up_target)
+def test_fixture_matches_golden_hir(target):
+    module = _to_hir(target)
     assert print_hir(module) == GOLDEN_PATH.read_text()
 
 
-def test_fixture_params(half_up_target):
-    module = _to_hir(half_up_target)
+def test_fixture_params(target):
+    module = _to_hir(target)
     params = module.ops[0].params
     assert params["requant_shift"] == 23  # 38 - 15
     assert params["requant_scale"] == 1073741824
@@ -152,8 +145,8 @@ def test_fixture_params(half_up_target):
     assert (params["pad_top"], params["pad_bottom"], params["pad_left"], params["pad_right"]) == (1, 1, 1, 1)
 
 
-def test_fixture_buffers(half_up_target):
-    module = _to_hir(half_up_target)
+def test_fixture_buffers(target):
+    module = _to_hir(target)
     weight = module.buffer("%0")
     bias = module.buffer("%1")
     assert weight.data == bytes([1]) * 288
@@ -163,8 +156,8 @@ def test_fixture_buffers(half_up_target):
     assert module.buffer("%10").role == "output"
 
 
-def test_fixture_deps_and_entry_io(half_up_target):
-    module = _to_hir(half_up_target)
+def test_fixture_deps_and_entry_io(target):
+    module = _to_hir(target)
     assert module.ops[0].deps == ()
     assert module.entry_inputs == ("%arg0",)
     assert module.entry_outputs == ("%10",)
@@ -172,18 +165,26 @@ def test_fixture_deps_and_entry_io(half_up_target):
 
 
 # --------------------------------------------------------------------------
-# Rounding gate (H0)
+# Rounding gate: real (half_up) target passes, synthetic half_even is rejected
 # --------------------------------------------------------------------------
 
 
-def test_half_even_target_rejected():
-    target = load_target("cnn_accel")
+def test_real_target_passes_rounding_gate(target):
     graph = _fuse(_fixture_graph(), target)
+    module = to_hir(graph, target)
+    assert module.stage == "mapped"
+
+
+def test_half_even_target_rejected(target):
+    from conftest import half_even_target
+
+    synthetic = half_even_target(target)
+    graph = _fuse(_fixture_graph(), synthetic)
     with pytest.raises(CapabilityError) as exc_info:
-        to_hir(graph, target)
+        to_hir(graph, synthetic)
     message = str(exc_info.value)
     assert "half_up" in message
-    assert "H0" in message
+    assert "half_even" in message
 
 
 # --------------------------------------------------------------------------
@@ -191,69 +192,69 @@ def test_half_even_target_rejected():
 # --------------------------------------------------------------------------
 
 
-def test_cout_not_divisible_rejected(half_up_target):
+def test_cout_not_divisible_rejected(target):
     with pytest.raises(CapabilityError) as exc_info:
-        _to_hir(half_up_target, out_c=12, bias=tuple([0] * 12))
+        _to_hir(target, out_c=12, bias=tuple([0] * 12))
     assert "%4" in str(exc_info.value) or "%10" in str(exc_info.value)
     assert exc_info.value.constraint == "out_channels"
 
 
-def test_row_tile_words_exceeded_rejected(half_up_target):
+def test_row_tile_words_exceeded_rejected(target):
     with pytest.raises(CapabilityError) as exc_info:
-        _to_hir(half_up_target, in_w=600, in_c=8, out_c=8, bias=tuple([0] * 8))
+        _to_hir(target, in_w=600, in_c=8, out_c=8, bias=tuple([0] * 8))
     assert "in_width" in str(exc_info.value.constraint)
 
 
-def test_5x5_kernel_rejected(half_up_target):
+def test_5x5_kernel_rejected(target):
     with pytest.raises(CapabilityError) as exc_info:
-        _to_hir(half_up_target, k=5, pad=(2, 2, 2, 2))
+        _to_hir(target, k=5, pad=(2, 2, 2, 2))
     assert exc_info.value.constraint == "kernels"
 
 
-def test_stride_300_exceeds_field_width_rejected(half_up_target):
+def test_stride_300_exceeds_field_width_rejected(target):
     with pytest.raises(CapabilityError) as exc_info:
-        _to_hir(half_up_target, stride=(300, 300))
+        _to_hir(target, stride=(300, 300))
     assert "stride" in exc_info.value.constraint
 
 
-def test_stride_3_passes_capability_checks(half_up_target):
+def test_stride_3_passes_capability_checks(target):
     # `unit.strides` is discovered as "any" (no elaboration-time RTL
     # bound); stride 3 is well within the 1-byte ISA field, so it is
     # only bounded by the general `max stride_h/stride_w` constraint
     # (255), not rejected outright like the M6 plan's original static
     # JSON example assumed.
-    module = _to_hir(half_up_target, stride=(3, 3), pad=(0, 0, 0, 0))
+    module = _to_hir(target, stride=(3, 3), pad=(0, 0, 0, 0))
     assert module.ops[0].params["stride_h"] == 3
 
 
-def test_conv_in_zp_rejected(half_up_target):
+def test_conv_in_zp_rejected(target):
     with pytest.raises(CapabilityError) as exc_info:
-        _to_hir(half_up_target, conv_in_zp=1)
+        _to_hir(target, conv_in_zp=1)
     # Nonzero zero points don't block fusion, so this reaches to_hir as a
     # fused_conv whose id is the fused chain's output id (clamp's %10).
     assert "%10" in str(exc_info.value)
     assert exc_info.value.constraint == "conv.zero_point"
 
 
-def test_per_channel_rescale_stays_unfused_and_rejected(half_up_target):
+def test_per_channel_rescale_stays_unfused_and_rejected(target):
     # MVP `epilogue.rescale.per_channel=False`: `FusePass` refuses to fuse
     # a per_channel rescale in the first place (doc/tosa_compiler_plan.md
     # §9), so `to_hir` sees a standalone `conv2d`, not a `fused_conv` with
     # `per_channel=True`.
     with pytest.raises(CapabilityError) as exc_info:
-        _to_hir(half_up_target, per_channel=True, mult=(1073741824,) * 8, shift=(38,) * 8)
+        _to_hir(target, per_channel=True, mult=(1073741824,) * 8, shift=(38,) * 8)
     assert "%4" in str(exc_info.value)
 
 
-def test_out_zp_stays_unfused_and_rejected(half_up_target):
+def test_out_zp_stays_unfused_and_rejected(target):
     with pytest.raises(CapabilityError) as exc_info:
-        _to_hir(half_up_target, rescale_out_zp=5)
+        _to_hir(target, rescale_out_zp=5)
     assert "%4" in str(exc_info.value)
 
 
-def test_unfused_clamp_5_100_rejected(half_up_target):
+def test_unfused_clamp_5_100_rejected(target):
     with pytest.raises(CapabilityError) as exc_info:
-        _to_hir(half_up_target, clamp=(5, 100))
+        _to_hir(target, clamp=(5, 100))
     assert "%10" in str(exc_info.value)
 
 
@@ -284,7 +285,7 @@ def _direct_fused_graph(rescale: RescaleParams) -> Graph:
     return Graph(name="main", tensors=tensors, ops=ops, inputs=("arg0",), outputs=("10",))
 
 
-def test_to_hir_rejects_per_channel_directly(half_up_target):
+def test_to_hir_rejects_per_channel_directly(target):
     rescale = RescaleParams(
         multiplier=(1073741824,) * 8, shift=(38,) * 8, per_channel=True, in_zp=0, out_zp=0,
         rounding="SINGLE_ROUND", scale32=True, input_unsigned=False, output_unsigned=False,
@@ -292,12 +293,12 @@ def test_to_hir_rejects_per_channel_directly(half_up_target):
     graph = _direct_fused_graph(rescale)
     verify_gir(graph)
     with pytest.raises(CapabilityError) as exc_info:
-        to_hir(graph, half_up_target)
+        to_hir(graph, target)
     assert exc_info.value.constraint == "rescale.per_channel"
     assert exc_info.value.op_id == "%10"
 
 
-def test_to_hir_rejects_out_zp_directly(half_up_target):
+def test_to_hir_rejects_out_zp_directly(target):
     rescale = RescaleParams(
         multiplier=(1073741824,), shift=(38,), per_channel=False, in_zp=0, out_zp=5,
         rounding="SINGLE_ROUND", scale32=True, input_unsigned=False, output_unsigned=False,
@@ -305,7 +306,7 @@ def test_to_hir_rejects_out_zp_directly(half_up_target):
     graph = _direct_fused_graph(rescale)
     verify_gir(graph)
     with pytest.raises(CapabilityError) as exc_info:
-        to_hir(graph, half_up_target)
+        to_hir(graph, target)
     assert exc_info.value.constraint == "rescale.out_zp"
     assert exc_info.value.op_id == "%10"
 
@@ -315,17 +316,17 @@ def test_to_hir_rejects_out_zp_directly(half_up_target):
 # --------------------------------------------------------------------------
 
 
-def test_accumulator_note_for_worst_case_bias(half_up_target):
+def test_accumulator_note_for_worst_case_bias(target):
     bias = tuple([2**31 - 1] + [0] * 7)
-    module = _to_hir(half_up_target, in_c=8, out_c=8, k=3, bias=bias)
+    module = _to_hir(target, in_c=8, out_c=8, k=3, bias=bias)
     assert any("worst-case accumulation" in note and "int32" in note for note in module.notes)
     # The note references the fused_conv op's id, i.e. the fused chain's
     # output id (the clamp's %10), not the original conv2d's %4.
     assert any("%10" in note for note in module.notes)
 
 
-def test_no_accumulator_note_for_fixture(half_up_target):
-    module = _to_hir(half_up_target)
+def test_no_accumulator_note_for_fixture(target):
+    module = _to_hir(target)
     assert module.notes == ()
 
 
@@ -334,14 +335,14 @@ def test_no_accumulator_note_for_fixture(half_up_target):
 # --------------------------------------------------------------------------
 
 
-def test_select_unit_finds_conv_engine(half_up_target):
-    unit = select_unit(half_up_target, "conv2d")
+def test_select_unit_finds_conv_engine(target):
+    unit = select_unit(target, "conv2d")
     assert unit.name == "conv_engine"
 
 
-def test_select_unit_raises_for_unknown_kind(half_up_target):
+def test_select_unit_raises_for_unknown_kind(target):
     with pytest.raises(CapabilityError):
-        select_unit(half_up_target, "pool2d")
+        select_unit(target, "pool2d")
 
 
 def test_layer_env_extracts_shape_fields():
@@ -359,8 +360,8 @@ def test_layer_env_extracts_shape_fields():
     }
 
 
-def test_constraint_check_flags_divisible_violation(half_up_target):
-    unit = select_unit(half_up_target, "conv2d")
+def test_constraint_check_flags_divisible_violation(target):
+    unit = select_unit(target, "conv2d")
     divisible = next(c for c in unit.constraints if c.kind == "divisible")
     env = layer_env(
         {
@@ -374,8 +375,8 @@ def test_constraint_check_flags_divisible_violation(half_up_target):
     assert violation.actual == 12
 
 
-def test_constraint_check_passes_for_fixture(half_up_target):
-    unit = select_unit(half_up_target, "conv2d")
+def test_constraint_check_passes_for_fixture(target):
+    unit = select_unit(target, "conv2d")
     env = layer_env(
         {
             "in_width": 8, "in_height": 8, "in_channels": 4, "out_channels": 8,
