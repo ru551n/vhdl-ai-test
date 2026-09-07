@@ -281,9 +281,10 @@ def _build_target(root: Path, constants, model, constants_path: Path, model_path
                 align=64,
             )
         },
-        activation_layout="HWC",
-        weight_layout="OHWI",
-        bias_format="i32_le",
+        activation_layout="PLANES",
+        activation_plane_channels=constants.ACTIVATION_PLANE_CHANNELS,
+        weight_layout="TILED_OHWI",
+        bias_format="i32_le_tiled",
     )
 
     isa = IsaInfo(
@@ -312,8 +313,11 @@ def _build_target(root: Path, constants, model, constants_path: Path, model_path
             "memory.spaces['ddr'].size_bytes derived from the in_addr ISA field "
             "width (cnn_accel_constants.ISA_LAYOUT); .align=64 is a compiler burst "
             "alignment POLICY (AXI-burst-friendly), not a value read from the HW.",
-            "activation_layout/weight_layout/bias_format taken from cnn_accel_model.py's "
-            "module docstring ('Tensor layout conventions').",
+            "activation_layout='PLANES' is decision S6 (channel-tiled planes of "
+            "ACTIVATION_PLANE_CHANNELS, read from cnn_accel_constants.py); "
+            "weight_layout='TILED_OHWI'/bias_format='i32_le_tiled' are decisions D10/D11 "
+            "(cnn_accel_model.pack_weights_for_hw/pack_bias_for_hw images, tiled by "
+            "TILE_CHANNELS x PE_ROWS = internal_tiling.cin x cout).",
             f"epilogue.rescale.implicit_shift={implicit_shift} and "
             f"rounding={rounding!r} were discovered by probing "
             "cnn_accel_model.bias_requantize_relu, not hard-coded.",

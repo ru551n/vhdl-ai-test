@@ -52,9 +52,10 @@ _CORE_FIELD_PARAMS = (
     "requant_scale", "requant_shift",
 )
 
-_WEIGHT_LAYOUT_NOTE = (
-    '"weight_ddr_layout": "OHWI (cnn_accel_model.run_program convention; RTL-native '
-    'packing per pack_weights_for_hw is deferred to M10)"'
+_LAYOUT_NOTE = (
+    '"ddr_layouts": "activations are S6 channel-tiled planes (memory.activation_plane_channels); '
+    'weights/bias are the D10/D11 tile-major images of cnn_accel_model.pack_weights_for_hw/'
+    'pack_bias_for_hw (tiled by the unit\'s internal_tiling.cin x cout)"'
 )
 
 
@@ -289,6 +290,10 @@ def _build_manifest(
         "memory": {
             "space": program_buf.space,
             "size_bytes": module.memory_size,
+            "activation_layout": target.memory.activation_layout,
+            "activation_plane_channels": target.memory.activation_plane_channels,
+            "weight_layout": target.memory.weight_layout,
+            "bias_format": target.memory.bias_format,
             "program": {
                 "addr": program_buf.addr,
                 "size_bytes": program_buf.size_bytes,
@@ -303,7 +308,7 @@ def _build_manifest(
         "inputs": list(module.entry_inputs),
         "outputs": list(module.entry_outputs),
         "ops": op_entries,
-        "notes": list(module.notes) + [_WEIGHT_LAYOUT_NOTE],
+        "notes": list(module.notes) + [_LAYOUT_NOTE],
     }
 
 

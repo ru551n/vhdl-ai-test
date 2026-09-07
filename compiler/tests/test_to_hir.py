@@ -149,9 +149,15 @@ def test_fixture_buffers(target):
     module = _to_hir(target)
     weight = module.buffer("%0")
     bias = module.buffer("%1")
-    assert weight.data == bytes([1]) * 288
+    # 8x3x3x4 all-ones weights, tiled 8 (cin) x 8 (cout): one output tile, one
+    # input tile whose lanes c=4..7 are D11 zero padding -> 3*3*8*8 = 576 B.
+    assert len(weight.data) == 576
+    rows = [weight.data[i : i + 8] for i in range(0, 576, 8)]
+    assert all(row == bytes([1, 1, 1, 1, 0, 0, 0, 0]) for row in rows)
     assert bias.data == bytes(32)
-    assert weight.layout == "OHWI" and bias.layout == "I32_VEC"
+    assert weight.layout == "TILED_OHWI" and bias.layout == "I32_TILED"
+    assert module.buffer("%arg0").size_bytes == 512  # 4 channels padded to one 8-channel plane
+    assert module.buffer("%10").size_bytes == 512
     assert module.buffer("%arg0").role == "input"
     assert module.buffer("%10").role == "output"
 

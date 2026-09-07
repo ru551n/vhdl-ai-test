@@ -16,7 +16,7 @@ from __future__ import annotations
 import dataclasses
 from types import MappingProxyType
 
-LAYOUTS = ("HWC", "OHWI", "I32_VEC", "SCALE_TABLE", "PROGRAM")
+LAYOUTS = ("HWC", "PLANES", "OHWI", "TILED_OHWI", "I32_VEC", "I32_TILED", "SCALE_TABLE", "PROGRAM")
 ROLES = ("input", "output", "const", "intermediate", "program")
 STAGES = ("mapped", "scheduled", "planned")
 

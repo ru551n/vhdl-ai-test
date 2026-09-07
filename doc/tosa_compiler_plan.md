@@ -24,8 +24,11 @@ memory `tosa_compiler_env_findings.md`):
   `cnn_accel_bias_requant` rounds half-to-even (`[0,0,2,-2,2,-2]`).
 - torch-mlir does **not** lower PT2E quantized graphs to `tosa.rescale`;
   hand-written TOSA + IREE as oracle is the realistic MVP input path.
-- `cnn_accel` (this repo): per-layer 64-byte descriptor ISA, HWC activations,
-  OHWI weights (identical to TOSA's `[OC,KH,KW,IC]`), int32 LE bias, full
+- `cnn_accel` (this repo): per-layer 64-byte descriptor ISA; DDR byte images
+  are decision S6 channel-tiled activation planes `[ceil(C/T)][H][W][T]`
+  (`T = ACTIVATION_PLANE_CHANNELS`), D10/D11 tile-major weights
+  (`pack_weights_for_hw` of TOSA's logical `[OC,KH,KW,IC]`, zero-padded to
+  `TILE_CHANNELS x PE_ROWS` tiles) and `PE_ROWS`-padded int32 LE bias; full
   int32 requant multiplier (33×32-bit product), combined shift `15 +
   requant_shift`, ReLU before int8 saturate, no zero points, per-tensor
   scale only, Cin/Cout tiling done **inside** the hardware, no partial-sum
@@ -140,7 +143,8 @@ of the three unfused ops, and `gir/interp.py` executes it exactly that way.
 
 ```
 Buffer   { id, space: DDR|(future: SRAM), size_bytes, align, addr: int|None,
-           role: input|output|const|intermediate, layout: HWC|OHWI|I32_VEC }
+           role: input|output|const|intermediate,
+           layout: PLANES|TILED_OHWI|I32_TILED (cnn_accel S6/D10) | HWC|OHWI|I32_VEC }
 HirOp    { id, unit: str, kind: str, params: dict, reads: [Buffer], writes: [Buffer],
            deps: [HirOp.id], seq: int|None }
 HirModule{ target, ops, buffers, entry_inputs, entry_outputs, program: Buffer|None }
@@ -150,10 +154,10 @@ Same conv after `to_hir` + `schedule` + `memplan`:
 
 ```
 buffers:
-  %in   DDR HWC  256 B  align 64  addr 0x00010000  role input
-  %w    DDR OHWI 288 B  align 64  addr 0x00001000  role const
-  %b    DDR I32  32 B   align 64  addr 0x00001140  role const
-  %y    DDR HWC  512 B  align 64  addr 0x00020000  role output
+  %in   DDR PLANES     512 B  align 64  addr 0x00010000  role input   (4 ch -> one 8-ch plane)
+  %w    DDR TILED_OHWI 576 B  align 64  addr 0x00001000  role const   (ic 4..7 zero lanes)
+  %b    DDR I32_TILED   32 B  align 64  addr 0x00001280  role const
+  %y    DDR PLANES     512 B  align 64  addr 0x00020000  role output
 ops:
   #0 seq 0 unit conv_engine kind conv_layer
      reads [%in %w %b] writes [%y] deps []
@@ -210,7 +214,8 @@ single source of truth.
   "name": "cnn_accel_v1",
   "program_model": "layer_descriptors",
   "memory": { "spaces": { "DDR": { "size": 268435456, "align": 64 } },
-              "activation_layout": "HWC", "weight_layout": "OHWI", "bias_format": "i32_le" },
+              "activation_layout": "PLANES", "activation_plane_channels": 8,
+              "weight_layout": "TILED_OHWI", "bias_format": "i32_le_tiled" },
   "units": [
     { "name": "conv_engine",
       "ops": ["conv2d"],
@@ -703,7 +708,10 @@ Decide early (they shape data structures):
 
 1. **Rounding** — decided (H0). Until it lands the compiler is correctly
    *unable* to target `cnn_accel_v1`; M8 is gated on it.
-2. **HWC / OHWI layouts and N=1** — fixed by HW; baked into HIR `layout`.
+2. **DDR layouts and N=1** — fixed by HW (S6 planes, D10/D11 tiled weights/
+   bias); baked into HIR `layout` with the tile widths discovered from
+   `cnn_accel_constants.py`, packed by `cnnc/lower/layout.py` and pinned
+   against the golden model's `pack_*` functions in `tests/test_layout.py`.
    Fine for CNN inference; revisit only if the HW changes.
 3. **Zero points / per-channel** — rejected in MVP; `output_zp`, general
    clamp and per-channel scale are scheduled (H1/H2, M11/M12). Remaining

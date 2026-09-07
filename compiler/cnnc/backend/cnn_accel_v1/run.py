@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 
 from cnnc.errors import CompilerError
+from cnnc.lower.layout import pack_activation_planes, unpack_activation_planes
 
 from .emit import Program
 
@@ -91,7 +92,7 @@ def _buffers_by_role(manifest: dict, role: str) -> list[dict]:
     return [b for b in manifest["buffers"] if b["role"] == role]
 
 
-def _encode_input(name: str, arr: np.ndarray, buf: dict) -> bytes:
+def _encode_input(name: str, arr: np.ndarray, buf: dict, plane_channels: int) -> bytes:
     dtype = _NP_DTYPE.get(buf["dtype"])
     if dtype is None:
         raise CompilerError(f"input {name!r}: unsupported buffer dtype {buf['dtype']!r}", stage=_STAGE)
@@ -105,7 +106,9 @@ def _encode_input(name: str, arr: np.ndarray, buf: dict) -> bytes:
         raise CompilerError(
             f"input {name!r}: dtype {arr.dtype} != expected {np.dtype(dtype)}", stage=_STAGE
         )
-    data = arr.tobytes(order="C")
+    if buf["layout"] != "PLANES":
+        raise CompilerError(f"input {name!r}: unsupported activation layout {buf['layout']!r}", stage=_STAGE)
+    data = pack_activation_planes(arr, plane_channels)
     if len(data) != buf["size_bytes"]:
         raise CompilerError(
             f"input {name!r}: encoded size {len(data)} != buffer size_bytes {buf['size_bytes']}",
@@ -114,14 +117,15 @@ def _encode_input(name: str, arr: np.ndarray, buf: dict) -> bytes:
     return data
 
 
-def _decode_output(memory: bytearray, buf: dict) -> np.ndarray:
+def _decode_output(memory: bytearray, buf: dict, plane_channels: int) -> np.ndarray:
     dtype = _NP_DTYPE.get(buf["dtype"])
     if dtype is None:
         raise CompilerError(f"output {buf['id']!r}: unsupported buffer dtype {buf['dtype']!r}", stage=_STAGE)
+    if buf["layout"] != "PLANES":
+        raise CompilerError(f"output {buf['id']!r}: unsupported activation layout {buf['layout']!r}", stage=_STAGE)
     addr, size = buf["addr"], buf["size_bytes"]
     raw = bytes(memory[addr : addr + size])
-    arr = np.frombuffer(raw, dtype=dtype)
-    return arr.reshape(tuple(buf["shape"]))
+    return unpack_activation_planes(raw, tuple(buf["shape"]), dtype, plane_channels)
 
 
 def run_program(
@@ -146,6 +150,7 @@ def run_program(
     model = _load_model(root, provenance.get("files", {}))
 
     program_info = manifest["memory"]["program"]
+    plane_channels = manifest["memory"]["activation_plane_channels"]
     if len(program.program_bytes) != program_info["size_bytes"]:
         raise CompilerError(
             f"program_bytes length {len(program.program_bytes)} != manifest size_bytes "
@@ -174,12 +179,12 @@ def run_program(
     if extra:
         raise CompilerError(f"unexpected input(s) (not a graph entry input): {extra}", stage=_STAGE)
     for name, buf in input_bufs.items():
-        chunks[buf["addr"]] = _encode_input(name, inputs[name], buf)
+        chunks[buf["addr"]] = _encode_input(name, inputs[name], buf, plane_channels)
 
     memory = model.build_memory_image(chunks, size=manifest["memory"]["size_bytes"])
     model.run_program(memory, program_info["addr"], max_instructions=max_instructions)
 
     outputs = {}
     for buf in _buffers_by_role(manifest, "output"):
-        outputs[buf["gir_tensor"]] = _decode_output(memory, buf)
+        outputs[buf["gir_tensor"]] = _decode_output(memory, buf, plane_channels)
     return outputs

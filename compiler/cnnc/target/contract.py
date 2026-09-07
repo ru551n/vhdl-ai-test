@@ -65,6 +65,7 @@ class MemorySpace:
 class Memory:
     spaces: dict[str, MemorySpace]
     activation_layout: str
+    activation_plane_channels: int
     weight_layout: str
     bias_format: str
 
@@ -77,11 +78,14 @@ class Memory:
         for field_name in ("activation_layout", "weight_layout", "bias_format"):
             if not getattr(self, field_name):
                 raise TargetError(f"Memory.{field_name} must be non-empty")
+        if self.activation_plane_channels <= 0:
+            raise TargetError("Memory.activation_plane_channels must be positive")
 
     def to_dict(self) -> dict:
         return {
             "spaces": {name: space.to_dict() for name, space in self.spaces.items()},
             "activation_layout": self.activation_layout,
+            "activation_plane_channels": self.activation_plane_channels,
             "weight_layout": self.weight_layout,
             "bias_format": self.bias_format,
         }
@@ -93,6 +97,7 @@ class Memory:
         return cls(
             spaces=spaces,
             activation_layout=_require(data, "activation_layout", "Memory"),
+            activation_plane_channels=_require(data, "activation_plane_channels", "Memory"),
             weight_layout=_require(data, "weight_layout", "Memory"),
             bias_format=_require(data, "bias_format", "Memory"),
         )

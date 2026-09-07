@@ -15,12 +15,15 @@ No pass mutates its input; scheduling (`HirOp.seq`) and memory planning
 
 from __future__ import annotations
 
-import struct
-
 from cnnc.errors import CapabilityError
 from cnnc.gir.ir import FusedConvAttrs, Graph, Op, Tensor
 from cnnc.hir.ir import Buffer, HirModule, HirOp
 from cnnc.hir.verify import verify_hir
+from cnnc.lower.layout import (
+    activation_bytes,
+    pack_bias_tiled,
+    pack_weights_tiled,
+)
 from cnnc.target.constraints import check
 from cnnc.target.contract import RescaleCaps, Target, Unit
 
@@ -64,15 +67,6 @@ def layer_env(params: dict) -> dict:
 
 def _dtype_bytes(dtype: str) -> int:
     return 4 if dtype == "i32" else 1
-
-
-def _pack_weight(values: tuple[int, ...]) -> bytes:
-    """OHWI int8 weight bytes in TOSA/two's-complement order, no transpose."""
-    return bytes(v & 0xFF for v in values)
-
-
-def _pack_bias(values: tuple[int, ...]) -> bytes:
-    return struct.pack(f"<{len(values)}i", *values)
 
 
 def _isa_at_least(version: str, minimum: str) -> bool:
@@ -210,7 +204,7 @@ def _accumulator_note(op: Op, kh: int, kw: int, in_channels: int, bias_values: t
 
 
 def _lower_fused_conv(
-    op: Op, graph: Graph, unit: Unit, *, space_name: str, align: int, activation_layout: str
+    op: Op, graph: Graph, unit: Unit, *, space_name: str, align: int, activation_layout: str, plane_channels: int
 ) -> tuple[HirOp, Buffer, str | None]:
     x_id, w_id, b_id = op.inputs
     y_id = op.outputs[0]
@@ -273,7 +267,7 @@ def _lower_fused_conv(
     y_buf = Buffer(
         id=f"%{y_id}",
         space=space_name,
-        size_bytes=y.numel * _dtype_bytes(y.dtype),
+        size_bytes=activation_bytes(y.shape, plane_channels, _dtype_bytes(y.dtype)),
         align=align,
         role="output" if y_id in graph.outputs else "intermediate",
         layout=activation_layout,
@@ -291,6 +285,8 @@ def to_hir(graph: Graph, target: Target) -> HirModule:
         raise AssertionError(f"to_hir MVP requires exactly one memory space, target has {sorted(target.memory.spaces)}")
     space_name, space = next(iter(target.memory.spaces.items()))
     activation_layout = target.memory.activation_layout
+    plane_channels = target.memory.activation_plane_channels
+    tiling = conv_unit.internal_tiling
 
     for op in graph.ops:
         if op.kind not in ("const", "fused_conv"):
@@ -305,14 +301,15 @@ def to_hir(graph: Graph, target: Target) -> HirModule:
     weight_of: dict[str, str] = {}
     for op in fused_ops:
         _x_id, w_id, b_id = op.inputs
-        weight_of[w_id] = "OHWI"
-        weight_of[b_id] = "I32_VEC"
+        weight_of[w_id] = "TILED_OHWI"
+        weight_of[b_id] = "I32_TILED"
 
     buffers: dict[str, Buffer] = {}
     for tid in graph.inputs:
         t = graph.tensor(tid)
         buffers[f"%{tid}"] = Buffer(
-            id=f"%{tid}", space=space_name, size_bytes=t.numel * _dtype_bytes(t.dtype), align=space.align,
+            id=f"%{tid}", space=space_name,
+            size_bytes=activation_bytes(t.shape, plane_channels, _dtype_bytes(t.dtype)), align=space.align,
             role="input", layout=activation_layout, shape=t.shape, dtype=t.dtype, gir_tensor=tid,
         )
 
@@ -321,8 +318,11 @@ def to_hir(graph: Graph, target: Target) -> HirModule:
             continue
         tid = op.outputs[0]
         t = graph.tensor(tid)
-        layout = weight_of.get(tid, "OHWI" if len(t.shape) == 4 else "I32_VEC")
-        data = _pack_weight(t.values or ()) if layout == "OHWI" else _pack_bias(t.values or ())
+        layout = weight_of.get(tid, "TILED_OHWI" if len(t.shape) == 4 else "I32_TILED")
+        if layout == "TILED_OHWI":
+            data = pack_weights_tiled(t.values or (), t.shape, tiling.cin, tiling.cout)
+        else:
+            data = pack_bias_tiled(t.values or (), tiling.cout)
         buffers[f"%{tid}"] = Buffer(
             id=f"%{tid}", space=space_name, size_bytes=len(data), align=space.align,
             role="const", layout=layout, shape=t.shape, dtype=t.dtype, data=data, gir_tensor=tid,
@@ -333,7 +333,8 @@ def to_hir(graph: Graph, target: Target) -> HirModule:
     writer_of: dict[str, str] = {}
     for idx, op in enumerate(fused_ops):
         hir_op, y_buf, note = _lower_fused_conv(
-            op, graph, conv_unit, space_name=space_name, align=space.align, activation_layout=activation_layout
+            op, graph, conv_unit, space_name=space_name, align=space.align, activation_layout=activation_layout,
+            plane_channels=plane_channels,
         )
         op_id = f"#{idx}"
         hir_op = hir_op.replace(id=op_id, deps=tuple(sorted({writer_of[bid] for bid in hir_op.reads if bid in writer_of})))
