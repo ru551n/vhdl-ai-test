@@ -1759,3 +1759,64 @@ def test_pe_array_tiled_dataflow_matches_conv2d(in_c, out_c, kernel, stride, pad
         input_values, weights, bias, desc, tile_channels=tile_channels, pe_rows=pe_rows
     )
     assert simulated == golden
+
+
+# ---------------------------------------------------------------------------
+# Frame budget (flow_status.md S5): the section-6 cycle model from
+# doc/cnn_accel_sizing_proposal.md, as a real, currently-shortfall-aware
+# test instead of a static markdown table -- `cnn_accel_constants.py` is
+# the single source of truth for `CLOCK_HZ`/`TARGET_FPS`/`BACKBONE_TARGET`
+# and the `cycles_per_frame()`/`frame_budget_cycles()` model.
+# ---------------------------------------------------------------------------
+
+
+def test_frame_budget_cycle_model_matches_sizing_proposal() -> None:
+    """Pins `cycles_per_frame()` to the exact per-config totals in
+    doc/cnn_accel_sizing_proposal.md section 3/4 at the 320x240 target, so
+    a silent change to `BACKBONE_TARGET` or the cycle formula is caught."""
+    assert cnn_accel_constants.cycles_per_frame(8) == 4_300_800
+    assert cnn_accel_constants.cycles_per_frame(16) == 2_150_400
+    assert cnn_accel_constants.frame_budget_cycles() == 2_500_000
+    assert cnn_accel_constants.frame_budget_cycles(fps=30) == 5_000_000
+
+
+def test_frame_budget_scaled_pe_rows_meets_60fps() -> None:
+    """`PE_ROWS_SCALED` (16) is the decision S1-S7 ratified as the 60 fps,
+    150 MHz point on the 320x240 target: this must have headroom, not
+    just clear the bar."""
+    cycles = cnn_accel_constants.cycles_per_frame(cnn_accel_constants.PE_ROWS_SCALED)
+    budget = cnn_accel_constants.frame_budget_cycles()
+    assert cycles <= budget, (
+        f"pe_rows={cnn_accel_constants.PE_ROWS_SCALED}: {cycles} cycles/frame "
+        f"exceeds the {budget}-cycle budget for {cnn_accel_constants.TARGET_FPS} fps "
+        f"at {cnn_accel_constants.CLOCK_HZ} Hz by {cycles / budget:.3f}x"
+    )
+    headroom = 1 - cycles / budget
+    assert headroom == pytest.approx(0.14, abs=0.01)
+
+
+def test_frame_budget_default_pe_rows_misses_60fps_by_known_shortfall() -> None:
+    """Documents, as a running assertion rather than prose, that the
+    shipped default (`PE_ROWS`, 8 rows, ~30 fps) does NOT meet the 60 fps
+    target -- doc/cnn_accel_sizing_proposal.md section 4's "1.72x over"
+    verdict. If this ever starts passing, `PE_ROWS`'s default changed and
+    flow_status.md's S1-S7 block needs updating, not this test."""
+    cycles = cnn_accel_constants.cycles_per_frame(cnn_accel_constants.PE_ROWS)
+    budget = cnn_accel_constants.frame_budget_cycles()
+    shortfall = cycles / budget
+    assert shortfall == pytest.approx(1.72, abs=0.01), (
+        f"pe_rows={cnn_accel_constants.PE_ROWS}: {cycles} cycles/frame is "
+        f"{shortfall:.3f}x the {budget}-cycle, "
+        f"{cnn_accel_constants.TARGET_FPS} fps @ {cnn_accel_constants.CLOCK_HZ} Hz budget"
+    )
+
+
+def test_frame_budget_default_pe_rows_meets_30fps() -> None:
+    """The shipped default does meet 30 fps at 150 MHz, per
+    doc/cnn_accel_sizing_proposal.md section 4: "8x8 does meet 30 FPS"."""
+    cycles = cnn_accel_constants.cycles_per_frame(cnn_accel_constants.PE_ROWS)
+    budget = cnn_accel_constants.frame_budget_cycles(fps=30)
+    assert cycles <= budget, (
+        f"pe_rows={cnn_accel_constants.PE_ROWS}: {cycles} cycles/frame "
+        f"exceeds the {budget}-cycle, 30 fps budget by {cycles / budget:.3f}x"
+    )

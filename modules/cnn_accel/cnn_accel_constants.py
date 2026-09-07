@@ -24,6 +24,7 @@ import this cheaply, and hdl-registers is not a golden-model dependency.
 
 from __future__ import annotations
 
+import math
 from typing import NamedTuple
 
 # ---------------------------------------------------------------------------
@@ -64,6 +65,77 @@ MAX_ROW_TILE_WORDS = 512
 WEIGHT_BUFFER_DEPTH = 288
 BIAS_BUFFER_DEPTH = 8
 ACCUM_WIDTH = 32
+
+# ---------------------------------------------------------------------------
+# Frame budget (flow_status.md S5): the target backbone, the clock/fps
+# targets, and the section-6 cycle model from
+# doc/cnn_accel_sizing_proposal.md, ported to Python so
+# `test_cnn_accel_model.py` can assert the budget as a real (currently
+# failing at PE_ROWS) test instead of a static markdown table that can
+# silently go stale.
+#
+# `BACKBONE_TARGET` is the 9-layer target backbone from
+# doc/cnn_accel_tiled_dataflow_proposal.md section 6, `pixels_320` being
+# each layer's per-pixel output count at the reference 320x320 input
+# (already reflecting that layer's cumulative downsampling). Per
+# doc/cnn_accel_sizing_proposal.md section 3, an input of a different size
+# scales every layer's pixel count by the input/reference area ratio.
+# ---------------------------------------------------------------------------
+
+CLOCK_HZ = 150_000_000
+TARGET_FPS = 60
+INPUT_W = 320
+INPUT_H = 240
+
+# Reference resolution the BACKBONE_TARGET pixel counts were measured at
+# (doc/cnn_accel_tiled_dataflow_proposal.md section 6).
+_REFERENCE_W = 320
+_REFERENCE_H = 320
+
+
+class BackboneLayer(NamedTuple):
+    in_channels: int
+    out_channels: int
+    pixels_at_reference: int  # output pixel count at _REFERENCE_W x _REFERENCE_H
+
+
+BACKBONE_TARGET = (
+    BackboneLayer(3, 16, 25600),
+    BackboneLayer(16, 32, 6400),
+    BackboneLayer(32, 32, 6400),
+    BackboneLayer(32, 64, 1600),
+    BackboneLayer(64, 64, 1600),
+    BackboneLayer(64, 128, 400),
+    BackboneLayer(128, 128, 400),
+    BackboneLayer(128, 256, 100),
+    BackboneLayer(256, 256, 100),
+)
+
+
+def cycles_per_frame(
+    pe_rows: int,
+    pe_cols: int = PE_COLS,
+    input_w: int = INPUT_W,
+    input_h: int = INPUT_H,
+) -> int:
+    """Cycle count for one frame, `doc/cnn_accel_sizing_proposal.md` section 3:
+    per-pixel cycles = ceil(9*in_channels/pe_cols), output-channel tile
+    count OT = ceil(out_channels/pe_rows), layer cycles = pixels *
+    cyc_per_pixel * OT, summed over `BACKBONE_TARGET`.
+    """
+    area_ratio = (input_w * input_h) / (_REFERENCE_W * _REFERENCE_H)
+    total = 0.0
+    for layer in BACKBONE_TARGET:
+        pixels = layer.pixels_at_reference * area_ratio
+        cycles_per_pixel = math.ceil(9 * layer.in_channels / pe_cols)
+        out_tiles = math.ceil(layer.out_channels / pe_rows)
+        total += pixels * cycles_per_pixel * out_tiles
+    return round(total)
+
+
+def frame_budget_cycles(clock_hz: int = CLOCK_HZ, fps: int = TARGET_FPS) -> int:
+    """Cycle budget for one frame at `clock_hz` to sustain `fps`."""
+    return clock_hz // fps
 
 # ---------------------------------------------------------------------------
 # Opcodes: instruction word W0 bits [7:0]. Values only -- VHDL type

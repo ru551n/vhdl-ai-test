@@ -437,6 +437,22 @@ Basis: `doc/cnn_accel_sizing_proposal.md` (8x8 = 34.9 fps at 150 MHz on
   default from the regs pkg), S5 (pytest frame budget), S6 (arch/layer_ctrl
   docs), S7 (150 MHz constrained build).
 
+### S5 progress, 2026-09-07
+
+- `cnn_accel_constants.py`: `CLOCK_HZ=150_000_000`, `TARGET_FPS=60`,
+  `INPUT_W=320`, `INPUT_H=240`, the 9-entry `BACKBONE_TARGET` (in/out
+  channels + reference pixel count per layer, from
+  `cnn_accel_tiled_dataflow_proposal.md` section 6), and
+  `cycles_per_frame(pe_rows, ...)` / `frame_budget_cycles(...)` porting the
+  `cnn_accel_sizing_proposal.md` section 3 cycle model to Python.
+- `test_cnn_accel_model.py`: four new tests -- pins `cycles_per_frame()` to
+  the proposal's exact totals (4,300,800 @ 8 rows, 2,150,400 @ 16 rows) and
+  budgets (2,500,000 @ 60 fps, 5,000,000 @ 30 fps); asserts
+  `PE_ROWS_SCALED` (16) meets the 60 fps budget with ~14% headroom;
+  asserts the shipped default (`PE_ROWS`, 8) misses 60 fps by the documented
+  1.72x shortfall (a running regression, not prose, per S5's "failing
+  test" framing) while meeting 30 fps. 195/195 pytest passing.
+
 Also committed this date: M9a `cnn_accel_axi_read_dma` (`efc96e6`), M9b
 `cnn_accel_ofmap_dma` (`4c5953e`), dual Vivado/Yosys backend (`d513958`),
 hdl-registers single-source-of-truth constants (`967562b`). Phase table
