@@ -388,6 +388,18 @@ Why this layout, and what it costs:
 raster-order beats of `g_tile_channels` channels, which is exactly one
 plane's worth per beat when `g_tile_channels = T = 8`.
 
+This section covers activations only. `CONV2D`/`FC` weights and bias have
+their own, separate DDR image: exactly `pack_weights_for_hw()`'s tile-major
+byte layout and `pack_bias_for_hw()`'s `OT*g_pe_rows`-int32 layout (decision
+D10, see the opcode-support section below) — unlike activation planes,
+this image depends on `g_pe_rows`, which is why the host reads `HW_INFO`
+before packing weights but not before packing activations.
+`modules/cnn_accel/cnn_accel_model.py`'s `run_program`/`run_layer` now
+consume exactly this contract end to end: activations through
+`pack_activation_planes`/`unpack_activation_planes`, weights/bias through
+`pack_weights_for_hw`/`unpack_weights_from_hw`/`pack_bias_for_hw` — the
+golden model reads/writes the same DDR bytes the real DMA engines would.
+
 ### Bus-width bound (decision D1)
 
 Both DMA engines require `req.addr` and `req.length` to be multiples of

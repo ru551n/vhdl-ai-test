@@ -60,6 +60,8 @@ from cnn_accel_model import (
     FLAG_PAD_EN,
     FLAG_RELU_EN,
     FLAG_REQUANT_EN,
+    activation_bytes,
+    activation_plane_count,
     bias_requantize_relu,
     build_memory_image,
     conv2d,
@@ -68,14 +70,19 @@ from cnn_accel_model import (
     encode_instruction,
     encode_program,
     fc,
+    pack_activation_planes,
     pack_bias_for_hw,
     pack_weights_for_hw,
+    packed_bias_count,
+    packed_weight_count,
     pool_avg,
     pool_max,
     round_shift_right_signed,
     run_layer,
     run_program,
     saturate_signed,
+    unpack_activation_planes,
+    unpack_weights_from_hw,
 )
 
 
@@ -1287,6 +1294,32 @@ def _from_signed_bytes(data: bytes) -> list[int]:
     return [b - 256 if b >= 128 else b for b in data]
 
 
+# `run_layer`/`run_program` speak the ratified DDR layout (decision S6 for
+# activations, D10 for weights/bias), NOT the LOGICAL flat-list layout
+# `conv2d`/`pool_*`/`fc` take/return -- these three helpers build/read the
+# DDR-side `memory[]` chunks a real `memory_image.csv` would contain, using
+# the module's own default TILE_CHANNELS/PE_ROWS (what `run_layer` itself
+# assumes).
+def _activation_chunk(values_hwc: list[int], width: int, height: int, channels: int) -> bytes:
+    return _to_signed_bytes(pack_activation_planes(values_hwc, width, height, channels))
+
+
+def _read_activation(mem: bytearray, addr: int, width: int, height: int, channels: int) -> list[int]:
+    n = activation_bytes(width, height, channels)
+    return unpack_activation_planes(_from_signed_bytes(bytes(mem[addr : addr + n])), width, height, channels)
+
+
+def _weight_chunk(weights: list[int], desc: LayerDesc) -> bytes:
+    return _to_signed_bytes(
+        pack_weights_for_hw(weights, desc, cnn_accel_constants.TILE_CHANNELS, cnn_accel_constants.PE_ROWS)
+    )
+
+
+def _bias_chunk(bias: list[int], desc: LayerDesc) -> bytes:
+    packed = pack_bias_for_hw(bias, desc, cnn_accel_constants.PE_ROWS)
+    return struct.pack(f"<{len(packed)}i", *packed)
+
+
 def test_run_layer_conv2d_end_to_end_via_memory_image() -> None:
     rng = random.Random(42001)
     in_w, in_h, in_c, out_c, k = 4, 4, 2, 3, 3
@@ -1305,15 +1338,16 @@ def test_run_layer_conv2d_end_to_end_via_memory_image() -> None:
         requant_scale=1 << 13, requant_shift=1,
     )
     chunks = {
-        in_addr: _to_signed_bytes(input_values),
-        weight_addr: _to_signed_bytes(weights),
-        bias_addr: struct.pack(f"<{out_c}i", *bias),
+        in_addr: _activation_chunk(input_values, in_w, in_h, in_c),
+        weight_addr: _weight_chunk(weights, desc),
+        bias_addr: _bias_chunk(bias, desc),
     }
     mem = build_memory_image(chunks, size=0x5000)
     run_layer(mem, desc)
 
     expected = conv2d(input_values, weights, bias, desc)
-    actual = _from_signed_bytes(bytes(mem[out_addr : out_addr + len(expected)]))
+    out_w, out_h = in_w, in_h  # same-padding, stride 1 -> unchanged spatial size
+    actual = _read_activation(mem, out_addr, out_w, out_h, out_c)
     assert actual == expected
 
 
@@ -1329,11 +1363,12 @@ def test_run_layer_pool_end_to_end_via_memory_image() -> None:
         in_width=in_w, in_height=in_h, in_channels=in_c,
         pool_kernel_h=2, pool_kernel_w=2, pool_stride_h=2, pool_stride_w=2,
     )
-    mem = build_memory_image({in_addr: _to_signed_bytes(input_values)}, size=0x3000)
+    mem = build_memory_image({in_addr: _activation_chunk(input_values, in_w, in_h, in_c)}, size=0x3000)
     run_layer(mem, desc)
 
     expected = pool_max(input_values, desc)
-    actual = _from_signed_bytes(bytes(mem[out_addr : out_addr + len(expected)]))
+    out_w, out_h = in_w // 2, in_h // 2
+    actual = _read_activation(mem, out_addr, out_w, out_h, in_c)
     assert actual == expected
 
 
@@ -1352,15 +1387,15 @@ def test_run_layer_fc_end_to_end_via_memory_image() -> None:
         in_width=1, in_height=1, in_channels=in_c, out_channels=out_c, kernel_h=1, kernel_w=1,
     )
     chunks = {
-        in_addr: _to_signed_bytes(input_values),
-        weight_addr: _to_signed_bytes(weights),
-        bias_addr: struct.pack(f"<{out_c}i", *bias),
+        in_addr: _activation_chunk(input_values, 1, 1, in_c),
+        weight_addr: _weight_chunk(weights, desc),
+        bias_addr: _bias_chunk(bias, desc),
     }
     mem = build_memory_image(chunks, size=0x5000)
     run_layer(mem, desc)
 
     expected = fc(input_values, weights, bias, desc)
-    actual = _from_signed_bytes(bytes(mem[out_addr : out_addr + len(expected)]))
+    actual = _read_activation(mem, out_addr, 1, 1, out_c)
     assert actual == expected
 
 
@@ -1396,9 +1431,9 @@ def test_run_program_chains_conv_then_pool_and_halts() -> None:
     program = encode_program([conv_desc, pool_desc, halt_desc], program_addr=program_addr)
     chunks = {
         program_addr: program,
-        in_addr: _to_signed_bytes(input_values),
-        weight_addr: _to_signed_bytes(weights),
-        bias_addr: struct.pack(f"<{out_c}i", *bias),
+        in_addr: _activation_chunk(input_values, in_w, in_h, in_c),
+        weight_addr: _weight_chunk(weights, conv_desc),
+        bias_addr: _bias_chunk(bias, conv_desc),
     }
     mem = build_memory_image(chunks, size=0x6000)
 
@@ -1406,12 +1441,189 @@ def test_run_program_chains_conv_then_pool_and_halts() -> None:
     assert executed == 2  # conv + pool, HALT not counted
 
     conv_expected = conv2d(input_values, weights, bias, conv_desc)
-    mid_actual = _from_signed_bytes(bytes(mem[mid_addr : mid_addr + len(conv_expected)]))
+    mid_actual = _read_activation(mem, mid_addr, in_w, in_h, out_c)
     assert mid_actual == conv_expected  # layer 2 really consumed layer 1's output
 
+    final_w, final_h = in_w // 2, in_h // 2
     pool_expected = pool_max(conv_expected, pool_desc)
-    final_actual = _from_signed_bytes(bytes(mem[final_addr : final_addr + len(pool_expected)]))
+    final_actual = _read_activation(mem, final_addr, final_w, final_h, out_c)
     assert final_actual == pool_expected
+
+    # (e) D1's alignment argument: every activation buffer's DDR byte size
+    # AND its own address are multiples of ACTIVATION_PLANE_CHANNELS,
+    # across this whole two-layer chain -- because every request is a
+    # whole plane, an AXI bus of at most ACTIVATION_PLANE_CHANNELS bytes
+    # is aligned unconditionally (doc/cnn_accel_arch.md "Bus-width bound
+    # (decision D1)").
+    t = cnn_accel_constants.ACTIVATION_PLANE_CHANNELS
+    for addr, w, h, c in (
+        (in_addr, in_w, in_h, in_c),
+        (mid_addr, in_w, in_h, out_c),
+        (final_addr, final_w, final_h, out_c),
+    ):
+        assert addr % t == 0
+        assert activation_bytes(w, h, c) % t == 0
+
+
+def test_run_program_conv2d_multi_tile_matches_direct_conv2d_in_channels_partial() -> None:
+    """Multi-input-tile case (`in_channels=3` not a multiple of
+    `TILE_CHANNELS=8`, `out_channels=8` exactly one output tile): a full
+    `run_program` round trip through the ratified S6/D10 DDR layout must
+    match `conv2d()` called directly on the LOGICAL lists."""
+    rng = random.Random(0x5106)
+    in_w, in_h, in_c, out_c, k = 5, 5, 3, 8, 3
+    input_values = [rng.randint(-128, 127) for _ in range(in_w * in_h * in_c)]
+    weights = [rng.randint(-128, 127) for _ in range(out_c * k * k * in_c)]
+    bias = [rng.randint(-1000, 1000) for _ in range(out_c)]
+
+    program_addr = 0x0000
+    in_addr, weight_addr, bias_addr, out_addr = 0x1000, 0x2000, 0x8000, 0x9000
+    conv_desc = LayerDesc(
+        opcode=OPCODE_CONV2D,
+        flags=(1 << FLAG_BIAS_EN) | (1 << FLAG_PAD_EN),
+        in_addr=in_addr, out_addr=out_addr, weight_addr=weight_addr, bias_addr=bias_addr,
+        in_width=in_w, in_height=in_h, in_channels=in_c, out_channels=out_c,
+        kernel_h=k, kernel_w=k, stride_h=1, stride_w=1,
+        pad_top=1, pad_bottom=1, pad_left=1, pad_right=1,
+    )
+    halt_desc = LayerDesc(opcode=OPCODE_HALT)
+    program = encode_program([conv_desc, halt_desc], program_addr=program_addr)
+    chunks = {
+        program_addr: program,
+        in_addr: _activation_chunk(input_values, in_w, in_h, in_c),
+        weight_addr: _weight_chunk(weights, conv_desc),
+        bias_addr: _bias_chunk(bias, conv_desc),
+    }
+    mem = build_memory_image(chunks, size=0xA000)
+
+    executed = run_program(mem, program_addr)
+    assert executed == 1
+
+    expected = conv2d(input_values, weights, bias, conv_desc)
+    actual = _read_activation(mem, out_addr, in_w, in_h, out_c)
+    assert actual == expected
+
+
+def test_run_program_conv2d_multi_tile_matches_direct_conv2d_both_dims() -> None:
+    """Multi-tile on BOTH sides (`in_channels=16` = 2 input tiles,
+    `out_channels=24` = 3 output tiles at `PE_ROWS=8`): same acceptance
+    check as above, exercising the full `OT x T` sweep of
+    `pack_weights_for_hw`/`unpack_weights_from_hw`."""
+    rng = random.Random(0x1624)
+    in_w, in_h, in_c, out_c, k = 4, 4, 16, 24, 3
+    input_values = [rng.randint(-128, 127) for _ in range(in_w * in_h * in_c)]
+    weights = [rng.randint(-128, 127) for _ in range(out_c * k * k * in_c)]
+    bias = [rng.randint(-1000, 1000) for _ in range(out_c)]
+
+    program_addr = 0x0000
+    in_addr, weight_addr, bias_addr, out_addr = 0x1000, 0x2000, 0x8000, 0x9000
+    conv_desc = LayerDesc(
+        opcode=OPCODE_CONV2D,
+        flags=(1 << FLAG_BIAS_EN) | (1 << FLAG_PAD_EN),
+        in_addr=in_addr, out_addr=out_addr, weight_addr=weight_addr, bias_addr=bias_addr,
+        in_width=in_w, in_height=in_h, in_channels=in_c, out_channels=out_c,
+        kernel_h=k, kernel_w=k, stride_h=1, stride_w=1,
+        pad_top=1, pad_bottom=1, pad_left=1, pad_right=1,
+    )
+    halt_desc = LayerDesc(opcode=OPCODE_HALT)
+    program = encode_program([conv_desc, halt_desc], program_addr=program_addr)
+    chunks = {
+        program_addr: program,
+        in_addr: _activation_chunk(input_values, in_w, in_h, in_c),
+        weight_addr: _weight_chunk(weights, conv_desc),
+        bias_addr: _bias_chunk(bias, conv_desc),
+    }
+    mem = build_memory_image(chunks, size=0xA000)
+
+    executed = run_program(mem, program_addr)
+    assert executed == 1
+
+    expected = conv2d(input_values, weights, bias, conv_desc)
+    actual = _read_activation(mem, out_addr, in_w, in_h, out_c)
+    assert actual == expected
+
+
+# ---------------------------------------------------------------------------
+# Activation channel-tiled planes (decision S6): pack/unpack round trip,
+# zero-padding, and the byte-offset formula itself.
+# ---------------------------------------------------------------------------
+
+
+def test_pack_activation_planes_round_trips_and_zero_pads() -> None:
+    """`unpack_activation_planes(pack_activation_planes(x, w, h, c), w, h,
+    c) == x` for every x, and every padded lane (`c_tile*T + t >=
+    channels`, `T = ACTIVATION_PLANE_CHANNELS`) in the packed image is
+    exactly 0 -- swept over channel counts spanning partial and exact
+    tiles of `T = 8`."""
+    rng = random.Random(0x5678)
+    t = cnn_accel_constants.ACTIVATION_PLANE_CHANNELS
+    width, height = 3, 2
+    for channels in (3, 5, 8, 9, 16):
+        values = [rng.randint(-128, 127) for _ in range(width * height * channels)]
+        packed = pack_activation_planes(values, width, height, channels)
+        n_tiles = activation_plane_count(channels)
+        assert len(packed) == n_tiles * t * width * height
+        assert len(packed) == activation_bytes(width, height, channels)
+
+        for c_tile in range(n_tiles):
+            for y in range(height):
+                for x in range(width):
+                    base = ((c_tile * height + y) * width + x) * t
+                    for lane in range(t):
+                        c = c_tile * t + lane
+                        if c >= channels:
+                            assert packed[base + lane] == 0
+
+        assert unpack_activation_planes(packed, width, height, channels) == values
+
+
+def test_pack_activation_planes_byte_formula_spot_check() -> None:
+    """Direct spot-check of decision S6's own byte formula:
+    `byte_offset = ((c_tile*H + y)*W + x)*T + t`."""
+    t = cnn_accel_constants.ACTIVATION_PLANE_CHANNELS
+    width, height, channels = 5, 4, 20  # ceil(20/8) = 3 planes
+    rng = random.Random(0xF0F0)
+    values = [rng.randint(-128, 127) for _ in range(width * height * channels)]
+    packed = pack_activation_planes(values, width, height, channels)
+
+    for _ in range(200):
+        c_tile = rng.randrange(activation_plane_count(channels))
+        y = rng.randrange(height)
+        x = rng.randrange(width)
+        lane = rng.randrange(t)
+        offset = ((c_tile * height + y) * width + x) * t + lane
+        c = c_tile * t + lane
+        expected = values[(y * width + x) * channels + c] if c < channels else 0
+        assert packed[offset] == expected
+
+
+# ---------------------------------------------------------------------------
+# unpack_weights_from_hw (D10): exact inverse of pack_weights_for_hw on the
+# valid region.
+# ---------------------------------------------------------------------------
+
+
+def test_unpack_weights_from_hw_inverts_pack_weights_for_hw() -> None:
+    """`unpack_weights_from_hw(pack_weights_for_hw(w, desc, T, R), desc,
+    T, R) == w` (the LOGICAL OHWI array) for a shape sweep including
+    `out_channels` not a multiple of `pe_rows` and `in_channels` not a
+    multiple of `tile_channels`."""
+    rng = random.Random(0xABCD)
+    for in_c, out_c, kernel, tile_channels, pe_rows in itertools.product(
+        [3, 8, 11, 16], [5, 8, 10, 16], [1, 3], [4, 8], [4, 8]
+    ):
+        desc = _desc(in_channels=in_c, out_channels=out_c, kernel_h=kernel, kernel_w=kernel)
+        weights = [rng.randint(-128, 127) for _ in range(out_c * kernel * kernel * in_c)]
+        packed = pack_weights_for_hw(weights, desc, tile_channels, pe_rows)
+        assert len(packed) == packed_weight_count(desc, tile_channels, pe_rows)
+        assert unpack_weights_from_hw(packed, desc, tile_channels, pe_rows) == weights
+
+
+def test_unpack_weights_from_hw_rejects_dwconv2d() -> None:
+    desc = _desc(opcode=OPCODE_DWCONV2D, in_channels=4, out_channels=4, kernel_h=3, kernel_w=3)
+    packed = [0] * (4 * 3 * 3 * 8 * 8)
+    with pytest.raises(ValueError):
+        unpack_weights_from_hw(packed, desc, tile_channels=8, pe_rows=8)
 
 
 # ---------------------------------------------------------------------------

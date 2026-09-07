@@ -19,18 +19,48 @@ models)") — same role `canny_model.py` plays for the Canny IP. Covers:
   produce the `memory_image.csv`/`expected_output.csv` pair (byte-address,
   byte-value rows).
 
-Tensor layout conventions (golden-model choice, not yet constrained by any
-committed RTL microarchitecture -- `cnn_accel_pe_array`/
-`cnn_accel_weight_buffer`'s exact internal addressing is deferred to their
-own `vhdesign`; this is the DDR-resident byte layout the compiler/DMA
-engines must agree on regardless of internal PE sequencing):
+Tensor layout conventions -- two layers, LOGICAL vs DDR, now that the DDR
+byte image is ratified (activations: decision S6; weights/bias: decision
+D10). `conv2d`/`dwconv2d`/`pool_max`/`pool_avg`/`fc` operate on the
+LOGICAL layout only -- that is also what `generate_vectors.py` and the
+VHDL testbenches feed them directly, unaffected by anything below.
+`run_layer`/`run_program` are the only functions that speak the DDR
+layout; they convert to/from LOGICAL at the `memory[]` boundary via
+`pack_activation_planes`/`unpack_activation_planes` and
+`pack_weights_for_hw`/`unpack_weights_from_hw`/`pack_bias_for_hw`.
 
-- Activations (input and output): row-major `(height, width, channels)`
-  (HWC), one signed int8 byte per element, no padding between elements.
-- Weights: row-major `(out_channels, kernel_h, kernel_w, in_channels)`
-  (OHWI) for `CONV2D`/`FC`; `(channels, kernel_h, kernel_w)` for
-  `DWCONV2D` (one filter per channel, no cross-channel dimension).
-- Bias: one little-endian signed int32 per output channel, contiguous.
+- Activations, LOGICAL layout (what `conv2d`/`dwconv2d`/`pool_*`/`fc`
+  take and return): row-major `(height, width, channels)` (HWC), one
+  signed int8 byte per element, no padding between elements.
+- Activations, DDR layout (decision S6 -- what `run_layer`/`run_program`
+  actually read/write, every opcode's ifmap AND ofmap, FC included with
+  its degenerate `1x1xC`): channel-tiled planes of `T =
+  ACTIVATION_PLANE_CHANNELS` (8) channels each,
+  `byte_offset = ((c_tile*height + y)*width + x)*T + t`,
+  `c_tile = 0 .. ceil(channels/T)-1`, channels `>= channels` inside the
+  last tile zero-padded. Total length always
+  `ceil(channels/T)*T*width*height` bytes (`activation_bytes()`). See
+  `pack_activation_planes`/`unpack_activation_planes` and
+  `doc/cnn_accel_arch.md`'s "Off-chip activation layout (decision S6)".
+- Weights, LOGICAL layout: row-major
+  `(out_channels, kernel_h, kernel_w, in_channels)` (OHWI) for
+  `CONV2D`/`FC`; `(channels, kernel_h, kernel_w)` for `DWCONV2D` (one
+  filter per channel, no cross-channel dimension).
+- Weights, DDR layout for `CONV2D`/`FC` (decision D10 -- what
+  `run_layer` actually reads): exactly `pack_weights_for_hw`'s tile-major
+  byte image (see that function's docstring), built with this module's
+  own `TILE_CHANNELS`/`PE_ROWS` constants because that is what the
+  currently loaded bitstream expects (the host reads `HW_INFO` to learn
+  the real `PE_ROWS` before packing on a real system; this golden model
+  has one fixed pair). `DWCONV2D`'s weight layout is UNRATIFIED (decision
+  D2 -- the compiler rejects the opcode); `run_layer` reads it as the
+  raw, un-tiled LOGICAL layout, unchanged -- only its activations moved
+  to S6 planes.
+- Bias, LOGICAL layout: one little-endian signed int32 per output
+  channel, contiguous. Bias, DDR layout for `CONV2D`/`FC`: exactly
+  `pack_bias_for_hw`'s `OT*PE_ROWS`-int32 image (`OT =
+  ceil(out_channels/PE_ROWS)`, padded lanes zero); `run_layer` uses the
+  first `out_channels` of it.
 """
 
 from __future__ import annotations
@@ -38,7 +68,15 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
-from cnn_accel_constants import FLAGS, INSTR_WORD_BYTES, OPCODES, isa_field_offsets
+from cnn_accel_constants import (
+    ACTIVATION_PLANE_CHANNELS,
+    FLAGS,
+    INSTR_WORD_BYTES,
+    OPCODES,
+    PE_ROWS,
+    TILE_CHANNELS,
+    isa_field_offsets,
+)
 
 # ---------------------------------------------------------------------------
 # ISA constants, derived from cnn_accel_constants.py -- the single Python
@@ -445,6 +483,69 @@ def fc(input_values: list[int], weights: list[int], bias: list[int], desc: Layer
     return conv2d(input_values, weights, bias, fc_desc)
 
 
+def activation_plane_count(channels: int) -> int:
+    """Number of `T = ACTIVATION_PLANE_CHANNELS`-channel planes (decision
+    S6) a `channels`-channel activation occupies in DDR:
+    `ceil(channels / T)`."""
+    if channels <= 0:
+        raise ValueError(f"channels must be positive, got channels={channels}")
+    return -(-channels // ACTIVATION_PLANE_CHANNELS)  # ceil
+
+
+def activation_bytes(width: int, height: int, channels: int) -> int:
+    """Total DDR byte length of a `width x height x channels` activation
+    stored as decision-S6 channel-tiled planes:
+    `ceil(channels/T) * T * width * height`, `T =
+    ACTIVATION_PLANE_CHANNELS` -- the zero-padded channels in the last
+    plane (`t >= channels - c_tile*T`) still occupy bytes, so this is
+    always a multiple of `T * width * height` (decision D1's alignment
+    argument)."""
+    return activation_plane_count(channels) * ACTIVATION_PLANE_CHANNELS * width * height
+
+
+def pack_activation_planes(values_hwc: list[int], width: int, height: int, channels: int) -> list[int]:
+    """Repack a LOGICAL HWC activation (module docstring) into the
+    decision-S6 DDR byte image: channel-tiled planes of `T =
+    ACTIVATION_PLANE_CHANNELS` channels each,
+
+        byte_offset = ((c_tile * height + y) * width + x) * T + t
+        c_tile = 0 .. ceil(channels/T) - 1,  t = 0 .. T-1
+
+    with `t >= channels - c_tile*T` (i.e. `c_tile*T + t >= channels`)
+    zero-padded. Output length is always
+    `activation_bytes(width, height, channels)`."""
+    n_tiles = activation_plane_count(channels)
+    packed = [0] * (n_tiles * ACTIVATION_PLANE_CHANNELS * width * height)
+    for c_tile in range(n_tiles):
+        for y in range(height):
+            for x in range(width):
+                base = ((c_tile * height + y) * width + x) * ACTIVATION_PLANE_CHANNELS
+                for t in range(ACTIVATION_PLANE_CHANNELS):
+                    c = c_tile * ACTIVATION_PLANE_CHANNELS + t
+                    if c < channels:
+                        packed[base + t] = values_hwc[(y * width + x) * channels + c]
+    return packed
+
+
+def unpack_activation_planes(values_planes: list[int], width: int, height: int, channels: int) -> list[int]:
+    """Exact inverse of `pack_activation_planes`: reads a decision-S6
+    channel-tiled-plane DDR image (`activation_bytes(width, height,
+    channels)` elements) back into a LOGICAL HWC list
+    (`width*height*channels` elements), dropping the zero-padding lanes
+    (`c_tile*T + t >= channels`)."""
+    n_tiles = activation_plane_count(channels)
+    hwc = [0] * (width * height * channels)
+    for c_tile in range(n_tiles):
+        for y in range(height):
+            for x in range(width):
+                base = ((c_tile * height + y) * width + x) * ACTIVATION_PLANE_CHANNELS
+                for t in range(ACTIVATION_PLANE_CHANNELS):
+                    c = c_tile * ACTIVATION_PLANE_CHANNELS + t
+                    if c < channels:
+                        hwc[(y * width + x) * channels + c] = values_planes[base + t]
+    return hwc
+
+
 def pack_weights_for_hw(
     weights: list[int], desc: LayerDesc, tile_channels: int, pe_rows: int
 ) -> list[int]:
@@ -552,6 +653,68 @@ def pack_weights_for_hw(
     return packed
 
 
+def packed_weight_count(desc: LayerDesc, tile_channels: int, pe_rows: int) -> int:
+    """Element count of `pack_weights_for_hw`'s output, computable before
+    packing (so `run_layer` can slice `memory[]` without materializing
+    the image): `OT * T * kernel_h * kernel_w * tile_channels * pe_rows`,
+    `OT = ceil(out_channels/pe_rows)`, `T = ceil(in_channels/
+    tile_channels)` -- see that function's docstring for the layout."""
+    if tile_channels <= 0 or pe_rows <= 0:
+        raise ValueError(
+            f"tile_channels and pe_rows must be positive, got tile_channels={tile_channels} "
+            f"pe_rows={pe_rows}"
+        )
+    n_in_tiles = -(-desc.in_channels // tile_channels)  # ceil
+    n_out_tiles = -(-desc.out_channels // pe_rows)  # ceil
+    return n_out_tiles * n_in_tiles * desc.kernel_h * desc.kernel_w * tile_channels * pe_rows
+
+
+def unpack_weights_from_hw(
+    packed: list[int], desc: LayerDesc, tile_channels: int, pe_rows: int
+) -> list[int]:
+    """Exact inverse of `pack_weights_for_hw` on the valid (non-padded)
+    region: reconstructs the LOGICAL OHWI weight array
+    (`out_channels*kernel_h*kernel_w*in_channels` elements,
+    decision D10) that `conv2d`/`fc` need from the tile-major DDR byte
+    image `run_layer` actually reads. Padded lanes in `packed`
+    (`ic >= in_channels` or `oc >= out_channels`, decision D11) are
+    dropped, not asserted zero -- `pack_weights_for_hw`'s own tests cover
+    that invariant on the packing side.
+
+    `len(packed)` must be exactly `packed_weight_count(desc,
+    tile_channels, pe_rows)`; only `OPCODE_CONV2D`/`OPCODE_FC` are in
+    scope (same D10 scoping as `pack_weights_for_hw`)."""
+    if desc.opcode not in (OPCODE_CONV2D, OPCODE_FC):
+        raise ValueError(
+            "unpack_weights_from_hw only supports OPCODE_CONV2D/OPCODE_FC's OHWI "
+            f"weight layout (ratified D10 scope), got opcode=0x{desc.opcode:02x}"
+        )
+    if tile_channels <= 0 or pe_rows <= 0:
+        raise ValueError(
+            f"tile_channels and pe_rows must be positive, got tile_channels={tile_channels} "
+            f"pe_rows={pe_rows}"
+        )
+    in_c, out_c = desc.in_channels, desc.out_channels
+    k_h, k_w = desc.kernel_h, desc.kernel_w
+    n_in_tiles = -(-in_c // tile_channels)  # ceil
+    n_out_tiles = -(-out_c // pe_rows)  # ceil
+
+    ohwi = [0] * (out_c * k_h * k_w * in_c)
+    idx = 0
+    for ot in range(n_out_tiles):
+        for t in range(n_in_tiles):
+            for kr in range(k_h):
+                for kc in range(k_w):
+                    for r in range(pe_rows):
+                        oc = ot * pe_rows + r
+                        for c in range(tile_channels):
+                            ic = t * tile_channels + c
+                            if ic < in_c and oc < out_c:
+                                ohwi[((oc * k_h + kr) * k_w + kc) * in_c + ic] = packed[idx]
+                            idx += 1
+    return ohwi
+
+
 def pack_bias_for_hw(bias: list[int], desc: LayerDesc, pe_rows: int) -> list[int]:
     """Zero-pad `bias` (one int32 per output channel, see the module
     docstring) to a whole number of `pe_rows`-wide output-channel tiles,
@@ -574,6 +737,15 @@ def pack_bias_for_hw(bias: list[int], desc: LayerDesc, pe_rows: int) -> list[int
             oc = ot * pe_rows + r
             packed.append(bias[oc] if oc < out_c else 0)
     return packed
+
+
+def packed_bias_count(desc: LayerDesc, pe_rows: int) -> int:
+    """Element count of `pack_bias_for_hw`'s output, computable before
+    packing: `OT * pe_rows` int32s, `OT = ceil(out_channels / pe_rows)`."""
+    if pe_rows <= 0:
+        raise ValueError(f"pe_rows must be positive, got pe_rows={pe_rows}")
+    n_out_tiles = -(-desc.out_channels // pe_rows)  # ceil
+    return n_out_tiles * pe_rows
 
 
 def _pool_windows(input_values: list[int], desc: LayerDesc) -> list[list[int]]:
@@ -664,9 +836,52 @@ def pool_avg(input_values: list[int], desc: LayerDesc) -> list[int]:
     return output
 
 
+def _conv_output_dims(desc: LayerDesc) -> tuple[int, int]:
+    """`(out_width, out_height)` for `CONV2D`/`DWCONV2D`/`FC`, duplicating
+    `_conv2d_generic`'s own formula (kept separate rather than factored
+    out so `conv2d`/`dwconv2d`/`fc` stay untouched by the S6 DDR-layout
+    plumbing) -- needed by `run_layer` to know the output activation's
+    spatial shape before it can call `pack_activation_planes`."""
+    pad_top = desc.pad_top if desc.pad_en else 0
+    pad_left = desc.pad_left if desc.pad_en else 0
+    pad_bottom = desc.pad_bottom if desc.pad_en else 0
+    pad_right = desc.pad_right if desc.pad_en else 0
+    padded_h = desc.in_height + pad_top + pad_bottom
+    padded_w = desc.in_width + pad_left + pad_right
+    out_h = (padded_h - desc.kernel_h) // desc.stride_h + 1
+    out_w = (padded_w - desc.kernel_w) // desc.stride_w + 1
+    return out_w, out_h
+
+
+def _pool_output_dims(desc: LayerDesc) -> tuple[int, int]:
+    """`(out_width, out_height)` for `POOL_MAX`/`POOL_AVG`, duplicating
+    `_pool_windows`'s own formula for the same reason as
+    `_conv_output_dims`."""
+    out_h = (desc.in_height - desc.pool_kernel_h) // desc.pool_stride_h + 1
+    out_w = (desc.in_width - desc.pool_kernel_w) // desc.pool_stride_w + 1
+    return out_w, out_h
+
+
 def run_layer(memory: bytearray, desc: LayerDesc) -> None:
     """Execute one decoded instruction against `memory` (read input/
-    weights/bias, write output), in place."""
+    weights/bias, write output), in place, through the ratified DDR byte
+    layout (module docstring):
+
+    - ifmap/ofmap (every opcode, including FC's degenerate `1x1xC`):
+      decision-S6 channel-tiled planes via `activation_bytes`/
+      `pack_activation_planes`/`unpack_activation_planes`.
+    - `CONV2D`/`FC` weights: exactly `pack_weights_for_hw`'s byte image
+      (`packed_weight_count`/`unpack_weights_from_hw`), using this
+      module's `TILE_CHANNELS`/`PE_ROWS` constants -- the layout the
+      currently loaded bitstream expects (a real host learns these from
+      `HW_INFO` before packing; this golden model has one fixed pair).
+    - `DWCONV2D` weights: UNRATIFIED (decision D2 -- the compiler rejects
+      the opcode) -- read as the raw, un-tiled `(channels, kernel_h,
+      kernel_w)` layout unchanged; only its activations moved to S6
+      planes.
+    - `CONV2D`/`FC` bias: exactly `pack_bias_for_hw`'s byte image
+      (`packed_bias_count`), first `out_channels` int32s used.
+    """
     in_w, in_h, in_c = desc.in_width, desc.in_height, desc.in_channels
 
     if desc.opcode == OPCODE_FC and (
@@ -675,9 +890,10 @@ def run_layer(memory: bytearray, desc: LayerDesc) -> None:
         # fc() silently rebuilds its own degenerate 1x1-spatial LayerDesc
         # internally; if the ORIGINAL desc (used here to slice memory) has
         # non-degenerate in_width/in_height/kernel_h/kernel_w, the input
-        # byte count computed below (in_w*in_h*in_c) would not match what
-        # fc()/conv2d() actually consume (in_c only), silently dropping
-        # input bytes. Callers must emit the degenerate form explicitly.
+        # byte count computed below (activation_bytes(in_w, in_h, in_c))
+        # would not match what fc()/conv2d() actually consume (in_c only),
+        # silently dropping input bytes. Callers must emit the degenerate
+        # form explicitly.
         raise ValueError(
             "OPCODE_FC requires in_width=in_height=kernel_h=kernel_w=1 in the "
             f"encoded instruction itself, got in_width={desc.in_width} "
@@ -685,22 +901,30 @@ def run_layer(memory: bytearray, desc: LayerDesc) -> None:
         )
 
     if desc.opcode in (OPCODE_CONV2D, OPCODE_FC, OPCODE_DWCONV2D):
-        in_size = in_w * in_h * in_c
+        in_size = activation_bytes(in_w, in_h, in_c)
         input_bytes = memory[desc.in_addr : desc.in_addr + in_size]
-        input_values = [b - 256 if b >= 128 else b for b in input_bytes]
+        input_planes = [b - 256 if b >= 128 else b for b in input_bytes]
+        input_values = unpack_activation_planes(input_planes, in_w, in_h, in_c)
 
         out_c = desc.out_channels
         if desc.opcode == OPCODE_DWCONV2D:
+            # D2: DWCONV2D has no ratified weight layout -- raw, un-tiled
+            # (channels, kernel_h, kernel_w), unchanged from before S6.
             weight_count = out_c * desc.kernel_h * desc.kernel_w
+            weight_bytes = memory[desc.weight_addr : desc.weight_addr + weight_count]
+            weights = [b - 256 if b >= 128 else b for b in weight_bytes]
         else:
-            weight_count = out_c * desc.kernel_h * desc.kernel_w * in_c
-        weight_bytes = memory[desc.weight_addr : desc.weight_addr + weight_count]
-        weights = [b - 256 if b >= 128 else b for b in weight_bytes]
+            weight_count = packed_weight_count(desc, TILE_CHANNELS, PE_ROWS)
+            weight_bytes = memory[desc.weight_addr : desc.weight_addr + weight_count]
+            packed_weights = [b - 256 if b >= 128 else b for b in weight_bytes]
+            weights = unpack_weights_from_hw(packed_weights, desc, TILE_CHANNELS, PE_ROWS)
 
         bias = [0] * out_c
         if desc.bias_en:
-            bias_bytes = memory[desc.bias_addr : desc.bias_addr + 4 * out_c]
-            bias = list(struct.unpack(f"<{out_c}i", bytes(bias_bytes)))
+            bias_count = packed_bias_count(desc, PE_ROWS)
+            bias_bytes = memory[desc.bias_addr : desc.bias_addr + 4 * bias_count]
+            packed_bias_values = struct.unpack(f"<{bias_count}i", bytes(bias_bytes))
+            bias = list(packed_bias_values[:out_c])
 
         if desc.opcode == OPCODE_CONV2D:
             output = conv2d(input_values, weights, bias, desc)
@@ -708,19 +932,24 @@ def run_layer(memory: bytearray, desc: LayerDesc) -> None:
             output = dwconv2d(input_values, weights, bias, desc)
         else:
             output = fc(input_values, weights, bias, desc)
+        out_w, out_h = _conv_output_dims(desc)
 
     elif desc.opcode in (OPCODE_POOL_MAX, OPCODE_POOL_AVG):
-        in_size = in_w * in_h * in_c
+        in_size = activation_bytes(in_w, in_h, in_c)
         input_bytes = memory[desc.in_addr : desc.in_addr + in_size]
-        input_values = [b - 256 if b >= 128 else b for b in input_bytes]
+        input_planes = [b - 256 if b >= 128 else b for b in input_bytes]
+        input_values = unpack_activation_planes(input_planes, in_w, in_h, in_c)
         output = pool_max(input_values, desc) if desc.opcode == OPCODE_POOL_MAX else pool_avg(
             input_values, desc
         )
+        out_c = in_c  # pooling is channel-preserving
+        out_w, out_h = _pool_output_dims(desc)
 
     else:
         raise ValueError(f"run_layer: unsupported opcode 0x{desc.opcode:02x}")
 
-    out_bytes = bytes((v & 0xFF) for v in output)
+    output_planes = pack_activation_planes(output, out_w, out_h, out_c)
+    out_bytes = bytes((v & 0xFF) for v in output_planes)
     memory[desc.out_addr : desc.out_addr + len(out_bytes)] = out_bytes
 
 

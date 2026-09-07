@@ -837,3 +837,60 @@ Verification (vunit-mcp, this clone): `*bias_requant*` **10/10**, then
 model-generated vectors; `pytest modules/cnn_accel` **315 passed**.
 Unblocks compiler M8's real-target end-to-end (`run_program == interp ==
 IREE`), previously an `xfail`.
+
+## S6 (model) — run_program consumes the ratified DDR layout (2026-09-07)
+
+`cnn_accel_model.py`'s `run_layer`/`run_program` still read/wrote flat HWC
+activations and OHWI weights straight out of `memory[]`, even though
+decision S6 (activations) and D10 (weights/bias) had already ratified a
+different DDR byte layout for everything else in this module. Closed that
+gap — no change to `conv2d`/`dwconv2d`/`pool_max`/`pool_avg`/`fc`, which
+keep operating on the LOGICAL flat-list layouts `generate_vectors.py` and
+the VHDL testbenches feed them directly.
+
+New pure helpers, next to `pack_weights_for_hw`/`pack_bias_for_hw`:
+
+- `activation_plane_count(channels)`, `activation_bytes(width, height,
+  channels)`, `pack_activation_planes`/`unpack_activation_planes` — the S6
+  channel-tiled-plane byte image (`T = ACTIVATION_PLANE_CHANNELS = 8`),
+  `byte_offset = ((c_tile*H + y)*W + x)*T + t`.
+- `packed_weight_count`, `unpack_weights_from_hw` — the D10 tile-major
+  weight image's element count and exact inverse (on the non-padded
+  region) of `pack_weights_for_hw`.
+- `packed_bias_count` — `pack_bias_for_hw`'s element count.
+
+`run_layer` now reads `activation_bytes(...)` bytes for every ifmap and
+writes `activation_bytes(...)` bytes for every ofmap (all opcodes,
+including FC's degenerate `1x1xC`); for `CONV2D`/`FC` it reads
+`packed_weight_count`/`packed_bias_count` bytes and unpacks with
+`TILE_CHANNELS`/`PE_ROWS` from `cnn_accel_constants` (the layout the
+currently loaded bitstream expects — a real host learns these from
+`HW_INFO`). `DWCONV2D` weights are unratified (decision D2, the compiler
+rejects the opcode) and are read as the raw, un-tiled `(channels,
+kernel_h, kernel_w)` layout, unchanged — only its activations moved to S6
+planes.
+
+### Verification
+
+`.venv/bin/python -m pytest modules/cnn_accel -q`: **321 passed** (was
+315; +6): round-trip and zero-padding tests for
+`pack_activation_planes`/`unpack_activation_planes` (channels 3/5/8/9/16)
+plus a direct byte-formula spot-check; a round-trip test for
+`unpack_weights_from_hw(pack_weights_for_hw(...))` over a shape sweep
+including `out_channels` not a multiple of `PE_ROWS` and `in_channels` not
+a multiple of `TILE_CHANNELS`; two `run_program` `CONV2D` acceptance tests
+(`in_channels=3,out_channels=8` and `in_channels=16,out_channels=24`,
+multi-tile on both sides) whose DDR-round-tripped result equals `conv2d()`
+called directly on the LOGICAL lists; and a D1 alignment check woven into
+the existing two-layer `run_program` chain test (every activation buffer's
+address and byte size is a multiple of `ACTIVATION_PLANE_CHANNELS`).
+`generate_vectors.py` untouched and still imports/runs (it calls
+`conv2d`/`pool_*`/`fc`/`pack_weights_for_hw` directly on LOGICAL lists, not
+`run_program`).
+
+### Open item for `layer_ctrl`
+
+`tb_cnn_accel_conv_core` streams the ifmap as `(row, col, tile)` beats,
+whereas issuing one DMA request per plane per row yields `(row, tile,
+col)` order; `layer_ctrl`/`window_gen` must reconcile the beat order with
+the S6 plane reads.
