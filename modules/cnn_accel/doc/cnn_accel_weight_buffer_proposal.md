@@ -311,6 +311,75 @@ regression to chase down further in this round. See
 `module_cnn_accel.py`'s `cnn_accel_weight_buffer` build project comment
 for the checker thresholds this measurement was re-baselined against.
 
+## 12. Proposed replacement for the hand-owned Functional Description
+
+**Why the current text is wrong.** M7b (commit `2d78d59`, "perf(cnn_accel):
+stream weights into a single-buffered weight_buffer") deleted the A/B
+ping-pong design entirely: `fill_bank_sel`/`read_bank_sel` no longer exist
+anywhere in `cnn_accel_weight_buffer.vhd`, replaced by a `fill_start` pulse,
+a single pair of region memories, and a row-assembly-register + prefetch-
+FIFO fill path (§11 above; `doc/cnn_accel_weight_buffer.md`,
+`src/cnn_accel_weight_buffer.vhd`). `cnn_accel_weight_buffer_req.md`'s
+hand-owned `## Functional Description` still narrates the old bank-select
+behavior verbatim ("while `fill_bank_sel` selects bank X... the pointer
+resets to 0 whenever `cnn_accel_layer_ctrl` starts a new fill for that
+bank... while `read_bank_sel` selects bank Y") — every noun in it (`bank
+X`, `bank Y`, `fill_bank_sel`, `read_bank_sel`) refers to ports and
+concepts that were removed by M7b and do not exist in the RTL, generics
+table, ports table, or `doc/cnn_accel_weight_buffer.md` it sits alongside.
+This was flagged rather than fixed at the time (`flow_status.md`'s M7b
+"Open" note, and this proposal's own §11 preamble) because the section is
+user-owned. The replacement text below describes only what the current
+single-buffer RTL actually does, grounded in
+`src/cnn_accel_weight_buffer.vhd` and `doc/cnn_accel_weight_buffer.md`
+(both already correct).
+
+**Paste target:** `modules/cnn_accel/doc/cnn_accel_weight_buffer_req.md`,
+replacing its entire `## Functional Description` section (the text after
+the `<!-- functional-spec: hand-owned below this line -->` marker) with
+the block below.
+
+```markdown
+## Functional Description
+
+Single-buffered: one weight region and one, independently-sized, bias
+region, each written by its own fill path and read through its own
+synchronous read port. There is no bank select of any kind and no second
+copy of either region.
+
+Fill path: a `fill_start` pulse begins a new fill session, resetting both
+regions' write row pointers, lane indices and row-assembly registers to 0
+together (a beat presented the same cycle as `fill_start` is not
+accepted). Incoming `s_stream` bytes then auto-increment a lane index into
+a row-assembly register for the region selected by `fill_is_bias` (`'0'`
+weight, `'1'` bias); once a row's lanes are all written, the assembled row
+is committed to that region's memory with a single wide write, the lane
+index wraps to 0, and the row pointer advances. Weight-region and
+bias-region row pointers, lane indices and row-assembly registers are
+fully independent of each other, so weight-then-bias, bias-then-weight, or
+interleaved fill order all work identically, and one region reaching its
+own depth (asserting backpressure on `s_stream_s2m.ready` for that region
+only) never affects the other region's fill.
+
+`cnn_accel_layer_ctrl` pulses `fill_start` once per output-channel-tile
+pass (not once per layer): weights and bias for the pass currently
+executing are streamed in fresh from DDR4 ahead of that pass, read
+through `weight_rd_addr`/`bias_rd_addr` while the pass runs, and then
+overwritten in place by the next pass's `fill_start`/fill stream. An
+optional shallow prefetch FIFO on the fill stream (`g_fill_fifo_depth`,
+default 32, `0` disables it) absorbs DDR4/DMA burst latency in place of
+the ping-pong bank this module previously used for that purpose.
+
+Read path: `weight_rd_addr`/`bias_rd_addr` are registered synchronous read
+addresses into their respective region (no bank selection), one cycle of
+read latency, matching `cnn_accel_pe_array`'s expected weight-fetch
+latency. Reads of already-committed rows are correct while a fill of
+later rows in the same region is still in progress — single-buffering
+means there is no second copy to read from, but the row-assembly register
+never touches memory until a row is complete, so a read can never observe
+a partially-written row.
+```
+
 ## Implementation Notes (vhfill)
 
 (filled in during/after implementation)

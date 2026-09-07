@@ -354,3 +354,40 @@ CI-gating backend; Vivado is the vendor-accurate cross-check.
 M8 `cnn_accel_layer_ctrl` (incl. the D6 output-channel tile loop), then M9
 DMAs, per the milestone table in
 `~/.local/state/maki/plans/cosmic-hip-cod.md`.
+
+## M8 — design decision gate RESOLVED, `layer_ctrl` proposal drafted, 2026-09-07
+
+**Design decision gate (ifmap buffering) RESOLVED (user decision).** The
+ifmap is ALWAYS re-streamed from DDR on every output-channel-tile pass;
+there is no on-chip ifmap buffer. A hybrid fits-in-BRAM ifmap buffer and
+an always-buffer scheme were both explicitly considered and REJECTED,
+accepting up to `OT`x DDR read traffic on late layers (D6,
+`doc/cnn_accel_tiled_dataflow_proposal.md` §5) on the grounds that the
+accelerator is expected to be DDR-read-bandwidth bound there. No
+`ifmap_buffer` module exists or is to be proposed. `cnn_accel_layer_ctrl`'s
+FSM stays simple: per output-channel tile, weight/bias DMA request, then a
+full ifmap DMA request, then run the tile to completion.
+
+**`doc/cnn_accel_layer_ctrl_proposal.md` now exists**, per-output-channel-
+tile FSM (`IDLE`/`LOAD_WEIGHTS`/`STREAM_IFMAP`/`WAIT_DRAIN`/
+`WRITE_OFMAP`/`DONE`, tile loop as a guarded back-edge `WRITE_OFMAP` ->
+`LOAD_WEIGHTS`), consistent with `cnn_accel_axi_read_dma`/
+`cnn_accel_ofmap_dma`'s `dma_req`/`dma_done`/`resp_error` contracts. It
+flags a real, unresolved conflict rather than silently working around it:
+per-tile write-back only produces `g_pe_rows` of `out_channels` channels
+at a time, which is not a contiguous byte range under the model's HWC
+ofmap layout, and neither `cnn_accel_ofmap_dma`'s current requirement nor
+`dma_req_t` (`addr`+`length` only) can express the resulting strided
+write — needs an architect decision before `vhfill`.
+
+**Two `_req.md` hand-owned Functional Descriptions are awaiting the
+user's paste** (per `AGENTS.md`'s hand-owned-section rule, these were not
+edited): `cnn_accel_weight_buffer_req.md`'s (still describes the pre-M7b
+ping-pong design) and `cnn_accel_layer_ctrl_req.md`'s (still describes a
+once-per-layer `LOAD_WEIGHTS`, predates D6). Ready-to-paste replacement
+text for both is in `doc/cnn_accel_weight_buffer_proposal.md` §12 and
+`doc/cnn_accel_layer_ctrl_proposal.md`'s final section, respectively.
+`cnn_accel_layer_ctrl_req.md`'s Ports table also still carries the dead
+`weight_buffer_bank_sel` port (ping-pong bank select — the buffer is
+single-buffered as of M7b); its deletion is likewise a ready-to-paste
+block in the same final section.
