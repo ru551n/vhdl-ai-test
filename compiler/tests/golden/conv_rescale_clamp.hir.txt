@@ -1,0 +1,11 @@
+hir.module target=cnn_accel_v1 stage=mapped memory_size=-
+buffers:
+  %arg0 ddr HWC     1x8x8x4xi8 256 B align 64 addr - role input
+  %0    ddr OHWI    8x3x3x4xi8 288 B align 64 addr - role const
+  %1    ddr I32_VEC 8xi32       32 B align 64 addr - role const
+  %10   ddr HWC     1x8x8x8xi8 512 B align 64 addr - role output
+ops:
+  #0 seq - unit conv_engine kind conv_layer gir %10
+     reads [%arg0 %0 %1] writes [%10] deps []
+     params {bias_en=1 in_channels=4 in_height=8 in_width=8 kernel_h=3 kernel_w=3 out_channels=8 pad_bottom=1 pad_en=1 pad_left=1 pad_right=1 pad_top=1 relu_en=1 requant_en=1 requant_scale=1073741824 requant_shift=23 stride_h=1 stride_w=1}
+program: -

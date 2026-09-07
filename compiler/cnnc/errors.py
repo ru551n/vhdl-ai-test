@@ -51,10 +51,33 @@ class VerifyError(CompilerError):
     invariant."""
 
 
-# Later milestones add further typed errors on top of `CompilerError`
-# (e.g. `CapabilityError` for HIR capability checks -- already present in
-# `cnnc.target.contract` for target/backend concerns; schedule/memplan
-# errors for M7). Not added here: out of scope for M2.
+class CapabilityError(CompilerError):
+    """Raised by `lower.to_hir` (M6) when a GIR op cannot be lowered onto
+    the target's advertised capabilities: unit selection, dtype/kernel/
+    stride/dilation admissibility, rescale/clamp epilogue limits,
+    `Unit.constraints` violations, or a target-wide gate such as the
+    rounding mode. `unit` is the offending `Target.Unit.name` (`None` for
+    checks that are not unit-specific); `constraint` is the capability
+    name or constraint expression that failed (`None` if not applicable).
+
+    Distinct from `cnnc.target.contract.CapabilityError` (a plain
+    `Exception` reserved for target/backend-internal concerns); this one
+    is a `CompilerError` so it carries `op_id`/`stage` like every other
+    compiler diagnostic.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        op_id: str | None = None,
+        stage: str | None = None,
+        unit: str | None = None,
+        constraint: str | None = None,
+    ) -> None:
+        self.unit = unit
+        self.constraint = constraint
+        super().__init__(message, op_id=op_id, stage=stage)
 
 
 class LegalizeError(CompilerError):

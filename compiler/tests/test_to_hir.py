@@ -1,0 +1,387 @@
+"""M6 tests: `cnnc.lower.to_hir` (GIR -> HIR lowering with capability
+checks, doc/tosa_compiler_plan.md §2.2, §4, §6, §13 M6)."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from cnnc.errors import CapabilityError
+from cnnc.frontend.mlir_generic import parse_module
+from cnnc.frontend.tosa_import import import_tosa
+from cnnc.gir.ir import ClampAttrs, ConvAttrs, FusedConvAttrs, Graph, Op, RescaleParams, Tensor
+from cnnc.gir.verify import verify as verify_gir
+from cnnc.hir.printer import print_hir
+from cnnc.lower.to_hir import layer_env, select_unit, to_hir
+from cnnc.passes import PassContext, default_pipeline, run_pipeline
+from cnnc.target.constraints import check
+from cnnc.target.load import load_target
+from cnnc.testing.accel_variants import load_half_up_target
+
+GOLDEN_PATH = Path(__file__).parent / "golden" / "conv_rescale_clamp.hir.txt"
+
+
+@pytest.fixture
+def half_up_target(tmp_path):
+    return load_half_up_target(tmp_path)
+
+
+def _conv_op_shape(in_h: int, in_w: int, pad: tuple[int, int, int, int], k: int, stride: tuple[int, int]) -> tuple[int, int]:
+    pad_t, pad_b, pad_l, pad_r = pad
+    out_h = (in_h + pad_t + pad_b - (k - 1) - 1) // stride[0] + 1
+    out_w = (in_w + pad_l + pad_r - (k - 1) - 1) // stride[1] + 1
+    return out_h, out_w
+
+
+def _dense(values: tuple[int, ...], ty: str) -> str:
+    if len(values) == 1:
+        return f"dense<{values[0]}> : tensor<{ty}>"
+    return f"dense<[{', '.join(str(v) for v in values)}]> : tensor<{ty}>"
+
+
+def _build_mlir(
+    *,
+    in_h: int = 8,
+    in_w: int = 8,
+    in_c: int = 4,
+    out_c: int = 8,
+    k: int = 3,
+    stride: tuple[int, int] = (1, 1),
+    pad: tuple[int, int, int, int] = (1, 1, 1, 1),
+    conv_in_zp: int = 0,
+    conv_w_zp: int = 0,
+    bias: tuple[int, ...] | None = None,
+    mult: tuple[int, ...] = (1073741824,),
+    shift: tuple[int, ...] = (38,),
+    per_channel: bool = False,
+    rescale_in_zp: int = 0,
+    rescale_out_zp: int = 0,
+    clamp: tuple[int, int] | None = (0, 127),
+) -> str:
+    """A parameterized `conv2d -> rescale [-> clamp]` TOSA generic-form
+    module, mirroring `fixtures/conv_rescale_clamp.mlir`'s structure with
+    every dimension/quantization knob free to vary (used to build the
+    to_hir capability-rejection fixtures below)."""
+    out_h, out_w = _conv_op_shape(in_h, in_w, pad, k, stride)
+    bias = bias if bias is not None else tuple([0] * out_c)
+    assert len(bias) == out_c
+    n_scale = out_c if per_channel else 1
+    assert len(mult) == n_scale and len(shift) == n_scale
+
+    in_type = f"1x{in_h}x{in_w}x{in_c}xi8"
+    w_type = f"{out_c}x{k}x{k}x{in_c}xi8"
+    b_type = f"{out_c}xi32"
+    acc_type = f"1x{out_h}x{out_w}x{out_c}xi32"
+    q_type = f"1x{out_h}x{out_w}x{out_c}xi8"
+
+    lines = [
+        '"builtin.module"() ({',
+        f'  "func.func"() <{{function_type = (tensor<{in_type}>) -> tensor<{q_type}>, sym_name = "main"}}> ({{',
+        "  ^bb0(%arg0: tensor<{}>):".format(in_type),
+        f'    %0 = "tosa.const"() <{{values = {_dense((1,) * (out_c * k * k * in_c) if False else (1,), w_type)}}}> : () -> tensor<{w_type}>',
+        f'    %1 = "tosa.const"() <{{values = {_dense(bias, b_type)}}}> : () -> tensor<{b_type}>',
+        f'    %2 = "tosa.const"() <{{values = dense<{conv_in_zp}> : tensor<1xi8>}}> : () -> tensor<1xi8>',
+        f'    %3 = "tosa.const"() <{{values = dense<{conv_w_zp}> : tensor<1xi8>}}> : () -> tensor<1xi8>',
+        f'    %4 = "tosa.conv2d"(%arg0, %0, %1, %2, %3) <{{acc_type = i32, dilation = array<i64: 1, 1>, '
+        f'pad = array<i64: {pad[0]}, {pad[1]}, {pad[2]}, {pad[3]}>, stride = array<i64: {stride[0]}, {stride[1]}>}}> : '
+        f"(tensor<{in_type}>, tensor<{w_type}>, tensor<{b_type}>, tensor<1xi8>, tensor<1xi8>) -> tensor<{acc_type}>",
+        f'    %5 = "tosa.const"() <{{values = {_dense(mult, f"{n_scale}xi32")}}}> : () -> tensor<{n_scale}xi32>',
+        f'    %6 = "tosa.const"() <{{values = {_dense(shift, f"{n_scale}xi8")}}}> : () -> tensor<{n_scale}xi8>',
+        f'    %7 = "tosa.const"() <{{values = dense<{rescale_in_zp}> : tensor<1xi32>}}> : () -> tensor<1xi32>',
+        f'    %8 = "tosa.const"() <{{values = dense<{rescale_out_zp}> : tensor<1xi8>}}> : () -> tensor<1xi8>',
+        f'    %9 = "tosa.rescale"(%4, %5, %6, %7, %8) <{{input_unsigned = false, output_unsigned = false, '
+        f'per_channel = {"true" if per_channel else "false"}, rounding_mode = #tosa.rounding_mode<SINGLE_ROUND>, scale32 = true}}> : '
+        f"(tensor<{acc_type}>, tensor<{n_scale}xi32>, tensor<{n_scale}xi8>, tensor<1xi32>, tensor<1xi8>) -> tensor<{q_type}>",
+    ]
+    if clamp is not None:
+        lines.append(
+            f'    %10 = "tosa.clamp"(%9) <{{max_val = {clamp[1]} : i8, min_val = {clamp[0]} : i8, '
+            f'nan_mode = #tosa.nan_mode<PROPAGATE>}}> : (tensor<{q_type}>) -> tensor<{q_type}>'
+        )
+        ret = "%10"
+    else:
+        ret = "%9"
+    lines += [
+        f'    "func.return"({ret}) : (tensor<{q_type}>) -> ()',
+        "  }) : () -> ()",
+        "}) : () -> ()",
+    ]
+    return "\n".join(lines)
+
+
+def _graph(**kwargs) -> Graph:
+    return import_tosa(parse_module(_build_mlir(**kwargs)))
+
+
+def _fuse(graph: Graph, target) -> Graph:
+    ctx = PassContext(target=target)
+    return run_pipeline(graph, default_pipeline(target), ctx)
+
+
+def _to_hir(target, **kwargs):
+    return to_hir(_fuse(_graph(**kwargs), target), target)
+
+
+def _fixture_graph() -> Graph:
+    return import_tosa(parse_module(_build_mlir()))
+
+
+# --------------------------------------------------------------------------
+# Golden dump + params/buffers/entry io
+# --------------------------------------------------------------------------
+
+
+def test_fixture_matches_golden_hir(half_up_target):
+    module = _to_hir(half_up_target)
+    assert print_hir(module) == GOLDEN_PATH.read_text()
+
+
+def test_fixture_params(half_up_target):
+    module = _to_hir(half_up_target)
+    params = module.ops[0].params
+    assert params["requant_shift"] == 23  # 38 - 15
+    assert params["requant_scale"] == 1073741824
+    assert params["relu_en"] is True
+    assert params["pad_en"] is True
+    assert params["bias_en"] is True
+    assert params["requant_en"] is True
+    assert params["in_width"] == 8 and params["in_height"] == 8 and params["in_channels"] == 4
+    assert params["out_channels"] == 8 and params["kernel_h"] == 3 and params["kernel_w"] == 3
+    assert params["stride_h"] == 1 and params["stride_w"] == 1
+    assert (params["pad_top"], params["pad_bottom"], params["pad_left"], params["pad_right"]) == (1, 1, 1, 1)
+
+
+def test_fixture_buffers(half_up_target):
+    module = _to_hir(half_up_target)
+    weight = module.buffer("%0")
+    bias = module.buffer("%1")
+    assert weight.data == bytes([1]) * 288
+    assert bias.data == bytes(32)
+    assert weight.layout == "OHWI" and bias.layout == "I32_VEC"
+    assert module.buffer("%arg0").role == "input"
+    assert module.buffer("%10").role == "output"
+
+
+def test_fixture_deps_and_entry_io(half_up_target):
+    module = _to_hir(half_up_target)
+    assert module.ops[0].deps == ()
+    assert module.entry_inputs == ("%arg0",)
+    assert module.entry_outputs == ("%10",)
+    assert module.stage == "mapped"
+
+
+# --------------------------------------------------------------------------
+# Rounding gate (H0)
+# --------------------------------------------------------------------------
+
+
+def test_half_even_target_rejected():
+    target = load_target("cnn_accel")
+    graph = _fuse(_fixture_graph(), target)
+    with pytest.raises(CapabilityError) as exc_info:
+        to_hir(graph, target)
+    message = str(exc_info.value)
+    assert "half_up" in message
+    assert "H0" in message
+
+
+# --------------------------------------------------------------------------
+# Rejections: capability checks
+# --------------------------------------------------------------------------
+
+
+def test_cout_not_divisible_rejected(half_up_target):
+    with pytest.raises(CapabilityError) as exc_info:
+        _to_hir(half_up_target, out_c=12, bias=tuple([0] * 12))
+    assert "%4" in str(exc_info.value) or "%10" in str(exc_info.value)
+    assert exc_info.value.constraint == "out_channels"
+
+
+def test_row_tile_words_exceeded_rejected(half_up_target):
+    with pytest.raises(CapabilityError) as exc_info:
+        _to_hir(half_up_target, in_w=600, in_c=8, out_c=8, bias=tuple([0] * 8))
+    assert "in_width" in str(exc_info.value.constraint)
+
+
+def test_5x5_kernel_rejected(half_up_target):
+    with pytest.raises(CapabilityError) as exc_info:
+        _to_hir(half_up_target, k=5, pad=(2, 2, 2, 2))
+    assert exc_info.value.constraint == "kernels"
+
+
+def test_stride_300_exceeds_field_width_rejected(half_up_target):
+    with pytest.raises(CapabilityError) as exc_info:
+        _to_hir(half_up_target, stride=(300, 300))
+    assert "stride" in exc_info.value.constraint
+
+
+def test_stride_3_passes_capability_checks(half_up_target):
+    # `unit.strides` is discovered as "any" (no elaboration-time RTL
+    # bound); stride 3 is well within the 1-byte ISA field, so it is
+    # only bounded by the general `max stride_h/stride_w` constraint
+    # (255), not rejected outright like the M6 plan's original static
+    # JSON example assumed.
+    module = _to_hir(half_up_target, stride=(3, 3), pad=(0, 0, 0, 0))
+    assert module.ops[0].params["stride_h"] == 3
+
+
+def test_conv_in_zp_rejected(half_up_target):
+    with pytest.raises(CapabilityError) as exc_info:
+        _to_hir(half_up_target, conv_in_zp=1)
+    # Nonzero zero points don't block fusion, so this reaches to_hir as a
+    # fused_conv whose id is the fused chain's output id (clamp's %10).
+    assert "%10" in str(exc_info.value)
+    assert exc_info.value.constraint == "conv.zero_point"
+
+
+def test_per_channel_rescale_stays_unfused_and_rejected(half_up_target):
+    # MVP `epilogue.rescale.per_channel=False`: `FusePass` refuses to fuse
+    # a per_channel rescale in the first place (doc/tosa_compiler_plan.md
+    # §9), so `to_hir` sees a standalone `conv2d`, not a `fused_conv` with
+    # `per_channel=True`.
+    with pytest.raises(CapabilityError) as exc_info:
+        _to_hir(half_up_target, per_channel=True, mult=(1073741824,) * 8, shift=(38,) * 8)
+    assert "%4" in str(exc_info.value)
+
+
+def test_out_zp_stays_unfused_and_rejected(half_up_target):
+    with pytest.raises(CapabilityError) as exc_info:
+        _to_hir(half_up_target, rescale_out_zp=5)
+    assert "%4" in str(exc_info.value)
+
+
+def test_unfused_clamp_5_100_rejected(half_up_target):
+    with pytest.raises(CapabilityError) as exc_info:
+        _to_hir(half_up_target, clamp=(5, 100))
+    assert "%10" in str(exc_info.value)
+
+
+# --------------------------------------------------------------------------
+# to_hir's own rescale capability checks (direct GIR construction,
+# bypassing `FusePass`'s upstream admissibility filter -- see
+# `test_per_channel_rescale_stays_unfused_and_rejected` /
+# `test_out_zp_stays_unfused_and_rejected` above for why the normal
+# pipeline never reaches these checks with an MVP target).
+# --------------------------------------------------------------------------
+
+
+def _direct_fused_graph(rescale: RescaleParams) -> Graph:
+    conv = ConvAttrs(pad=(1, 1, 1, 1), stride=(1, 1), dilation=(1, 1), in_zp=0, w_zp=0, acc_dtype="i32")
+    clamp = ClampAttrs(min=0, max=127)
+    attrs = FusedConvAttrs(conv=conv, rescale=rescale, clamp=clamp)
+    tensors = {
+        "arg0": Tensor(id="arg0", shape=(1, 8, 8, 4), dtype="i8"),
+        "w": Tensor(id="w", shape=(8, 3, 3, 4), dtype="i8", values=tuple([1] * (8 * 3 * 3 * 4))),
+        "b": Tensor(id="b", shape=(8,), dtype="i32", values=tuple([0] * 8)),
+        "10": Tensor(id="10", shape=(1, 8, 8, 8), dtype="i8"),
+    }
+    ops = (
+        Op(id="%w", kind="const", inputs=(), outputs=("w",), attrs=None),
+        Op(id="%b", kind="const", inputs=(), outputs=("b",), attrs=None),
+        Op(id="%10", kind="fused_conv", inputs=("arg0", "w", "b"), outputs=("10",), attrs=attrs),
+    )
+    return Graph(name="main", tensors=tensors, ops=ops, inputs=("arg0",), outputs=("10",))
+
+
+def test_to_hir_rejects_per_channel_directly(half_up_target):
+    rescale = RescaleParams(
+        multiplier=(1073741824,) * 8, shift=(38,) * 8, per_channel=True, in_zp=0, out_zp=0,
+        rounding="SINGLE_ROUND", scale32=True, input_unsigned=False, output_unsigned=False,
+    )
+    graph = _direct_fused_graph(rescale)
+    verify_gir(graph)
+    with pytest.raises(CapabilityError) as exc_info:
+        to_hir(graph, half_up_target)
+    assert exc_info.value.constraint == "rescale.per_channel"
+    assert exc_info.value.op_id == "%10"
+
+
+def test_to_hir_rejects_out_zp_directly(half_up_target):
+    rescale = RescaleParams(
+        multiplier=(1073741824,), shift=(38,), per_channel=False, in_zp=0, out_zp=5,
+        rounding="SINGLE_ROUND", scale32=True, input_unsigned=False, output_unsigned=False,
+    )
+    graph = _direct_fused_graph(rescale)
+    verify_gir(graph)
+    with pytest.raises(CapabilityError) as exc_info:
+        to_hir(graph, half_up_target)
+    assert exc_info.value.constraint == "rescale.out_zp"
+    assert exc_info.value.op_id == "%10"
+
+
+# --------------------------------------------------------------------------
+# Accumulator overflow note (contract D3)
+# --------------------------------------------------------------------------
+
+
+def test_accumulator_note_for_worst_case_bias(half_up_target):
+    bias = tuple([2**31 - 1] + [0] * 7)
+    module = _to_hir(half_up_target, in_c=8, out_c=8, k=3, bias=bias)
+    assert any("worst-case accumulation" in note and "int32" in note for note in module.notes)
+    # The note references the fused_conv op's id, i.e. the fused chain's
+    # output id (the clamp's %10), not the original conv2d's %4.
+    assert any("%10" in note for note in module.notes)
+
+
+def test_no_accumulator_note_for_fixture(half_up_target):
+    module = _to_hir(half_up_target)
+    assert module.notes == ()
+
+
+# --------------------------------------------------------------------------
+# select_unit / layer_env / constraint evaluation
+# --------------------------------------------------------------------------
+
+
+def test_select_unit_finds_conv_engine(half_up_target):
+    unit = select_unit(half_up_target, "conv2d")
+    assert unit.name == "conv_engine"
+
+
+def test_select_unit_raises_for_unknown_kind(half_up_target):
+    with pytest.raises(CapabilityError):
+        select_unit(half_up_target, "pool2d")
+
+
+def test_layer_env_extracts_shape_fields():
+    params = {
+        "in_width": 8, "in_height": 8, "in_channels": 4, "out_channels": 8,
+        "kernel_h": 3, "kernel_w": 3, "stride_h": 1, "stride_w": 1,
+        "pad_top": 1, "pad_bottom": 1, "pad_left": 1, "pad_right": 1,
+        "bias_en": True, "relu_en": True, "requant_scale": 1073741824,
+    }
+    env = layer_env(params)
+    assert env == {
+        "in_width": 8, "in_height": 8, "in_channels": 4, "out_channels": 8,
+        "kernel_h": 3, "kernel_w": 3, "stride_h": 1, "stride_w": 1,
+        "pad_top": 1, "pad_bottom": 1, "pad_left": 1, "pad_right": 1,
+    }
+
+
+def test_constraint_check_flags_divisible_violation(half_up_target):
+    unit = select_unit(half_up_target, "conv2d")
+    divisible = next(c for c in unit.constraints if c.kind == "divisible")
+    env = layer_env(
+        {
+            "in_width": 8, "in_height": 8, "in_channels": 4, "out_channels": 12,
+            "kernel_h": 3, "kernel_w": 3, "stride_h": 1, "stride_w": 1,
+            "pad_top": 1, "pad_bottom": 1, "pad_left": 1, "pad_right": 1,
+        }
+    )
+    violation = check(divisible, env)
+    assert violation is not None
+    assert violation.actual == 12
+
+
+def test_constraint_check_passes_for_fixture(half_up_target):
+    unit = select_unit(half_up_target, "conv2d")
+    env = layer_env(
+        {
+            "in_width": 8, "in_height": 8, "in_channels": 4, "out_channels": 8,
+            "kernel_h": 3, "kernel_w": 3, "stride_h": 1, "stride_w": 1,
+            "pad_top": 1, "pad_bottom": 1, "pad_left": 1, "pad_right": 1,
+        }
+    )
+    for constraint in unit.constraints:
+        assert check(constraint, env) is None
