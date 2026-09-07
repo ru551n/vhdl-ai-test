@@ -250,11 +250,49 @@ class Module(BaseModule):
             name="error", description="Mask for STATUS.ERROR.", default_value="0"
         )
 
+        hw_info = regs.append_register(
+            name="hw_info",
+            mode=REGISTER_MODES["r"],
+            description="Read-only array geometry, driven from the "
+            "`g_pe_rows`/`g_pe_cols`/`g_tile_channels` generics actually elaborated "
+            "into this bitstream (flow_status.md S3): the host driver reads this "
+            "instead of hardcoding an array size, so the same driver binary works "
+            "unmodified against the default (8-row) and scaled (16-row) builds.",
+        )
+        hw_info.append_bit_vector(
+            name="pe_rows",
+            description="Elaborated `g_pe_rows` (output-channel lanes). "
+            f"One of {cnn_accel_constants.PE_ROWS_LEGAL}.",
+            width=8,
+            default_value=format(cnn_accel_constants.PE_ROWS, "08b"),
+        )
+        hw_info.append_bit_vector(
+            name="pe_cols",
+            description="Elaborated `g_pe_cols` (input-channel lanes, = tile_channels).",
+            width=8,
+            default_value=format(cnn_accel_constants.PE_COLS, "08b"),
+        )
+        hw_info.append_bit_vector(
+            name="tile_channels",
+            description="Elaborated `g_tile_channels` (= pe_cols).",
+            width=8,
+            default_value=format(cnn_accel_constants.TILE_CHANNELS, "08b"),
+        )
+
         # --- Accelerator HW properties, as plain constants -----------------
         # Native hdl-registers constants: each is a single scalar value with
         # no internal structure, so IntegerConstant (via add_constant's
         # automatic type dispatch on a plain `int`) is a complete, faithful
         # representation -- no custom generator needed for these.
+        #
+        # `pe_rows`/`pe_cols`/`tile_channels` below are NOT redundant with
+        # `HW_INFO` above: these are generation-time Python constants (this
+        # repo's reference/default build point, baked into generated VHDL as
+        # `constant`s for e.g. static assertions), whereas `HW_INFO` is a
+        # runtime AXI-readable register driven by the generics an actual
+        # elaborated bitstream was built with -- the two agree for the
+        # default (8-row) build and deliberately disagree for the scaled
+        # (16-row) one, which is the entire point of S3.
 
         regs.add_constant(
             name="pe_rows",

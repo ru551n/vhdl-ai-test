@@ -453,6 +453,23 @@ Basis: `doc/cnn_accel_sizing_proposal.md` (8x8 = 34.9 fps at 150 MHz on
   1.72x shortfall (a running regression, not prose, per S5's "failing
   test" framing) while meeting 30 fps. 195/195 pytest passing.
 
+### S3 progress, 2026-09-07
+
+- `module_cnn_accel.py`'s `registers_hook()`: new RO `HW_INFO` register
+  (offset `0x10`, mode `r`) with `pe_rows`/`pe_cols`/`tile_channels` byte
+  fields, distinct from the pre-existing `add_constant()` scalars of the
+  same names -- the constants are generation-time reference values baked
+  into VHDL `constant`s, `HW_INFO` is the runtime, AXI-readable value of
+  whatever generics a given bitstream was actually elaborated with (8-row
+  default vs. 16-row scaled), so the host driver never hardcodes the
+  array size. `doc/cnn_accel_csr_req.md`'s register map table updated to
+  match (`cnn_accel_csr` itself, the RTL that would wire this up, is
+  still M10, not yet written).
+- Regenerated `regs_src/cnn_accel_regs_pkg.vhd` and confirmed the new
+  register's bit layout (`cnn_accel_hw_info_pe_rows`: bits 7:0,
+  `..._pe_cols`: 15:8, `..._tile_channels`: 23:16). Full `cnn_accel*`
+  VUnit suite still 58/58 on GHDL.
+
 Also committed this date: M9a `cnn_accel_axi_read_dma` (`efc96e6`), M9b
 `cnn_accel_ofmap_dma` (`4c5953e`), dual Vivado/Yosys backend (`d513958`),
 hdl-registers single-source-of-truth constants (`967562b`). Phase table

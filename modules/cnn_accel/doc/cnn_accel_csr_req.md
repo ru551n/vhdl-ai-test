@@ -38,6 +38,7 @@ around it — pulse generation, IRQ masking).
 | `0x04` | `PROGRAM_BASE_ADDR` | RW | full `g_axi_addr_width` bits, program's first instruction byte address |
 | `0x08` | `STATUS` | RO | bit0 `BUSY`, bit1 `DONE` (sticky, write-1-to-clear), bit2 `ERROR` (sticky, write-1-to-clear) |
 | `0x0C` | `IRQ_MASK` | RW | bit0 mask for `DONE`, bit1 mask for `ERROR` |
+| `0x10` | `HW_INFO` | RO | bits[7:0] `PE_ROWS`, bits[15:8] `PE_COLS`, bits[23:16] `TILE_CHANNELS` -- elaborated array geometry (flow_status.md S3), so the host driver never hardcodes it |
 
 ## Clock/reset
 
