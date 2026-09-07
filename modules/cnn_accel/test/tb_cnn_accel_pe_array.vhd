@@ -482,9 +482,17 @@ begin
     elsif run("test_full_throughput") then
       -- Zero stall on both links (generic-driven, per
       -- module_cnn_accel.py's per-test config): must sustain the ideal
-      -- per-pixel cycle count (1 idle accept cycle + num_groups+1 run
-      -- cycles = 16, for this fixed 3x3/c_tile_channels=6/c_pe_cols=4
-      -- shape) back-to-back, with no extra bubble beyond that.
+      -- per-pixel cycle count back-to-back, with no extra bubble beyond
+      -- that. With the S7 pipelined MAC that is
+      -- 'T*(num_groups + 1) + c_mac_latency' cycles per pixel (1 idle
+      -- accept cycle + num_groups address-issue cycles per tile beat, plus
+      -- one 'drain' of the last beat's pipeline tail per pixel). For this
+      -- fixed T=1/3x3/c_tile_channels=6/c_pe_cols=4 shape: num_groups =
+      -- ceil(54/4) = 14 and c_mac_latency = 2 + ceil(log2(4)) = 4, so
+      -- 1*(14 + 1) + 4 = 19 cycles per pixel (was 16 with the
+      -- single-cycle combinational MAC, which capped the entity at
+      -- ~56 MHz -- see cnn_accel_pe_array.vhd's entity comment). 40
+      -- pixels * 19 = 760 cycles, still inside the 800-cycle bound below.
       start_time := now;
       for p in 0 to 39 loop
         run_pixel(3, 3, 1, p = 39);

@@ -444,16 +444,56 @@ class Module(BaseModule):
         # configuration. Do not silently "fix" a future checker failure here
         # by assuming the RTL changed without checking the diff first.
         #
-        # Result across the six: bias_requant (520.02 MHz) and
-        # weight_buffer (257.80 MHz) clear 150 MHz comfortably.
-        # pe_array (56.52/56.44 MHz for 8/16 rows) and conv_core
-        # (46.77/45.38 MHz for 8/16 rows) do **not** -- roughly a third of
-        # target, and essentially row-count-independent, meaning the
-        # critical path is inside one PE lane's MAC/accumulate chain, not
-        # across the array. Analyzing the actual critical path and fixing
-        # it (pipelining `compute_partial_sums` in `cnn_accel_pe_array.vhd`
-        # or similar) is real RTL/timing work, delegated to a
-        # strong-model subagent per this project's standing rule (see
+        # First measurement round (pre-fix) came out at: bias_requant
+        # 520.02 MHz, weight_buffer 257.80 MHz, pe_array 56.52/56.44 MHz
+        # (8/16 rows), conv_core 46.77/45.38 MHz (8/16 rows) -- the last
+        # four roughly a third of target.
+        #
+        # **THE 520.02 MHz FOR bias_requant WAS A LIE, AND THE LESSON IS
+        # THE MOST IMPORTANT THING IN THIS COMMENT.** `report_timing
+        # -setup` on an out-of-context netlist reports only
+        # *register-to-register* paths. An out-of-context build gives its
+        # input ports no input delay, so any combinational cone that
+        # *starts at an input port* is never timed at all. Every one of
+        # `cnn_accel_bias_requant`'s ~21 ns of bias-add / requant-multiply
+        # / rounded-shift / saturate logic hangs off `s_accum_m2s.data` and
+        # `bias_rd_data`, i.e. off input ports, so standalone synthesis saw
+        # none of it and happily reported a 1-LUT `out_valid_q ->
+        # out_data_q/CE` path as the worst case. Inside `conv_core`, where
+        # that same cone is fed by `weight_buffer`'s registers, it was the
+        # 46.77 MHz critical path of the whole composition.
+        #
+        # **Rule: a leaf entity's out-of-context Fmax is an upper bound and
+        # nothing more. Only a composition entity (conv_core, eventually
+        # cnn_accel_top) produces a number worth acting on.** Never
+        # "optimize" a leaf against its own standalone figure, and never
+        # conclude a leaf is fine because its standalone figure is high.
+        #
+        # Fixing this took three independent reworks, each of which only
+        # became visible once the previous one was done -- conv_core sat at
+        # 46.77 -> 46.77 -> 47.66 -> 159.72 -> 159.95 MHz, i.e. the first
+        # two fixes looked like they had achieved *nothing* at the
+        # composition level because a comparable path was hiding behind
+        # each:
+        #   1. `cnn_accel_pe_array`: the single-cycle `compute_partial_sums`
+        #      MAC cone became a self-timed pipeline with one register per
+        #      adder-tree level (56.52 -> 232.67 MHz standalone).
+        #   2. `cnn_accel_bias_requant`: one combinational cone became a
+        #      7-stage pipeline, and `round_shift_right`'s
+        #      re-multiply/subtract/compare rounding was replaced by the
+        #      guard/sticky round-half-to-even form (21.3 ns -> off the
+        #      critical path).
+        #   3. `cnn_accel_window_gen`: the per-cycle read-address
+        #      arithmetic (two runtime multiplies, a modulo and four range
+        #      compares feeding the BRAM address pins directly) became
+        #      registered per-pixel geometry plus look-ahead accumulators;
+        #      this is also why its DSP count went 4 -> 0.
+        # Final: **conv_core 159.95 MHz at both 8 and 16 rows**, target met.
+        # conv_core now has a *plateau* of paths around 6 ns, so expect the
+        # next single-path fix here to buy almost nothing on its own.
+        #
+        # This is real RTL/timing work and was delegated to strong-model
+        # subagents per this project's standing rule (see the
         # `vivado-gotchas` skill): always use a strong model to analyze and
         # fix timing, never a quick pass by the orchestrating agent.
 
@@ -578,9 +618,17 @@ class Module(BaseModule):
                 # measured -- 0 BRAM and 32 DSP are the meaningful,
                 # structural checks here (the 2-DSP-per-lane requant
                 # multiply pattern, unconditionally mapped by Yosys).
+                #
+                # FF re-pinned 2026-09 (S7): 66 -> 2938 measured, because
+                # this entity went from one combinational cone to a 7-stage
+                # pipeline to make 150 MHz (module-level comment). ~1.5x
+                # headroom. LUT moved 4853 (was well inside the 13000
+                # already). DSP unchanged at 32 -- the requant multiply
+                # pattern is untouched, which is exactly what that check is
+                # for.
                 checkers=[
                     TotalLuts(LessThan(13000)),
-                    Ffs(LessThan(130)),
+                    Ffs(LessThan(4500)),
                     BlockRams(LessThan(1)),
                     DspBlocks(LessThan(36)),
                 ],
@@ -889,9 +937,19 @@ class Module(BaseModule):
                 # inference regressing) or DSP dropping sharply (MAC
                 # structure lost) is exactly what this gate must still
                 # catch.
+                #
+                # FF re-pinned 2026-09 (S7): 3066 -> 6806 measured, from
+                # pipelining pe_array, bias_requant and window_gen to make
+                # 150 MHz (module-level comment). ~1.5x headroom. LUT came
+                # *down* to 10054 and BRAM held at 18. DSP moved 106 -> 104
+                # because window_gen's two runtime address multiplies are
+                # gone (its 4 DSPs -> 2 under Yosys, which unconditionally
+                # maps every `*`); still far inside the limit, and still
+                # catching a collapse of pe_array's 65-DSP MAC structure,
+                # which is what the check is for.
                 checkers=[
                     TotalLuts(LessThan(34000)),
-                    Ffs(LessThan(5400)),
+                    Ffs(LessThan(10500)),
                     BlockRams(LessThan(20)),
                     DspBlocks(LessThan(115)),
                 ],
@@ -970,12 +1028,28 @@ class Module(BaseModule):
                     # requant multiply is wide enough (not a tiny int8 x
                     # int8) that both tools map it to DSP48E1 the same way,
                     # unlike pe_array (see that entry below).
-                    # 150 MHz timing estimate: PASS, 520.02 MHz (0.077 ns
-                    # positive slack against the 2.000 ns/500 MHz auto-clock,
-                    # `Fmax = 1e9 / (2.000 - slack_ns)`.
+                    # 150 MHz timing estimate: 520.02 MHz -- **A MEANINGLESS
+                    # NUMBER, DO NOT TRUST IT.** Read the S7 module-level
+                    # comment above: this entity's whole datapath cone hangs
+                    # off input ports, which an out-of-context build never
+                    # times, and the same logic was conv_core's 46.77 MHz
+                    # critical path. Only conv_core's figure means anything
+                    # for this entity.
+                    #
+                    # Re-measured 2026-09 after the S7 7-stage pipelining:
+                    # 3163 LUTs, 2817 FFs, 0 BRAM, 32 DSP, 206.40 MHz
+                    # standalone (still an upper bound, but at least the
+                    # register-to-register paths it reports are now the real
+                    # ones). LUTs came *down* by ~1700 because the
+                    # guard/sticky rounding replaced a re-multiply, a
+                    # 65-bit subtract and two 66-bit comparators; FFs are up
+                    # from 66 because there are now 7 stages where there was
+                    # one combinational cone. DSP held at 32, i.e. the
+                    # requant multiply pattern survived the rework, which is
+                    # what that `EqualTo` is for.
                     checkers=[
                         TotalLuts(LessThan(5200)),
-                        Ffs(LessThan(80)),
+                        Ffs(LessThan(3200)),
                         Ramb36(LessThan(1)),
                         Ramb18(LessThan(1)),
                         DspBlocks(EqualTo(32)),
@@ -1043,23 +1117,57 @@ class Module(BaseModule):
                         "g_max_row_tile_words": _MAX_ROW_TILE_WORDS,
                         "g_tile_channels": _TILE_CHANNELS,
                     },
-                    # Measured 2026-09: 2900 LUTs, 815 FFs, 3 RAMB36 +
-                    # 0 RAMB18, 4 DSP. BRAM count of exactly 3 (one per
-                    # kernel-row bank) agrees with Yosys's own
+                    # Measured 2026-09 (pre-S7): 2900 LUTs, 815 FFs,
+                    # 3 RAMB36 + 0 RAMB18, 4 DSP.
+                    # Re-measured 2026-09 after the S7 read-address timing
+                    # rework: 2750 LUTs, 1171 FFs, 3 RAMB36 + 0 RAMB18,
+                    # 0 DSP. Both moved checkers moved for one reason:
+                    #
+                    #  * DSP 4 -> 0, exact. The 4 DSP48E1s were the two
+                    #    *runtime* multiplies S7 deleted -- the read
+                    #    address `input_col * n_tiles + rd_tile` and the
+                    #    `out_col * stride_w` / `out_row * stride_h` window
+                    #    origins -- which sat combinationally in front of
+                    #    the row-bank address pins and were the design's
+                    #    critical path. What is left multiplies only at
+                    #    `start` on narrow values, which Vivado maps to
+                    #    LUTs. Kept exact (`LessThan(1)`, i.e. zero) and in
+                    #    the opposite direction to before: a DSP
+                    #    *reappearing* here means a runtime multiply has
+                    #    crept back into the address path and the timing
+                    #    fix has regressed.
+                    #  * FF 815 -> 1171. S7 precomputes the whole
+                    #    per-output-position geometry (window origin, real
+                    #    row/column extents, per-bank kernel-row validity)
+                    #    and the read address into registers advanced by
+                    #    plain increments, plus one-output-row/-column
+                    #    look-ahead accumulators. That is registers traded
+                    #    for logic depth, and it shows up here (LUTs went
+                    #    *down* 150 in the same trade).
+                    #
+                    # The 3-RAMB36 check is untouched and stays exact: one
+                    # per kernel-row bank, agreeing with Yosys's own
                     # `BlockRams(EqualTo(3))` below -- both tools confirm
-                    # the M7 BRAM-inference fix -- so this checker is kept
-                    # just as exact here, on the authoritative backend,
-                    # as it is on the CI-gating one. The 4 DSPs are address
-                    # arithmetic that Vivado folded into DSP48E1s (Yosys
-                    # folds a similar adder into one of its 9 DSPs too, for
-                    # the same underlying reason).
+                    # the M7 BRAM-inference fix, so this checker is kept
+                    # just as exact here, on the authoritative backend, as
+                    # it is on the CI-gating one.
                     checkers=[
                         TotalLuts(LessThan(3200)),
-                        Ffs(LessThan(900)),
+                        Ffs(LessThan(1300)),
                         Ramb36(EqualTo(3)),
                         Ramb18(LessThan(1)),
-                        DspBlocks(EqualTo(4)),
+                        DspBlocks(LessThan(1)),
                     ],
+                    # Added 2026-09 (S7): this entity had never been timed,
+                    # which is precisely why its 20.4 ns / 21-CARRY4
+                    # address path went unnoticed until it surfaced as
+                    # conv_core's critical path after pe_array and
+                    # bias_requant were fixed. Same caveat as every other
+                    # leaf here: the number it prints is an upper bound (its
+                    # geometry cone is driven from `start`-time input
+                    # ports), so it is worth watching for regressions but
+                    # conv_core's figure is the one that decides.
+                    analyze_synthesis_timing=True,
                 ),
                 vivado_build(
                     "cnn_accel_pe_array",
@@ -1108,15 +1216,24 @@ class Module(BaseModule):
                     # is unchanged from the Yosys entry's own
                     # `BlockRams(LessThan(1))` rule: this entity's
                     # accumulators must stay in flip-flops on both backends.
-                    # 150 MHz timing estimate: **FAIL**, 56.52 MHz --
-                    # roughly a third of the 150 MHz target. This is the
-                    # deep MAC-array accumulate chain, and is the dominant
-                    # bottleneck for conv_core too (see below); delegated to
-                    # a strong-model timing analysis/fix, not hand-waved --
-                    # see flow_status.md S7.
+                    # 150 MHz timing estimate: was **FAIL**, 56.52 MHz --
+                    # roughly a third of target, the deep MAC-array
+                    # accumulate chain. Fixed by S7 fix 1 (see the
+                    # module-level comment): `compute_partial_sums` became a
+                    # self-timed pipeline with one register per adder-tree
+                    # level, now **232.67 MHz**. Re-measured: 6297 LUTs,
+                    # 3212 FFs, 0 BRAM, 0 DSP. FFs nearly tripled (1118 ->
+                    # 3212) buying 4.1x the clock -- that is the trade this
+                    # entity exists to make, so the FF limit below is a
+                    # deliberate ceiling, not an accident.
+                    #
+                    # Note the intermediate data point, worth keeping: a
+                    # single balanced adder tree with no internal registers
+                    # only reached 110 MHz. Both the rebalance *and* the
+                    # per-level register were needed.
                     checkers=[
                         TotalLuts(LessThan(7200)),
-                        Ffs(LessThan(1200)),
+                        Ffs(LessThan(3600)),
                         Ramb36(LessThan(1)),
                         Ramb18(LessThan(1)),
                         DspBlocks(LessThan(1)),
@@ -1147,19 +1264,39 @@ class Module(BaseModule):
                     # as weight_buffer above: the real clock constraint
                     # changes Vivado's area/timing tradeoffs, it is not a
                     # regression. DSP additivity is unaffected by the
-                    # constraint (32 from bias_requant + 4 from window_gen +
-                    # 0 + 0 = 36); see the Yosys `cnn_accel_conv_core` entry
+                    # constraint; see the Yosys `cnn_accel_conv_core` entry
                     # above for the full leaf-additivity cross-check.
-                    # 150 MHz timing estimate: **FAIL**, 46.77 MHz -- close
-                    # to pe_array's standalone 56.52 MHz, confirming the
-                    # bottleneck is inside the MAC array, not introduced by
-                    # composition. See flow_status.md S7.
+                    # 150 MHz timing estimate: was **FAIL**, 46.77 MHz.
+                    # **This is the only entity in this file whose timing
+                    # number was ever trustworthy** -- see the S7
+                    # module-level comment. It took all three S7 reworks
+                    # (pe_array, bias_requant, window_gen), and after the
+                    # first two this number had moved only 46.77 -> 47.66,
+                    # because each fix merely exposed the next comparable
+                    # path.
+                    #
+                    # Final S7 measurement: **159.95 MHz** (PASS), 12951
+                    # LUTs, 7760 FFs, 14 RAMB36 + 2 RAMB18, 32 DSP.
+                    #
+                    # Both moved memory/DSP checkers are now *exactly*
+                    # leaf-additive, which is the real evidence the rework
+                    # did not quietly break inference:
+                    #   DSP    32 = 32 (bias_requant) + 0 (window_gen, was
+                    #                4 runtime address multiplies) + 0 + 0
+                    #   RAMB36 14 = 11 (weight_buffer) + 3 (window_gen)
+                    # RAMB36 went 10 -> 14 purely from the bias_requant
+                    # rework, which touches no memory at all: `bias_rd_data`
+                    # now lands on a clean stage-1 register instead of
+                    # feeding a 21 ns combinational cone, so Vivado no
+                    # longer partially dissolves weight_buffer's bias
+                    # memory into fabric. The old 10 was the anomaly; 14 is
+                    # the leaf-additive truth. Do not "restore" it.
                     checkers=[
                         TotalLuts(LessThan(16300)),
-                        Ffs(LessThan(3200)),
-                        Ramb36(EqualTo(10)),
+                        Ffs(LessThan(8600)),
+                        Ramb36(EqualTo(14)),
                         Ramb18(EqualTo(2)),
-                        DspBlocks(EqualTo(36)),
+                        DspBlocks(EqualTo(32)),
                     ],
                     analyze_synthesis_timing=True,
                 ),

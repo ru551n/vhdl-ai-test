@@ -30,6 +30,13 @@ use cnn_accel.cnn_accel_pkg.all;
 -- (architectural decision D2), matching cnn_accel_model.py's golden
 -- reference.
 --
+-- Timing: the datapath is a 7-stage pipeline (still one output beat per
+-- accepted input beat, but 7 cycles of latency) and the per-beat 'cfg_*'
+-- values are captured together with the beat, so 'cfg_*' may change as
+-- soon as a beat has been accepted. See the architecture's "Pipeline"
+-- comment for the stage-by-stage split, and for why this module's own
+-- out-of-context netlist Fmax is not a usable number.
+--
 -- bias_rd_addr / bias tiling (v1 design decision, see proposal doc §3):
 -- this module always drives 'bias_rd_addr' to all-zeros, i.e. it assumes a
 -- single bias row (row 0) covers all 'g_pe_rows' output channels for the
@@ -90,70 +97,148 @@ architecture a of cnn_accel_bias_requant is
   -- exactly a+b bits wide, no truncation before rounding).
   constant c_product_width : positive := c_sum_width + 32;
 
+  ------------------------------------------------------------------------
+  -- Pipeline
+  --
+  -- This module used to compute the whole bias-add -> multiply -> rounded
+  -- shift -> ReLU -> saturate chain in one combinational cone feeding a
+  -- single output register. Measured inside 'cnn_accel_conv_core' on
+  -- xc7a200tfbg484-2 that cone was 21.337 ns / 43 logic levels
+  -- (25 CARRY4 + 2 series DSP48E1), i.e. 46.77 MHz, and it was the
+  -- critical path of the entire M6b composition.
+  --
+  -- NOTE for anyone re-measuring: this entity's *own* out-of-context
+  -- netlist build reported 520.02 MHz for the very same RTL, because
+  -- synthesis-only register-to-register timing never times a
+  -- combinational cone that starts at an input port -- and here the whole
+  -- cone is driven from 's_accum_m2s.data' / 'bias_rd_data'. Only the
+  -- composition entity gives a real number for this module. Do not
+  -- "optimize" against the standalone figure.
+  --
+  -- The datapath is therefore split into 'c_stages' register stages,
+  -- suffix '_<n>' on every signal naming the stage it is registered in:
+  --
+  --   1  capture 's_accum'/'bias_rd_data' and the per-beat config
+  --      (cuts the input-port cone at a register immediately)
+  --   2  total = accum + bias        (c_sum_width-bit add)
+  --   3  product = total * scale     (DSP48E1 MREG stage)
+  --      and, in parallel, the whole bypass path's 8-bit result
+  --   4  product pipeline register   (DSP48E1 PREG stage)
+  --   5  rounded shift: quotient (barrel shift) + round-up decision
+  --   6  quotient + round_up (the c_product_width incrementer)
+  --   7  ReLU, saturate, pack -> output register
+  --
+  -- Stages 6 and 7 are split rather than fused. Fused, this module was
+  -- conv_core's critical path at 6.215 ns / 21 levels / 17 CARRY4
+  -- (159.72 MHz): the incrementer's carry chain plus the saturate cone
+  -- does not fit one 150 MHz cycle with any margin left for
+  -- place-and-route. Splitting them moves this module off the critical
+  -- path but buys conv_core almost nothing by itself (159.72 ->
+  -- 159.95 MHz), because conv_core has a *plateau* of paths around 6 ns
+  -- and window_gen's tap-index decode simply took over at 6.012 ns. It is
+  -- kept because 522 FFs (0.2% of the device) to retire a near-limit path
+  -- is worth it ahead of real place-and-route closure, not because it
+  -- raised the synthesis estimate. Do not read the 0.23 MHz as the value
+  -- of the change, and do not expect the next such split to pay either
+  -- until the whole plateau moves.
+  --
+  -- Throughput is unchanged at one output beat per accepted input beat;
+  -- only latency grows from 1 to 'c_stages' cycles. Latency is not
+  -- observable in 'cnn_accel_conv_core''s cycle budget: this module is a
+  -- pure streaming stage downstream of the accumulate-and-emit PE array,
+  -- so its latency costs once per frame, not once per pixel.
+  --
+  -- Backpressure: all stages share one 'pipe_en'. When the output stage
+  -- holds a beat the consumer will not take, the whole pipeline freezes
+  -- and 's_accum_s2m.ready' goes low; nothing is dropped and no bubble is
+  -- inserted while the consumer keeps up.
+  ------------------------------------------------------------------------
+
+  constant c_stages : positive := 7;
+
+  -- 'combined_shift' is always 15 plus a non-negative clamp, so the
+  -- rounding logic may rely on shift >= 15. It really only needs >= 1 (so
+  -- that bit 'shift - 1' of the product exists), but encoding the true
+  -- lower bound in the subtype also shrinks the barrel shifter and the
+  -- guard-bit decoder that synthesis builds from it.
+  subtype shift_t is natural range 15 to 15 + g_max_requant_shift;
+
+  type accum_lanes_t is array (0 to g_pe_rows - 1) of signed(g_accum_width - 1 downto 0);
+  type sum_lanes_t is array (0 to g_pe_rows - 1) of signed(c_sum_width - 1 downto 0);
+  type product_lanes_t is array (0 to g_pe_rows - 1) of signed(c_product_width - 1 downto 0);
+  type byte_lanes_t is array (0 to g_pe_rows - 1) of signed(7 downto 0);
+
+  type shift_pipe_t is array (1 to 4) of shift_t;
+  type scale_pipe_t is array (1 to 2) of signed(31 downto 0);
+
+  ------------------------------------------------------------------------
+  -- Shared (per-beat, all lanes) control signal decoding.
+  ------------------------------------------------------------------------
+
   signal shift_amt_raw : natural range 0 to 255;
   signal shift_amt_clamped : natural range 0 to g_max_requant_shift;
-  signal combined_shift : natural range 0 to 15 + g_max_requant_shift;
+  signal combined_shift : shift_t;
 
-  signal scale_signed : signed(31 downto 0);
+  ------------------------------------------------------------------------
+  -- Pipeline control.
+  ------------------------------------------------------------------------
 
-  signal m_out_data_low : std_ulogic_vector(8 * g_pe_rows - 1 downto 0);
+  signal pipe_en : std_ulogic;
+  signal valid_q : std_ulogic_vector(1 to c_stages) := (others => '0');
+  signal last_q : std_ulogic_vector(1 to c_stages) := (others => '0');
+
+  ------------------------------------------------------------------------
+  -- Per-beat captured configuration. Captured *with* the beat at stage 1
+  -- rather than read live at each stage: the module is 'c_stages' cycles
+  -- deep now, so a 'cfg_*' change made right after a beat was accepted
+  -- must not retroactively change that beat's result. (The testbench's
+  -- 'send_beat' does exactly this -- drive cfg, hand over one beat, then
+  -- drive the next beat's cfg.) Each config signal is carried only as far
+  -- as the stage that consumes it.
+  ------------------------------------------------------------------------
+
+  signal bias_en_1 : std_ulogic := '0';
+  -- Consumed at stage 3 (bypass ReLU) and stage 7 (requant ReLU).
+  signal relu_en_p : std_ulogic_vector(1 to 6) := (others => '0');
+  -- Consumed at stage 7 (final path mux).
+  signal requant_en_p : std_ulogic_vector(1 to 6) := (others => '0');
+  -- Consumed at stage 3 (the multiply).
+  signal scale_p : scale_pipe_t := (others => (others => '0'));
+  -- Consumed at stage 5 (the rounded shift).
+  signal shift_p : shift_pipe_t := (others => 15);
+
+  ------------------------------------------------------------------------
+  -- Per-lane datapath registers.
+  ------------------------------------------------------------------------
+
+  signal accum_1 : accum_lanes_t := (others => (others => '0'));
+  signal bias_1 : accum_lanes_t := (others => (others => '0'));
+  signal total_2 : sum_lanes_t := (others => (others => '0'));
+  signal prod_3 : product_lanes_t := (others => (others => '0'));
+  signal prod_4 : product_lanes_t := (others => (others => '0'));
+  signal quot_5 : product_lanes_t := (others => (others => '0'));
+  signal round_up_5 : std_ulogic_vector(0 to g_pe_rows - 1) := (others => '0');
+  signal scaled_6 : product_lanes_t := (others => (others => '0'));
+  signal bypass_3 : byte_lanes_t := (others => (others => '0'));
+  signal bypass_4 : byte_lanes_t := (others => (others => '0'));
+  signal bypass_5 : byte_lanes_t := (others => (others => '0'));
+  signal bypass_6 : byte_lanes_t := (others => (others => '0'));
+
+  ------------------------------------------------------------------------
+  -- Per-lane combinational stage inputs (the '_next' of each register
+  -- above) and the packed output word.
+  ------------------------------------------------------------------------
+
+  signal total_next : sum_lanes_t;
+  signal bypass_next : byte_lanes_t;
+  signal quot_next : product_lanes_t;
+  signal round_up_next : std_ulogic_vector(0 to g_pe_rows - 1);
+  signal scaled_next : product_lanes_t;
+  signal final_lane : byte_lanes_t;
+
   signal next_out_data_full : std_ulogic_vector(axi_stream_data_sz - 1 downto 0);
 
-  signal accept_input : std_ulogic;
-  signal out_valid_q : std_ulogic := '0';
   signal out_data_q : std_ulogic_vector(axi_stream_data_sz - 1 downto 0) := (others => '0');
-  signal out_last_q : std_ulogic := '0';
-
-  -- Round 'product_in' to the nearest integer after an arithmetic right
-  -- shift by 'shift_amt' bits (runtime-variable), ties rounding to even.
-  -- Deliberately hand-written rather than instantiating
-  -- 'math.truncate_round_signed': that entity's number of removed LSBs is
-  -- fixed by its 'input_width'/'result_width' generics at elaboration time,
-  -- but 'shift_amt' here is a genuine runtime value derived from
-  -- 'cfg_requant_shift' (an ISA field, loaded per instruction) -- see
-  -- proposal doc §4 for the full rationale (a per-shift-value generate/mux
-  -- array was considered and rejected: resource-explosive, and *not*
-  -- reusing it would otherwise force two separate rounding steps, which
-  -- would double-round versus the golden model's single combined shift).
-  -- Structurally mirrors 'truncate_round_signed's algorithm (compare twice
-  -- the remainder against the divisor, tie -> round to even), verified
-  -- bit-exact against cnn_accel_model.py's 'round_shift_right_signed' by
-  -- the testbench.
-  function round_shift_right(
-    product_in : signed(c_product_width - 1 downto 0);
-    shift_amt : natural
-  ) return signed is
-    variable quotient : signed(c_product_width - 1 downto 0);
-    variable quotient_shifted_back : signed(c_product_width - 1 downto 0);
-    variable remainder : signed(c_product_width - 1 downto 0);
-    variable remainder_ext : signed(c_product_width downto 0);
-    variable divisor_ext : signed(c_product_width downto 0);
-    variable twice_remainder : signed(c_product_width downto 0);
-    variable result : signed(c_product_width - 1 downto 0);
-  begin
-    quotient := shift_right(product_in, shift_amt);
-    quotient_shifted_back := shift_left(quotient, shift_amt);
-    remainder := product_in - quotient_shifted_back;
-
-    remainder_ext := resize(remainder, remainder_ext'length);
-    twice_remainder := shift_left(remainder_ext, 1);
-    divisor_ext := shift_left(to_signed(1, divisor_ext'length), shift_amt);
-
-    if twice_remainder < divisor_ext then
-      result := quotient;
-    elsif twice_remainder > divisor_ext then
-      result := quotient + 1;
-    else
-      -- Exact tie: round to even (quotient's LSB is its parity bit).
-      if quotient(0) = '0' then
-        result := quotient;
-      else
-        result := quotient + 1;
-      end if;
-    end if;
-
-    return result;
-  end function;
 
 begin
 
@@ -170,10 +255,10 @@ begin
     severity failure;
 
   ------------------------------------------------------------------------
-  -- Shared (per-beat, all lanes) control signal decoding.
+  -- Shared (per-beat, all lanes) control signal decoding. Combinational
+  -- off the 'cfg_*' ports; the result is captured at stage 1 with the
+  -- beat it belongs to.
   ------------------------------------------------------------------------
-
-  scale_signed <= signed(cfg_requant_scale);
 
   shift_amt_raw <= to_integer(unsigned(cfg_requant_shift));
   shift_amt_clamped <= shift_amt_raw when shift_amt_raw <= g_max_requant_shift else g_max_requant_shift;
@@ -187,38 +272,144 @@ begin
   bias_rd_addr <= (others => '0');
 
   ------------------------------------------------------------------------
-  -- Per-lane datapath.
+  -- Flow control: one enable for the whole pipeline (see the "Pipeline"
+  -- comment above).
+  ------------------------------------------------------------------------
+
+  pipe_en <= (not valid_q(c_stages)) or m_out_s2m.ready;
+  s_accum_s2m.ready <= pipe_en;
+
+  ------------------------------------------------------------------------
+  -- Per-lane combinational logic between the register stages.
   ------------------------------------------------------------------------
 
   lane_gen : for l in 0 to g_pe_rows - 1 generate
 
-    signal accum_l : signed(g_accum_width - 1 downto 0);
-    signal bias_l : signed(g_accum_width - 1 downto 0);
-    signal total_l : signed(c_sum_width - 1 downto 0);
-    signal product_l : signed(c_product_width - 1 downto 0);
-    signal scaled_l : signed(c_product_width - 1 downto 0);
+    -- Stage 3's bypass path.
+    signal relu_clamped_total_l : signed(c_sum_width - 1 downto 0);
+    -- Stage 7's requant path.
     signal relu_scaled_l : signed(c_product_width - 1 downto 0);
     signal sat_result_l : signed(7 downto 0);
-    signal relu_clamped_total_l : signed(c_sum_width - 1 downto 0);
-    signal bypass_result_l : signed(7 downto 0);
-    signal final_lane_l : signed(7 downto 0);
 
   begin
 
-    accum_l <= s_accum_m2s.data(l);
-    bias_l <= signed(bias_rd_data(g_accum_width * (l + 1) - 1 downto g_accum_width * l));
+    --------------------------------------------------------------------
+    -- Into stage 2: total = accum + (bias when enabled).
+    --------------------------------------------------------------------
 
-    total_l <= resize(accum_l, c_sum_width) + resize(bias_l, c_sum_width) when cfg_bias_en = '1' else
-               resize(accum_l, c_sum_width);
+    total_next(l) <= resize(accum_1(l), c_sum_width) + resize(bias_1(l), c_sum_width) when bias_en_1 = '1' else
+                     resize(accum_1(l), c_sum_width);
 
-    -- Requant path: total * scale (Q15), rounded shift, ReLU-before-saturate,
-    -- saturate to int8 (genuine reuse of 'math.saturate_signed').
-    product_l <= total_l * scale_signed;
+    --------------------------------------------------------------------
+    -- Into stage 3: the bypass path (cfg_requant_en='0'), computed in
+    -- parallel with the multiply so only 8 bits per lane need carrying
+    -- down the rest of the pipeline instead of the full 'total'. Bias
+    -- and ReLU are still applied to 'total', then it is saturated to
+    -- int8 -- the same overflow semantic (saturate, not wrap) as the
+    -- requant path, per architectural decision D2, matching
+    -- cnn_accel_model.py's golden reference. Reuses
+    -- 'math.saturate_signed' directly, same primitive as the requant
+    -- path below, rather than hand-rolling a second saturation.
+    --------------------------------------------------------------------
 
-    scaled_l <= round_shift_right(product_l, combined_shift);
+    relu_clamped_total_l <= (others => '0') when (relu_en_p(2) = '1' and total_2(l)(total_2(l)'high) = '1') else
+                            total_2(l);
 
-    relu_scaled_l <= (others => '0') when (cfg_relu_en = '1' and scaled_l(scaled_l'high) = '1') else
-                     scaled_l;
+    bypass_saturate_signed_inst : entity math.saturate_signed
+      generic map (
+        input_width => c_sum_width,
+        result_width => 8,
+        enable_output_register => false
+      )
+      port map (
+        clk => clk,
+        input_valid => '1',
+        input_value => relu_clamped_total_l,
+        result_valid => open,
+        result_value => bypass_next(l),
+        result_is_saturated => open
+      );
+
+    --------------------------------------------------------------------
+    -- Into stage 5: the rounded arithmetic right shift, split across the
+    -- stage 5 / stage 6 boundary.
+    --
+    -- 'shift_right' on a signed value is a floor division by 2**shift,
+    -- so the remainder 'product mod 2**shift' is exactly the low 'shift'
+    -- bits of the product read as unsigned -- for negative products too.
+    -- The old formulation re-multiplied the quotient back up, subtracted
+    -- to get that remainder and then compared 2*remainder against
+    -- 2**shift, which cost a second variable shift, a c_product_width
+    -- subtract and two wide comparators (the bulk of the 25 CARRY4 on
+    -- the measured critical path). The classic guard/sticky form below
+    -- is bit-identical and needs neither:
+    --
+    --   guard  = product(shift - 1)          -- is remainder >= half?
+    --   sticky = or product(shift - 2 .. 0)  -- is remainder > half?
+    --   2*rem <  2**shift  <=>  guard = '0'                -> truncate
+    --   2*rem >  2**shift  <=>  guard = '1' and sticky = '1' -> +1
+    --   2*rem =  2**shift  <=>  guard = '1' and sticky = '0' -> tie,
+    --                                round to even, i.e. +1 iff quotient
+    --                                is odd
+    --   => round_up = guard and (sticky or quotient(0))
+    --
+    -- Still verified bit-exact against cnn_accel_model.py's
+    -- 'round_shift_right_signed' by the testbench (that is what
+    -- 'test_round_to_even_ties' is for), rather than by this comment.
+    --
+    -- 'math.truncate_round_signed' is still not usable here: its number
+    -- of removed LSBs is fixed by generics at elaboration time, whereas
+    -- 'shift' is a genuine runtime value derived from
+    -- 'cfg_requant_shift' (an ISA field, loaded per instruction) -- see
+    -- proposal doc section 4.
+    --------------------------------------------------------------------
+
+    round_shift_proc : process(all)
+      variable product_u : unsigned(c_product_width - 1 downto 0);
+      variable low_mask : unsigned(c_product_width - 1 downto 0);
+      variable shift_amt : shift_t;
+      variable quotient : signed(c_product_width - 1 downto 0);
+      variable guard : std_ulogic;
+      variable sticky : std_ulogic;
+    begin
+      shift_amt := shift_p(4);
+      product_u := unsigned(prod_4(l));
+
+      quotient := shift_right(prod_4(l), shift_amt);
+
+      guard := product_u(shift_amt - 1);
+
+      -- Mask of the bits strictly below the guard bit. Built as a
+      -- per-bit compare against the (registered) shift amount so it
+      -- synthesizes to one level of decode logic, not a subtractor
+      -- chain, and so the sticky bit is one balanced 'or' reduction.
+      for i in 0 to c_product_width - 1 loop
+        if i < shift_amt - 1 then
+          low_mask(i) := '1';
+        else
+          low_mask(i) := '0';
+        end if;
+      end loop;
+      sticky := or std_ulogic_vector(product_u and low_mask);
+
+      quot_next(l) <= quotient;
+      round_up_next(l) <= guard and (sticky or quotient(0));
+    end process;
+
+    --------------------------------------------------------------------
+    -- Into stage 6: finish the rounding.
+    --------------------------------------------------------------------
+
+    scaled_next(l) <= quot_5(l) + 1 when round_up_5(l) = '1' else quot_5(l);
+
+    --------------------------------------------------------------------
+    -- Into stage 7: apply ReLU BEFORE the int8 clamp, saturate (genuine
+    -- reuse of 'math.saturate_signed'), then select the requant or the
+    -- bypass result.
+    --------------------------------------------------------------------
+
+    relu_scaled_l <= (others => '0') when (relu_en_p(6) = '1' and scaled_6(l)(c_product_width - 1) = '1') else
+                     scaled_6(l);
 
     saturate_signed_inst : entity math.saturate_signed
       generic map (
@@ -235,77 +426,101 @@ begin
         result_is_saturated => open
       );
 
-    -- Bypass path (cfg_requant_en='0'): bias/ReLU still applied to 'total',
-    -- then saturated to int8 -- same overflow semantic (saturate, not
-    -- wrap) as the requant path, per architectural decision D2 (a single
-    -- overflow semantic across both paths, matching cnn_accel_model.py's
-    -- golden reference). Reuses 'math.saturate_signed' directly (same
-    -- primitive as the requant path above), rather than hand-rolling a
-    -- second saturation.
-    bypass_relu_proc : process(all)
-    begin
-      if cfg_relu_en = '1' and total_l(total_l'high) = '1' then
-        relu_clamped_total_l <= (others => '0');
-      else
-        relu_clamped_total_l <= total_l;
-      end if;
-    end process;
+    final_lane(l) <= sat_result_l when requant_en_p(6) = '1' else bypass_6(l);
 
-    bypass_saturate_signed_inst : entity math.saturate_signed
-      generic map (
-        input_width => c_sum_width,
-        result_width => 8,
-        enable_output_register => false
-      )
-      port map (
-        clk => clk,
-        input_valid => '1',
-        input_value => relu_clamped_total_l,
-        result_valid => open,
-        result_value => bypass_result_l,
-        result_is_saturated => open
-      );
-
-    final_lane_l <= sat_result_l when cfg_requant_en = '1' else bypass_result_l;
-
-    m_out_data_low(8 * (l + 1) - 1 downto 8 * l) <= std_ulogic_vector(final_lane_l);
+    next_out_data_full(8 * (l + 1) - 1 downto 8 * l) <= std_ulogic_vector(final_lane(l));
 
   end generate lane_gen;
 
-  ------------------------------------------------------------------------
-  -- Output packing and single-stage flow-through register: registers
-  -- valid/data/last with reset, but never inserts a bubble (accepts a new
-  -- input beat in the same cycle it drains the current one to a ready
-  -- consumer) -- full throughput, one cycle latency. Reset clears
-  -- 'out_valid_q' only (no completeness contract on stale data content).
-  ------------------------------------------------------------------------
-
-  next_out_data_full(8 * g_pe_rows - 1 downto 0) <= m_out_data_low;
   data_padding_gen : if 8 * g_pe_rows < axi_stream_data_sz generate
     next_out_data_full(axi_stream_data_sz - 1 downto 8 * g_pe_rows) <= (others => '0');
   end generate;
 
-  accept_input <= (not out_valid_q) or m_out_s2m.ready;
-  s_accum_s2m.ready <= accept_input;
+  ------------------------------------------------------------------------
+  -- The pipeline registers themselves. Reset clears the valid chain only
+  -- (no completeness contract on stale data content), same as the
+  -- single-stage version this replaces.
+  ------------------------------------------------------------------------
 
-  output_register : process(clk)
+  pipeline : process(clk)
   begin
     if rising_edge(clk) then
       if reset = '1' then
-        out_valid_q <= '0';
-      else
-        if accept_input = '1' then
-          out_valid_q <= s_accum_m2s.valid;
-          out_data_q <= next_out_data_full;
-          out_last_q <= s_accum_m2s.last;
-        end if;
+        valid_q <= (others => '0');
+      elsif pipe_en = '1' then
+        -- Stage 1: capture the accepted beat, its bias word and its config.
+        valid_q(1) <= s_accum_m2s.valid;
+        last_q(1) <= s_accum_m2s.last;
+        for l in 0 to g_pe_rows - 1 loop
+          accum_1(l) <= s_accum_m2s.data(l);
+          bias_1(l) <= signed(bias_rd_data(g_accum_width * (l + 1) - 1 downto g_accum_width * l));
+        end loop;
+        bias_en_1 <= cfg_bias_en;
+        relu_en_p(1) <= cfg_relu_en;
+        requant_en_p(1) <= cfg_requant_en;
+        scale_p(1) <= signed(cfg_requant_scale);
+        shift_p(1) <= combined_shift;
+
+        -- Stage 2: bias add.
+        valid_q(2) <= valid_q(1);
+        last_q(2) <= last_q(1);
+        total_2 <= total_next;
+        relu_en_p(2) <= relu_en_p(1);
+        requant_en_p(2) <= requant_en_p(1);
+        scale_p(2) <= scale_p(1);
+        shift_p(2) <= shift_p(1);
+
+        -- Stage 3: the requant multiply, plus the finished bypass result.
+        valid_q(3) <= valid_q(2);
+        last_q(3) <= last_q(2);
+        for l in 0 to g_pe_rows - 1 loop
+          prod_3(l) <= total_2(l) * scale_p(2);
+        end loop;
+        bypass_3 <= bypass_next;
+        relu_en_p(3) <= relu_en_p(2);
+        requant_en_p(3) <= requant_en_p(2);
+        shift_p(3) <= shift_p(2);
+
+        -- Stage 4: product pipeline register. Deliberately a bare
+        -- register move: it lets Vivado retime it into the DSP48E1
+        -- cascade's own PREG instead of spending fabric on it.
+        valid_q(4) <= valid_q(3);
+        last_q(4) <= last_q(3);
+        prod_4 <= prod_3;
+        bypass_4 <= bypass_3;
+        relu_en_p(4) <= relu_en_p(3);
+        requant_en_p(4) <= requant_en_p(3);
+        shift_p(4) <= shift_p(3);
+
+        -- Stage 5: quotient and round-up decision.
+        valid_q(5) <= valid_q(4);
+        last_q(5) <= last_q(4);
+        quot_5 <= quot_next;
+        round_up_5 <= round_up_next;
+        bypass_5 <= bypass_4;
+        relu_en_p(5) <= relu_en_p(4);
+        requant_en_p(5) <= requant_en_p(4);
+
+        -- Stage 6: the rounding incrementer, on its own so that its
+        -- carry chain does not share a cycle with the saturate cone.
+        valid_q(6) <= valid_q(5);
+        last_q(6) <= last_q(5);
+        scaled_6 <= scaled_next;
+        bypass_6 <= bypass_5;
+        relu_en_p(6) <= relu_en_p(5);
+        requant_en_p(6) <= requant_en_p(5);
+
+        -- Stage 7: the output register.
+        valid_q(7) <= valid_q(6);
+        last_q(7) <= last_q(6);
+        out_data_q <= next_out_data_full;
       end if;
     end if;
   end process;
 
-  m_out_m2s.valid <= out_valid_q;
+  m_out_m2s.valid <= valid_q(c_stages);
   m_out_m2s.data <= out_data_q;
-  m_out_m2s.last <= out_last_q;
+  m_out_m2s.last <= last_q(c_stages);
   m_out_m2s.user <= (others => '0');
 
 end architecture a;

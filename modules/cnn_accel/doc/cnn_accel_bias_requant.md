@@ -104,12 +104,41 @@ D2), matching the golden model.
 
 ## Timing/latency
 
-One cycle latency (`s_accum` beat accepted at cycle `N` appears on
-`m_out` at cycle `N+1`, or whenever it next drains against
-`m_out_s2m.ready`). Full throughput at zero stall on both links (a
-flow-through single-stage output register, not a bubble-inserting
-pipeline: it accepts a new input beat the same cycle it drains to a
-ready consumer).
+**Seven cycles latency** (`c_stages = 7`): an `s_accum` beat accepted at
+cycle `N` appears on `m_out` at cycle `N+7`, or whenever it next drains
+against `m_out_s2m.ready`. Full throughput at zero stall on both links:
+one output beat per accepted input beat, no bubbles. All seven stages
+share a single `pipe_en <= (not valid_q(c_stages)) or m_out_s2m.ready`,
+which also drives `s_accum_s2m.ready` — when the output stage is stalled
+the whole pipeline freezes together, so nothing is dropped and no bubble
+is inserted.
+
+The stage split (S7 timing work, 2026-09-07 — previously this was a
+single-cycle datapath, and its ~21 ns combinational cone was the 46.77 MHz
+critical path of `cnn_accel_conv_core`):
+
+| Stage | Work |
+|---|---|
+| 1 | capture the accepted beat, its bias word and its `cfg_*` values |
+| 2 | bias add (`total = accum + bias`) |
+| 3 | requant multiply (DSP48E1 MREG) + the finished bypass result |
+| 4 | product pipeline register (bare DSP48E1 PREG, no logic) |
+| 5 | quotient and the round-up decision (guard/sticky) |
+| 6 | the rounding incrementer, alone so its carry chain gets a full cycle |
+| 7 | ReLU before the int8 clamp, saturate, path mux, output register |
+
+Per-beat `cfg_*` values are captured *with* the beat at stage 1 rather
+than read live at the stage that consumes them, because the module is
+seven cycles deep: `cfg_*` may therefore change as soon as a beat has
+been accepted. Throughput is unchanged by the added depth and latency
+costs once per pipeline fill, not once per pixel, so the S5 frame-budget
+model is unaffected.
+
+> Note: this module's own out-of-context netlist Fmax is **not** a usable
+> number — its whole datapath cone starts at input ports, which
+> synthesis-only register-to-register timing never sees. It reported
+> 520 MHz standalone while being `conv_core`'s 46.77 MHz critical path.
+> See the `vivado-gotchas` skill.
 
 ## Registers/configuration
 
@@ -139,12 +168,24 @@ driving `cnn_accel_layer_ctrl`, not yet designed).
   `doc/cnn_accel_arch.md`'s submodule table describing this module as
   composing it: its removed-LSB count is fixed by generics at elaboration,
   but the combined shift amount (`15 + cfg_requant_shift`) is a genuine
-  runtime value. A hand-written `round_shift_right` function reproduces
-  its round-to-even algorithm using `ieee.numeric_std`'s dynamic
-  `shift_right`/`shift_left` (runtime `natural` shift count, synthesizes
-  as a barrel shifter). `math.saturate_signed` *is* genuinely reused
-  (fixed widths regardless of `cfg_requant_shift`'s value). Full
-  three-options-considered rationale in proposal doc §4.
+  runtime value. Round-to-even is reproduced inline instead.
+  `math.saturate_signed` *is* genuinely reused (fixed widths regardless
+  of `cfg_requant_shift`'s value). Full three-options-considered
+  rationale in proposal doc §4.
+- **Rounding is guard/sticky, not re-multiply-and-compare** (S7 timing
+  work, 2026-09-07). The original `round_shift_right` recovered the
+  remainder by shifting the quotient back left, subtracting, and
+  comparing against half — a second variable shift, a 65-bit subtract and
+  two 66-bit comparators in series, which was most of the module's 25
+  CARRY4 and ~1700 LUT. The classic form is used now:
+  `guard = product(shift-1)`, `sticky = or product(shift-2 downto 0)`,
+  `round_up = guard and (sticky or quotient(0))`. The sticky mask is
+  built as a mask-and-or-reduce (one balanced `or` tree) rather than a
+  carry chain, and the round-up decision (stage 5) is separated from the
+  incrementer it drives (stage 6) so the carry chain gets a full cycle.
+  Identical results to the old function — the testbench cross-checks
+  against an independently transliterated reference, not against this
+  RTL's structure.
 - `axi_stream_pkg`'s `data` field is a fixed 128-bit vector; this module
   asserts `g_accum_width*g_pe_rows <= 128` at elaboration. At
   `doc/cnn_accel_arch.md`'s own top-level defaults

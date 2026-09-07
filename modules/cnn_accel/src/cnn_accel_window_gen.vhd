@@ -5,6 +5,9 @@ use ieee.numeric_std.all;
 library axi_stream;
 use axi_stream.axi_stream_pkg.all;
 
+library math;
+use math.math_pkg.all;
+
 library cnn_accel;
 use cnn_accel.cnn_accel_pkg.all;
 
@@ -137,6 +140,31 @@ architecture a of cnn_accel_window_gen is
   constant c_lane_width : positive := 8 * g_tile_channels;
   constant c_window_data_length : positive := window_data_length(g_max_kernel_size, g_tile_channels);
 
+  -- S7 timing rework (see the read-address comment block below): every
+  -- row-bank cell address is now maintained as an increment-only
+  -- accumulator instead of being recomputed by a runtime multiply each
+  -- cycle, so read/write addresses are carried *modulo*
+  -- '2**c_addr_width' rather than exactly. That is sufficient because
+  -- every address the design ever actually *uses* is an in-frame cell,
+  -- i.e. '< cfg_in_width * n_tiles <= g_max_row_tile_words <=
+  -- 2**c_addr_width' (the bound is asserted at 'start'), so the low
+  -- 'c_addr_width' bits of a modular accumulator reproduce it exactly;
+  -- out-of-frame accumulator values (the left/right zero-padding
+  -- excursions a column walk passes through, where the true value is
+  -- negative or beyond the row) are never read out -- 'in_frame_now'
+  -- discards them, exactly as the predecessor's 'rd_addr(b) <= 0' branch
+  -- did.
+  constant c_addr_width : positive := num_bits_needed(g_max_row_tile_words - 1);
+  subtype word_t is unsigned(c_addr_width - 1 downto 0);
+
+  -- Signed row/column coordinate. 'cfg_in_width'/'cfg_in_height' are
+  -- 16-bit and every kernel/stride/padding value 8-bit, so 18 bits
+  -- signed covers every 'row_top'/'col_left'/'input_row'/'input_col'
+  -- intermediate below -- including the negative values top/left padding
+  -- produces -- without any of them becoming an unbounded 32-bit
+  -- 'integer' in the netlist.
+  subtype coord_t is integer range -131072 to 131071;
+
   ------------------------------------------------------------------------
   -- Row banks: 'g_max_kernel_size' full-row buffers, each
   -- 'g_max_row_tile_words' channel-tile cells wide -- cell 'col * n_tiles
@@ -193,30 +221,51 @@ architecture a of cnn_accel_window_gen is
     std_ulogic_vector(c_lane_width - 1 downto 0);
   signal bank_rd_data : bank_word_arr_t;
 
-  -- Per-bank read address and in-frame flag, driven combinationally by
-  -- 'addr_gen' below from the current 'kc_q' column-walk position; 'kr_of'
-  -- records which kernel-row tap (if any) that bank currently represents,
-  -- for the capture stage's tap-index decode.
-  type addr_arr_t is array (0 to g_max_kernel_size - 1) of
-    integer range 0 to g_max_row_tile_words - 1;
-  signal rd_addr : addr_arr_t := (others => 0);
+  -- S7: ONE shared read address register, not one per bank, driving every
+  -- bank's address port directly.
+  --
+  -- Why (measured, Vivado xc7a200tfbg484-2, 500 MHz constraint): the
+  -- predecessor's combinational per-bank 'rd_addr(b)' was the design's
+  -- critical path at 20.419 ns / 34 logic levels / 21 CARRY4 -- 47.66 MHz
+  -- for the whole 'cnn_accel_conv_core' -- from a DSP48E1's CLK->P
+  -- (3.375 ns, MREG but no PREG, i.e. straight through the post-multiply
+  -- adder) all the way onto 'gen_banks[2].bank_mem''s ADDRARDADDR pins,
+  -- because one cycle had to evaluate 'out_col_q * stride_w_q', then
+  -- 'input_col * n_tiles_q', then the per-bank in-frame mux, with nothing
+  -- registered in between. Two independent wastes fed that: 'rd_addr(b)'
+  -- was the *same value for every bank* (only the 'in_frame_now(b)'
+  -- enable differs), and the value itself is an affine function of 'kc_q'
+  -- and so wants to be an accumulator, not a multiplier (see
+  -- 'rd_word_q').
+  signal rd_addr_q : integer range 0 to g_max_row_tile_words - 1 := 0;
 
-  -- Write-side decode (combinational, 'wr_decode' below): which single
-  -- bank 'fire' writes this cycle, at which cell, with which (D11
-  -- zero-padded) data -- shared by every 'gen_banks' branch's write
-  -- process.
-  signal wr_bank_idx_c : natural range 0 to g_max_kernel_size - 1;
-  signal wr_addr_c : integer range 0 to g_max_row_tile_words - 1;
+  -- Write-side decode. 'wr_bank_q'/'wr_addr_q' are S7 *counters*
+  -- (advanced by 'control' on each accepted beat), replacing the former
+  -- combinational 'cur_row_q mod g_max_kernel_size' (a runtime modulo of
+  -- a 16-bit value by a non-power-of-two) and 'cur_col_q * n_tiles_q +
+  -- wr_tile_q' (a second runtime multiply, also landing directly on a
+  -- BRAM address port). Neither needs any arithmetic: consecutive
+  -- accepted beats write consecutive cells of one row, restarting at
+  -- cell 0 at every input-row boundary, where the bank number advances
+  -- one step around a mod-'g_max_kernel_size' ring. 'wr_data_c' stays
+  -- combinational -- it is a byte-lane mask on 's_stream_m2s.data' (D11)
+  -- feeding DI, not ADDR.
+  signal wr_bank_q : natural range 0 to g_max_kernel_size - 1 := 0;
+  signal wr_addr_q : integer range 0 to g_max_row_tile_words - 1 := 0;
   signal wr_data_c : std_ulogic_vector(c_lane_width - 1 downto 0);
 
   type flag_arr_t is array (0 to g_max_kernel_size - 1) of std_ulogic;
   signal in_frame_now : flag_arr_t := (others => '0');
 
+  -- Which kernel-row tap (if any) each bank currently represents, for the
+  -- capture stage's tap-index decode. S7: registered (maintained by
+  -- 'control' together with 'out_row_q', see the geometry block below)
+  -- rather than recomputed combinationally from 'row_top' every cycle.
   type kr_arr_t is array (0 to g_max_kernel_size - 1) of
     integer range 0 to g_max_kernel_size - 1;
-  signal kr_of : kr_arr_t := (others => 0);
+  signal kr_of_q : kr_arr_t := (others => 0);
 
-  -- One cycle behind 'in_frame_now'/'kr_of'/'kc_q' -- aligned with
+  -- One cycle behind 'in_frame_now'/'kr_of_q'/'kc_q' -- aligned with
   -- 'bank_rd_data', which lags the address by one registered read.
   signal in_frame_capture_q : flag_arr_t := (others => '0');
   signal kr_capture_q : kr_arr_t := (others => 0);
@@ -326,6 +375,125 @@ architecture a of cnn_accel_window_gen is
   signal out_row_q, out_col_q : unsigned(15 downto 0) := (others => '0');
   signal rd_tile_q : unsigned(15 downto 0) := (others => '0');
 
+  ------------------------------------------------------------------------
+  -- S7: per-output-position geometry, precomputed into registers.
+  --
+  -- Every signal in this block is a function of 'out_row_q'/'out_col_q'/
+  -- 'rd_tile_q' and the 'cfg_*' latch alone -- it changes once per output
+  -- pixel (or per tile), never once per 'kc_q' cycle -- yet the
+  -- predecessor design recomputed all of it combinationally *inside* the
+  -- per-cycle read-address cone: two runtime multiplies, a runtime
+  -- modulo, and four range compares per bank, all in series ahead of the
+  -- BRAM address pins. That is what the logic-level histogram's ~966
+  -- endpoints at levels 19-20 were.
+  --
+  -- These are maintained by 'control', by plain increments applied in the
+  -- *same* clocked branch that advances 'out_row_q'/'out_col_q'/
+  -- 'rd_tile_q'. That is deliberately not a pipeline stage: because they
+  -- update in lockstep with the counters they are derived from, they are
+  -- always exactly coherent with them and never one cycle stale. Two
+  -- consequences worth spelling out:
+  --   * 'row_ready_i' and 'write_freeze_i' keep their original,
+  --     cycle-accurate semantics (they are handshake/interlock signals,
+  --     not datapath -- see their declaration comments), so the M7
+  --     bank-aliasing interlock argument carries over verbatim.
+  --   * the read path gains NO latency: the walk's first address is still
+  --     issued in the same cycle as before, so the 'kc_capture_q'/
+  --     'kr_capture_q'/'in_frame_capture_q'/'capture_valid_q' one-deep
+  --     delay pipeline and 'walk_control's single 'kc_q = kernel_w_q'
+  --     drain cycle are unchanged.
+  ------------------------------------------------------------------------
+
+  -- Current-output-position geometry, all consumed by 'read_qualify' or
+  -- by 'walk_control's walk-start load:
+  --   'real_row_bot_q' = 'imin(row_top + kernel_h_q - 1, in_height_q - 1)'
+  --   'has_real_row_q' = '(row_top <= in_height_q - 1)
+  --                       and (row_top + kernel_h_q - 1 >= 0)'
+  --   'anchor_limit_q' = 'imax(row_top, 0) + g_max_kernel_size' -- the
+  --     'cur_row_q' value at which the write side would alias the
+  --     earliest real row this output row still needs; pre-added so
+  --     'write_freeze_i' is a single compare
+  --   'row_ok_q(b)'    = 'kr_of_q(b) < kernel_h_q' and 'row_top +
+  --     kr_of_q(b)' inside '[0, in_height_q - 1]' -- the row half of the
+  --     former per-bank in-frame test
+  --   'col_left_q'     = 'out_col_q * stride_w_q - pad_left_q'
+  --   'real_col_right_q'/'has_real_col_q' -- the column analogues
+  signal real_row_bot_q : coord_t := 0;
+  signal has_real_row_q : std_ulogic := '0';
+  signal anchor_limit_q : coord_t := g_max_kernel_size;
+  signal row_ok_q : flag_arr_t := (others => '0');
+  signal col_left_q : coord_t := 0;
+  signal real_col_right_q : coord_t := 0;
+  signal has_real_col_q : std_ulogic := '0';
+
+  -- 'row_top mod g_max_kernel_size', kept as a ring counter (step
+  -- 'stride_h_mod_q') so 'kr_of_q' never needs a runtime modulo of a
+  -- 16-bit value by a non-power-of-two.
+  signal row_top_mod_q : natural range 0 to g_max_kernel_size - 1 := 0;
+  signal stride_h_mod_q : natural range 0 to g_max_kernel_size - 1 := 0;
+
+  -- S7 second iteration, purely for timing: one-output-row / one-output-
+  -- column *look-ahead* accumulators holding 'row_top', 'row_top +
+  -- kernel_h_q - 1', 'row_top + g_max_kernel_size', 'col_left' and
+  -- 'col_left + kernel_w_q - 1' for the position the counters are about
+  -- to move to. Each is advanced by a single '+ stride' of its own, so
+  -- the geometry registers above are updated by a *compare-and-select on
+  -- register outputs* instead of by 'add, add, compare, select' in
+  -- series. The first iteration of this rework left exactly that
+  -- three-carry-chain next-state cone as the design's critical path
+  -- (measured: 6.438 ns / 9 levels, 'row_top_q' -> 'row_ok_q',
+  -- 154.23 MHz); splitting the adds out into these accumulators -- each
+  -- of which is then its own single-chain register-to-register path --
+  -- is what removes it.
+  signal row_top_next_q, row_bot_next_q, row_top_k_next_q : coord_t := 0;
+  signal col_left_next_q, col_right_next_q : coord_t := 0;
+
+  -- Frame constants, one-shot at 'start': the '-1'/'-2' forms of the
+  -- frame size that the range tests above compare against (so no test
+  -- has to subtract first), the column-0 reload values copied into the
+  -- column geometry at every output-row boundary, the per-kernel-row
+  -- upper row bound 'in_height_q - 1 - kr' and the per-kernel-row
+  -- 'kr < kernel_h_q' predicate.
+  signal in_height_m1_q, in_width_m1_q, in_width_m2_q : coord_t := 0;
+  signal col_left_start_q, col_left_start_next_q : coord_t := 0;
+  signal col_right_start_next_q : coord_t := 0;
+  signal real_col_right_start_q : coord_t := 0;
+  signal has_real_col_start_q : std_ulogic := '0';
+  type coord_arr_t is array (0 to g_max_kernel_size - 1) of coord_t;
+  signal row_hi_bound_q : coord_arr_t := (others => 0);
+  signal kr_valid_q : flag_arr_t := (others => '0');
+
+  -- Row-bank cell address of the *first* column ('kc = 0') of the window
+  -- at 'out_col_q'/'rd_tile_q': 'col_left * n_tiles_q + rd_tile_q', mod
+  -- '2**c_addr_width'. Maintained by increments: '+1' per tile,
+  -- '+ col_step_words_q' per output column, reloaded to
+  -- 'row_start_words_q' at each output-row start.
+  signal rd_base_q : word_t := (others => '0');
+  -- One-shot at 'start' -- like the integer divisions in 'control', these
+  -- are frame setup, not a per-cycle datapath. 'col_step_words_q' =
+  -- 'stride_w_q * n_tiles_q - (n_tiles_q - 1)' (advance one output column
+  -- *and* rewind the tile index to 0), 'row_start_words_q' =
+  -- '(-pad_left_q) * n_tiles_q' (column 0 of a new output row),
+  -- 'n_tiles_words_q' = 'n_tiles_q' (advance one 'kc' step); all mod
+  -- '2**c_addr_width'.
+  signal col_step_words_q : word_t := (others => '0');
+  signal row_start_words_q : word_t := (others => '0');
+  signal n_tiles_words_q : word_t := (others => '0');
+
+  -- Read-address accumulator, advanced once per 'kc_q' step: as 'kc_q'
+  -- increments by 1 'input_col' increments by 1, so the cell address
+  -- increments by exactly 'n_tiles_q'. 'rd_word_q' is the raw modular
+  -- accumulator; 'rd_addr_q' above is that value clamped to a legal bank
+  -- address (0 while out of frame, exactly the predecessor's behaviour)
+  -- so it can index 'bank_mem' straight out of a flip-flop.
+  -- 'rd_col_q'/'rd_col_ok_q' are the matching 'input_col' accumulator and
+  -- its '[0, in_width_q - 1]' range test -- registered too, so
+  -- 'in_frame_now' is an AND of register outputs rather than the tail of
+  -- the address cone.
+  signal rd_word_q : word_t := (others => '0');
+  signal rd_col_q : coord_t := 0;
+  signal rd_col_ok_q : std_ulogic := '0';
+
   function imin(a, b : integer) return integer is
   begin
     if a < b then
@@ -333,6 +501,23 @@ architecture a of cnn_accel_window_gen is
     else
       return b;
     end if;
+  end function;
+
+  function imax(a, b : integer) return integer is
+  begin
+    if a > b then
+      return a;
+    else
+      return b;
+    end if;
+  end function;
+
+  function to_sl(cond : boolean) return std_ulogic is
+  begin
+    if cond then
+      return '1';
+    end if;
+    return '0';
   end function;
 
 begin
@@ -351,13 +536,12 @@ begin
   consume <= window_valid and m_window_s2m.ready;
 
   ------------------------------------------------------------------------
-  -- Row-bank write decode (combinational): which bank 'fire' writes this
-  -- cycle ('wr_bank_idx_c', 'physical row mod g_max_kernel_size'), at
-  -- which cell ('wr_addr_c', 'col * n_tiles + tile'), with which data
-  -- ('wr_data_c'). Moved out of 'control' (still current-cycle,
-  -- pre-increment 'cur_row_q'/'cur_col_q'/'wr_tile_q') so the
-  -- 'gen_banks' branches below -- not 'control' -- own the actual
-  -- 'bank_mem' writes; see the 'row_banks' comment above for why.
+  -- Row-bank write data decode (combinational). The bank number and cell
+  -- address it used to compute here are now the 'wr_bank_q'/'wr_addr_q'
+  -- counters maintained by 'control' (S7 -- see their declaration
+  -- comment); only the write *data* is still decoded combinationally,
+  -- since it is a byte-lane mask on 's_stream_m2s.data' feeding DI, not a
+  -- multiply feeding an address port.
   --
   -- D11: zero-pad the unused high channel lanes of a partial final tile,
   -- deterministically -- not whatever 's_stream_m2s.data' happens to
@@ -378,14 +562,10 @@ begin
   -- loops/array indexing.
   ------------------------------------------------------------------------
   wr_decode : process(
-    cur_row_q, cur_col_q, wr_tile_q, n_tiles_q, last_tile_channels_q,
-    s_stream_m2s.data
+    wr_tile_q, n_tiles_q, last_tile_channels_q, s_stream_m2s.data
   )
     variable v_write_data : std_ulogic_vector(c_lane_width - 1 downto 0);
   begin
-    wr_bank_idx_c <= to_integer(cur_row_q) mod g_max_kernel_size;
-    wr_addr_c <= to_integer(cur_col_q) * to_integer(n_tiles_q) + to_integer(wr_tile_q);
-
     v_write_data := s_stream_m2s.data(c_lane_width - 1 downto 0);
     if wr_tile_q = n_tiles_q - 1 then
       for c in 0 to g_tile_channels - 1 loop
@@ -403,9 +583,10 @@ begin
   -- Each branch is the exact same shape as
   -- cnn_accel_weight_buffer.vhd's 'weight_mem'/'read_ports' pair: one
   -- statically-addressed write process (write enable = 'fire' and this
-  -- branch's bank number matching 'wr_bank_idx_c'), and one registered,
-  -- unconditional, single read process ('rd_addr(b)' is only meaningful
-  -- while 'in_frame_now(b)' is set, checked at capture time, not here) --
+  -- branch's bank number matching 'wr_bank_q'), and one registered,
+  -- unconditional, single read process (the shared 'rd_addr_q' is only
+  -- meaningful while 'in_frame_now(b)' is set, checked at capture time,
+  -- not here) --
   -- no reset on 'bank_mem' itself, same as cnn_accel_weight_buffer.vhd.
   ------------------------------------------------------------------------
   gen_banks : for b in 0 to g_max_kernel_size - 1 generate
@@ -415,8 +596,8 @@ begin
     write_port : process(clk)
     begin
       if rising_edge(clk) then
-        if fire = '1' and wr_bank_idx_c = b then
-          bank_mem(wr_addr_c) <= wr_data_c;
+        if fire = '1' and wr_bank_q = b then
+          bank_mem(wr_addr_q) <= wr_data_c;
         end if;
       end if;
     end process;
@@ -424,7 +605,7 @@ begin
     read_port : process(clk)
     begin
       if rising_edge(clk) then
-        bank_rd_data(b) <= bank_mem(rd_addr(b));
+        bank_rd_data(b) <= bank_mem(rd_addr_q);
       end if;
     end process;
 
@@ -441,11 +622,20 @@ begin
     (not (window_valid or reading_q) or (window_valid and m_window_s2m.ready));
 
   ------------------------------------------------------------------------
-  -- Configuration latch, position counters, and row-bank writes.
+  -- Configuration latch, position counters, write-side address counters,
+  -- and the S7 per-output-position geometry registers (see their
+  -- declaration block above -- they are updated here, in the very same
+  -- clocked branches that advance 'out_row_q'/'out_col_q'/'rd_tile_q',
+  -- which is what keeps them exactly coherent with those counters rather
+  -- than a cycle behind them).
   ------------------------------------------------------------------------
   control : process(clk)
     variable v_num_w, v_num_h : integer;
     variable v_in_channels, v_n_tiles : integer;
+    variable v_kh, v_kw, v_sh, v_sw, v_pt, v_pl, v_inh, v_inw : integer;
+    variable v_row_top, v_col_left : coord_t;
+    variable v_mod : natural range 0 to 2 * g_max_kernel_size - 2;
+    variable v_kr : natural range 0 to 2 * g_max_kernel_size - 1;
   begin
     if rising_edge(clk) then
       if reset = '1' then
@@ -456,6 +646,8 @@ begin
         out_row_q <= (others => '0');
         out_col_q <= (others => '0');
         rd_tile_q <= (others => '0');
+        wr_bank_q <= 0;
+        wr_addr_q <= 0;
 
       elsif start = '1' then
         assert unsigned(cfg_kernel_h) <= to_unsigned(g_max_kernel_size, 8)
@@ -505,23 +697,122 @@ begin
         rd_tile_q <= (others => '0');
         active_q <= '1';
 
+        wr_bank_q <= 0;
+        wr_addr_q <= 0;
+
+        -- S7: seed every geometry register / address accumulator for
+        -- 'out_row = out_col = rd_tile = 0'. Read from the 'cfg_*' ports
+        -- rather than from 'kernel_h_q' et al, which are only being
+        -- latched this same cycle.
+        v_kh := to_integer(unsigned(cfg_kernel_h));
+        v_kw := to_integer(unsigned(cfg_kernel_w));
+        v_sh := to_integer(unsigned(cfg_stride_h));
+        v_sw := to_integer(unsigned(cfg_stride_w));
+        v_pt := to_integer(unsigned(cfg_pad_top));
+        v_pl := to_integer(unsigned(cfg_pad_left));
+        v_inh := to_integer(unsigned(cfg_in_height));
+        v_inw := to_integer(unsigned(cfg_in_width));
+
+        v_row_top := -v_pt;
+        v_col_left := -v_pl;
+
+        -- Frame constants in the exact '-1'/'-2' forms the range tests
+        -- below compare against, so no test has to subtract first.
+        in_height_m1_q <= v_inh - 1;
+        in_width_m1_q <= v_inw - 1;
+        in_width_m2_q <= v_inw - 2;
+
+        real_row_bot_q <= imin(v_row_top + v_kh - 1, v_inh - 1);
+        has_real_row_q <= to_sl(v_row_top <= v_inh - 1 and v_row_top + v_kh - 1 >= 0);
+        anchor_limit_q <= imax(v_row_top, 0) + g_max_kernel_size;
+
+        -- Row look-ahead accumulators, seeded for output row 1.
+        row_top_next_q <= v_row_top + v_sh;
+        row_bot_next_q <= v_row_top + v_sh + v_kh - 1;
+        row_top_k_next_q <= v_row_top + v_sh + g_max_kernel_size;
+
+        stride_h_mod_q <= v_sh mod g_max_kernel_size;
+        v_mod := (-v_pt) mod g_max_kernel_size;
+        row_top_mod_q <= v_mod;
+        for b in 0 to g_max_kernel_size - 1 loop
+          v_kr := b + g_max_kernel_size - v_mod;
+          if v_kr >= g_max_kernel_size then
+            v_kr := v_kr - g_max_kernel_size;
+          end if;
+          kr_of_q(b) <= v_kr;
+          row_ok_q(b) <= to_sl(
+            v_kr < v_kh and v_row_top + v_kr >= 0 and v_row_top + v_kr <= v_inh - 1
+          );
+        end loop;
+
+        -- Per-kernel-row upper bound and validity, so the per-output-row
+        -- update of 'row_ok_q' is a compare of 'row_top_next_q' against a
+        -- register rather than an add ('row_top + kr') followed by two
+        -- compares: 'row_top + kr <= in_height - 1' is exactly
+        -- 'row_top <= row_hi_bound_q(kr)'.
+        for k in 0 to g_max_kernel_size - 1 loop
+          row_hi_bound_q(k) <= v_inh - 1 - k;
+          kr_valid_q(k) <= to_sl(k < v_kh);
+        end loop;
+
+        col_left_q <= v_col_left;
+        real_col_right_q <= imin(v_col_left + v_kw - 1, v_inw - 1);
+        has_real_col_q <= to_sl(v_col_left <= v_inw - 1 and v_col_left + v_kw - 1 >= 0);
+
+        -- Column look-ahead accumulators, seeded for output column 1.
+        col_left_next_q <= v_col_left + v_sw;
+        col_right_next_q <= v_col_left + v_sw + v_kw - 1;
+
+        -- Column-0 reload values: what the column geometry and its
+        -- look-ahead must become at every output-row boundary. Registered
+        -- once here so that boundary is a set of plain register copies.
+        col_left_start_q <= v_col_left;
+        real_col_right_start_q <= imin(v_col_left + v_kw - 1, v_inw - 1);
+        has_real_col_start_q <= to_sl(
+          v_col_left <= v_inw - 1 and v_col_left + v_kw - 1 >= 0
+        );
+        col_left_start_next_q <= v_col_left + v_sw;
+        col_right_start_next_q <= v_col_left + v_sw + v_kw - 1;
+
+        -- The only multiplies left in this entity, and all three are
+        -- one-shot frame setup (same argument as the divisions above).
+        n_tiles_words_q <= to_unsigned(v_n_tiles mod 2 ** c_addr_width, c_addr_width);
+        col_step_words_q <= to_unsigned(
+          (v_sw * v_n_tiles - v_n_tiles + 1) mod 2 ** c_addr_width, c_addr_width
+        );
+        row_start_words_q <= to_unsigned(
+          (-v_pl * v_n_tiles) mod 2 ** c_addr_width, c_addr_width
+        );
+        rd_base_q <= to_unsigned((-v_pl * v_n_tiles) mod 2 ** c_addr_width, c_addr_width);
+
       else
         if fire = '1' then
-          -- Row-bank write itself ('wr_bank_idx_c'/'wr_addr_c'/'wr_data_c',
-          -- decoded combinationally by 'wr_decode' below) now happens in
-          -- the 'gen_banks' generate block below, not here -- see the
-          -- 'row_banks' comment above for why. This process only still
-          -- advances the write-side position counters.
+          -- Row-bank write itself ('wr_bank_q'/'wr_addr_q'/'wr_data_c')
+          -- happens in the 'gen_banks' generate block above, not here --
+          -- see the 'row_banks' comment above for why. This process only
+          -- advances the write-side position counters, which since S7
+          -- includes the bank/cell address the write actually uses: one
+          -- accepted beat is always the next cell of the current input
+          -- row, and an input-row boundary restarts at cell 0 of the next
+          -- bank in the ring.
           if wr_tile_q = n_tiles_q - 1 then
             wr_tile_q <= (others => '0');
             if cur_col_q = in_width_q - 1 then
               cur_col_q <= (others => '0');
               cur_row_q <= cur_row_q + 1;
+              wr_addr_q <= 0;
+              if wr_bank_q = g_max_kernel_size - 1 then
+                wr_bank_q <= 0;
+              else
+                wr_bank_q <= wr_bank_q + 1;
+              end if;
             else
               cur_col_q <= cur_col_q + 1;
+              wr_addr_q <= wr_addr_q + 1;
             end if;
           else
             wr_tile_q <= wr_tile_q + 1;
+            wr_addr_q <= wr_addr_q + 1;
           end if;
         end if;
 
@@ -531,11 +822,77 @@ begin
 
             if out_col_q = out_width_q - 1 then
               out_col_q <= (others => '0');
+
+              -- Output-row boundary: column geometry, and its look-ahead,
+              -- back to the column-0 values registered at 'start'. All
+              -- plain register-to-register copies -- no arithmetic.
+              col_left_q <= col_left_start_q;
+              real_col_right_q <= real_col_right_start_q;
+              has_real_col_q <= has_real_col_start_q;
+              col_left_next_q <= col_left_start_next_q;
+              col_right_next_q <= col_right_start_next_q;
+              rd_base_q <= row_start_words_q;
+
               if out_row_q /= out_height_q - 1 then
                 out_row_q <= out_row_q + 1;
+
+                -- ... and row geometry one stride further down. Every
+                -- value needed here already sits in a look-ahead
+                -- accumulator, so this branch is a copy plus at most one
+                -- compare -- never the 'add, add, compare, select' series
+                -- that was the first S7 iteration's critical path.
+                -- 'anchor_limit' clamps 'row_top' up to 0 (top padding
+                -- reserves no bank), which is a sign-bit select here.
+                real_row_bot_q <= imin(row_bot_next_q, in_height_m1_q);
+                has_real_row_q <= to_sl(
+                  row_top_next_q <= in_height_m1_q and row_bot_next_q >= 0
+                );
+                if row_top_next_q >= 0 then
+                  anchor_limit_q <= row_top_k_next_q;
+                else
+                  anchor_limit_q <= g_max_kernel_size;
+                end if;
+
+                -- Push the look-ahead one output row further. Each of the
+                -- three is its own single '+ stride' carry chain, from
+                -- flip-flop to flip-flop and nothing else.
+                row_top_next_q <= row_top_next_q + to_integer(stride_h_q);
+                row_bot_next_q <= row_bot_next_q + to_integer(stride_h_q);
+                row_top_k_next_q <= row_top_k_next_q + to_integer(stride_h_q);
+
+                v_mod := row_top_mod_q + stride_h_mod_q;
+                if v_mod >= g_max_kernel_size then
+                  v_mod := v_mod - g_max_kernel_size;
+                end if;
+                row_top_mod_q <= v_mod;
+
+                for b in 0 to g_max_kernel_size - 1 loop
+                  v_kr := b + g_max_kernel_size - v_mod;
+                  if v_kr >= g_max_kernel_size then
+                    v_kr := v_kr - g_max_kernel_size;
+                  end if;
+                  kr_of_q(b) <= v_kr;
+                  row_ok_q(b) <= kr_valid_q(v_kr) and to_sl(
+                    row_top_next_q >= -v_kr
+                    and row_top_next_q <= row_hi_bound_q(v_kr)
+                  );
+                end loop;
               end if;
             else
               out_col_q <= out_col_q + 1;
+
+              -- Same shape as the row advance above: copy out of the
+              -- look-ahead accumulators, then push those one stride on.
+              col_left_q <= col_left_next_q;
+              real_col_right_q <= imin(col_right_next_q, in_width_m1_q);
+              has_real_col_q <= to_sl(
+                col_left_next_q <= in_width_m1_q and col_right_next_q >= 0
+              );
+
+              col_left_next_q <= col_left_next_q + to_integer(stride_w_q);
+              col_right_next_q <= col_right_next_q + to_integer(stride_w_q);
+
+              rd_base_q <= rd_base_q + col_step_words_q;
             end if;
 
             if last_pixel = '1' then
@@ -543,6 +900,7 @@ begin
             end if;
           else
             rd_tile_q <= rd_tile_q + 1;
+            rd_base_q <= rd_base_q + 1;
           end if;
         end if;
       end if;
@@ -562,86 +920,70 @@ begin
   m_window_m2s.data <= assembly_q;
 
   ------------------------------------------------------------------------
-  -- Read-side address generation (combinational). 'row_ready_i' is the
-  -- unchanged spatial readiness test from the predecessor design
-  -- (cnn_accel_window_gen_proposal.md section 4): every tile of a given
-  -- output pixel reads the same row/column range, tiling only changes
-  -- which row-bank cell ('input_col * n_tiles_q + rd_tile_q') supplies
-  -- each tap -- see cnn_accel_tiled_dataflow_proposal.md section 2's
-  -- orthogonality argument.
+  -- Read-side qualification (combinational). S7: this is all that is left
+  -- of the predecessor's 'addr_gen' process. The read *address* itself is
+  -- no longer computed here at all -- it is the 'rd_addr_q' accumulator
+  -- driven by 'walk_control' below -- and every per-output-position term
+  -- ('row_top', 'col_left', 'has_real_row', 'real_row_bot', the anchor
+  -- row, 'kr_of_q(b)', and the whole row half of the per-bank in-frame
+  -- test) is now a register maintained by 'control'. What remains is
+  -- three shallow tests against register outputs, all of them ending on
+  -- flip-flops rather than on a BRAM address port:
   --
-  -- Per bank 'b' (0 .. g_max_kernel_size - 1, the *physical* bank index,
-  -- not a kernel-row index): 'kr_of(b)' is the kernel-row tap that bank
-  -- currently represents for the window at 'out_row_q' -- the inverse of
-  -- the write side's 'physical row mod g_max_kernel_size' mapping,
-  -- 'kr_of(b) = (b - row_top) mod g_max_kernel_size' (VHDL's 'mod' has
-  -- the sign of its right operand, so this always lands in
-  -- '0 .. g_max_kernel_size - 1' regardless of how negative 'row_top'
-  -- is under top padding). 'in_frame_now(b)' is '1' only while a walk is
-  -- in progress ('reading_q'), the current 'kc_q' is still a real column
-  -- ('kc_q < kernel_w_q'), 'kr_of(b) < kernel_h_q' (this bank's tap is
-  -- within the runtime kernel height), and the resulting
-  -- '(input_row, input_col)' is inside the real (unpadded) frame.
+  --   * 'row_ready_i': the unchanged spatial readiness test from the
+  --     predecessor design (cnn_accel_window_gen_proposal.md section 4) --
+  --     ready once the largest real row/column this window needs has been
+  --     fully written: no real row at all (window entirely vertical
+  --     padding) -> ready immediately; the needed row already complete
+  --     ('cur_row_q > real_row_bot') -> ready regardless of columns; still
+  --     writing that exact row -> also need its columns caught up (or no
+  --     real column at all). Same formula, same cycle: 'has_real_row_q'/
+  --     'real_row_bot_q'/'has_real_col_q'/'real_col_right_q' are updated
+  --     in lockstep with 'out_row_q'/'out_col_q', so this is bit- and
+  --     cycle-identical to the predecessor's inline arithmetic, not a
+  --     delayed approximation of it. That matters: 'row_ready_i' is NOT
+  --     monotone in 'out_col_q' (advancing an output column raises
+  --     'real_col_right'), so a merely *registered* version of it could
+  --     read '1' for a window whose columns are not written yet and start
+  --     a walk too early. Coherent-by-construction avoids that entirely.
+  --
+  --   * 'write_freeze_i': likewise unchanged, and for the same reason --
+  --     'anchor_limit_q' is 'imax(row_top, 0) + g_max_kernel_size'
+  --     maintained in lockstep with 'out_row_q', so the M7 bank-aliasing
+  --     interlock (see 'write_freeze_i's declaration comment) asserts and
+  --     releases on exactly the same cycles as before. 'row_top' clamped
+  --     up to 0 because a negative 'row_top' (top padding) reserves no
+  --     bank at all: there is no row -2 to protect, so the first bank
+  --     actually in use starts at row 0.
+  --
+  --   * 'in_frame_now(b)': an AND of four register outputs plus one
+  --     8-bit compare. 'row_ok_q(b)' carries 'kr_of_q(b) < kernel_h_q'
+  --     and 'row_top + kr_of_q(b)' in '[0, in_height_q - 1]';
+  --     'rd_col_ok_q' carries 'input_col' in '[0, in_width_q - 1]' for
+  --     the column the *currently presented* address reads (it is
+  --     advanced in lockstep with 'rd_addr_q', so the two are always
+  --     aligned). 'kc_q < kernel_w_q' excludes the drain cycle.
   --
   -- NOTE: explicit sensitivity list, not 'process(all)' -- see
   -- canny_window3x3.vhd's identical note on GHDL 7.0.0-dev's 'all'
   -- inference not reliably tracking signals read only through nested
   -- loops/array indexing.
   ------------------------------------------------------------------------
-  addr_gen : process(
-    kernel_h_q, kernel_w_q, stride_h_q, stride_w_q, pad_top_q, pad_left_q,
-    in_width_q, in_height_q, cur_row_q, cur_col_q,
-    out_row_q, out_col_q, n_tiles_q, rd_tile_q, kc_q, reading_q
+  read_qualify : process(
+    kernel_w_q, cur_row_q, cur_col_q, kc_q, reading_q, rd_col_ok_q,
+    has_real_row_q, real_row_bot_q, has_real_col_q, real_col_right_q,
+    anchor_limit_q, row_ok_q
   )
-    variable kh, kw, sh, sw, pt, pl, inh, inw : integer;
-    variable orow, ocol : integer;
-    variable row_top, row_bot, real_row_bot : integer;
-    variable col_left, col_right, real_col_right : integer;
-    variable has_real_row, has_real_col : boolean;
-    variable input_col, kc_i : integer;
-    variable n_tiles_i, rd_tile_i : integer;
-    variable kr_b, input_row_b : integer;
-    variable anchor_row : integer;
+    variable v_cur_row : coord_t;
+    variable v_kc_real : std_ulogic;
   begin
-    kh := to_integer(kernel_h_q);
-    kw := to_integer(kernel_w_q);
-    sh := to_integer(stride_h_q);
-    sw := to_integer(stride_w_q);
-    pt := to_integer(pad_top_q);
-    pl := to_integer(pad_left_q);
-    inh := to_integer(in_height_q);
-    inw := to_integer(in_width_q);
-    orow := to_integer(out_row_q);
-    ocol := to_integer(out_col_q);
-    n_tiles_i := to_integer(n_tiles_q);
-    rd_tile_i := to_integer(rd_tile_q);
-    kc_i := to_integer(kc_q);
+    v_cur_row := to_integer(cur_row_q);
 
-    -- Row range needed by this window: [row_top, row_bot] (may extend
-    -- outside [0, inh-1) -- top/bottom padding).
-    row_top := orow * sh - pt;
-    row_bot := row_top + kh - 1;
-    has_real_row := (row_top <= inh - 1) and (row_bot >= 0);
-    real_row_bot := imin(row_bot, inh - 1);
-
-    -- Column range needed by this window: [col_left, col_right].
-    col_left := ocol * sw - pl;
-    col_right := col_left + kw - 1;
-    has_real_col := (col_left <= inw - 1) and (col_right >= 0);
-    real_col_right := imin(col_right, inw - 1);
-
-    -- Ready once the largest real row/column this window needs has been
-    -- fully written: no real row at all (window entirely vertical
-    -- padding) -> ready immediately; the needed row already complete
-    -- ('cur_row_q > real_row_bot') -> ready regardless of columns;
-    -- still writing that exact row -> also need its columns caught up
-    -- (or no real column at all) -- see cnn_accel_window_gen_proposal.md
-    -- section 4.
-    if (not has_real_row)
-      or (to_integer(cur_row_q) > real_row_bot)
+    if has_real_row_q = '0'
+      or v_cur_row > real_row_bot_q
       or (
-        to_integer(cur_row_q) = real_row_bot
-        and ((not has_real_col) or (to_integer(cur_col_q) > real_col_right))
+        v_cur_row = real_row_bot_q
+        and (has_real_col_q = '0' or to_integer(cur_col_q) > real_col_right_q)
       )
     then
       row_ready_i <= '1';
@@ -649,42 +991,16 @@ begin
       row_ready_i <= '0';
     end if;
 
-    -- The earliest real (unpadded) physical row this window's row range
-    -- covers -- 'row_top' clamped up to 0, since a negative 'row_top'
-    -- (top padding) reserves no bank at all: there is no row -2 to
-    -- protect, so the first bank actually in use starts at row 0.
-    if row_top < 0 then
-      anchor_row := 0;
-    else
-      anchor_row := row_top;
-    end if;
-
-    -- See 'write_freeze_i's declaration comment. No real row at all ->
-    -- nothing to protect (this out_row's window has no row dependency to
-    -- outlive).
-    if has_real_row and to_integer(cur_row_q) >= anchor_row + g_max_kernel_size then
+    if has_real_row_q = '1' and v_cur_row >= anchor_limit_q then
       write_freeze_i <= '1';
     else
       write_freeze_i <= '0';
     end if;
 
-    input_col := ocol * sw + kc_i - pl;
+    v_kc_real := to_sl(kc_q < kernel_w_q);
 
     for b in 0 to g_max_kernel_size - 1 loop
-      kr_b := (b - row_top) mod g_max_kernel_size;
-      input_row_b := row_top + kr_b;
-      kr_of(b) <= kr_b;
-
-      if reading_q = '1' and kc_i < kw and kr_b < kh
-        and input_row_b >= 0 and input_row_b <= inh - 1
-        and input_col >= 0 and input_col <= inw - 1
-      then
-        in_frame_now(b) <= '1';
-        rd_addr(b) <= input_col * n_tiles_i + rd_tile_i;
-      else
-        in_frame_now(b) <= '0';
-        rd_addr(b) <= 0;
-      end if;
+      in_frame_now(b) <= reading_q and v_kc_real and row_ok_q(b) and rd_col_ok_q;
     end loop;
   end process;
 
@@ -712,8 +1028,28 @@ begin
   --    the window needs has already been written -- unchanged invariant
   --    from the predecessor design, just no longer same-cycle (proposal
   --    doc section 7.1 item 4 / section 8 risk 3).
+  -- 3. S7: the read-address accumulators. 'rd_word_q'/'rd_col_q' are
+  --    loaded -- from registers 'control' keeps coherent with
+  --    'out_col_q'/'rd_tile_q' -- in the *same* cycle the walk is armed,
+  --    i.e. the cycle that already set 'reading_q'/'kc_q', so the
+  --    'kc = 0' address is presented on exactly the cycle the
+  --    predecessor's combinational 'addr_gen' presented it. The read
+  --    latency is therefore still one cycle and items 1 and 2 above are
+  --    untouched: the delay pipeline stays one deep and the drain stays
+  --    one cycle. Each subsequent 'kc' step is '+ n_tiles_words_q' (one
+  --    input column = 'n_tiles_q' consecutive channel-tile cells),
+  --    replacing the predecessor's 'input_col * n_tiles_q + rd_tile_q'
+  --    multiply. 'rd_addr_q' is that accumulator clamped to a legal
+  --    address, so the BRAM address port is driven by a flip-flop and
+  --    nothing else; the clamp condition is the same
+  --    '[0, in_width_q - 1]' test that gates 'in_frame_now', so an
+  --    out-of-frame cycle reads cell 0 exactly as the predecessor's
+  --    'rd_addr(b) <= 0' branch did.
   ------------------------------------------------------------------------
   walk_control : process(clk)
+    variable v_next_word : word_t;
+    variable v_next_col : coord_t;
+    variable v_next_ok : boolean;
   begin
     if rising_edge(clk) then
       if reset = '1' then
@@ -725,6 +1061,10 @@ begin
         in_frame_capture_q <= (others => '0');
         kr_capture_q <= (others => 0);
         assembly_q <= (others => (others => '0'));
+        rd_addr_q <= 0;
+        rd_word_q <= (others => '0');
+        rd_col_q <= 0;
+        rd_col_ok_q <= '0';
 
       elsif start = '1' then
         reading_q <= '0';
@@ -735,6 +1075,10 @@ begin
         in_frame_capture_q <= (others => '0');
         kr_capture_q <= (others => 0);
         assembly_q <= (others => (others => '0'));
+        rd_addr_q <= 0;
+        rd_word_q <= (others => '0');
+        rd_col_q <= 0;
+        rd_col_ok_q <= '0';
 
       else
         -- Delay pipeline: always shifts by one cycle, so the capture
@@ -742,7 +1086,7 @@ begin
         -- mapping alongside this cycle's now-valid 'bank_rd_data'.
         capture_valid_q <= reading_q;
         kc_capture_q <= kc_q;
-        kr_capture_q <= kr_of;
+        kr_capture_q <= kr_of_q;
         in_frame_capture_q <= in_frame_now;
 
         if capture_valid_q = '1' then
@@ -770,6 +1114,22 @@ begin
             window_valid <= '1';
           else
             kc_q <= kc_q + 1;
+
+            v_next_word := rd_word_q + n_tiles_words_q;
+            v_next_col := rd_col_q + 1;
+            -- '(rd_col_q + 1) in [0, in_width - 1]' expressed on
+            -- 'rd_col_q' itself, so the range test does not wait on the
+            -- increment's carry chain: registered bounds, one compare.
+            v_next_ok := rd_col_q >= -1 and rd_col_q <= in_width_m2_q;
+
+            rd_word_q <= v_next_word;
+            rd_col_q <= v_next_col;
+            rd_col_ok_q <= to_sl(v_next_ok);
+            if v_next_ok then
+              rd_addr_q <= to_integer(v_next_word);
+            else
+              rd_addr_q <= 0;
+            end if;
           end if;
 
         else
@@ -783,6 +1143,16 @@ begin
             reading_q <= '1';
             kc_q <= (others => '0');
             assembly_q <= (others => (others => '0'));
+
+            v_next_ok := col_left_q >= 0 and col_left_q <= in_width_m1_q;
+            rd_word_q <= rd_base_q;
+            rd_col_q <= col_left_q;
+            rd_col_ok_q <= to_sl(v_next_ok);
+            if v_next_ok then
+              rd_addr_q <= to_integer(rd_base_q);
+            else
+              rd_addr_q <= 0;
+            end if;
           end if;
         end if;
       end if;
