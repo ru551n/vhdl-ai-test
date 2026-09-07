@@ -98,7 +98,12 @@ class CnnAccelIsaPackageGenerator(RegisterCodeGenerator):
         The comparison ignores the generated header, which carries a
         timestamp and a Git commit and therefore always differs.
         """
-        new_code = self.get_code(**kwargs)
+        # Must match `RegisterCodeGenerator._create_artifact()` byte for byte:
+        # it writes f"{self.header}\n{code}", i.e. there is a blank line
+        # between the header and the code. Comparing against the bare
+        # `get_code()` output silently never matches, which makes this whole
+        # override a no-op -- do not "simplify" this.
+        new_body = f"\n{self.get_code(**kwargs)}"
 
         if output_file.exists():
             separator_line = self.get_separator_line(indent=0)
@@ -106,8 +111,8 @@ class CnnAccelIsaPackageGenerator(RegisterCodeGenerator):
             # body is everything after the second separator. maxsplit=2 keeps
             # any later separator-looking line as part of the body.
             existing = output_file.read_text().split(separator_line, 2)
-            if len(existing) == 3 and existing[2] == new_code:
-                print(f"  {output_file.name} unchanged, not rewritten (preserving mtime).")
+            if len(existing) == 3 and existing[2] == new_body:
+                print(f"{self.SHORT_DESCRIPTION} unchanged, not rewritten: {output_file.name}")
                 return output_file
 
         return super()._create_artifact(output_file=output_file, **kwargs)
