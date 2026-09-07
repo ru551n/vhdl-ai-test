@@ -2,68 +2,26 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
--- Shared record types and constants for modules/cnn_accel/. See
+-- Generated: opcodes (OPCODE_*), flag bit indices (FLAG_*), and the
+-- instruction word's byte-offset constants (c_instr_word_bytes, c_off_*).
+-- Single Python source of truth is ../cnn_accel_constants.py, propagated
+-- via hdl-registers (module_cnn_accel.py's registers_hook()/
+-- create_register_synthesis_files()) into regs_src/cnn_accel_isa_pkg.vhd
+-- -- see cnn_accel_isa_generator.py for why that table needs a custom
+-- generator rather than plain hdl-registers constants. Re-run
+-- `python3 build_fpga.py --generate-registers-only` (or any run.py/
+-- build_fpga.py invocation, which regenerates automatically) after
+-- editing cnn_accel_constants.py.
+library cnn_accel;
+use cnn_accel.cnn_accel_isa_pkg.all;
+
+-- Shared record types for modules/cnn_accel/ that hdl-registers cannot
+-- generate (mixed unsigned/signed record fields, handshake wrapper
+-- records, window-link types, helper functions). See
 -- modules/cnn_accel/doc/cnn_accel_pkg_req.md and doc/cnn_accel_arch.md
 -- ("Instruction Set (v1)") for the authoritative field layout. Pure
 -- constant/type declarations; no behavior.
 package cnn_accel_pkg is
-
-  ------------------------------------------------------------------------
-  -- Opcodes (W0 bits [7:0])
-  ------------------------------------------------------------------------
-
-  constant OPCODE_HALT     : std_ulogic_vector(7 downto 0) := x"00";
-  constant OPCODE_CONV2D   : std_ulogic_vector(7 downto 0) := x"01";
-  constant OPCODE_DWCONV2D : std_ulogic_vector(7 downto 0) := x"02";
-  constant OPCODE_POOL_MAX : std_ulogic_vector(7 downto 0) := x"03";
-  constant OPCODE_POOL_AVG : std_ulogic_vector(7 downto 0) := x"04";
-  constant OPCODE_FC       : std_ulogic_vector(7 downto 0) := x"05";
-
-  ------------------------------------------------------------------------
-  -- Flag bits (W0 bits [15:8]), indices into the flags byte
-  ------------------------------------------------------------------------
-
-  constant FLAG_RELU_EN    : natural := 0;
-  constant FLAG_BIAS_EN    : natural := 1;
-  constant FLAG_REQUANT_EN : natural := 2;
-  constant FLAG_PAD_EN     : natural := 3;
-
-  ------------------------------------------------------------------------
-  -- Instruction word layout: size and per-field byte offsets, matching
-  -- doc/cnn_accel_arch.md's ISA table. cnn_accel_model.py's encoder must
-  -- agree with these byte-for-byte.
-  ------------------------------------------------------------------------
-
-  constant c_instr_word_bytes : positive := 64;
-
-  constant c_off_opcode         : natural := 0;
-  constant c_off_flags          : natural := 1;
-  -- W0 bytes 2-3: reserved, must be 0.
-  constant c_off_in_addr         : natural := 4;
-  constant c_off_out_addr        : natural := 8;
-  constant c_off_weight_addr     : natural := 12;
-  constant c_off_bias_addr       : natural := 16;
-  constant c_off_in_width        : natural := 20;
-  constant c_off_in_height       : natural := 22;
-  constant c_off_in_channels     : natural := 24;
-  constant c_off_out_channels    : natural := 26;
-  constant c_off_kernel_h        : natural := 28;
-  constant c_off_kernel_w        : natural := 29;
-  constant c_off_stride_h        : natural := 30;
-  constant c_off_stride_w        : natural := 31;
-  constant c_off_pad_top         : natural := 32;
-  constant c_off_pad_bottom      : natural := 33;
-  constant c_off_pad_left        : natural := 34;
-  constant c_off_pad_right       : natural := 35;
-  constant c_off_requant_scale   : natural := 36;
-  constant c_off_requant_shift   : natural := 40;
-  -- W10 bytes 41-43: reserved.
-  constant c_off_pool_kernel_h   : natural := 44;
-  constant c_off_pool_kernel_w   : natural := 45;
-  constant c_off_pool_stride_h   : natural := 46;
-  constant c_off_pool_stride_w   : natural := 47;
-  constant c_off_next_instr_addr : natural := 48;
-  -- W13-W15 bytes 52-63: reserved, must be 0.
 
   ------------------------------------------------------------------------
   -- Decoded-instruction record, one field per ISA table column.

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -11,6 +12,21 @@ from ghdl_yosys_env import (
     resolve_vivado_path,
 )
 
+# `cnn_accel_constants.py` and `cnn_accel_isa_generator.py` are flat sibling
+# modules (no `__init__.py` anywhere under `modules/`, matching every other
+# module here -- see `cnn_accel_model.py`/`test_cnn_accel_model.py`'s own
+# flat imports), so this directory must be on `sys.path` before a plain
+# `import` of either will resolve. tsfpga loads this file itself via
+# `importlib.util.spec_from_file_location` (see `system_utils.load_python_module`)
+# which does not add its own directory to `sys.path`, hence the explicit
+# bootstrap here rather than relying on the caller's cwd/sys.path.
+_MODULE_DIR = Path(__file__).resolve().parent
+if str(_MODULE_DIR) not in sys.path:
+    sys.path.insert(0, str(_MODULE_DIR))
+
+import cnn_accel_constants  # noqa: E402
+from cnn_accel_isa_generator import CnnAccelIsaPackageGenerator  # noqa: E402
+
 if TYPE_CHECKING:
     from vunit.ui import VUnit
 
@@ -19,20 +35,25 @@ if TYPE_CHECKING:
 # These are the generic values every per-entity netlist build below is sized
 # for, so the recorded resource numbers are all from one coherent design
 # point rather than a per-module free-for-all. D12: target XC7A100T.
-_PE_ROWS = 8
-_PE_COLS = 8
-_TILE_CHANNELS = 8  # = _PE_COLS, see proposal section 3.
-_MAX_KERNEL_SIZE = 3
-_MAX_ROW_TILE_WORDS = 512
+#
+# Values themselves now live in cnn_accel_constants.py (the single Python
+# source of truth also consumed by registers_hook() below and by the
+# golden model), so there is exactly one place to edit each number; these
+# names are unchanged so nothing downstream in this file has to change.
+_PE_ROWS = cnn_accel_constants.PE_ROWS
+_PE_COLS = cnn_accel_constants.PE_COLS
+_TILE_CHANNELS = cnn_accel_constants.TILE_CHANNELS  # = _PE_COLS, see proposal section 3.
+_MAX_KERNEL_SIZE = cnn_accel_constants.MAX_KERNEL_SIZE
+_MAX_ROW_TILE_WORDS = cnn_accel_constants.MAX_ROW_TILE_WORDS
 # = K^2 * ceil(C_max/8) = 9*32 for the target backbone's worst layer
 # (3x3x256, layer 9) -- replaces the old arbitrary 512 now that weights are
 # streamed per output-channel pass from DDR4 instead of double-buffered
 # on-chip (see doc/cnn_accel_weight_buffer.md's depth-sizing note).
-_WEIGHT_BUFFER_DEPTH = 288
+_WEIGHT_BUFFER_DEPTH = cnn_accel_constants.WEIGHT_BUFFER_DEPTH
 # Independent of _WEIGHT_BUFFER_DEPTH: a real layer only ever needs
 # ceil(out_channels/g_pe_rows) bias rows, far fewer than the weight region.
-_BIAS_BUFFER_DEPTH = 8
-_ACCUM_WIDTH = 32
+_BIAS_BUFFER_DEPTH = cnn_accel_constants.BIAS_BUFFER_DEPTH
+_ACCUM_WIDTH = cnn_accel_constants.ACCUM_WIDTH
 
 # Pooling is a separate, much smaller kernel bound: the target network only
 # pools 2x2. The entity's own contract is `g_max_kernel_size**2 * 8 <= 128`,
@@ -108,6 +129,198 @@ _VIVADO_PART = "xc7a200tfbg484-2"
 
 
 class Module(BaseModule):
+    def registers_hook(self) -> None:
+        """
+        Build this module's `hdl-registers` `RegisterList` entirely from
+        Python -- no `regs_cnn_accel.toml` exists (see `BaseModule.registers`:
+        this hook still runs even when the TOML file is absent, which is
+        what makes a 100% Python-defined register list possible). Source of
+        truth for every value here is `cnn_accel_constants.py`, per that
+        file's own docstring.
+
+        Covers `doc/cnn_accel_csr_req.md` "Register map" (the milestone-M10
+        `cnn_accel_csr` AXI4-Lite block's registers -- this only defines the
+        map in Python and lets `create_register_synthesis_files()` /
+        `create_register_simulation_files()` (inherited from `BaseModule`,
+        unmodified) generate `regs_src/cnn_accel_regs_pkg.vhd`,
+        `regs_src/cnn_accel_register_record_pkg.vhd`,
+        `regs_src/cnn_accel_register_file_axi_lite.vhd`, and
+        `regs_sim/cnn_accel_register_read_write_pkg.vhd`; `cnn_accel_csr`
+        itself, instantiating the AXI-Lite wrapper, is M10, not this
+        change) plus every accelerator HW property from
+        `cnn_accel_constants.py` as plain `hdl-registers` constants.
+
+        `RegisterMode` friction, flagged rather than silently approximated
+        (see also this project's hdl-registers integration report):
+        `hdl-registers` 8.1.0's `RegisterMode` set is `r`/`w`/`r_w`/
+        `wpulse`/`r_wpulse` -- there is no register mode, and no per-field
+        mode, for a *sticky, write-1-to-clear* bit. `STATUS.DONE`/
+        `STATUS.ERROR` are specified as exactly that in
+        `doc/cnn_accel_csr_req.md`. The mode used here for the whole
+        `status` register, `r_wpulse`, is the closest faithful mapping:
+        software reads the live value (hardware "up" conduit, which also
+        covers the plain-`RO` `BUSY` bit sharing this register), and a
+        write is presented to hardware as a one-cycle pulse of the written
+        bits rather than being stored -- `cnn_accel_csr`'s own (M10, not
+        yet written) RTL must AND that write-pulse against the current
+        sticky bits to implement "write 1 clears" itself; `hdl-registers`/
+        `axi_lite_register_file` do not do the clear-on-write-1 reduction
+        for us. `CTRL.START`/`CTRL.ABORT` are genuine "write pulses the bit
+        for hardware for one cycle" (no readback contract implied by
+        "self-clearing"), which `r_wpulse` expresses exactly, no
+        approximation needed there.
+        """
+        from hdl_registers.register_list import RegisterList
+        from hdl_registers.register_modes import REGISTER_MODES
+
+        regs = RegisterList(
+            name=self.name, source_definition_file=self.path / "cnn_accel_constants.py"
+        )
+
+        # --- doc/cnn_accel_csr_req.md "Register map" -----------------------
+
+        ctrl = regs.append_register(
+            name="ctrl",
+            mode=REGISTER_MODES["r_wpulse"],
+            description="Control pulses. Writing a bit pulses the corresponding signal "
+            "for one clock cycle; reads return the (always-zero, self-clearing) "
+            "hardware value.",
+        )
+        ctrl.append_bit(
+            name="start",
+            description="Pulses 'start' for one cycle when written '1' while "
+            "STATUS.BUSY='0'; launches the program at PROGRAM_BASE_ADDR.",
+            default_value="0",
+        )
+        ctrl.append_bit(
+            name="abort",
+            description="Pulses 'soft_reset_pulse' for one cycle when written '1', "
+            "regardless of STATUS.BUSY (ABORT/SOFT_RESET).",
+            default_value="0",
+        )
+
+        program_base_addr = regs.append_register(
+            name="program_base_addr",
+            mode=REGISTER_MODES["r_w"],
+            description="Program's first instruction byte address. Writes while "
+            "STATUS.BUSY='1' are accepted (AXI4-Lite OKAY) but only take effect on "
+            "the next START.",
+        )
+        program_base_addr.append_bit_vector(
+            name="addr",
+            description="Byte address, full register width.",
+            width=32,
+            default_value="0" * 32,
+        )
+
+        status = regs.append_register(
+            name="status",
+            mode=REGISTER_MODES["r_wpulse"],
+            description="Status bits. BUSY is a plain hardware-provided read value; "
+            "DONE/ERROR are sticky and write-1-to-clear (see this method's "
+            "docstring for the RegisterMode approximation used to express that).",
+        )
+        status.append_bit(name="busy", description="Program running.", default_value="0")
+        status.append_bit(
+            name="done",
+            description="Sticky: whole program halted normally (seq_done). "
+            "Write-1-to-clear.",
+            default_value="0",
+        )
+        status.append_bit(
+            name="error",
+            description="Sticky: fatal error, bad opcode or AXI error response "
+            "(seq_error). Write-1-to-clear.",
+            default_value="0",
+        )
+
+        irq_mask = regs.append_register(
+            name="irq_mask",
+            mode=REGISTER_MODES["r_w"],
+            description="Per-cause IRQ enable: "
+            "irq <= (STATUS.DONE and done) or (STATUS.ERROR and error). "
+            "Masked (0) after reset -- host must enable explicitly.",
+        )
+        irq_mask.append_bit(name="done", description="Mask for STATUS.DONE.", default_value="0")
+        irq_mask.append_bit(
+            name="error", description="Mask for STATUS.ERROR.", default_value="0"
+        )
+
+        # --- Accelerator HW properties, as plain constants -----------------
+        # Native hdl-registers constants: each is a single scalar value with
+        # no internal structure, so IntegerConstant (via add_constant's
+        # automatic type dispatch on a plain `int`) is a complete, faithful
+        # representation -- no custom generator needed for these.
+
+        regs.add_constant(
+            name="pe_rows",
+            value=cnn_accel_constants.PE_ROWS,
+            description="Number of PE array rows (output-channel lanes).",
+        )
+        regs.add_constant(
+            name="pe_cols",
+            value=cnn_accel_constants.PE_COLS,
+            description="Number of PE array columns (= tile_channels).",
+        )
+        regs.add_constant(
+            name="tile_channels",
+            value=cnn_accel_constants.TILE_CHANNELS,
+            description="Input-channel tile group size (= pe_cols).",
+        )
+        regs.add_constant(
+            name="max_kernel_size",
+            value=cnn_accel_constants.MAX_KERNEL_SIZE,
+            description="Largest K_h/K_w this accelerator's datapath supports.",
+        )
+        regs.add_constant(
+            name="max_row_tile_words",
+            value=cnn_accel_constants.MAX_ROW_TILE_WORDS,
+            description="Weight-buffer row-tile-word sizing bound.",
+        )
+        regs.add_constant(
+            name="weight_buffer_depth",
+            value=cnn_accel_constants.WEIGHT_BUFFER_DEPTH,
+            description="cnn_accel_weight_buffer's g_weight_buffer_depth reference value.",
+        )
+        regs.add_constant(
+            name="bias_buffer_depth",
+            value=cnn_accel_constants.BIAS_BUFFER_DEPTH,
+            description="Bias buffer depth (independent of weight_buffer_depth).",
+        )
+        regs.add_constant(
+            name="accum_width",
+            value=cnn_accel_constants.ACCUM_WIDTH,
+            description="PE array / bias_requant accumulator width, bits.",
+        )
+
+        self._registers = regs
+
+    def create_register_synthesis_files(self) -> None:
+        """
+        `BaseModule`'s register-artifact generation (`cnn_accel_regs_pkg.vhd`,
+        the record package, the AXI-Lite wrapper -- all native `hdl-registers`
+        generators, gated on `create_register_package`/`create_record_package`/
+        `create_axi_lite_wrapper`, unmodified) plus this module's own custom
+        generator for the ISA byte-offset table / opcodes / flags, which
+        `hdl-registers`' native register/constant model cannot express as one
+        coherent, structurally-checked table (see `cnn_accel_isa_generator.py`'s
+        own docstring) -- so it is not just more `RegisterList.add_constant`
+        calls in `registers_hook()` above.
+        """
+        super().create_register_synthesis_files()
+
+        if self.registers is not None:
+            # Not `.create_if_needed()`: that gates on `self.registers`'
+            # `object_hash`, which never changes here since the ISA table
+            # lives in `cnn_accel_constants.py`, not in any `RegisterList`
+            # constant/register that would be part of that hash. Generation
+            # is cheap (one small file), so always regenerating is simpler
+            # and correct rather than wiring up a second, parallel
+            # staleness check.
+            CnnAccelIsaPackageGenerator(
+                register_list=self.registers, output_folder=self.register_synthesis_folder
+            ).create()
+
     def get_build_projects(self) -> list:
         # Local import: tsfpga.yosys.project needs a tsfpga build with Yosys
         # netlist-build support (not in the stable release this project's

@@ -14,6 +14,7 @@ use axi_stream.axi_stream_pkg.all;
 
 library cnn_accel;
 use cnn_accel.cnn_accel_pkg.all;
+use cnn_accel.cnn_accel_isa_pkg.all;
 
 -- VUnit-5 testbench for cnn_accel_pool. See
 -- modules/cnn_accel/doc/cnn_accel_pool_req.md and

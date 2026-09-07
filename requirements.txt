@@ -25,7 +25,22 @@ vunit-hdl @ git+https://github.com/ru551n/vunit.git@6304bcf2c80b239077d44aeb52e3
 # Yosys half — but under a *different* VUnit, see requirements-synth.txt.
 tsfpga @ git+https://github.com/ru551n/tsfpga.git@6304052f52d13b2b9986cdfba5d0ee02eb2b16ff
 
+# Single source of truth for every cnn_accel constant. The register map, the
+# accelerator HW properties and the instruction-set opcodes/flags/byte offsets
+# are declared once in modules/cnn_accel/cnn_accel_constants.py and generated
+# into VHDL packages (regs_src/, regs_sim/) by module_cnn_accel.py's
+# registers_hook() plus the custom cnn_accel_isa_generator.py plugin.
+#
+# Needed in BOTH environments, unlike VUnit: the generated packages are
+# ordinary VHDL sources, so simulation must generate them before it can
+# compile, and synthesis must generate them before it can synthesize. Pinned
+# exactly because a generator-output change is a silent RTL change.
+hdl-registers==8.1.0
+
 # Golden-model test suites (test_canny_model.py,
 # modules/cnn_accel/test_cnn_accel_model.py). Both models are pure stdlib by
-# design, so nothing numeric is pinned here.
+# design, so nothing numeric is pinned here -- except that the cnn_accel model
+# now imports cnn_accel_constants.py, which is what makes its instruction
+# encoder agree with the RTL byte-for-byte by construction rather than by
+# comment.
 pytest

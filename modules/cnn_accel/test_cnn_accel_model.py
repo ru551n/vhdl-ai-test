@@ -20,6 +20,7 @@ import pytest
 
 import itertools
 
+import cnn_accel_constants
 from cnn_accel_model import (
     AccumulatorOverflow,
     INSTR_WORD_BYTES,
@@ -353,6 +354,44 @@ def test_instruction_offsets_match_vhdl_pkg_literals() -> None:
     }
     assert actual == expected
     assert INSTR_WORD_BYTES == 64
+
+
+def test_isa_layout_self_consistent() -> None:
+    """Structural self-check of `cnn_accel_constants.ISA_LAYOUT` itself
+    (as opposed to `test_instruction_offsets_match_vhdl_pkg_literals`
+    above, which cross-checks the model's *exported* `OFF_*` names against
+    independently hand-typed literals): no two fields overlap, no field
+    (named or reserved) crosses the 64-byte word boundary, and the
+    documented reserved gaps (W0 bytes 2-3, W10 bytes 41-43, W13-W15
+    bytes 52-63 -- doc/cnn_accel_arch.md's ISA table) land exactly where
+    specified. This is the guarantee that replaces the old hand-maintained
+    "cnn_accel_model.py's encoder must agree with these byte-for-byte"
+    comment with something a test actually enforces."""
+    occupied = bytearray(cnn_accel_constants.INSTR_WORD_BYTES)
+
+    offset = 0
+    for field in cnn_accel_constants.ISA_LAYOUT:
+        start, end = offset, offset + field.width_bytes  # end exclusive
+        assert end <= cnn_accel_constants.INSTR_WORD_BYTES, (
+            f"field '{field.name}' at bytes [{start}, {end}) crosses the "
+            f"{cnn_accel_constants.INSTR_WORD_BYTES}-byte word boundary"
+        )
+        for byte in range(start, end):
+            assert occupied[byte] == 0, (
+                f"field '{field.name}' overlaps another field at byte {byte}"
+            )
+            occupied[byte] = 1
+        offset = end
+
+    assert offset == cnn_accel_constants.INSTR_WORD_BYTES
+    assert all(occupied), "instruction word has unaccounted-for byte(s)"
+
+    assert cnn_accel_constants.isa_reserved_ranges() == [(2, 3), (41, 43), (52, 63)]
+
+    # Every non-reserved field name is unique and does not collide with the
+    # `RESERVED` sentinel.
+    names = [f.name for f in cnn_accel_constants.ISA_LAYOUT if f.name != cnn_accel_constants.RESERVED]
+    assert len(names) == len(set(names))
 
 
 def test_encode_decode_round_trip() -> None:

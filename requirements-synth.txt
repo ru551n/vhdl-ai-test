@@ -13,3 +13,11 @@
 #           .venv-synth/bin/pip install -r requirements-synth.txt
 vunit_hdl==4.7.1
 tsfpga @ git+https://github.com/ru551n/tsfpga.git@6304052f52d13b2b9986cdfba5d0ee02eb2b16ff
+
+# cnn_accel's constants are declared in Python and generated into VHDL
+# packages; see the longer note in requirements.txt. Unlike VUnit, this is the
+# SAME pin in both environments -- the generated packages are real synthesis
+# sources, so build_fpga.py cannot assemble a file list without it. Keeping the
+# two pins identical is deliberate: a version skew between the simulation and
+# synthesis generators would mean simulating different RTL than is synthesized.
+hdl-registers==8.1.0

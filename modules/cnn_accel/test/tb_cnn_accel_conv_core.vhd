@@ -16,6 +16,7 @@ use axi_stream.axi_stream_pkg.all;
 
 library cnn_accel;
 use cnn_accel.cnn_accel_pkg.all;
+use cnn_accel.cnn_accel_isa_pkg.all;
 
 -- Cross-language, bit-exact, end-to-end guard for cnn_accel_conv_core
 -- ("M6b", see cnn_accel_conv_core.vhd's own header comment): drives the

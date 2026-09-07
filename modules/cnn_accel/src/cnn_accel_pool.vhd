@@ -7,6 +7,7 @@ use axi_stream.axi_stream_pkg.all;
 
 library cnn_accel;
 use cnn_accel.cnn_accel_pkg.all;
+use cnn_accel.cnn_accel_isa_pkg.all;
 
 -- Spatial reduction over a 'cnn_accel_window_gen'-produced pooling window.
 -- See modules/cnn_accel/doc/cnn_accel_pool_req.md and

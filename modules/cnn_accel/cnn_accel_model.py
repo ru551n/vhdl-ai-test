@@ -38,49 +38,31 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass
 
+from cnn_accel_constants import FLAGS, INSTR_WORD_BYTES, OPCODES, isa_field_offsets
+
 # ---------------------------------------------------------------------------
-# ISA constants -- must match modules/cnn_accel/src/cnn_accel_pkg.vhd and
-# doc/cnn_accel_arch.md "Instruction Set (v1)" byte-for-byte.
+# ISA constants, derived from cnn_accel_constants.py -- the single Python
+# source of truth also consumed by cnn_accel_isa_generator.py to generate
+# modules/cnn_accel/src's regs_src/cnn_accel_isa_pkg.vhd (`use`d from
+# cnn_accel_pkg.vhd). This encoder and that generated VHDL package agree
+# byte-for-byte by construction (same source table), not by hand-matched
+# comment, per doc/cnn_accel_arch.md "Instruction Set (v1)".
+#
+# OPCODE_*/FLAG_*/OFF_* names below are generated at import time from
+# OPCODES/FLAGS/isa_field_offsets() so every existing usage in this file
+# (and in test_cnn_accel_model.py) keeps working unchanged.
 # ---------------------------------------------------------------------------
 
-OPCODE_HALT = 0x00
-OPCODE_CONV2D = 0x01
-OPCODE_DWCONV2D = 0x02
-OPCODE_POOL_MAX = 0x03
-OPCODE_POOL_AVG = 0x04
-OPCODE_FC = 0x05
+for _name, _value in OPCODES.items():
+    globals()[f"OPCODE_{_name}"] = _value
 
-FLAG_RELU_EN = 0
-FLAG_BIAS_EN = 1
-FLAG_REQUANT_EN = 2
-FLAG_PAD_EN = 3
+for _name, _bit in FLAGS.items():
+    globals()[f"FLAG_{_name}"] = _bit
 
-INSTR_WORD_BYTES = 64
+for _field in isa_field_offsets():
+    globals()[f"OFF_{_field.name.upper()}"] = _field.offset_bytes
 
-OFF_OPCODE = 0
-OFF_FLAGS = 1
-OFF_IN_ADDR = 4
-OFF_OUT_ADDR = 8
-OFF_WEIGHT_ADDR = 12
-OFF_BIAS_ADDR = 16
-OFF_IN_WIDTH = 20
-OFF_IN_HEIGHT = 22
-OFF_IN_CHANNELS = 24
-OFF_OUT_CHANNELS = 26
-OFF_KERNEL_H = 28
-OFF_KERNEL_W = 29
-OFF_STRIDE_H = 30
-OFF_STRIDE_W = 31
-OFF_PAD_TOP = 32
-OFF_PAD_BOTTOM = 33
-OFF_PAD_LEFT = 34
-OFF_PAD_RIGHT = 35
-OFF_REQUANT_SCALE = 36
-OFF_REQUANT_SHIFT = 40
-OFF_POOL_KERNEL_H = 44
-OFF_POOL_KERNEL_W = 45
-OFF_POOL_STRIDE_H = 46
-OFF_POOL_STRIDE_W = 47
+del _name, _value, _bit, _field
 OFF_NEXT_INSTR_ADDR = 48
 
 
