@@ -70,6 +70,48 @@ class CnnAccelIsaPackageGenerator(RegisterCodeGenerator):
     def output_file(self) -> Path:
         return self.output_folder / "cnn_accel_isa_pkg.vhd"
 
+    def _create_artifact(self, output_file: Path, **kwargs: Any) -> Path:  # noqa: ANN401
+        """
+        Write the package only when its body actually changed, so an
+        unchanged run does not bump the file's mtime.
+
+        **This is load-bearing, not an optimization.** GHDL records the
+        source timestamp of every analysed file in its work library and
+        refuses to elaborate against a stale one ("file ... has changed and
+        must be reanalysed"). tsfpga's netlist flow *creates* every build
+        project (which regenerates register artifacts, then analyses) before
+        it *builds* any of them (elaboration), so an unconditional rewrite
+        here means a later project's create invalidates the work library an
+        earlier project already analysed. That is exactly what made
+        `cnn_accel_pe_array` and `cnn_accel_conv_core` -- the last two of the
+        six Yosys netlist builds -- fail in CI while all six passed when run
+        one at a time.
+
+        `RegisterCodeGenerator.create()` always rewrites, and
+        `create_if_needed()` cannot fix it: its staleness check hashes the
+        `RegisterList`, which does not contain this file's source of truth
+        (`cnn_accel_constants.py`'s `ISA_LAYOUT`), so it would never
+        regenerate after the first time and would silently ship a stale ISA
+        package when the layout changes. Comparing the generated body is the
+        check that is actually correct for this generator.
+
+        The comparison ignores the generated header, which carries a
+        timestamp and a Git commit and therefore always differs.
+        """
+        new_code = self.get_code(**kwargs)
+
+        if output_file.exists():
+            separator_line = self.get_separator_line(indent=0)
+            # The header is 'separator + comment block + separator', so the
+            # body is everything after the second separator. maxsplit=2 keeps
+            # any later separator-looking line as part of the body.
+            existing = output_file.read_text().split(separator_line, 2)
+            if len(existing) == 3 and existing[2] == new_code:
+                print(f"  {output_file.name} unchanged, not rewritten (preserving mtime).")
+                return output_file
+
+        return super()._create_artifact(output_file=output_file, **kwargs)
+
     def get_code(
         self,
         **kwargs: Any,  # noqa: ANN401, ARG002

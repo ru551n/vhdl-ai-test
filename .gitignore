@@ -7,6 +7,12 @@ generated/
 tsfpga_mcp_out/
 .vunit-mcp-cache/
 
+# Virtualenvs. uv-created ones self-ignore via an internal .gitignore, but
+# `python -m venv` ones do not, and this repo needs two of them
+# (requirements.txt for run.py, requirements-synth.txt for build_fpga.py).
+.venv*/
+venv-synth/
+
 # Local source clones of the pinned VUnit and tsfpga (requirements*.txt pin
 # them by commit; these are working copies for reading/patching them, not part
 # of the project). Ignored so a stray `git add -A` cannot vendor them in, and

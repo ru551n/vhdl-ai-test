@@ -379,10 +379,14 @@ class Module(BaseModule):
             # Not `.create_if_needed()`: that gates on `self.registers`'
             # `object_hash`, which never changes here since the ISA table
             # lives in `cnn_accel_constants.py`, not in any `RegisterList`
-            # constant/register that would be part of that hash. Generation
-            # is cheap (one small file), so always regenerating is simpler
-            # and correct rather than wiring up a second, parallel
-            # staleness check.
+            # constant/register that would be part of that hash -- it would
+            # never regenerate after the first time and would silently ship a
+            # stale ISA package. Plain `.create()` is correct: the generator
+            # overrides `_create_artifact()` to skip the write (and so
+            # preserve the file's mtime) when the generated body is
+            # unchanged. That mtime matters -- see that override's docstring
+            # for the GHDL "must be reanalysed" netlist-build failure an
+            # unconditional rewrite causes.
             CnnAccelIsaPackageGenerator(
                 register_list=self.registers, output_folder=self.register_synthesis_folder
             ).create()
