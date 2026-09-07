@@ -1,6 +1,7 @@
 # TOSA → `cnn_accel` compiler — architecture analysis and implementation plan
 
-Status: PLAN ONLY (no implementation). Rev 1, 2026-09-07.
+Status: PLAN ONLY (no implementation). Rev 2, 2026-09-07 (adds ISA extensions 1–2 as H1/H2 + M11/M12).
+Canonical copy: `~/.local/state/maki/plans/smashing-patient-albacore.md`; sync to `doc/tosa_compiler_plan.md` in the repo.
 
 Decisions already ratified by the user for this plan:
 
@@ -10,7 +11,7 @@ Decisions already ratified by the user for this plan:
 | Rounding mismatch | Change `cnn_accel` RTL + golden model from round-half-even to TOSA round-half-up (separate HW milestone) |
 | Tiling in MVP | Capability checking only; tiling pass designed, implemented post-MVP |
 | TOSA input | Hand-written `.mlir` in MLIR **generic form** |
-| Zero points / per-channel | MVP verifier rejects `zp != 0` and `per_channel`; HW extensions listed |
+| Zero points / per-channel | MVP verifier rejects `zp != 0` and `per_channel`; ISA extensions 1 (output offset + general clamp) and 2 (per-channel scale) are **scheduled** (H1/H2 + M11/M12), `input_zp`/`weight_zp` remain rejected |
 
 Empirical facts this plan is grounded in (verified in this session, see
 memory `tosa_compiler_env_findings.md`):
@@ -230,6 +231,7 @@ single source of truth.
                      "input_zp": false, "output_zp": false },
         "clamp_ranges": [[-128,127],[0,127]]
       },
+      "isa_version": "1.0",
       "partial_sum_io": false
     }
   ]
@@ -249,7 +251,12 @@ Design points:
   `partial_sum_io: false` tells the tiling pass Cin-splitting is not
   available. A future 64-MAC target changes these numbers and the
   constraint values; the frontend and GIR passes are untouched.
-- `epilogue` describes what may be fused into the unit; §9 uses it.
+- `epilogue` describes what may be fused into the unit; §9 uses it. After
+  H1 the JSON flips `output_zp: true`, `clamp_ranges: "any"`,
+  `isa_version: "1.1"`; after H2 `per_channel: true`, `isa_version:
+  "1.2"`. The backend emitter refuses to emit a field the target's
+  `isa_version` does not define, so a stale JSON can never produce a
+  descriptor the RTL misreads.
 
 ## 5. Accelerator programming model
 
@@ -268,15 +275,39 @@ general (explicit `deps`, `unit`, optional explicit DMA ops), so if a later
 accelerator exposes standalone units (e.g. an `add` unit or SRAM-resident
 tensors) the backend gains ops without changing the frontend or GIR.
 
-Recommended ISA extensions for the HW team (all fit in the reserved bytes
-W13–W15 / W10 bytes 41–43; none needed for the MVP):
+ISA extensions. 1 and 2 are **scheduled in this plan** (HW milestones H1/H2,
+compiler milestones M11/M12); 3 and 5 are recommendations only. All fit in
+the reserved bytes W13–W15 (12 bytes) and flag bits 4–7; none is needed for
+the MVP. Every field is declared once in `cnn_accel_constants.py`
+(`ISA_LAYOUT`, `FLAGS`) and propagates to VHDL via hdl-registers.
 
-1. `output_offset` (int8/int16): enables TOSA `output_zp`.
-2. `scale_addr` + `PER_CHANNEL_EN` flag: per-channel multiplier/shift buffer
-   (the bias buffer already is per-channel; same DMA path).
+1. **Output offset + general clamp** (`ISA v1.1`):
+   `output_offset` (2 B signed), `clamp_min` (1 B signed), `clamp_max`
+   (1 B signed) in W13; flag `CLAMP_EN` = bit 4.
+   Epilogue becomes `s = round_shift(total*scale); s += output_offset;
+   y = clamp(s, lo, hi)` with `lo/hi = clamp_min/clamp_max` when `CLAMP_EN`,
+   else today's `lo = 0 if RELU_EN else -128, hi = 127`. Backward
+   compatible: `CLAMP_EN=0` is bit-identical to current behaviour. Enables
+   TOSA `output_zp` and arbitrary `clamp`. Merges the earlier "extension 4"
+   because with `output_zp != 0` a TOSA ReLU is `clamp[output_zp,127]`,
+   which `RELU_EN` alone cannot express.
+2. **Per-channel requantization** (`ISA v1.2`): `scale_addr` (4 B) in W14;
+   flag `PER_CHANNEL_EN` = bit 5. DDR table of `out_channels` entries ×
+   8 B: `multiplier i32 LE, shift u8, 3 B zero` (one 64-bit AXI beat per
+   channel). Loaded per output-channel tile through the same DMA path and
+   alongside the bias buffer (`BIAS_BUFFER_DEPTH = PE_ROWS` entries →
+   a parallel `scale_buffer` of PE_ROWS × 40 bits); `bias_requant` takes a
+   per-lane `(scale, shift)` vector instead of one `cfg_requant_*`. When
+   `PER_CHANNEL_EN=0` the lane vector is broadcast from the descriptor
+   fields → bit-identical to today.
 3. `PSUM_IN/PSUM_OUT` flags + int32 psum address: enables compiler-side Cin
-   tiling and larger-than-buffer layers.
-4. `clamp_min/clamp_max` bytes: general clamp instead of ReLU-only.
+   tiling and larger-than-buffer layers. Not scheduled.
+5. `pad_value` (1 B signed): pad with a constant instead of literal 0. With
+   `pad_value = input_zp`, TOSA `input_zp` folds **exactly** into the bias
+   (`bias'[o] = bias[o] - input_zp·Σw[o]`, padded taps cancel identically
+   in TOSA and HW). Cheapest path to asymmetric *inputs*; recommended
+   next, not scheduled. `weight_zp != 0` stays rejected (data-dependent
+   `-w_zp·Σx` term needs a datapath change).
 
 ## 6. Quantization model
 
@@ -315,10 +346,11 @@ y       = saturate_i8(s)
 | `rounding_mode` | `SINGLE_ROUND` (and `INFERENCE`, which the spec lets the implementation choose; recorded in manifest) | half-up |
 | `DOUBLE_ROUND` | — | reject (value-sign-dependent correction not expressible) |
 | `in_zp` (rescale) | 0 (spec requires for i32) | — |
-| `out_zp` | 0 (MVP) | — (needs `output_offset` extension) |
+| `out_zp` | 0 (MVP); any int8 after H1/M11 | `output_offset = out_zp`, `CLAMP_EN=1`, `clamp = [-128,127]` (TOSA saturate) or the following clamp's bounds |
 | `clamp [0,127]` after rescale | — | `relu_en=1`. Proof: HW `sat_i8(max(s,0)) = clamp(s,0,127)`; TOSA `clamp(clamp_i8(s),0,127) = clamp(s,0,127)`. Identical. |
 | `clamp [-128,127]` | — | identity, removed by `normalize` |
-| any other clamp | — | reject (no general clamp unit) |
+| any other clamp `[lo,hi]` | reject (MVP); after H1/M11 | `CLAMP_EN=1`, `clamp_min=lo`, `clamp_max=hi`. Proof: TOSA `clamp(clamp_i8(s+zp),lo,hi) = clamp(s+zp,lo,hi)` since `[lo,hi] ⊆ [-128,127]`; HW computes exactly the right-hand side |
+| `per_channel=true` | reject (MVP); after H2/M12 | `PER_CHANNEL_EN=1`, `scale_addr` → table `(mult[oc], shift[oc]-15)`; the `shift<15` legalization runs per element |
 | accumulator | TOSA i32 acc incl. bias | HW int32 MAC + 33-bit bias add. Contract (D3): programs whose true accumulation leaves int32 are **invalid**; both simulators raise `AccumulatorOverflow` rather than wrap. Compile-time bound check: `9·Cin·127·128 + |bias|` worst case emitted as a warning when it could exceed 2^31. |
 | signedness | all signed i8/i32 | `input_unsigned/output_unsigned` must be false |
 
@@ -570,7 +602,7 @@ TESTS: 2 e2e + dumps.
 
 **H0 — HW track: rounding change to half-up (parallel, HW agent)**
 INPUT: §6 HW semantics.
-TASK: `cnn_accel_model.round_shift_right_signed` default → half-up (keep convergent as opt-in for `truncate_round_signed` users, if any); `cnn_accel_bias_requant.vhd` `round_shift_right` → add `2^(S-1)` then arithmetic shift (removes the remainder comparator); `tb_cnn_accel_bias_requant` `test_round_to_even_ties` → half-up ties; regenerate `conv_core` vectors; run `cnn_accel.*` VUnit regression via vunit-mcp; update `cnn_accel_bias_requant.md` + this doc's §6; set `targets/cnn_accel_v1.json` `rounding` to `half_up` and remove the M8 xfail.
+TASK: `cnn_accel_model.round_shift_right_signed` default → half-up (keep convergent as opt-in for `truncate_round_signed` users, if any); `cnn_accel_bias_requant.vhd` `round_shift_right` → add `2^(S-1)` then arithmetic shift (removes the remainder comparator); `tb_cnn_accel_bias_requant` `test_round_to_even_ties` → half-up ties; regenerate `conv_core` vectors; run `cnn_accel.*` VUnit regression via vunit-mcp; update `cnn_accel_bias_requant.md` + this doc's §6; set `targets/cnn_accel_v1.js...
 ACCEPTANCE: real vunit-mcp result all green; pytest for the model green; M8 e2e green.
 
 **M10 — RTL cross-check via existing testbench vectors**
@@ -578,12 +610,92 @@ INPUT: M8, `generate_vectors.py` format, `tb_cnn_accel_conv_core`.
 TASK: `backend/cnn_accel_v1/vectors.py` writes the compiler's program's per-layer stimulus/expected vectors in the format `tb_cnn_accel_conv_core` consumes; one VUnit config fed from a compiler-generated case.
 ACCEPTANCE: VUnit test passes bit-exact against compiler-produced expected data (real vunit-mcp result).
 
-**M11 (post-MVP) — tiling pass, row bands, synthetic target**
+**H1 — HW track: ISA v1.1, output offset + general clamp (after H0)**
+INPUT: §5 extension 1.
+TASK: `cnn_accel_constants.py`: `ISA_LAYOUT` reserved W13 → `output_offset`
+(2, signed), `clamp_min` (1, signed), `clamp_max` (1, signed); `FLAGS["CLAMP_EN"] = 4`;
+ISA self-consistency test still 64 B. `cnn_accel_model.py`: `LayerDesc`
+fields with defaults 0, `bias_requantize_relu(..., output_offset, clamp_en,
+clamp_min, clamp_max)` per §5 semantics, encoder/decoder round-trip.
+`cnn_accel_bias_requant.vhd`: new `cfg_output_offset`, `cfg_clamp_en`,
+`cfg_clamp_min/max` ports; offset add after the rounded shift, then
+`clamp(lo,hi)` replacing `relu → saturate`; `conv_core` plumbs the ports.
+`tb_cnn_accel_bias_requant`: tests `test_output_offset`,
+`test_general_clamp`, `test_clamp_en_zero_is_legacy` (bit-identical to old
+vectors). Regenerate `conv_core` vectors with new fields = 0 and prove
+unchanged. Docs: `cnn_accel_arch.md` ISA table, `cnn_accel_bias_requant.md`.
+ACCEPTANCE: real vunit-mcp `cnn_accel.*` green; pytest model green; all
+pre-existing vector files byte-identical; `targets/cnn_accel_v1.json`
+bumped to `isa_version 1.1`, `output_zp: true`, `clamp_ranges: "any"`.
+TESTS: 3 new tb tests; model tests for offset+clamp corner cases
+(`s+offset` beyond int8 both sides, `lo=hi`, `lo>hi` rejected by encoder).
+
+**M11 — compiler: output_zp + general clamp (after H1)**
+INPUT: M9, H1.
+TASK: importer accepts `rescale.output_zp != 0`; `normalize` removes the
+identity clamp only when the target lacks `clamp_ranges: "any"` (otherwise
+it is harmless and kept for traceability); `fuse` accepts any clamp when
+capability allows; `to_hir` emits `output_offset`, `clamp_en/min/max`
+(rule: clamp bounds = following clamp if present else `[-128,127]`,
+`relu_en=0`); `interp` unchanged (already spec-complete); emitter writes
+new fields only for `isa_version >= 1.1`.
+OUTPUT: fixtures `out_zp_relu.mlir` (`out_zp=-128`, `clamp[-128,127]`) and
+`clamp_5_100.mlir`.
+ACCEPTANCE: e2e byte-exact `interp == run_program == IREE` for both
+fixtures ×3 seeds; the MVP fixture is emitted as `CLAMP_EN=1,[0,127]` and
+a test asserts it is bit-identical to the `RELU_EN=1` encoding;
+`isa_version 1.0` target + `out_zp != 0` → `CapabilityError`.
+TESTS: 2 e2e, 1 rejection, 1 golden dump each.
+
+**H2 — HW track: ISA v1.2, per-channel requantization (after H1)**
+INPUT: §5 extension 2.
+TASK: `cnn_accel_constants.py`: `scale_addr` (4) in W14; `FLAGS["PER_CHANNEL_EN"] = 5`;
+`SCALE_TABLE_ENTRY_BYTES = 8`. `cnn_accel_model.py`: `pack_scale_table_for_hw`,
+`run_layer` reads the table when the flag is set, per-oc `(scale, shift)`
+into `bias_requantize_relu`. RTL: `cnn_accel_weight_buffer` gains a
+`scale_buffer` (PE_ROWS × 40 bits, filled by the same stream that fills
+the bias buffer, one extra tile-load phase); `cnn_accel_bias_requant`
+takes `lane_scale`/`lane_shift` vectors (broadcast from cfg when
+`PER_CHANNEL_EN=0`); `conv_core` plumbs. **Dependency:** the DMA request
+for the table is issued by `cnn_accel_layer_ctrl`, which is still PENDING
+in `flow_status.md` — H2's RTL scope ends at `conv_core` (table presented
+on the weight/bias stream by the testbench); `layer_ctrl` picks the flag
+up when it is designed.
+ACCEPTANCE: vunit-mcp green incl. new tests `test_per_channel_lanes`
+(distinct scale/shift per lane, ties per lane) and
+`test_per_channel_en_zero_is_legacy`; model pytest green; `conv_core`
+vectors regenerated with a per-channel case and bit-exact; JSON →
+`isa_version 1.2`, `per_channel: true`.
+
+**M12 — compiler: per-channel rescale (after H2)**
+INPUT: M11, H2.
+TASK: importer accepts `per_channel=true` (multiplier/shift tensors of
+length `Cout`); `legalize_rescale` per element; `to_hir` creates a
+`Buffer(role=const, layout=SCALE_TABLE)` of `8·Cout` B and emits
+`scale_addr`/`PER_CHANNEL_EN`; memplan places it in the constants region;
+manifest lists it.
+OUTPUT: fixture `per_channel.mlir` (16 channels, distinct multipliers,
+some `shift<15` to exercise per-element legalization).
+ACCEPTANCE: e2e byte-exact ×3 seeds vs `interp` and IREE; decoded
+descriptor has the flag and a table address inside the constants region;
+`isa_version 1.1` target → `CapabilityError`.
+TESTS: 1 e2e, 1 rejection, planner test that the table is aligned and
+non-overlapping.
+
+**M13 (post-MVP) — tiling pass, row bands, synthetic target**
 INPUT: §7, `targets/synthetic_tiled.json`.
 TASK: `tile.py` H-band split with halos; `BufferView`; planner support.
 ACCEPTANCE: layer violating `max_row_words` on the synthetic target compiles to k ops; simulator output equals untiled interpreter.
 
-**M12 (post-MVP) — `tosa.add`, then Cin-tiling with psum on synthetic target; ISA extension proposals (§5) to HW team.**
+**M14 (post-MVP) — `tosa.add`, then Cin-tiling with psum on synthetic target; extensions 3/5 (§5) proposed to HW team.**
+
+Ordering summary:
+
+```
+compiler: M0 M1 → M2 → M3 → M4 → M5 → M6 → M7 → M8(xfail until H0) → M9 → M10 → M11 → M12 → M13 → M14
+HW:                                              H0 ─────────────────────────→ H1 ──────→ H2
+                                                  └ gates M8                   └ gates M11 └ gates M12
+```
 
 ## 14. Risks and open questions
 
@@ -593,11 +705,12 @@ Decide early (they shape data structures):
    *unable* to target `cnn_accel_v1`; M8 is gated on it.
 2. **HWC / OHWI layouts and N=1** — fixed by HW; baked into HIR `layout`.
    Fine for CNN inference; revisit only if the HW changes.
-3. **Zero points** — rejected in MVP. Real exporters (ExecuTorch-Arm,
-   TFLite) commonly emit asymmetric activations (`out_zp=-128` after ReLU)
-   and per-channel weights. Without the §5 extensions 1–2 the compiler will
-   reject most real models. This is the biggest gap between MVP and "runs a
-   detector"; flag to the HW team now.
+3. **Zero points / per-channel** — rejected in MVP; `output_zp`, general
+   clamp and per-channel scale are scheduled (H1/H2, M11/M12). Remaining
+   gap after M12: `input_zp != 0` (needs extension 5 `pad_value`, cheap)
+   and `weight_zp != 0` (rare in practice; stays rejected). H2 also
+   depends on `layer_ctrl`, which does not exist yet — the per-channel
+   table's DMA is only testbench-driven at `conv_core` level until then.
 4. **Int32 accumulator contract** — kept as "invalid program" (D3), detected
    at simulation, warned at compile time. Acceptable for the target
    backbone (worst case ≈ 3.7e7).
@@ -680,3 +793,4 @@ Prompt essentials for the Sonnet agent:
   `UnsupportedLiteral`.
 - Acceptance: `.venv-compiler/bin/python -m pytest compiler/tests -q` all
   green; report the real pytest output. No other files changed.
+
