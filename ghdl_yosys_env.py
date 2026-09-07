@@ -1,7 +1,6 @@
 """Shared local-machine GHDL/Yosys environment resolution for this
 project's ``module_*.py`` ``get_build_projects()`` methods
-(``modules/canny/module_canny.py``, ``modules/axi_stream_join/
-module_axi_stream_join.py``).
+(``modules/cnn_accel/module_cnn_accel.py``).
 
 Deliberately project-scoped, not MCP-specific: ``build_fpga.py`` and every
 ``get_build_projects()`` that calls this must behave identically whether

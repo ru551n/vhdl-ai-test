@@ -7,8 +7,8 @@ Mirrors tsfpga's own ``tsfpga/examples/build_fpga.py`` and tsfpga-mcp's
 a netlist build defines ``get_build_projects()`` on its own ``Module``
 class (``tsfpga.module.BaseModule``), returning one or more
 ``tsfpga.yosys.project.YosysNetlistBuild`` instances -- see
-``modules/axi_stream_join/module_axi_stream_join.py`` and
-``modules/canny/module_canny.py`` for examples. ``hdl-modules`` is used as
+``modules/cnn_accel/module_cnn_accel.py`` for the worked example.
+``hdl-modules`` is used as
 a dependency only from within each of those methods (no netlist builds of
 its own get registered here, unlike ``run.py``'s simulation-only
 ``modules_no_test`` set, which is unrelated to this file).

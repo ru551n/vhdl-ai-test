@@ -17,7 +17,7 @@ models)") — same role `canny_model.py` plays for the Canny IP. Covers:
   against a flat `bytearray` "DDR image", and a memory-image builder
   (`build_memory_image`) used by every testbench's VUnit `pre_config` to
   produce the `memory_image.csv`/`expected_output.csv` pair (byte-address,
-  byte-value rows, mirroring `canny_model.py`'s `_write_csv` idiom).
+  byte-value rows).
 
 Tensor layout conventions (golden-model choice, not yet constrained by any
 committed RTL microarchitecture -- `cnn_accel_pe_array`/

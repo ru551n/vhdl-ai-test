@@ -7,6 +7,13 @@ generated/
 tsfpga_mcp_out/
 .vunit-mcp-cache/
 
+# Local source clones of the pinned VUnit and tsfpga (requirements*.txt pin
+# them by commit; these are working copies for reading/patching them, not part
+# of the project). Ignored so a stray `git add -A` cannot vendor them in, and
+# so bare `pytest` from the repo root does not try to collect their suites.
+/vunit/
+/tsfpga/
+
 # hdl-registers generated VHDL packages (tsfpga BaseModule.register_synthesis_folder /
 # .register_simulation_folder -- see modules/cnn_accel/module_cnn_accel.py's
 # registers_hook()). Regenerated on every run.py/build_fpga.py invocation from

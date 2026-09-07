@@ -2,18 +2,15 @@
 
 Input requirement: `doc/cnn_accel_req.md`.
 
-## Layout note (deviation from the aspirational per-module layout)
+## Layout note (one library per IP, not one per entity)
 
-`doc/canny_arch.md` documents a "one folder per module under `modules/`"
-convention, but what is actually wired into `run.py` (`get_modules(...)`,
-one VUnit library per top-level `modules/` folder) and actually populated
-is a **single library per IP**: `modules/canny/{src,test,doc}` holds every
-Canny entity, testbench and doc file, while the per-entity directories
-(`modules/canny_window3x3/`, `modules/canny_top/`, ...) are empty, orphaned
-stubs from an earlier, abandoned plan.
+An earlier convention in this repo aspired to "one folder per module under
+`modules/`", i.e. one tsfpga module per *entity*. That was abandoned: what
+is actually wired into `run.py` (`get_modules(...)`, one VUnit library per
+top-level `modules/` folder) is a **single library per IP**.
 
 This architecture follows the convention that is **actually in effect**:
-one new tsfpga module/library, `modules/cnn_accel/`, holding every entity
+one tsfpga module/library, `modules/cnn_accel/`, holding every entity
 listed below under `modules/cnn_accel/src/*.vhd`, every testbench under
 `modules/cnn_accel/test/*.vhd`, and every per-entity requirement/proposal/
 doc file under `modules/cnn_accel/doc/<entity>_{req,proposal}.md` /
@@ -21,8 +18,8 @@ doc file under `modules/cnn_accel/doc/<entity>_{req,proposal}.md` /
 are created. `run.py` needs no changes: `get_modules(modules_folder=ROOT /
 "modules")` already picks up any new top-level folder automatically.
 
-This doc itself stays at the repo-level `doc/cnn_accel_arch.md`, mirroring
-`doc/canny_arch.md`.
+This doc itself stays at the repo-level `doc/cnn_accel_arch.md`; per-entity
+docs live under `modules/cnn_accel/doc/`.
 
 ## Intent
 
@@ -245,7 +242,7 @@ to design a packing that maps spatial taps onto `g_pe_cols` (awkward for
 | `cnn_accel_layer_ctrl` | Per-layer orchestration FSM: given a decoded `layer_desc`, sequences weight/bias fetch, ifmap fetch, datapath enable (conv/dwconv/fc vs pool, requant/ReLU), and output write-back; reports `done` to the sequencer | new | this IP |
 | `cnn_accel_axi_read_dma` | Generic AXI4 read master -> internal AXI4-Stream; byte address + length in, stream of fixed-width beats out. Instantiated x3 (instruction fetch, weight/bias fetch, ifmap fetch) | new, built from reused AXI4 read-channel building blocks | new; internals reuse `axi.axi_read_pipeline`, `axi.axi_read_throttle` (`hdl-modules/modules/axi`) |
 | `cnn_accel_ofmap_dma` | Output activation write-back: internal AXI4-Stream in -> AXI4 write master out | new, thin wrapper | `hdl-modules/modules/dma_axi_write_simple` |
-| `cnn_accel_window_gen` | Configurable K_h x K_w / stride / zero-padding sliding-window generator over line buffers; generalizes the fixed-3x3 `canny_window3x3` pattern to arbitrary kernel/stride; used both for conv/dwconv/fc (feeding `cnn_accel_pe_array`) and pooling (feeding `cnn_accel_pool`), one instance per active use | new (architecturally informed by `modules/canny/src/canny_window3x3.vhd`, not reusable as-is: fixed 3x3, fixed border-dilation semantics specific to Canny) | this IP |
+| `cnn_accel_window_gen` | Configurable K_h x K_w / stride / zero-padding sliding-window generator over line buffers; generalizes the classic fixed-3x3 line-buffer window pattern to arbitrary kernel/stride; used both for conv/dwconv/fc (feeding `cnn_accel_pe_array`) and pooling (feeding `cnn_accel_pool`), one instance per active use | new | this IP |
 | `cnn_accel_weight_buffer` | **Single-buffered** streaming on-chip weight/bias cache (separate weight and bias regions, whole-row writes behind a shallow prefetch FIFO); filled once per output-channel pass by the weight `cnn_accel_axi_read_dma` instance, read by `cnn_accel_pe_array`/`cnn_accel_bias_requant`. Ping-pong was removed in M7b: per decision D6 weights are re-streamed from DDR4 per pass, and DDR4 bandwidth is not the constraint — on-chip footprint is (72 -> 15 BRAM) | new | this IP |
 | `cnn_accel_pe_array` | int8 x int8 MAC array (parallelism `g_pe_rows` x `g_pe_cols`), int32 accumulation; executes `CONV2D`/`DWCONV2D`/`FC`. **Self-timed MAC pipeline** (S7): `c_mac_latency = 2 + c_tree_levels` cycles (5 at `g_pe_cols = 8`) from a group's address issue to its landing in `accum_q`, one adder-tree level per register stage; the latency costs once per output pixel, not once per MAC | new | this IP |
 | `cnn_accel_pool` | Max/avg spatial reduction over `cnn_accel_window_gen` output; max path emits int8 directly, avg path emits an int32 sum for `cnn_accel_bias_requant` to scale/round | new | this IP |

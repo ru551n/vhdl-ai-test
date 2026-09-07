@@ -391,8 +391,7 @@ class Module(BaseModule):
         # Local import: tsfpga.yosys.project needs a tsfpga build with Yosys
         # netlist-build support (not in the stable release this project's
         # run.py/VUnit flow uses), so this must not be imported at module
-        # load time -- only build_fpga.py ever calls this method. Matches
-        # module_canny.py / module_axi_stream_join.py.
+        # load time -- only build_fpga.py ever calls this method.
         from tsfpga.vivado.build_result_checker import (
             BlockRams,
             DspBlocks,
@@ -1443,8 +1442,7 @@ class Module(BaseModule):
             # Zero stall on both links only for the dedicated
             # full-throughput test (its check_relation timing check requires
             # back-to-back beats); randomized independent per-link
-            # backpressure otherwise. Matches module_canny.py's
-            # `_setup_canny_threshold` precedent.
+            # backpressure otherwise.
             stall = 0 if "full_throughput" in test.name else 20
 
             self.add_vunit_config(
@@ -1551,8 +1549,7 @@ class Module(BaseModule):
         for test in tb.get_tests():
             # Zero stall on all three links only for the dedicated
             # full-throughput test; randomized independent per-link
-            # backpressure otherwise. Matches module_canny.py's
-            # `_setup_canny_threshold` precedent.
+            # backpressure otherwise.
             stall = 0 if "full_throughput" in test.name else 20
 
             self.add_vunit_config(
@@ -1571,8 +1568,7 @@ class Module(BaseModule):
             # Zero stall on both links only for the dedicated
             # full-throughput test (its check_relation timing check requires
             # back-to-back beats); randomized independent per-link
-            # backpressure otherwise. Matches module_canny.py's
-            # `_setup_canny_threshold` precedent.
+            # backpressure otherwise.
             stall = 0 if "full_throughput" in test.name else 20
 
             self.add_vunit_config(

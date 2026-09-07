@@ -37,8 +37,8 @@ tsfpga @ git+https://github.com/ru551n/tsfpga.git@6304052f52d13b2b9986cdfba5d0ee
 # exactly because a generator-output change is a silent RTL change.
 hdl-registers==8.1.0
 
-# Golden-model test suites (test_canny_model.py,
-# modules/cnn_accel/test_cnn_accel_model.py). Both models are pure stdlib by
+# Golden-model test suite (modules/cnn_accel/test_cnn_accel_model.py). The
+# model is pure stdlib by
 # design, so nothing numeric is pinned here -- except that the cnn_accel model
 # now imports cnn_accel_constants.py, which is what makes its instruction
 # encoder agree with the RTL byte-for-byte by construction rather than by

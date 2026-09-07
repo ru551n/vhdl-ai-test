@@ -25,8 +25,8 @@ use cnn_accel.cnn_accel_pkg.all;
 -- K_h - 1 full rows ... plus the current row ... ping-pong across K_h row
 -- banks" description, not a FIFO/shift-register pipeline (see
 -- cnn_accel_window_gen_proposal.md section 4 for why a FIFO-based design,
--- closer to modules/canny/src/canny_window3x3.vhd's fixed-3x3 technique,
--- is insufficient here: canny has no configurable stride/padding, so it
+-- closer to the classic fixed-3x3 line-buffer technique, is insufficient
+-- here: a fixed 3x3 window has no configurable stride/padding, so it
 -- never needs to *replay* an already-fully-written row/column for more
 -- than one output position; this module's padding can make a
 -- bottom/right output row or column position's real (unpadded)
@@ -556,10 +556,9 @@ begin
   -- synth-vhdl_expr.adb). Caught by this module's netlist build -- see
   -- module_cnn_accel.py get_build_projects().
   --
-  -- NOTE: explicit sensitivity list, not 'process(all)' -- see
-  -- canny_window3x3.vhd's identical note on GHDL 7.0.0-dev's 'all'
-  -- inference not reliably tracking signals read only through nested
-  -- loops/array indexing.
+  -- NOTE: explicit sensitivity list, not 'process(all)' -- GHDL 7.0.0-dev's
+  -- 'all' inference does not reliably track signals read only through
+  -- nested loops/array indexing.
   ------------------------------------------------------------------------
   wr_decode : process(
     wr_tile_q, n_tiles_q, last_tile_channels_q, s_stream_m2s.data
@@ -964,10 +963,9 @@ begin
   --     advanced in lockstep with 'rd_addr_q', so the two are always
   --     aligned). 'kc_q < kernel_w_q' excludes the drain cycle.
   --
-  -- NOTE: explicit sensitivity list, not 'process(all)' -- see
-  -- canny_window3x3.vhd's identical note on GHDL 7.0.0-dev's 'all'
-  -- inference not reliably tracking signals read only through nested
-  -- loops/array indexing.
+  -- NOTE: explicit sensitivity list, not 'process(all)' -- GHDL 7.0.0-dev's
+  -- 'all' inference does not reliably track signals read only through
+  -- nested loops/array indexing.
   ------------------------------------------------------------------------
   read_qualify : process(
     kernel_w_q, cur_row_q, cur_col_q, kc_q, reading_q, rd_col_ok_q,

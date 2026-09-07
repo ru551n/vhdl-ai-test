@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   model:
-    name: Golden models (pytest)
+    name: Golden model (pytest)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -36,13 +36,13 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        # Both models are deliberately pure-stdlib (no numpy), so the
+        # The model is deliberately pure-stdlib (no numpy), so the
         # reference implementation the RTL is checked against has no
         # third-party numerics in its trust path.
         run: python -m pip install --upgrade pip pytest
 
-      - name: Run golden-model test suites
-        # The RTL is verified bit-exactly against these models, so a broken
+      - name: Run golden-model test suite
+        # The RTL is verified bit-exactly against this model, so a broken
         # model silently invalidates every simulation result downstream.
         #
         # Paths are listed explicitly rather than letting pytest discover from
@@ -50,7 +50,6 @@ jobs:
         # try to collect its suite too.
         run: >
           python -m pytest -q
-          test_canny_model.py
           modules/cnn_accel/test_cnn_accel_model.py
 
   simulate:
@@ -71,15 +70,9 @@ jobs:
             # GHDL is the reference simulator: everything must pass.
             patterns: "*"
           - simulator: nvc
-            # Everything except axi_stream_join's zero-stall full-throughput
-            # test, which is covered by the `nvc-known-issue` job below.
-            # VUnit has no `--exclude`, so the complement is spelled out;
-            # `stall_probability_percent_0` contains only that one test.
-            patterns: >-
-              canny.*
-              cnn_accel.*
-              lib.*
-              axi_stream_join.tb_axi_stream_join.stall_probability_percent_20.*
+            # Second simulator, same suite: a VHDL-2008 construct that only
+            # GHDL accepts is a portability defect worth catching here.
+            patterns: "*"
     steps:
       # Must precede actions/checkout: the image is deliberately minimal and
       # ships neither git nor python, and checkout needs git for the
@@ -115,53 +108,6 @@ jobs:
         env:
           VUNIT_SIMULATOR: ${{ matrix.simulator }}
         run: /opt/venv/bin/python run.py --num-threads 4 ${{ matrix.patterns }}
-
-  nvc-known-issue:
-    name: Simulate (nvc, known issue)
-    runs-on: ubuntu-24.04
-    # Informational only, deliberately not gating.
-    #
-    # axi_stream_join's zero-stall test asserts the join sustains one beat per
-    # clock with only a 5-cycle margin over 500 beats. That holds on GHDL but
-    # not on NVC, where VUnit's AXI-Stream verification components need ~1.4
-    # clocks per beat because of how the `net` message queue is serviced. It
-    # is a testbench/VC scheduling difference, not a defect in the (purely
-    # combinational) DUT, and the `simulate` job still runs this test on GHDL
-    # where the timing claim is actually meaningful.
-    #
-    # Kept as its own visible job rather than deleted or silently skipped, so
-    # the discrepancy stays on the dashboard and gets revisited if NVC or
-    # VUnit changes.
-    continue-on-error: true
-    container:
-      image: ru551n/hdl-docker:1.2.0
-      options: --user root
-    steps:
-      - name: Install git and Python
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends git python3 python3-venv
-          rm -rf /var/lib/apt/lists/*
-
-      - uses: actions/checkout@v5
-        with:
-          submodules: recursive
-
-      - name: Trust the workspace
-        run: git config --global --add safe.directory '*'
-
-      - name: Install Python dependencies
-        run: |
-          python3 -m venv /opt/venv
-          /opt/venv/bin/pip install --upgrade pip
-          /opt/venv/bin/pip install -r requirements.txt
-
-      - name: Run the known-issue test on NVC
-        env:
-          VUNIT_SIMULATOR: nvc
-        run: >
-          /opt/venv/bin/python run.py --num-threads 1
-          "axi_stream_join.tb_axi_stream_join.stall_probability_percent_0.*"
 
   synthesize:
     name: Synthesize (Yosys + GHDL, Artix-7)

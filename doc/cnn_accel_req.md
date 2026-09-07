@@ -10,8 +10,8 @@ fixed network — it is a small in-order engine that fetches one instruction
 per layer, configures its datapath accordingly, executes the layer, and
 moves on, until a `HALT` instruction is reached.
 
-This mirrors the repo's existing streaming-IP workflow (see
-`doc/canny_arch.md`) but targets memory-mapped AXI4 + DDR-resident
+This mirrors the repo's earlier streaming-IP workflow but targets
+memory-mapped AXI4 + DDR-resident
 tensors/program instead of a live AXI4-Stream video feed, since feature
 maps and weights are too large to assume live streaming end-to-end.
 

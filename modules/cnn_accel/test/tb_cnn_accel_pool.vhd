@@ -28,9 +28,8 @@ entity tb_cnn_accel_pool is
   generic (
     -- Split per-link randomized-backpressure generics, swept per test in
     -- module_cnn_accel.py's setup_vunit (0/0/0 for the dedicated
-    -- full-throughput test, nonzero otherwise) -- mirrors
-    -- module_canny.py's _setup_canny_sobel3x3 precedent (one input,
-    -- multiple independently-stalled outputs).
+    -- full-throughput test, nonzero otherwise): one input, multiple
+    -- independently-stalled outputs.
     stall_probability_percent_in : natural := 20;
     stall_probability_percent_max : natural := 20;
     stall_probability_percent_avgsum : natural := 20;

@@ -39,10 +39,9 @@ entity tb_cnn_accel_bias_requant is
   generic (
     -- Independent per-link randomized-backpressure generics, swept per
     -- test in module_cnn_accel.py's setup_vunit (0/0 for the dedicated
-    -- full-throughput test, nonzero otherwise) -- mirrors
-    -- module_canny.py's stall_probability_percent precedent (one input,
-    -- one output here, so a simple in/out pair rather than
-    -- tb_cnn_accel_pool.vhd's three-link split).
+    -- full-throughput test, nonzero otherwise): one input, one output
+    -- here, so a simple in/out pair rather than tb_cnn_accel_pool.vhd's
+    -- three-link split.
     stall_probability_percent_in : natural := 20;
     stall_probability_percent_out : natural := 20;
     -- Output-channel parallelism (lane count). Swept per test in
