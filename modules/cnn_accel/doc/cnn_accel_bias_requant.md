@@ -11,7 +11,7 @@ requant_scale) -> (>> requant_shift, rounded) -> saturate to int8 ->
 (architectural decision D2: a single overflow semantic across both
 paths). Generic wrapper composing `math.saturate_signed` (genuinely
 reused, two instances per lane -- one per path) around a bias-adder, a
-requant-multiplier, and a hand-written round-to-even variable-shift
+requant-multiplier, and a hand-written round-half-up variable-shift
 function (see "Implementation notes" for why `math.truncate_round_signed`
 is not instantiated). See `cnn_accel_bias_requant_proposal.md` for the full
 design rationale.
@@ -72,8 +72,11 @@ Per lane `l` (0 to `g_pe_rows - 1`), per accepted `s_accum` beat:
 
 1. `total_l = accum_l + (bias_l when cfg_bias_en='1' else 0)`.
 2. If `cfg_requant_en='1'`: `product_l = total_l * cfg_requant_scale`
-   (exact width, no truncation); `scaled_l = round_to_even(product_l >>
-   (15 + clamp(cfg_requant_shift, g_max_requant_shift)))`; if
+   (exact width, no truncation); `scaled_l = round_half_up(product_l >>
+   (15 + clamp(cfg_requant_shift, g_max_requant_shift)))` = `floor((product_l
+   + 2^(S-1)) / 2^S)` with `S` the combined shift — ties round towards
+   +infinity, identical to TOSA `apply_scale_32` SINGLE_ROUND (HW
+   milestone H0, 2026-09-07; previously round-to-even); if
    `cfg_relu_en='1'` and `scaled_l < 0`, clamp to 0 (before saturate);
    `result_l = saturate_signed(scaled_l, 8)`.
 3. If `cfg_requant_en='0'` (bypass): if `cfg_relu_en='1'` and `total_l <
@@ -123,7 +126,7 @@ critical path of `cnn_accel_conv_core`):
 | 2 | bias add (`total = accum + bias`) |
 | 3 | requant multiply (DSP48E1 MREG) + the finished bypass result |
 | 4 | product pipeline register (bare DSP48E1 PREG, no logic) |
-| 5 | quotient and the round-up decision (guard/sticky) |
+| 5 | quotient and the round-up decision (guard bit) |
 | 6 | the rounding incrementer, alone so its carry chain gets a full cycle |
 | 7 | ReLU before the int8 clamp, saturate, path mux, output register |
 
@@ -168,21 +171,24 @@ driving `cnn_accel_layer_ctrl`, not yet designed).
   `doc/cnn_accel_arch.md`'s submodule table describing this module as
   composing it: its removed-LSB count is fixed by generics at elaboration,
   but the combined shift amount (`15 + cfg_requant_shift`) is a genuine
-  runtime value. Round-to-even is reproduced inline instead.
+  runtime value (and, since H0, the rule is round-half-up, not
+  `truncate_round_signed`'s round-to-even). The rounding is written
+  inline instead.
   `math.saturate_signed` *is* genuinely reused (fixed widths regardless
   of `cfg_requant_shift`'s value). Full three-options-considered
   rationale in proposal doc §4.
-- **Rounding is guard/sticky, not re-multiply-and-compare** (S7 timing
-  work, 2026-09-07). The original `round_shift_right` recovered the
+- **Rounding is the guard bit, not re-multiply-and-compare** (S7 timing
+  work + H0, 2026-09-07). The original `round_shift_right` recovered the
   remainder by shifting the quotient back left, subtracting, and
   comparing against half — a second variable shift, a 65-bit subtract and
   two 66-bit comparators in series, which was most of the module's 25
-  CARRY4 and ~1700 LUT. The classic form is used now:
-  `guard = product(shift-1)`, `sticky = or product(shift-2 downto 0)`,
-  `round_up = guard and (sticky or quotient(0))`. The sticky mask is
-  built as a mask-and-or-reduce (one balanced `or` tree) rather than a
-  carry chain, and the round-up decision (stage 5) is separated from the
-  incrementer it drives (stage 6) so the carry chain gets a full cycle.
+  CARRY4 and ~1700 LUT. S7 replaced it with the classic guard/sticky
+  round-to-even form; H0 (round-half-up, ties towards +infinity, so the
+  TOSA compiler can be bit-exact) then dropped the sticky reduction and
+  the quotient-parity term entirely: `round_up = guard = product(shift-1)`,
+  i.e. `floor((product + 2^(shift-1)) / 2^shift)`. The round-up decision
+  (stage 5) stays separated from the incrementer it drives (stage 6) so
+  the carry chain gets a full cycle.
   Identical results to the old function — the testbench cross-checks
   against an independently transliterated reference, not against this
   RTL's structure.
@@ -198,8 +204,8 @@ driving `cnn_accel_layer_ctrl`, not yet designed).
 See `cnn_accel_bias_requant_proposal.md` §8-§9 for the full corner-case
 list and verification plan, and the project's final report for the exact
 `tb_cnn_accel_bias_requant` test case names and the literal `vunit-mcp`
-pass/fail result. Key corner cases: round-to-even ties (both parities,
-both signs), saturation both directions, ReLU-before-saturate ordering,
+pass/fail result. Key corner cases: round-half-up ties (both quotient
+parities, both signs; `test_round_half_up_ties`), saturation both directions, ReLU-before-saturate ordering,
 all 8 `bias_en`/`requant_en`/`relu_en` combinations, the
 `cfg_requant_en='0'` bypass path's int8 saturation (both directions, plus
 ReLU-before-saturate ordering), and full-throughput/randomized-

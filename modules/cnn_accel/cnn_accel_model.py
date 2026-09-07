@@ -11,8 +11,8 @@ models)") — same role `canny_model.py` plays for the Canny IP. Covers:
   `fc`) and the shared output-quantization step (`bias_requantize_relu`),
   matching `cnn_accel_bias_requant`'s documented
   `int32 -> (+bias) -> (x requant_scale) -> (>>requant_shift) -> saturate
-  -> (optional ReLU)` pipeline bit-exactly (convergent/round-to-even
-  shift, per `hdl-modules` `math.truncate_round_signed`'s default).
+  -> (optional ReLU)` pipeline bit-exactly (round-half-up shift, ties
+  towards +infinity, matching TOSA `apply_scale_32`; HW milestone H0).
 - An ISA interpreter (`run_program`) executing a full instruction stream
   against a flat `bytearray` "DDR image", and a memory-image builder
   (`build_memory_image`) used by every testbench's VUnit `pre_config` to
@@ -183,15 +183,20 @@ def decode_instruction(data: bytes) -> LayerDesc:
 
 # ---------------------------------------------------------------------------
 # Fixed-point helpers, matching hdl-modules math.truncate_round_signed
-# (default convergent_rounding=true) / math.saturate_signed bit-exactly.
+# / math.saturate_signed bit-exactly (the rounding rule is round-half-up
+# since H0, see round_shift_right_signed; math.truncate_round_signed's
+# round-to-even is no longer what the RTL implements).
 # ---------------------------------------------------------------------------
 
 
-def round_shift_right_signed(value: int, shift: int, convergent: bool = True) -> int:
-    """Round `value / 2**shift` to the nearest integer. Ties round to even
-    (`convergent=True`, the hdl-modules default) or towards +infinity
-    (`convergent=False`). `shift <= 0` is a plain left-shift (no rounding
-    needed)."""
+def round_shift_right_signed(value: int, shift: int, convergent: bool = False) -> int:
+    """Round `value / 2**shift` to the nearest integer. Ties round towards
+    +infinity (`convergent=False`, the default since HW milestone H0:
+    `floor((value + 2**(shift-1)) / 2**shift)`, identical to TOSA's
+    `apply_scale_32` SINGLE_ROUND so the TOSA compiler can emit bit-exact
+    programs) or to even (`convergent=True`, the pre-H0 hdl-modules
+    `truncate_round_signed` convention, kept for reference only). `shift <=
+    0` is a plain left-shift (no rounding needed)."""
     if shift <= 0:
         return value << (-shift)
 

@@ -80,31 +80,32 @@ from cnn_accel_model import (
 
 
 # ---------------------------------------------------------------------------
-# round_shift_right_signed: round-half-to-even table.
+# round_shift_right_signed: round-half-up table (H0: ties towards +inf,
+# i.e. floor((value + 2**(shift-1)) / 2**shift), TOSA apply_scale_32).
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
     "value, shift, expected",
     [
-        # shift=1, divisor=2: exact ties round to even quotient.
-        (0, 1, 0),  # 0/2 = 0.0, quotient 0 (even) -> 0
-        (1, 1, 0),  # 1/2 = 0.5 tie, quotient 0 (even) -> 0
-        (3, 1, 2),  # 3/2 = 1.5 tie, quotient 1 (odd) -> 2
-        (-1, 1, 0),  # -1/2 = -0.5 tie, floor quotient -1 (odd) -> 0
-        (-3, 1, -2),  # -3/2 = -1.5 tie, floor quotient -2 (even) -> -2
+        # shift=1, divisor=2: exact ties round towards +infinity.
+        (0, 1, 0),  # 0/2 = 0.0 -> 0
+        (1, 1, 1),  # 1/2 = 0.5 tie -> 1
+        (3, 1, 2),  # 3/2 = 1.5 tie -> 2
+        (-1, 1, 0),  # -1/2 = -0.5 tie -> 0
+        (-3, 1, -1),  # -3/2 = -1.5 tie -> -1
         # shift=2, divisor=4: exact ties at remainder==2.
-        (2, 2, 0),  # 2/4 tie, quotient 0 (even) -> 0
-        (6, 2, 2),  # 6/4 tie (q=1, odd) -> 2
-        (-2, 2, 0),  # -2/4 tie, floor q=-1 (odd) -> 0
-        (-6, 2, -2),  # -6/4 tie, floor q=-2 (even) -> -2
+        (2, 2, 1),  # 2/4 = 0.5 tie -> 1
+        (6, 2, 2),  # 6/4 = 1.5 tie -> 2
+        (-2, 2, 0),  # -2/4 = -0.5 tie -> 0
+        (-6, 2, -1),  # -6/4 = -1.5 tie -> -1
         # shift=3, divisor=8: exact ties at remainder==4.
-        (4, 3, 0),  # q=0 even -> 0
-        (12, 3, 2),  # q=1 odd -> 2
-        (20, 3, 2),  # q=2 even -> 2
-        (-4, 3, 0),  # floor q=-1 odd -> 0
-        (-12, 3, -2),  # floor q=-2 even -> -2
-        # Non-tie cases: round to nearest regardless of parity.
+        (4, 3, 1),  # 0.5 -> 1
+        (12, 3, 2),  # 1.5 -> 2
+        (20, 3, 3),  # 2.5 -> 3
+        (-4, 3, 0),  # -0.5 -> 0
+        (-12, 3, -1),  # -1.5 -> -1
+        # Non-tie cases: round to nearest.
         (5, 2, 1),  # 5/4 = 1.25 -> 1
         (7, 2, 2),  # 7/4 = 1.75 -> 2
         (-5, 2, -1),  # -5/4 = -1.25 -> -1
@@ -119,12 +120,19 @@ def test_round_shift_right_signed_table(value: int, shift: int, expected: int) -
     assert round_shift_right_signed(value, shift) == expected
 
 
-def test_round_shift_right_signed_convergent_false_ties_up() -> None:
-    # convergent=False: exact ties always round away-from-floor (+infinity).
-    assert round_shift_right_signed(1, 1, convergent=False) == 1
-    assert round_shift_right_signed(3, 1, convergent=False) == 2
-    assert round_shift_right_signed(-1, 1, convergent=False) == 0
-    assert round_shift_right_signed(-3, 1, convergent=False) == -1
+def test_round_shift_right_signed_convergent_true_ties_to_even() -> None:
+    # convergent=True: the pre-H0 round-to-even rule, kept for reference.
+    assert round_shift_right_signed(1, 1, convergent=True) == 0
+    assert round_shift_right_signed(3, 1, convergent=True) == 2
+    assert round_shift_right_signed(-1, 1, convergent=True) == 0
+    assert round_shift_right_signed(-3, 1, convergent=True) == -2
+
+
+@pytest.mark.parametrize("shift", [1, 5, 15, 23, 40])
+@pytest.mark.parametrize("value", [v * 977 - 60000 for v in range(0, 128, 7)] + [-1, 0, 1, 2**31 - 1, -(2**31)])
+def test_round_shift_right_signed_matches_tosa_apply_scale_formula(value: int, shift: int) -> None:
+    # TOSA apply_scale_32 (SINGLE_ROUND) = (value + (1 << (shift - 1))) >> shift with floor shift.
+    assert round_shift_right_signed(value, shift) == (value + (1 << (shift - 1))) >> shift
 
 
 # ---------------------------------------------------------------------------
@@ -684,7 +692,7 @@ def test_pool_max_basic() -> None:
 def test_pool_avg_rounding_behaviour() -> None:
     # 2x2 average pool, sum=10 over 4 taps -> true average 2.5.
     # requant_scale chosen as Q15 scale factor 1/4 = 8192; requant_shift=0
-    # so combined shift is 15; round-half-to-even applies to sum*scale.
+    # so combined shift is 15; round-half-up applies to sum*scale.
     desc = LayerDesc(
         opcode=OPCODE_POOL_AVG, flags=(1 << FLAG_REQUANT_EN),
         in_width=2, in_height=2, in_channels=1,
@@ -818,18 +826,12 @@ def test_fix5_pool_pad_en_raises() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _naive_round_half_even(value: int, shift: int) -> int:
+def _naive_round_half_up(value: int, shift: int) -> int:
+    # Independent formulation of the H0 rule (TOSA apply_scale_32):
+    # add half, then floor-shift. Ties go towards +infinity.
     if shift <= 0:
         return value << (-shift)
-    divisor = 1 << shift
-    q = value // divisor
-    r = value - q * divisor
-    twice = 2 * r
-    if twice < divisor:
-        return q
-    if twice > divisor:
-        return q + 1
-    return q if q % 2 == 0 else q + 1
+    return (value + (1 << (shift - 1))) >> shift
 
 
 def _naive_saturate_int8(value: int) -> int:
@@ -882,7 +884,7 @@ def _naive_conv_generic(
                                 acc += tap * weights[widx]
                 total = acc + (bias[oc] if bias_en else 0)
                 if requant_en:
-                    scaled = _naive_round_half_even(total * requant_scale, 15 + requant_shift)
+                    scaled = _naive_round_half_up(total * requant_scale, 15 + requant_shift)
                 else:
                     scaled = total
                 if relu_en:
@@ -1174,7 +1176,7 @@ def _naive_pool(
                 else:
                     total = sum(taps)
                     if requant_en:
-                        scaled = _naive_round_half_even(total * requant_scale, 15 + requant_shift)
+                        scaled = _naive_round_half_up(total * requant_scale, 15 + requant_shift)
                     else:
                         scaled = total
                     if relu_en:
@@ -1250,24 +1252,24 @@ def test_pool_max_int8_extremes() -> None:
     assert pool_max([-128, -128], desc) == [-128]
 
 
-def test_pool_avg_rounding_half_to_even_explicit() -> None:
+def test_pool_avg_rounding_half_up_explicit() -> None:
     # Two windows whose sums are both odd (so total*scale lands exactly
-    # on a rounding tie at combined_shift=16) but whose quotients have
-    # opposite parity -- demonstrates round-HALF-TO-EVEN, not
-    # round-half-up, for pool_avg specifically (not just round_shift_
-    # right_signed in isolation).
+    # on a rounding tie at combined_shift=16) with quotients of opposite
+    # parity -- demonstrates round-HALF-UP (H0: every tie goes towards
+    # +infinity regardless of parity) for pool_avg specifically, not just
+    # round_shift_right_signed in isolation. Negative tie too.
     desc = LayerDesc(
         opcode=OPCODE_POOL_AVG, flags=(1 << FLAG_REQUANT_EN),
         in_width=2, in_height=1, in_channels=1,
         pool_kernel_h=1, pool_kernel_w=2, pool_stride_h=1, pool_stride_w=2,
         requant_scale=1 << 15, requant_shift=1,  # combined shift = 16
     )
-    # window sum = 5 (odd): 5*32768=163840, /65536 -> q=2 r=32768 (tie),
-    # q even -> stays 2.
-    assert pool_avg([2, 3], desc) == [2]
-    # window sum = 3 (odd): 3*32768=98304, /65536 -> q=1 r=32768 (tie),
-    # q odd -> rounds up to 2.
+    # window sum = 5: 5*32768=163840, /65536 -> q=2 r=32768 (tie) -> 3.
+    assert pool_avg([2, 3], desc) == [3]
+    # window sum = 3: 3*32768=98304, /65536 -> q=1 r=32768 (tie) -> 2.
     assert pool_avg([1, 2], desc) == [2]
+    # window sum = -3: -1.5 -> floor q=-2, tie -> -1.
+    assert pool_avg([-1, -2], desc) == [-1]
 
 
 # ---------------------------------------------------------------------------

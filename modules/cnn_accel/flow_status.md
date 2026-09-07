@@ -810,3 +810,30 @@ Full regression after all three, on this worktree:
 (Whole-repo `pytest` from the root does not work: the untracked `vunit/`
 and `tsfpga/` source clones sitting in the worktree get collected and error
 out. Scope pytest to `modules/` plus the root-level model tests.)
+
+## H0 — requant rounding half-even → half-up (2026-09-07)
+
+Ratified by the TOSA compiler plan (`doc/tosa_compiler_plan.md` §6/§13 H0):
+the compiler refuses to target a half-even accelerator because TOSA
+`apply_scale_32` (SINGLE_ROUND) rounds ties towards +infinity and no exact
+rewrite exists. Change, all three legs together:
+
+- `cnn_accel_bias_requant.vhd`: stage-5 `round_up = guard` (was
+  `guard and (sticky or quotient(0))`). The sticky mask/or-reduce and the
+  parity term are gone — strictly less logic on the S7 critical path.
+  Result is `floor((product + 2^(S-1)) / 2^S)`, `S = 15 + requant_shift`.
+- `cnn_accel_model.py`: `round_shift_right_signed(..., convergent=False)`
+  default (round-to-even kept as an explicit opt-in for reference only).
+- `tb_cnn_accel_bias_requant`: `ref_round_shift_right` ties → `+1`;
+  `test_round_to_even_ties` → `test_round_half_up_ties` (1→1, 3→2,
+  -1→0, -3→-1 at scale 0.5 / combined shift 15).
+- `test_cnn_accel_model.py`: rounding tables, `pool_avg` tie test and the
+  randomized naive reference rewritten for half-up; a new table checks
+  `round_shift_right_signed == (v + 2^(S-1)) >> S` directly.
+- Docs: module doc, `cnn_accel_arch.md` module table.
+
+Verification (vunit-mcp, this clone): `*bias_requant*` **10/10**, then
+`*cnn_accel*` **58/58** (39 s) incl. `conv_core` bit-exact ×4 against the
+model-generated vectors; `pytest modules/cnn_accel` **315 passed**.
+Unblocks compiler M8's real-target end-to-end (`run_program == interp ==
+IREE`), previously an `xfail`.

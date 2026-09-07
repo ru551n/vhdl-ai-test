@@ -126,14 +126,18 @@ architecture tb of tb_cnn_accel_bias_requant is
   -- structurally different derivation from the RTL's own shift-and-
   -- subtract-then-compare-twice-remainder approach.
   --
+  -- Rounding rule: round-half-up (ties towards +infinity, HW milestone
+  -- H0, matching TOSA apply_scale_32 SINGLE_ROUND): +1 iff
+  -- 2*remainder >= divisor.
+  --
   -- Manually cross-checked during authoring (also cross-checked against
-  -- cnn_accel_model.py by hand): accum=3, bias=0, bias_en=0,
+  -- cnn_accel_model.py by hand): accum=1, bias=0, bias_en=0,
   -- requant_scale=16384 (Q15 0.5), requant_shift=0 (combined shift 15):
-  -- product=3*16384=49152; 49152 mod 32768 = 16384 (an exact tie,
-  -- twice_remainder=32768=divisor); quotient=(49152-16384)/32768=1 (odd)
-  -- -> rounds up to 2. requant_en=1, relu_en=0 -> saturate_signed(2,8)=2
-  -- (no saturation). Both this function and a hand check against
-  -- cnn_accel_model.py's round_shift_right_signed(49152, 15) agree: 2.
+  -- product=16384; 16384 mod 32768 = 16384 (an exact tie,
+  -- twice_remainder=32768=divisor); quotient=0 -> rounds up to 1.
+  -- accum=-1: product=-16384; -16384 mod 32768 = 16384 (tie), floor
+  -- quotient=-1 -> rounds up to 0. Both this function and
+  -- cnn_accel_model.py's round_shift_right_signed agree.
   ------------------------------------------------------------------------
 
   function ref_round_shift_right(value : signed; shift : natural) return signed is
@@ -168,15 +172,9 @@ architecture tb of tb_cnn_accel_bias_requant is
 
     if twice_remainder < divisor_wide then
       return resize(quotient, value'length);
-    elsif twice_remainder > divisor_wide then
-      return resize(quotient + 1, value'length);
     else
-      -- Exact tie: round to even (quotient's LSB is its parity bit).
-      if quotient(0) = '0' then
-        return resize(quotient, value'length);
-      else
-        return resize(quotient + 1, value'length);
-      end if;
+      -- >= half, exact ties included: round towards +infinity.
+      return resize(quotient + 1, value'length);
     end if;
   end function;
 
@@ -486,17 +484,18 @@ begin
     do_reset;
     wait until rising_edge(clk);
 
-    if run("test_round_to_even_ties") then
-      -- Directed ties (both parities, both signs) at combined shift=15
-      -- (requant_shift=0), scale=0.5 Q15: product=accum*16384, remainder
-      -- exactly half the divisor (32768) whenever accum is odd.
-      -- accum=1 -> product=16384, quotient=0 (even) -> stays 0.
+    if run("test_round_half_up_ties") then
+      -- Directed ties (both quotient parities, both signs) at combined
+      -- shift=15 (requant_shift=0), scale=0.5 Q15: product=accum*16384,
+      -- remainder exactly half the divisor (32768) whenever accum is odd.
+      -- Half-up: every tie rounds towards +infinity (H0).
+      -- accum=1 -> product=16384 (0.5), quotient=0 -> 1.
       send_directed(1, 0, '0', '1', '0', c_scale_half, 0);
-      -- accum=3 -> product=49152, quotient=1 (odd) -> rounds up to 2.
+      -- accum=3 -> product=49152 (1.5), quotient=1 -> 2.
       send_directed(3, 0, '0', '1', '0', c_scale_half, 0);
-      -- accum=-1 -> product=-16384, quotient=-1 (odd) -> rounds up to 0.
+      -- accum=-1 -> product=-16384 (-0.5), floor quotient=-1 -> 0.
       send_directed(-1, 0, '0', '1', '0', c_scale_half, 0);
-      -- accum=-3 -> product=-49152, quotient=-2 (even) -> stays -2.
+      -- accum=-3 -> product=-49152 (-1.5), floor quotient=-2 -> -1.
       send_directed(-3, 0, '0', '1', '0', c_scale_half, 0);
       drain_and_check(200);
 

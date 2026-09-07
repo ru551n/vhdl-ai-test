@@ -17,10 +17,14 @@ use cnn_accel.cnn_accel_pkg.all;
 -- Per lane (one per output-channel PE row, 'g_pe_rows' lanes total), per
 -- accepted 's_accum' beat:
 --   total  = accum + (bias when cfg_bias_en else 0)
---   scaled = round_to_even(total * cfg_requant_scale, shift = 15 + cfg_requant_shift)
---            -- combined single rounding step: the Q15 fractional shift (15)
---            -- and cfg_requant_shift are folded into one shift amount, per
---            -- the requirement's documented option, so no double-rounding
+--   scaled = round_half_up(total * cfg_requant_scale, shift = 15 + cfg_requant_shift)
+--            -- = floor((product + 2**(shift-1)) / 2**shift): ties round
+--            -- towards +infinity, matching TOSA's `apply_scale_32`
+--            -- (SINGLE_ROUND) so the TOSA->cnn_accel compiler can emit
+--            -- bit-exact programs (HW milestone H0). Combined single
+--            -- rounding step: the Q15 fractional shift (15) and
+--            -- cfg_requant_shift are folded into one shift amount, per the
+--            -- requirement's documented option, so no double-rounding
 --            -- error versus two separate rounding steps.
 --   relu   = max(scaled, 0) when cfg_relu_en, applied BEFORE the int8 clamp
 --   result = saturate_signed(relu, 8)
@@ -337,25 +341,22 @@ begin
     -- 'shift_right' on a signed value is a floor division by 2**shift,
     -- so the remainder 'product mod 2**shift' is exactly the low 'shift'
     -- bits of the product read as unsigned -- for negative products too.
-    -- The old formulation re-multiplied the quotient back up, subtracted
-    -- to get that remainder and then compared 2*remainder against
-    -- 2**shift, which cost a second variable shift, a c_product_width
-    -- subtract and two wide comparators (the bulk of the 25 CARRY4 on
-    -- the measured critical path). The classic guard/sticky form below
-    -- is bit-identical and needs neither:
+    -- Round-half-up (ties towards +infinity, H0) is then just the guard
+    -- bit:
     --
     --   guard  = product(shift - 1)          -- is remainder >= half?
-    --   sticky = or product(shift - 2 .. 0)  -- is remainder > half?
-    --   2*rem <  2**shift  <=>  guard = '0'                -> truncate
-    --   2*rem >  2**shift  <=>  guard = '1' and sticky = '1' -> +1
-    --   2*rem =  2**shift  <=>  guard = '1' and sticky = '0' -> tie,
-    --                                round to even, i.e. +1 iff quotient
-    --                                is odd
-    --   => round_up = guard and (sticky or quotient(0))
+    --   2*rem <  2**shift  <=>  guard = '0'  -> truncate
+    --   2*rem >= 2**shift  <=>  guard = '1'  -> +1   (ties included)
+    --   => round_up = guard
     --
-    -- Still verified bit-exact against cnn_accel_model.py's
+    -- i.e. floor((product + 2**(shift-1)) / 2**shift), identical to
+    -- TOSA's apply_scale_32 (SINGLE_ROUND). No sticky reduction and no
+    -- quotient-parity term are needed any more (the former round-to-even
+    -- rule required both).
+    --
+    -- Verified bit-exact against cnn_accel_model.py's
     -- 'round_shift_right_signed' by the testbench (that is what
-    -- 'test_round_to_even_ties' is for), rather than by this comment.
+    -- 'test_round_half_up_ties' is for), rather than by this comment.
     --
     -- 'math.truncate_round_signed' is still not usable here: its number
     -- of removed LSBs is fixed by generics at elaboration time, whereas
@@ -366,34 +367,13 @@ begin
 
     round_shift_proc : process(all)
       variable product_u : unsigned(c_product_width - 1 downto 0);
-      variable low_mask : unsigned(c_product_width - 1 downto 0);
       variable shift_amt : shift_t;
-      variable quotient : signed(c_product_width - 1 downto 0);
-      variable guard : std_ulogic;
-      variable sticky : std_ulogic;
     begin
       shift_amt := shift_p(4);
       product_u := unsigned(prod_4(l));
 
-      quotient := shift_right(prod_4(l), shift_amt);
-
-      guard := product_u(shift_amt - 1);
-
-      -- Mask of the bits strictly below the guard bit. Built as a
-      -- per-bit compare against the (registered) shift amount so it
-      -- synthesizes to one level of decode logic, not a subtractor
-      -- chain, and so the sticky bit is one balanced 'or' reduction.
-      for i in 0 to c_product_width - 1 loop
-        if i < shift_amt - 1 then
-          low_mask(i) := '1';
-        else
-          low_mask(i) := '0';
-        end if;
-      end loop;
-      sticky := or std_ulogic_vector(product_u and low_mask);
-
-      quot_next(l) <= quotient;
-      round_up_next(l) <= guard and (sticky or quotient(0));
+      quot_next(l) <= shift_right(prod_4(l), shift_amt);
+      round_up_next(l) <= product_u(shift_amt - 1);
     end process;
 
     --------------------------------------------------------------------
