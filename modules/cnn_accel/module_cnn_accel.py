@@ -25,6 +25,7 @@ if str(_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(_MODULE_DIR))
 
 import cnn_accel_constants  # noqa: E402
+import generate_vectors  # noqa: E402
 from cnn_accel_isa_generator import CnnAccelIsaPackageGenerator  # noqa: E402
 
 if TYPE_CHECKING:
@@ -41,6 +42,9 @@ if TYPE_CHECKING:
 # golden model), so there is exactly one place to edit each number; these
 # names are unchanged so nothing downstream in this file has to change.
 _PE_ROWS = cnn_accel_constants.PE_ROWS
+# The 60 fps scaling point, proven by CI/local builds and tests next to
+# the default without replacing it (flow_status.md S1-S7).
+_PE_ROWS_SCALED = cnn_accel_constants.PE_ROWS_SCALED
 _PE_COLS = cnn_accel_constants.PE_COLS
 _TILE_CHANNELS = cnn_accel_constants.TILE_CHANNELS  # = _PE_COLS, see proposal section 3.
 _MAX_KERNEL_SIZE = cnn_accel_constants.MAX_KERNEL_SIZE
@@ -785,7 +789,9 @@ class Module(BaseModule):
         # above (`cnn_accel_axi_read_dma`/`cnn_accel_ofmap_dma` excluded:
         # under concurrent development elsewhere, not yet registered here),
         # using the same generics as the matching Yosys build so the two are
-        # directly comparable. Registered ONLY when this machine actually
+        # directly comparable, plus the two `_pe_rows_16` scaled-point
+        # entries at the end, which are Vivado-only by decision (this
+        # project synthesizes with Vivado; the Yosys set is not extended). Registered ONLY when this machine actually
         # has Vivado -- see `ghdl_yosys_env.resolve_vivado_path()`'s
         # docstring for why that guard is mandatory rather than defensive
         # (CI's hdl-docker image has no Vivado, and
@@ -996,6 +1002,86 @@ class Module(BaseModule):
                         DspBlocks(EqualTo(36)),
                     ],
                 ),
+                # The 60 fps scaling point (flow_status.md S1-S7:
+                # `PE_ROWS_SCALED`, THE single scaling knob doubled, every
+                # other generic identical to the shipped default above).
+                # Proven here on the authoritative backend only -- this
+                # project synthesizes with Vivado, there is deliberately no
+                # Yosys twin of these two -- so the "does 16 rows still fit
+                # the XC7A200T" question has a real answer without changing
+                # the default. The scaled point exists to be measured, so
+                # both entries below are sized against a real run at
+                # g_pe_rows=16, not extrapolated from the 8-row numbers:
+                # pe_array's MAC array and bias_requant's requant lanes both
+                # scale linearly with rows, weight_buffer's lane count and
+                # bias width too, window_gen not at all.
+                vivado_build(
+                    f"cnn_accel_pe_array_pe_rows_{_PE_ROWS_SCALED}",
+                    "cnn_accel_pe_array",
+                    {
+                        "g_pe_rows": _PE_ROWS_SCALED,
+                        "g_pe_cols": _PE_COLS,
+                        "g_accum_width": _ACCUM_WIDTH,
+                        "g_max_kernel_size": _MAX_KERNEL_SIZE,
+                        "g_tile_channels": _TILE_CHANNELS,
+                        "g_weight_buffer_depth": _WEIGHT_BUFFER_DEPTH,
+                    },
+                    # Measured 2026-09 (Vivado 2026.1): 13136 LUTs, 1642 FFs,
+                    # 0 BRAM, 0 DSP -- LUTs 1.94x the 8-row 6778, i.e. the
+                    # MAC array scales linearly with rows as it must (128
+                    # int8 lanes instead of 64), FFs less than 2x because
+                    # the control/address side does not scale at all. 0 DSP
+                    # for the same reason as the 8-row entry above (the
+                    # `is_valid`-gated accumulate keeps the whole MAC array
+                    # in LUT fabric), and the accumulators still live in
+                    # flip-flops (0 BRAM), both unchanged by the knob.
+                    checkers=[
+                        TotalLuts(LessThan(13800)),
+                        Ffs(LessThan(1750)),
+                        Ramb36(LessThan(1)),
+                        Ramb18(LessThan(1)),
+                        DspBlocks(LessThan(1)),
+                    ],
+                ),
+                vivado_build(
+                    f"cnn_accel_conv_core_pe_rows_{_PE_ROWS_SCALED}",
+                    "cnn_accel_conv_core",
+                    {
+                        "g_max_kernel_size": _MAX_KERNEL_SIZE,
+                        "g_pe_rows": _PE_ROWS_SCALED,
+                        "g_pe_cols": _PE_COLS,
+                        "g_accum_width": _ACCUM_WIDTH,
+                        "g_tile_channels": _TILE_CHANNELS,
+                        "g_max_row_tile_words": _MAX_ROW_TILE_WORDS,
+                        "g_weight_buffer_depth": _WEIGHT_BUFFER_DEPTH,
+                        "g_bias_buffer_depth": _BIAS_BUFFER_DEPTH,
+                    },
+                    # Measured 2026-09 (Vivado 2026.1): 29253 LUTs, 4219 FFs,
+                    # 24 RAMB36 + 3 RAMB18 (27 total), 68 DSP, 0 LUTRAM --
+                    # the 60 fps system-footprint number, the whole reason
+                    # this entry exists: 1.9x the 8-row 15358 LUTs, well
+                    # inside the XC7A200T (134600 LUTs, 365 RAMB36, 740
+                    # DSP), so the scaled point fits with room for the DMAs,
+                    # CSR and sequencer still to come. Leaf additivity holds
+                    # exactly for DSP: 64 (bias_requant, 4 per requant lane
+                    # x 16 lanes, was 32 at 8 rows) + 4 (window_gen, address
+                    # arithmetic, row-independent) + 0 + 0 = 68. BRAM 16 ->
+                    # 27 is weight_buffer alone (twice the weight lanes and
+                    # twice the bias-row width; window_gen's 3 line banks
+                    # do not scale with rows).
+                    #
+                    # Unconstrained logic-level report shows 32 endpoints at
+                    # 102-105 levels (none above 35 in pe_array alone), so
+                    # the deep paths sit in bias_requant/weight_buffer; see
+                    # the 150 MHz constrained-build item in flow_status.md.
+                    checkers=[
+                        TotalLuts(LessThan(30500)),
+                        Ffs(LessThan(4450)),
+                        Ramb36(EqualTo(24)),
+                        Ramb18(EqualTo(3)),
+                        DspBlocks(EqualTo(68)),
+                    ],
+                ),
             ]
 
         return projects
@@ -1053,29 +1139,39 @@ class Module(BaseModule):
         # Cross-language (Python packer -> real RTL) bit-exactness guard for
         # the D10 weight-lane-order defect, see
         # tb_cnn_accel_pe_array_from_vectors.vhd's own header comment.
-        # 'vectors_path' must be an absolute path (the simulator's own
-        # working directory is not this module's concern) -- self.path is
-        # tsfpga's own per-module root, so this is correct regardless of
-        # where run.py/vunit-mcp actually invokes the simulator from.
+        # The vectors are generated into VUnit's own per-test 'output_path'
+        # by the pre_config hook right before simulation (the testbench
+        # reads '<output_path>/pe_array_xlang_check'); nothing is checked
+        # in and nothing is read from the repository.
         tb = library.test_bench("tb_cnn_accel_pe_array_from_vectors")
-        vectors_path = self.path / "test" / "vectors" / "pe_array_xlang_check"
+
+        def pre_config(output_path: str) -> bool:
+            generate_vectors.generate_pe_array_xlang_case(
+                generate_vectors.hw_packing(Path(output_path))
+            )
+            return True
 
         for test in tb.get_tests():
-            self.add_vunit_config(
-                test=test,
-                generics={"vectors_path": str(vectors_path)},
-            )
+            self.add_vunit_config(test=test, pre_config=pre_config)
 
     def _setup_cnn_accel_conv_core(self, library) -> None:
         # Cross-language (Python golden model -> composed RTL) bit-exactness
         # guard for the full window_gen -> pe_array -> bias_requant
         # composition, see tb_cnn_accel_conv_core.vhd's own header comment.
-        # 'vectors_root' must be an absolute path (the simulator's own
-        # working directory is not this module's concern) -- self.path is
-        # tsfpga's own per-module root, so this is correct regardless of
-        # where run.py/vunit-mcp actually invokes the simulator from.
+        # Vectors are generated into VUnit's own per-config 'output_path'
+        # by each config's pre_config hook right before simulation, at that
+        # config's `g_pe_rows` packing point; nothing is checked in and
+        # nothing is read from the repository.
         tb = library.test_bench("tb_cnn_accel_conv_core")
-        vectors_root = self.path / "test" / "vectors"
+
+        def make_pre_config(pe_rows: int):
+            def pre_config(output_path: str) -> bool:
+                generate_vectors.generate_conv_core_cases(
+                    generate_vectors.hw_packing(Path(output_path), pe_rows=pe_rows)
+                )
+                return True
+
+            return pre_config
 
         for test in tb.get_tests():
             # Zero stall on both links only for the dedicated
@@ -1085,14 +1181,28 @@ class Module(BaseModule):
             # identical `_setup_*` precedent.
             stall = 0 if "full_throughput" in test.name else 20
 
-            self.add_vunit_config(
-                test=test,
-                generics={
-                    "stall_probability_percent_in": stall,
-                    "stall_probability_percent_out": stall,
-                    "vectors_root": str(vectors_root),
-                },
-            )
+            # One config per legal `g_pe_rows` (S1: the single scaling
+            # knob). The default (`PE_ROWS`, 8) and the CI-proven scaled
+            # point (`PE_ROWS_SCALED`, 16) each get their own generated
+            # root, packed at that many lanes per weight row; the scaled
+            # one carries the extra 16-output-channel case that only
+            # exists there. The testbench cross-checks each case's
+            # desc.txt `pe_rows` against its generic, so a root/generic
+            # mix-up here fails by name rather than as a data mismatch.
+            # The default is deliberately not renamed: its test names are
+            # unchanged, the scaled config is the one that grows a
+            # `.g_pe_rows_16` suffix.
+            for pe_rows in cnn_accel_constants.PE_ROWS_LEGAL:
+                self.add_vunit_config(
+                    test=test,
+                    name=None if pe_rows == cnn_accel_constants.PE_ROWS else f"g_pe_rows_{pe_rows}",
+                    generics={
+                        "stall_probability_percent_in": stall,
+                        "stall_probability_percent_out": stall,
+                        "g_pe_rows": pe_rows,
+                    },
+                    pre_config=make_pre_config(pe_rows),
+                )
 
     def _setup_cnn_accel_pool(self, library) -> None:
         tb = library.test_bench("tb_cnn_accel_pool")

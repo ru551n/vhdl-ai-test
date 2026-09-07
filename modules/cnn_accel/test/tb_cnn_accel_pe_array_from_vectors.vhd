@@ -45,15 +45,19 @@ use cnn_accel.cnn_accel_pkg.all;
 -- point); if that case's shape ever changes, these must change with it.
 entity tb_cnn_accel_pe_array_from_vectors is
   generic (
-    -- Absolute path to modules/cnn_accel/test/vectors/pe_array_xlang_check,
-    -- set by module_cnn_accel.py (self.path-derived, so it is correct
-    -- regardless of the simulator's own working directory).
-    vectors_path : string;
+    -- VUnit's own per-test output directory, filled in by VUnit itself.
+    -- module_cnn_accel.py's pre_config hook runs generate_vectors.
+    -- generate_pe_array_xlang_case() into it right before the simulation
+    -- starts, so the case is read from '<output_path>/pe_array_xlang_check'
+    -- -- nothing is read from the repository, no vector is checked in.
+    output_path : string;
     runner_cfg : string
   );
 end entity tb_cnn_accel_pe_array_from_vectors;
 
 architecture tb of tb_cnn_accel_pe_array_from_vectors is
+
+  constant vectors_path : string := output_path & "/pe_array_xlang_check";
 
   -- Must match generate_vectors.py's pe_array_xlang_check case
   -- (HW_TILE_CHANNELS/HW_PE_ROWS) and desc.txt exactly -- see this file's
@@ -129,7 +133,7 @@ architecture tb of tb_cnn_accel_pe_array_from_vectors is
   ------------------------------------------------------------------------
   -- Vector-file reader: one signed decimal integer per line, no header --
   -- exactly generate_vectors.py's own '_write_int_lines' format (see
-  -- test/vectors/README.md).
+  -- doc/cnn_accel_test_vectors.md).
   ------------------------------------------------------------------------
 
   procedure read_int_file(file_name : string; data : out flat_int_arr_t) is

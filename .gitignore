@@ -13,3 +13,10 @@ tsfpga_mcp_out/
 # modules/cnn_accel/cnn_accel_constants.py; never hand-edited, never checked in.
 regs_src/
 regs_sim/
+
+# cnn_accel golden-model test vectors are generated at test time by
+# modules/cnn_accel/module_cnn_accel.py's VUnit pre_config hooks straight into
+# each test's output_path (see modules/cnn_accel/generate_vectors.py). Never
+# checked in; this only guards manual `python generate_vectors.py` runs that
+# happen to target the module tree.
+modules/cnn_accel/test/vectors*/

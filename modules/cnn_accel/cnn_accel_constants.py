@@ -39,9 +39,26 @@ from typing import NamedTuple
 # instead of via a generic that some instantiation site might get wrong.
 # ---------------------------------------------------------------------------
 
+# PE_ROWS is THE single scaling knob (flow_status.md S1-S7): output-channel
+# lanes, i.e. the number of output channels computed per pass over the
+# ifmap. 8 is the shipped default (~30 fps on the 320x240 target, see
+# doc/cnn_accel_sizing_proposal.md); 16 is the 60 fps point that CI proves
+# in parallel (netlist builds + tb_cnn_accel_conv_core config in
+# module_cnn_accel.py, vectors generated per config at test time) WITHOUT
+# changing the default. PE_COLS and TILE_CHANNELS are fixed forever.
 PE_ROWS = 8
+# Every legal value must divide every layer's out_channels in the target
+# backbone (layer 1 has 16), and must keep 8*PE_ROWS <= axi_stream_data_sz
+# (128) for cnn_accel_bias_requant's int8 output beat -- both of which cap
+# the set at exactly these two. Asserted here and in cnn_accel_conv_core.vhd.
+PE_ROWS_LEGAL = (8, 16)
+PE_ROWS_SCALED = 16
 PE_COLS = 8
 TILE_CHANNELS = 8  # = PE_COLS, see doc/cnn_accel_tiled_dataflow_proposal.md section 3.
+
+assert PE_ROWS in PE_ROWS_LEGAL, f"PE_ROWS={PE_ROWS} not in {PE_ROWS_LEGAL}"
+assert PE_ROWS_SCALED in PE_ROWS_LEGAL, f"PE_ROWS_SCALED={PE_ROWS_SCALED} not in {PE_ROWS_LEGAL}"
+assert PE_ROWS_SCALED != PE_ROWS, "PE_ROWS_SCALED must be a second, distinct legal point"
 MAX_KERNEL_SIZE = 3
 MAX_ROW_TILE_WORDS = 512
 WEIGHT_BUFFER_DEPTH = 288
