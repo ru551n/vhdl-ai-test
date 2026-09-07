@@ -408,7 +408,7 @@ Basis: `doc/cnn_accel_sizing_proposal.md` (8x8 = 34.9 fps at 150 MHz on
 | S4 | **Legal values {8, 16}**, asserted in VHDL and Python: must divide every layer's `out_channels` (layer 1 has 16). |
 | S5 | **Frame budget is a failing test.** `CLOCK_HZ`, `TARGET_FPS`, `INPUT_W/H` in `cnn_accel_constants.py`; the section-6 cycle model becomes Python and pytest asserts the budget with the exact shortfall. |
 | S6 | **Ofmap layout = channel-tiled planes `[C/8][H][W][8]`, T fixed at 8, independent of `g_pe_rows`.** Every write is contiguous; a 16-row pass writes two planes as two ordinary `dma_req`s. `dma_req_t` unchanged, `ofmap_dma` stays thin. **Resolves the strided-write-back blocker** from the M8 entry. Costs: `layer_ctrl` issues `ceil(C/8)` read requests per ifmap row; host repacks the final output once. Must be written into `cnn_accel_arch.md` and the `layer_ctrl` proposal's section-7 request formulas. |
-| S7 | **150 MHz timing constrained after the 16-row build exists**, not before. Until then no fps figure is timing-backed. |
+| S7 | **150 MHz timing constrained after the 16-row build exists**, not before. Until then no fps figure is timing-backed. Option 1 (synthesis-only estimate) done 2026-09-07 — see "S7 progress" below: `pe_array`/`conv_core` do **not** meet 150 MHz, timing fix in progress. Option 2 (real place-and-route closure) stays deferred until `cnn_accel_top` exists (M10-M13). |
 
 ### S1/S2/S4 progress, 2026-09-07
 
@@ -473,4 +473,52 @@ Basis: `doc/cnn_accel_sizing_proposal.md` (8x8 = 34.9 fps at 150 MHz on
 Also committed this date: M9a `cnn_accel_axi_read_dma` (`efc96e6`), M9b
 `cnn_accel_ofmap_dma` (`4c5953e`), dual Vivado/Yosys backend (`d513958`),
 hdl-registers single-source-of-truth constants (`967562b`). Phase table
+
+### S7 progress, 2026-09-07 — option 1 done, timing fix delegated
+
+Option 1 ratified by the user: a fast, synthesis-only (no place-and-route)
+150 MHz estimate via tsfpga's `analyze_synthesis_timing=True`
+(`VivadoNetlistProject`), not a hand-rolled XDC+hook (tried first, reverted
+— Vivado post-synthesis hooks cannot reliably read back clock/constraint
+state; see the `vivado-gotchas` skill). Applied to the six entities the
+unconstrained logic-level report flagged as hosting the deepest paths:
+`bias_requant`, `weight_buffer`, `pe_array` and `conv_core` (both 8- and
+16-row).
+
+**Side effect discovered and handled**: `analyze_synthesis_timing=True`
+adds a real `create_clock -period 2.000ns` (500 MHz) constraint that is
+live *during synthesis itself*, not just the post-hoc `report_timing` step
+— see the `vivado-gotchas` skill for the mechanism. This shifted LUT/FF/BRAM
+counts for the same RTL/generics and broke 3 of the 6 previously-pinned
+`build_result_checkers` (`weight_buffer`'s RAMB18, `conv_core`'s
+LUTs/FFs/RAMB36, `conv_core_pe_rows_16`'s FFs/RAMB36/RAMB18). All six
+checkers and their "Measured" comments in `module_cnn_accel.py` were
+re-measured and re-pinned against the new (permanent, since this flag stays
+on) constrained-synthesis numbers — not a design regression.
+
+**Result** (`Fmax = 1e9 / (2.000ns - slack_ns)`, from each build's
+`timing.rpt`):
+
+| Entity | Fmax estimate | vs. 150 MHz |
+|---|---|---|
+| `bias_requant` | 520.02 MHz | PASS |
+| `weight_buffer` | 257.80 MHz | PASS |
+| `pe_array` (8-row) | 56.52 MHz | **FAIL** |
+| `pe_array` (16-row) | 56.44 MHz | **FAIL** |
+| `conv_core` (8-row) | 46.77 MHz | **FAIL** |
+| `conv_core` (16-row) | 45.38 MHz | **FAIL** |
+
+`pe_array`/`conv_core` are ~1/3 of target, and essentially row-count
+independent (56.52 vs 56.44 MHz; 46.77 vs 45.38 MHz) — the critical path is
+inside one PE lane's MAC/accumulate chain, not across the array, and
+composition (`conv_core` vs. standalone `pe_array`) does not materially
+change it either.
+
+**Not fixed in this pass, by design**: analyzing the actual critical path
+and restructuring the RTL to close it is real timing-closure work, not
+mechanical measurement. Per the project's standing rule (now in the
+`vivado-gotchas` skill: "always delegate timing analysis and timing fixes to
+a strong model"), this is handed to a strong-tier subagent rather than done
+inline by the orchestrating agent. Track its outcome in a follow-up entry
+here once done.
 row "AXI-facing engines" is now two-thirds complete; `cnn_accel_csr` remains.

@@ -381,6 +381,82 @@ class Module(BaseModule):
         )
         from tsfpga.yosys.project import YosysXilinxNetlistBuild
 
+        # S7 (flow_status.md), option 1 ratified by the user: a fast,
+        # synthesis-only (no place-and-route) 150 MHz timing estimate,
+        # via tsfpga's own `analyze_synthesis_timing=True` on the entities
+        # the unconstrained logic-level report flagged as hosting the deep
+        # (102-105 level) paths -- `pe_array`/`conv_core` (both row counts)
+        # and `bias_requant`/`weight_buffer`. This auto-detects the `clk`
+        # port, runs `create_clock`+`open_run`+`report_timing -setup`
+        # (`tsfpga/vivado/tcl.py`'s `_synthesis()`) and populates
+        # `build_result.maximum_synthesis_frequency_hz`.
+        #
+        # NOT wired up as a `build_result_checker`: `VivadoNetlistProject
+        # .build()` calls `self._check_size(build_result=result)` (which
+        # runs every `build_result_checkers` entry) *before* it computes
+        # `maximum_synthesis_frequency_hz` a few lines further down in the
+        # same method (tsfpga 2026.1-era source, `vivado/project.py`
+        # `build()`) -- so a checker reading that field always sees `None`,
+        # regardless of the real number. Verified empirically: a checker
+        # class doing exactly this raised on every entity, including ones
+        # whose `timing.rpt` on disk showed a real, easily-passing slack
+        # number. This is a genuine tsfpga ordering bug/limitation, not a
+        # design-side mistake -- do not "fix" it by making the checker
+        # swallow `None` (that would silently stop checking anything).
+        #
+        # Until tsfpga fixes the ordering (or this project forks
+        # `VivadoNetlistProject.build()` to reorder it), the frequency
+        # number is real and tool-produced but only available in the
+        # printed build summary / `timing.rpt`, not as an automated gate --
+        # so it is measured by hand and pinned as a comment below, the same
+        # way every LUT/FF/BRAM/DSP number in this Vivado section already
+        # is (see the module-level comment above `vivado_path =
+        # resolve_vivado_path()` for why that is the established pattern
+        # here, not a shortcut). A prior attempt at a custom
+        # `STEPS.SYNTH_DESIGN.TCL.POST` hook doing `create_clock` +
+        # `get_timing_paths` independently confirmed Vivado post-synthesis
+        # hooks are unreliable for this (empty `get_clocks` at hook time) --
+        # matching tsfpga's own maintainer comment in `tcl.py`
+        # ("post-synthesis hooks ... seems to be very bugged"), which is
+        # why tsfpga puts these calls directly in the build script instead
+        # of a hook, and why this project does not reinvent that path.
+        #
+        # Full timing closure (option 2, real place-and-route) is deferred
+        # until `cnn_accel_top` exists (M10-M13).
+        #
+        # IMPORTANT side effect discovered while measuring these six builds:
+        # `analyze_synthesis_timing=True` is NOT a pure post-hoc analysis
+        # switch. `VivadoNetlistProject.create()` unconditionally appends an
+        # "early"-processing-order auto-clock constraint file, and only
+        # populates it with a real `create_clock -period 2.000ns` (500 MHz,
+        # `_clock_period_ns` in `vivado/project.py`) on the `clk` port when
+        # this flag is set -- and that file is read via `read_xdc` and left
+        # `USED_IN_SYNTHESIS` (default), so it is live *during synthesis
+        # itself*, not just the post-synthesis `open_run`/`report_timing`
+        # step. Turning this on therefore changes Vivado's actual
+        # area/timing tradeoffs (retiming, BRAM-cascade choices, etc), which
+        # is why the six "Measured" comments below now differ from the
+        # pre-S7 unconstrained-synthesis numbers for the same RTL/generics,
+        # and why three of the six needed their `checkers=[...]` values
+        # re-pinned (weight_buffer's RAMB18, conv_core's LUTs/FFs/RAMB36,
+        # conv_core_pe_rows_16's FFs/RAMB36/RAMB18) -- not a regression, a
+        # different (and now permanent, since this flag stays on) synthesis
+        # configuration. Do not silently "fix" a future checker failure here
+        # by assuming the RTL changed without checking the diff first.
+        #
+        # Result across the six: bias_requant (520.02 MHz) and
+        # weight_buffer (257.80 MHz) clear 150 MHz comfortably.
+        # pe_array (56.52/56.44 MHz for 8/16 rows) and conv_core
+        # (46.77/45.38 MHz for 8/16 rows) do **not** -- roughly a third of
+        # target, and essentially row-count-independent, meaning the
+        # critical path is inside one PE lane's MAC/accumulate chain, not
+        # across the array. Analyzing the actual critical path and fixing
+        # it (pipelining `compute_partial_sums` in `cnn_accel_pe_array.vhd`
+        # or similar) is real RTL/timing work, delegated to a
+        # strong-model subagent per this project's standing rule (see
+        # `vivado-gotchas` skill): always use a strong model to analyze and
+        # fix timing, never a quick pass by the orchestrating agent.
+
         modules = get_modules(
             modules_folder=self.path.parent, names_include={self.name}
         ) + get_modules(
@@ -856,7 +932,11 @@ class Module(BaseModule):
             from tsfpga.vivado.project import VivadoNetlistProject
 
             def vivado_build(
-                name: str, top: str, generics: dict, checkers: list
+                name: str,
+                top: str,
+                generics: dict,
+                checkers: list,
+                analyze_synthesis_timing: bool = False,
             ) -> VivadoNetlistProject:
                 return VivadoNetlistProject(
                     name=f"{name}_vivado",
@@ -866,6 +946,7 @@ class Module(BaseModule):
                     generics=generics,
                     build_result_checkers=checkers,
                     vivado_path=vivado_path,
+                    analyze_synthesis_timing=analyze_synthesis_timing,
                     defined_at=Path(__file__),
                 )
 
@@ -878,11 +959,20 @@ class Module(BaseModule):
                         "g_pe_rows": _PE_ROWS,
                         "g_bias_addr_width": 9,
                     },
-                    # Measured 2026-09: 4906 LUTs, 66 FFs, 0 BRAM, 32 DSP.
-                    # DSP count matches Yosys's own 32 exactly -- this
-                    # entity's requant multiply is wide enough (not a tiny
-                    # int8 x int8) that both tools map it to DSP48E1 the
-                    # same way, unlike pe_array (see that entry below).
+                    # Measured 2026-09 with `analyze_synthesis_timing=True`
+                    # (real 500 MHz `create_clock` active during synthesis,
+                    # not just post-hoc analysis -- see the S7 module-level
+                    # comment above): 4906 LUTs, 66 FFs, 0 BRAM, 32 DSP,
+                    # unchanged from the unconstrained baseline (this entity
+                    # was already tight enough that the extra clock
+                    # constraint did not shift its mapping). DSP count
+                    # matches Yosys's own 32 exactly -- this entity's
+                    # requant multiply is wide enough (not a tiny int8 x
+                    # int8) that both tools map it to DSP48E1 the same way,
+                    # unlike pe_array (see that entry below).
+                    # 150 MHz timing estimate: PASS, 520.02 MHz (0.077 ns
+                    # positive slack against the 2.000 ns/500 MHz auto-clock,
+                    # `Fmax = 1e9 / (2.000 - slack_ns)`.
                     checkers=[
                         TotalLuts(LessThan(5200)),
                         Ffs(LessThan(80)),
@@ -890,6 +980,7 @@ class Module(BaseModule):
                         Ramb18(LessThan(1)),
                         DspBlocks(EqualTo(32)),
                     ],
+                    analyze_synthesis_timing=True,
                 ),
                 vivado_build(
                     "cnn_accel_pool",
@@ -919,20 +1010,30 @@ class Module(BaseModule):
                         "g_pe_cols": _PE_COLS,
                         "g_accum_width": _ACCUM_WIDTH,
                     },
-                    # Measured 2026-09: 848 LUTs, 820 FFs, 11 RAMB36 +
-                    # 2 RAMB18 (13 total), 0 DSP. BRAM is close to Yosys's
-                    # 15 (both far below the pre-rework 72) but not
-                    # identical: Vivado also puts the depth-32 prefetch
-                    # FIFO in block RAM here, where Yosys's RAM32M-based
-                    # distributed-RAM mapping for that same FIFO shows up
-                    # as LUTs instead (see conv_core_vivado's own comment).
+                    # Measured 2026-09 with `analyze_synthesis_timing=True`
+                    # (real 500 MHz `create_clock` active during synthesis --
+                    # see the S7 module-level comment above): 880 LUTs,
+                    # 855 FFs, 11 RAMB36 + *1* RAMB18 (12 total), 0 DSP.
+                    # RAMB18 dropped from the unconstrained baseline's 2 to
+                    # 1 -- turning on the clock constraint changed Vivado's
+                    # BRAM-cascade decision for the depth-32 prefetch FIFO,
+                    # not a regression in this project's RTL. LUT/FF also
+                    # moved up slightly (were 848/820) for the same reason.
+                    # BRAM is close to Yosys's 15 (both far below the
+                    # pre-rework 72) but not identical: Vivado also puts the
+                    # depth-32 prefetch FIFO in block RAM here, where
+                    # Yosys's RAM32M-based distributed-RAM mapping for that
+                    # same FIFO shows up as LUTs instead (see
+                    # conv_core_vivado's own comment).
+                    # 150 MHz timing estimate: PASS, 257.80 MHz.
                     checkers=[
                         TotalLuts(LessThan(950)),
                         Ffs(LessThan(900)),
                         Ramb36(EqualTo(11)),
-                        Ramb18(EqualTo(2)),
+                        Ramb18(EqualTo(1)),
                         DspBlocks(LessThan(1)),
                     ],
+                    analyze_synthesis_timing=True,
                 ),
                 vivado_build(
                     "cnn_accel_window_gen",
@@ -971,9 +1072,14 @@ class Module(BaseModule):
                         "g_tile_channels": _TILE_CHANNELS,
                         "g_weight_buffer_depth": _WEIGHT_BUFFER_DEPTH,
                     },
-                    # Measured 2026-09: 6778 LUTs, 1126 FFs, 0 BRAM,
-                    # *0* DSP. This is the one genuinely surprising number
-                    # in this whole set: constraint/prior assumption said
+                    # Measured 2026-09 with `analyze_synthesis_timing=True`
+                    # (real 500 MHz `create_clock` active during synthesis --
+                    # see the S7 module-level comment above): 7068 LUTs,
+                    # 1136 FFs (were 6778/1126 unconstrained -- both still
+                    # comfortably inside the `LessThan` margins below, so no
+                    # checker change needed here), 0 BRAM, *0* DSP. This is
+                    # the one genuinely surprising number in this whole set:
+                    # constraint/prior assumption said
                     # Vivado would pack the 64 int8 x int8 MAC lanes two per
                     # DSP48E1 (32 DSPs), by analogy with how it packs
                     # `bias_requant`'s multiply. A real measurement says
@@ -1002,6 +1108,12 @@ class Module(BaseModule):
                     # is unchanged from the Yosys entry's own
                     # `BlockRams(LessThan(1))` rule: this entity's
                     # accumulators must stay in flip-flops on both backends.
+                    # 150 MHz timing estimate: **FAIL**, 56.52 MHz --
+                    # roughly a third of the 150 MHz target. This is the
+                    # deep MAC-array accumulate chain, and is the dominant
+                    # bottleneck for conv_core too (see below); delegated to
+                    # a strong-model timing analysis/fix, not hand-waved --
+                    # see flow_status.md S7.
                     checkers=[
                         TotalLuts(LessThan(7200)),
                         Ffs(LessThan(1200)),
@@ -1009,6 +1121,7 @@ class Module(BaseModule):
                         Ramb18(LessThan(1)),
                         DspBlocks(LessThan(1)),
                     ],
+                    analyze_synthesis_timing=True,
                 ),
                 vivado_build(
                     "cnn_accel_conv_core",
@@ -1023,22 +1136,32 @@ class Module(BaseModule):
                         "g_weight_buffer_depth": _WEIGHT_BUFFER_DEPTH,
                         "g_bias_buffer_depth": _BIAS_BUFFER_DEPTH,
                     },
-                    # Measured 2026-09: 15358 LUTs, 2824 FFs, 14 RAMB36 +
-                    # 2 RAMB18 (16 total), 36 DSP, 0 LUTRAM -- the
-                    # system-footprint number ("does the accelerator fit an
-                    # XC7A200T") this whole Vivado backend exists for.
-                    # See the Yosys `cnn_accel_conv_core` entry above for
-                    # the full leaf-additivity cross-check and the
-                    # DSP-attribution correction (32 from bias_requant + 4
-                    # from window_gen + 0 + 0, NOT 32 from pe_array as an
-                    # earlier version of that comment assumed).
+                    # Measured 2026-09 with `analyze_synthesis_timing=True`
+                    # (real 500 MHz `create_clock` active during synthesis --
+                    # see the S7 module-level comment above): 16115 LUTs,
+                    # 3080 FFs, 10 RAMB36 + 2 RAMB18 (12 total), 36 DSP,
+                    # 0 LUTRAM -- the system-footprint number ("does the
+                    # accelerator fit an XC7A200T") this whole Vivado
+                    # backend exists for. LUT/FF grew and RAMB36 shrank
+                    # (were 15358/2824/14 unconstrained) for the same reason
+                    # as weight_buffer above: the real clock constraint
+                    # changes Vivado's area/timing tradeoffs, it is not a
+                    # regression. DSP additivity is unaffected by the
+                    # constraint (32 from bias_requant + 4 from window_gen +
+                    # 0 + 0 = 36); see the Yosys `cnn_accel_conv_core` entry
+                    # above for the full leaf-additivity cross-check.
+                    # 150 MHz timing estimate: **FAIL**, 46.77 MHz -- close
+                    # to pe_array's standalone 56.52 MHz, confirming the
+                    # bottleneck is inside the MAC array, not introduced by
+                    # composition. See flow_status.md S7.
                     checkers=[
-                        TotalLuts(LessThan(16000)),
-                        Ffs(LessThan(3000)),
-                        Ramb36(EqualTo(14)),
+                        TotalLuts(LessThan(16300)),
+                        Ffs(LessThan(3200)),
+                        Ramb36(EqualTo(10)),
                         Ramb18(EqualTo(2)),
                         DspBlocks(EqualTo(36)),
                     ],
+                    analyze_synthesis_timing=True,
                 ),
                 # The 60 fps scaling point (flow_status.md S1-S7:
                 # `PE_ROWS_SCALED`, THE single scaling knob doubled, every
@@ -1064,15 +1187,26 @@ class Module(BaseModule):
                         "g_tile_channels": _TILE_CHANNELS,
                         "g_weight_buffer_depth": _WEIGHT_BUFFER_DEPTH,
                     },
-                    # Measured 2026-09 (Vivado 2026.1): 13136 LUTs, 1642 FFs,
-                    # 0 BRAM, 0 DSP -- LUTs 1.94x the 8-row 6778, i.e. the
-                    # MAC array scales linearly with rows as it must (128
-                    # int8 lanes instead of 64), FFs less than 2x because
-                    # the control/address side does not scale at all. 0 DSP
-                    # for the same reason as the 8-row entry above (the
-                    # `is_valid`-gated accumulate keeps the whole MAC array
-                    # in LUT fabric), and the accumulators still live in
-                    # flip-flops (0 BRAM), both unchanged by the knob.
+                    # Measured 2026-09 (Vivado 2026.1) with
+                    # `analyze_synthesis_timing=True` (real 500 MHz
+                    # `create_clock` active during synthesis -- see the S7
+                    # module-level comment above): 13696 LUTs, 1657 FFs,
+                    # 0 BRAM, 0 DSP (were 13136/1642 unconstrained -- both
+                    # still comfortably inside the `LessThan` margins below,
+                    # no checker change needed here) -- LUTs 1.94x the 8-row
+                    # 7068, i.e. the MAC array scales linearly with rows as
+                    # it must (128 int8 lanes instead of 64), FFs less than
+                    # 2x because the control/address side does not scale at
+                    # all. 0 DSP for the same reason as the 8-row entry
+                    # above (the `is_valid`-gated accumulate keeps the whole
+                    # MAC array in LUT fabric), and the accumulators still
+                    # live in flip-flops (0 BRAM), both unchanged by the
+                    # knob.
+                    # 150 MHz timing estimate: **FAIL**, 56.44 MHz --
+                    # essentially identical to the 8-row 56.52 MHz, meaning
+                    # the critical path does not scale with `g_pe_rows` (it
+                    # is inside one PE lane's MAC chain, not across rows).
+                    # See flow_status.md S7.
                     checkers=[
                         TotalLuts(LessThan(13800)),
                         Ffs(LessThan(1750)),
@@ -1080,6 +1214,7 @@ class Module(BaseModule):
                         Ramb18(LessThan(1)),
                         DspBlocks(LessThan(1)),
                     ],
+                    analyze_synthesis_timing=True,
                 ),
                 vivado_build(
                     f"cnn_accel_conv_core_pe_rows_{_PE_ROWS_SCALED}",
@@ -1094,31 +1229,38 @@ class Module(BaseModule):
                         "g_weight_buffer_depth": _WEIGHT_BUFFER_DEPTH,
                         "g_bias_buffer_depth": _BIAS_BUFFER_DEPTH,
                     },
-                    # Measured 2026-09 (Vivado 2026.1): 29253 LUTs, 4219 FFs,
-                    # 24 RAMB36 + 3 RAMB18 (27 total), 68 DSP, 0 LUTRAM --
+                    # Measured 2026-09 (Vivado 2026.1) with
+                    # `analyze_synthesis_timing=True` (real 500 MHz
+                    # `create_clock` active during synthesis -- see the S7
+                    # module-level comment above): 29027 LUTs, 4725 FFs,
+                    # 17 RAMB36 + 2 RAMB18 (19 total), 68 DSP, 0 LUTRAM --
                     # the 60 fps system-footprint number, the whole reason
-                    # this entry exists: 1.9x the 8-row 15358 LUTs, well
-                    # inside the XC7A200T (134600 LUTs, 365 RAMB36, 740
+                    # this entry exists. FF grew and RAMB36/18 shrank from
+                    # the unconstrained baseline (were 4219/24/3) for the
+                    # same area/timing-tradeoff reason as every other entry
+                    # in this set; LUTs stayed close (29253 -> 29027). Still
+                    # well inside the XC7A200T (134600 LUTs, 365 RAMB36, 740
                     # DSP), so the scaled point fits with room for the DMAs,
                     # CSR and sequencer still to come. Leaf additivity holds
                     # exactly for DSP: 64 (bias_requant, 4 per requant lane
                     # x 16 lanes, was 32 at 8 rows) + 4 (window_gen, address
-                    # arithmetic, row-independent) + 0 + 0 = 68. BRAM 16 ->
-                    # 27 is weight_buffer alone (twice the weight lanes and
-                    # twice the bias-row width; window_gen's 3 line banks
-                    # do not scale with rows).
+                    # arithmetic, row-independent) + 0 + 0 = 68.
                     #
-                    # Unconstrained logic-level report shows 32 endpoints at
-                    # 102-105 levels (none above 35 in pe_array alone), so
-                    # the deep paths sit in bias_requant/weight_buffer; see
-                    # the 150 MHz constrained-build item in flow_status.md.
+                    # 150 MHz timing estimate: **FAIL**, 45.38 MHz --
+                    # essentially identical to the 8-row conv_core's
+                    # 46.77 MHz, confirming (together with the pe_array
+                    # pair above) that the critical path lives inside one
+                    # PE lane's MAC/accumulate chain and does not scale with
+                    # `g_pe_rows`. See flow_status.md S7 for the full
+                    # six-entity summary and the timing-fix delegation.
                     checkers=[
-                        TotalLuts(LessThan(30500)),
-                        Ffs(LessThan(4450)),
-                        Ramb36(EqualTo(24)),
-                        Ramb18(EqualTo(3)),
+                        TotalLuts(LessThan(29300)),
+                        Ffs(LessThan(4900)),
+                        Ramb36(EqualTo(17)),
+                        Ramb18(EqualTo(2)),
                         DspBlocks(EqualTo(68)),
                     ],
+                    analyze_synthesis_timing=True,
                 ),
             ]
 
