@@ -47,6 +47,21 @@ use cnn_accel.cnn_accel_isa_pkg.all;
 -- not implement, so this testbench cannot exercise more than one
 -- output-channel tile either).
 --
+-- Tests: 'test_bitexact_backpressure'/'test_bitexact_full_throughput' both
+-- run 'run_all_cases' -- the fixed, checked-in-name set of hand-authored
+-- 'generate_vectors.py' cases (module_cnn_accel.py's per-'g_pe_rows'
+-- config). 'test_bitexact_compiler_cases' (M10, doc/tosa_compiler_plan.md
+-- ~line 613) instead runs 'run_compiler_cases', which reads
+-- 'vectors_root & "/cases.txt"' and runs whatever it lists -- that root is
+-- populated by module_cnn_accel.py's compiler-vectors pre_config hook,
+-- which compiles real TOSA fixtures with 'cnnc' and writes their per-layer
+-- vectors via 'cnnc.backend.cnn_accel_v1.vectors.write_conv_core_vectors'
+-- (the compiler's OWN emitted weights/program output, not
+-- 'cnn_accel_model' called directly, is what is bit-exact-checked here),
+-- one config only at the default 'g_pe_rows'. A missing or empty
+-- 'cases.txt' is a hard 'severity failure', not a vacuous pass -- see
+-- 'run_compiler_cases' below.
+--
 -- Weight/bias preload: this testbench IS the "future cnn_accel_axi_read_
 -- dma instance" cnn_accel_conv_core.vhd's own header comment anticipates
 -- for driving 'fill_start'/'fill_is_bias'/'s_weight' -- 'weights_
@@ -557,6 +572,41 @@ begin
       drain_and_check(20000);
     end procedure;
 
+    -- Reads 'vectors_root & "/cases.txt"' (one case name per line) and
+    -- runs every case listed, in file order -- the compiler-generated
+    -- counterpart of 'run_all_cases' below, for 'test_bitexact_compiler_
+    -- cases' (see this file's own header comment). Fails loudly (rather
+    -- than passing vacuously) if 'cases.txt' is missing, or is present
+    -- but lists zero cases -- a config whose pre_config hook did not
+    -- actually write any vectors must not report a green test.
+    procedure run_compiler_cases is
+      file f : text;
+      variable l : line;
+      variable status : file_open_status;
+      variable n_cases : natural := 0;
+    begin
+      file_open(status, f, vectors_root & "/cases.txt", read_mode);
+      assert status = open_ok
+        report "tb_cnn_accel_conv_core: could not open '" & vectors_root &
+          "/cases.txt' -- module_cnn_accel.py's compiler-vectors pre_config hook " &
+          "did not write it"
+        severity failure;
+
+      while not endfile(f) loop
+        readline(f, l);
+        if l'length > 0 then
+          n_cases := n_cases + 1;
+          run_case(vectors_root & "/" & l.all);
+        end if;
+      end loop;
+      file_close(f);
+
+      assert n_cases > 0
+        report "tb_cnn_accel_conv_core: '" & vectors_root &
+          "/cases.txt' listed zero cases -- a config that runs no cases must not pass silently"
+        severity failure;
+    end procedure;
+
     -- Runs every generated CONV2D/FC vector case (doc/cnn_accel_test_vectors.md's
     -- table), each with its own fresh 'fill_start' session -- see this
     -- file's header comment. Called identically by both tests below;
@@ -605,6 +655,20 @@ begin
       -- introduced bubble, on top of (not instead of) the correctness
       -- check every case already performs.
       run_all_cases;
+
+    elsif run("test_bitexact_compiler_cases") then
+      -- Compiler-generated cases (M10, doc/tosa_compiler_plan.md ~line
+      -- 613): module_cnn_accel.py's compiler-vectors pre_config hook
+      -- compiles real TOSA fixtures with cnnc and writes their per-layer
+      -- vectors via cnnc.backend.cnn_accel_v1.vectors.
+      -- write_conv_core_vectors straight into this config's own
+      -- 'output_path' (one combined 'cases.txt', case dirs distinguished
+      -- by a per-fixture name prefix), one config only, at the default
+      -- 'g_pe_rows' (the compiler packs weights at the target's own
+      -- discovered internal_tiling, PE_ROWS -- see that hook's own
+      -- comment). Nonzero backpressure on both links, same as
+      -- 'test_bitexact_backpressure'.
+      run_compiler_cases;
 
     end if;
 

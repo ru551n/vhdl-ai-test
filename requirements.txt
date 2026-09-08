@@ -44,3 +44,10 @@ hdl-registers==8.1.0
 # encoder agree with the RTL byte-for-byte by construction rather than by
 # comment.
 pytest
+
+# M10: module_cnn_accel.py's compiler-vectors pre_config hook (see
+# _setup_cnn_accel_conv_core's test_bitexact_compiler_cases config)
+# imports `cnnc` (compiler/) to compile a real TOSA fixture and write its
+# per-layer test vectors -- cnnc needs numpy, which is otherwise unused by
+# this repo's own Python (the golden model is pure stdlib, see above).
+numpy

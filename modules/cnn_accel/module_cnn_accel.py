@@ -132,6 +132,93 @@ _VIVADO_PART = "xc7a200tfbg484-2"
 # --------------------------------------------------------------------------
 
 
+# M10 (doc/tosa_compiler_plan.md ~line 613): the two real TOSA fixtures
+# compiled into tb_cnn_accel_conv_core's 'test_bitexact_compiler_cases'
+# config, and the fixed seed each is compiled/run with (matches
+# compiler/tests/test_fixtures_m9.py's own `_seed_input` convention: one
+# `np.random.default_rng(seed)` per fixture's single graph input, keyed
+# "arg0" like every M8/M9 fixture). Shapes come from the compiler's own
+# fixtures dir (compiler/tests/fixtures/gen_fixtures.py), not repeated by
+# number here beyond what `write_conv_core_vectors` needs from the
+# manifest -- see `_compiler_vectors_pre_config`.
+_COMPILER_VECTORS_FIXTURES = {
+    "conv_rescale_clamp": (1, 8, 8, 4),
+    "first_layer_cin3": (1, 8, 8, 3),
+}
+_COMPILER_VECTORS_SEED = 0
+
+
+def _compiler_vectors_pre_config(output_path: str) -> bool:
+    """`pre_config` for tb_cnn_accel_conv_core's `test_bitexact_compiler_
+    cases` config ONLY (doc/tosa_compiler_plan.md M10): compiles each of
+    `_COMPILER_VECTORS_FIXTURES` with the `cnnc` compiler
+    (`compiler/cnnc`) against the real `cnn_accel_v1` target and writes
+    its per-layer test vectors -- the compiler's OWN emitted
+    weights/program bytes, not `cnn_accel_model` called directly -- into
+    this config's own VUnit `output_path` via
+    `cnnc.backend.cnn_accel_v1.vectors.write_conv_core_vectors`, one case
+    directory per fixture's conv layer, prefixed `'<fixture>_'` so the
+    two fixtures' case names cannot collide. Writes ONE combined
+    `cases.txt` covering every case from every fixture (each
+    `write_conv_core_vectors` call would otherwise overwrite the
+    previous one's, since they share `output_path`).
+
+    `compiler/` is only put on `sys.path` HERE, inside the hook -- not at
+    module import time -- so importing `module_cnn_accel.py` itself
+    stays side-effect-free (tsfpga imports this file just to discover
+    modules/entities; it must keep working even in a checkout with no
+    `compiler/` directory at all, e.g. a synthesis-only clone).
+
+    Returns `False` (fails the config, per `add_vunit_config`'s own
+    contract) if either fixture is unexpectedly skipped (both are single-
+    layer, `out_channels == PE_ROWS`, so neither should ever exceed
+    `max_out_channels`) or if nothing was written at all -- a silently
+    empty `cases.txt` must not report a green test (see
+    `tb_cnn_accel_conv_core.vhd`'s own `run_compiler_cases` assertion for
+    the other half of this guarantee)."""
+    repo_root = _MODULE_DIR.parent.parent
+    compiler_root = repo_root / "compiler"
+    if str(compiler_root) not in sys.path:
+        sys.path.insert(0, str(compiler_root))
+
+    import numpy as np
+
+    from cnnc.backend.cnn_accel_v1 import write_conv_core_vectors
+    from cnnc.driver import compile_tosa
+    from cnnc.target.load import load_target
+
+    target = load_target("cnn_accel_v1")
+    fixtures_dir = compiler_root / "tests" / "fixtures"
+    out_path = Path(output_path)
+
+    ok = True
+    all_written: list[str] = []
+    for fixture_name, shape in sorted(_COMPILER_VECTORS_FIXTURES.items()):
+        result = compile_tosa(fixtures_dir / f"{fixture_name}.mlir", target)
+        rng = np.random.default_rng(_COMPILER_VECTORS_SEED)
+        inputs = {"arg0": rng.integers(-128, 128, size=shape).astype(np.int8)}
+
+        vectors = write_conv_core_vectors(
+            result.program,
+            inputs,
+            out_path,
+            target=target,
+            graph=result.fused_graph,
+            max_out_channels=cnn_accel_constants.PE_ROWS,
+            case_prefix=f"{fixture_name}_",
+        )
+        if vectors.skipped:
+            print(f"_compiler_vectors_pre_config: {fixture_name}: unexpectedly skipped {vectors.skipped}")
+            ok = False
+        if not vectors.written:
+            print(f"_compiler_vectors_pre_config: {fixture_name}: wrote zero cases")
+            ok = False
+        all_written.extend(vectors.written)
+
+    (out_path / generate_vectors.CONV_CORE_CASES_FILE).write_text("".join(f"{n}\n" for n in all_written))
+    return ok and bool(all_written)
+
+
 class Module(BaseModule):
     def registers_hook(self) -> None:
         """
@@ -1517,6 +1604,25 @@ class Module(BaseModule):
             return pre_config
 
         for test in tb.get_tests():
+            if test.name == "test_bitexact_compiler_cases":
+                # M10 (doc/tosa_compiler_plan.md ~line 613): a single
+                # config, not one per `PE_ROWS_LEGAL` -- the compiler
+                # always packs weights at its discovered target's own
+                # `internal_tiling` (== `PE_ROWS`/`TILE_CHANNELS`, see
+                # `cnnc.target.discover`), it is not parameterizable by a
+                # `pe_rows` argument the way `generate_vectors.hw_packing`
+                # is, so there is no `g_pe_rows_16` variant of this test.
+                self.add_vunit_config(
+                    test=test,
+                    generics={
+                        "stall_probability_percent_in": 20,
+                        "stall_probability_percent_out": 20,
+                        "g_pe_rows": cnn_accel_constants.PE_ROWS,
+                    },
+                    pre_config=_compiler_vectors_pre_config,
+                )
+                continue
+
             # Zero stall on both links only for the dedicated
             # full-throughput test (proves sustained back-to-back
             # operation); randomized independent per-link backpressure

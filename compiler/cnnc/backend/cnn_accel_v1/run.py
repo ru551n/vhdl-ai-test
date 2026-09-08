@@ -11,6 +11,12 @@ imports) is loaded fresh from the path recorded in the manifest's
 checked against `target.provenance.files`'s sha256 hashes first, so a
 stale/hand-edited accelerator checkout fails loudly instead of silently
 producing a result from the wrong golden model.
+
+`prepare_memory_image`/`read_activation_buffer` are factored out of
+`run_program` so `vectors.write_conv_core_vectors` (M10) can read every
+per-layer activation buffer's content out of the same memory image,
+built with the exact same provenance/shape checks, instead of running
+the model a second time or duplicating any of this module's logic.
 """
 
 from __future__ import annotations
@@ -117,30 +123,42 @@ def _encode_input(name: str, arr: np.ndarray, buf: dict, plane_channels: int) ->
     return data
 
 
-def _decode_output(memory: bytearray, buf: dict, plane_channels: int) -> np.ndarray:
+def read_activation_buffer(memory: bytearray, buf: dict, plane_channels: int) -> np.ndarray:
+    """Decode one `PLANES`-layout activation buffer's current contents out
+    of `memory`. Works for ANY buffer role (`input`/`intermediate`/
+    `output`) -- `run_program` below only ever calls this for
+    role='output' buffers, but `vectors.write_conv_core_vectors` needs
+    every activation buffer's contents (every layer's input AND output,
+    not just the graph's own entry/exit), which is why this is a plain
+    function of `buf` rather than something baked into `run_program`'s
+    loop."""
     dtype = _NP_DTYPE.get(buf["dtype"])
     if dtype is None:
-        raise CompilerError(f"output {buf['id']!r}: unsupported buffer dtype {buf['dtype']!r}", stage=_STAGE)
+        raise CompilerError(f"buffer {buf['id']!r}: unsupported buffer dtype {buf['dtype']!r}", stage=_STAGE)
     if buf["layout"] != "PLANES":
-        raise CompilerError(f"output {buf['id']!r}: unsupported activation layout {buf['layout']!r}", stage=_STAGE)
+        raise CompilerError(f"buffer {buf['id']!r}: unsupported activation layout {buf['layout']!r}", stage=_STAGE)
     addr, size = buf["addr"], buf["size_bytes"]
     raw = bytes(memory[addr : addr + size])
     return unpack_activation_planes(raw, tuple(buf["shape"]), dtype, plane_channels)
 
 
-def run_program(
+def prepare_memory_image(
     program: Program,
     inputs: dict,
     *,
     accel_root: str | Path | None = None,
-    max_instructions: int = 1000,
-) -> dict:
-    """Run `program` (from `emit.emit_program`, or reconstructed from a
-    saved manifest/`program.bin`/`constants.bin`) against
-    `cnn_accel_model.run_program`. `inputs`/the return value are keyed by
-    GIR tensor id (`Buffer.gir_tensor`), matching `gir.interp.run` and
-    `testing.iree_oracle.run_iree`, so all three oracles are directly
-    comparable (doc/tosa_compiler_plan.md §10)."""
+) -> tuple[types.ModuleType, dict, bytearray, int]:
+    """Shared setup for `run_program` and `vectors.write_conv_core_vectors`
+    (the latter needs every activation buffer's contents, not just the
+    graph's own outputs, so it cannot just call `run_program`): validate
+    the manifest, load+provenance-check the golden model (`_load_model`),
+    and build the DDR memory image with the program, every const buffer
+    and every encoded input already written in. Returns `(model,
+    manifest, memory, program_addr)`; the caller still has to call
+    `model.run_program(memory, program_addr, ...)` themselves -- this
+    function never executes anything, so both callers share exactly the
+    same provenance/sha256/shape-checking logic up to (but not including)
+    execution."""
     manifest = program.manifest
     if manifest.get("format_version") != 1:
         raise CompilerError(f"unsupported manifest format_version {manifest.get('format_version')!r}", stage=_STAGE)
@@ -182,9 +200,27 @@ def run_program(
         chunks[buf["addr"]] = _encode_input(name, inputs[name], buf, plane_channels)
 
     memory = model.build_memory_image(chunks, size=manifest["memory"]["size_bytes"])
-    model.run_program(memory, program_info["addr"], max_instructions=max_instructions)
+    return model, manifest, memory, program_info["addr"]
 
+
+def run_program(
+    program: Program,
+    inputs: dict,
+    *,
+    accel_root: str | Path | None = None,
+    max_instructions: int = 1000,
+) -> dict:
+    """Run `program` (from `emit.emit_program`, or reconstructed from a
+    saved manifest/`program.bin`/`constants.bin`) against
+    `cnn_accel_model.run_program`. `inputs`/the return value are keyed by
+    GIR tensor id (`Buffer.gir_tensor`), matching `gir.interp.run` and
+    `testing.iree_oracle.run_iree`, so all three oracles are directly
+    comparable (doc/tosa_compiler_plan.md §10)."""
+    model, manifest, memory, program_addr = prepare_memory_image(program, inputs, accel_root=accel_root)
+    model.run_program(memory, program_addr, max_instructions=max_instructions)
+
+    plane_channels = manifest["memory"]["activation_plane_channels"]
     outputs = {}
     for buf in _buffers_by_role(manifest, "output"):
-        outputs[buf["gir_tensor"]] = _decode_output(memory, buf, plane_channels)
+        outputs[buf["gir_tensor"]] = read_activation_buffer(memory, buf, plane_channels)
     return outputs

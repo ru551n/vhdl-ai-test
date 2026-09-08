@@ -9,6 +9,7 @@ from __future__ import annotations
 from .decode import decode_program, print_program
 from .emit import Descriptor, Program, emit_program
 from .run import run_program
+from .vectors import VectorsResult, write_conv_core_vectors
 
 __all__ = [
     "Descriptor",
@@ -17,4 +18,6 @@ __all__ = [
     "decode_program",
     "print_program",
     "run_program",
+    "VectorsResult",
+    "write_conv_core_vectors",
 ]
