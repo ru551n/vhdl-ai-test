@@ -25,7 +25,10 @@ Each `<case>/` directory contains:
   `run_layer`/a memory image. Since ISA v1.1 (H1) the list also carries
   `output_offset`, `clamp_min` and `clamp_max` (all `0` for pre-H1 cases;
   `flags` bit4 is `CLAMP_EN`), read by `tb_cnn_accel_conv_core` into the
-  matching `cfg_*` ports. `CONV2D`/`FC` cases additionally have two
+  matching `cfg_*` ports; since ISA v1.2 (H2) also `scale_addr` (always
+  `0` here -- bare tensors, see above -- while `flags` bit5
+  `PER_CHANNEL_EN` says whether `scale_table_packed.txt` exists and is
+  streamed). `CONV2D`/`FC` cases additionally have two
   appended lines, `tile_channels <n>` and `pe_rows <n>` -- NOT `LayerDesc`
   fields, the host-compiler-time packing parameters
   `weights_packed.txt` (below) was built with (ratified D10, see
@@ -64,6 +67,23 @@ Each `<case>/` directory contains:
   exported to a file here -- no vector case currently needs it, unlike
   weights which every `CONV2D`/`FC` RTL testbench needs in hardware
   order).
+- `scale_table_packed.txt` -- **only for cases with `flags` bit5
+  `PER_CHANNEL_EN` set** (ISA v1.2, H2). The per-channel requant table in
+  `cnn_accel_model.pack_scale_table_for_hw(scale_table, desc, pe_rows)`'s
+  PADDED, accelerator-native order (entry `ot*pe_rows + r` -> output-
+  channel tile `ot`, PE row `r`; zero `(0, 0)` entries pad the last tile
+  to `pe_rows`), two records per entry: `multiplier` (signed decimal
+  int32, same Q15 semantics as `requant_scale`) then `shift` (decimal
+  `0..255`, same semantics as `requant_shift`). Length is always `2 *
+  ceil(out_channels/pe_rows) * pe_rows` lines. It is derived from the
+  8-byte-per-entry DDR image via `unpack_scale_table_from_hw`, not from
+  the logical table directly, so it can only disagree with the DDR
+  contents if the pack/unpack pair does. `tb_cnn_accel_conv_core` streams
+  it into `cnn_accel_weight_buffer`'s scale region one entry per
+  `fill_is_scale` beat (multiplier on `data[31:0]`, shift on
+  `data[39:32]`) right after the bias sub-fill. When the flag is set, the
+  descriptor's `requant_scale`/`requant_shift` are ignored by the
+  hardware and the model alike.
 - `expected.txt` -- output activations, flat HWC, one signed decimal int8
   per line, produced directly by `cnn_accel_model.conv2d`/`dwconv2d`/
   `pool_max`/`pool_avg`/`fc`.
@@ -87,6 +107,8 @@ integer per line -- directly readable with VHDL `std.textio`
 | `pool_avg_4x4` | POOL_AVG | 8x8x2 -> 4x4x2, pool k=2 s=2 | no (no weights) | average pool, `requant_en=1` scale=1/4 (pool area) + relu |
 | `fc_in6_out4` | FC | 6 -> 4 (degenerate 1x1 spatial) | yes | `in_width=in_height=kernel_h=kernel_w=1`, bias+relu+requant on |
 | `conv3x3_c20_o6_multitile` | CONV2D | 5x5x20 -> 5x5x6, k=3 s=1 pad=1 | yes | `in_channels=20 > tile_channels=8` -> `T=3` input-channel tiles/pixel; exercises the `window_gen`->`pe_array` `first_tile`/`last_tile` partial-sum-carry path end to end (added for `tb_cnn_accel_conv_core.vhd`, M6b) |
+| `conv3x3_offset_clamp` | CONV2D | 5x5x4 -> 5x5x5, k=3 s=1 pad=1 | yes | ISA v1.1 (H1) epilogue: `output_offset=-7`, `CLAMP_EN` with `[-100, 90]`, both bounds hit |
+| `conv3x3_per_channel` | CONV2D | 5x5x4 -> 5x5x6, k=3 s=1 pad=1 | yes, plus `scale_table_packed.txt` | ISA v1.2 (H2): `PER_CHANNEL_EN`, six distinct per-lane (multiplier, shift) pairs (one negative multiplier, shifts 5..10), `output_offset=3`; the descriptor's own `requant_scale/shift` are set to values that would be wrong on any lane, so a fallback to the scalar pair, a lane-index slip or a multiplier/shift byte-order slip all show up as mismatches |
 | `conv3x3_c8_o16` | CONV2D | 5x5x8 -> 5x5x16, k=3 s=1 pad=1 | yes | **`pe_rows >= 16` roots only**: 16 output channels in one output-channel tile, the target backbone's layer-1 `out_channels` at the 60 fps scaling point; `tb_cnn_accel_conv_core.vhd` runs it only in its `g_pe_rows_16` config |
 | `pe_array_xlang_check` | CONV2D | 3x3x10 -> 3x3x5, k=1 | yes, plus `pe_array_raw_accum.txt` | partial input tile (10 > 8) and partial output tile (5 < pe_rows); read by `tb_cnn_accel_pe_array_from_vectors.vhd` |
 

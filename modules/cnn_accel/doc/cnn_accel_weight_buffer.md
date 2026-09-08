@@ -2,10 +2,12 @@
 
 ## Purpose
 
-Single-buffered on-chip cache for one CNN layer's weights and bias, sized/
-organized for BRAM inference. `fill_start` pulses once to begin a new fill
+Single-buffered on-chip cache for one CNN layer's weights, bias and (ISA
+v1.2, HW milestone H2) per-channel requant table, sized/organized for BRAM
+inference. `fill_start` pulses once to begin a new fill
 session (resetting the write pointers), the whole weight set (weight
-region, then/interleaved with the bias region, selected by `fill_is_bias`)
+region, then/interleaved with the bias and scale regions, selected by
+`fill_is_bias`/`fill_is_scale`)
 is streamed in over `s_stream`, the pass runs while `cnn_accel_pe_array`/
 `cnn_accel_bias_requant` read through `weight_rd_addr`/`bias_rd_addr`, then
 the next pass's `fill_start` pulse begins the next refill. There is no
@@ -37,14 +39,16 @@ Entity `cnn_accel_weight_buffer`, architecture `a`
 |---|---|---|---|
 | `clk` | in | `std_ulogic` | Single clock domain. |
 | `reset` | in | `std_ulogic := '0'` | Synchronous active-high (`= reset_internal` at the IP top level). |
-| `s_stream_m2s` | in | `axi_stream_pkg.axi_stream_m2s_t` | Fill-side AXI4-Stream, from the weight/bias `cnn_accel_axi_read_dma` instance. One accepted beat writes one lane: a weight byte on `data(7 downto 0)`, or a bias lane on `data(g_accum_width-1 downto 0)`, selected by `fill_is_bias`. `last`/`user` are not consumed (proposal doc §3.5). |
+| `s_stream_m2s` | in | `axi_stream_pkg.axi_stream_m2s_t` | Fill-side AXI4-Stream, from the weight/bias `cnn_accel_axi_read_dma` instance. One accepted beat writes one lane: a weight byte on `data(7 downto 0)`, a bias lane on `data(g_accum_width-1 downto 0)`, or (H2) a per-channel scale entry on `data(c_scale_entry_width-1 downto 0)`, selected by `fill_is_bias`/`fill_is_scale`. `last`/`user` are not consumed (proposal doc §3.5). |
 | `s_stream_s2m` | out | `axi_stream_pkg.axi_stream_s2m_t` | `ready` deasserts once the selected region's own write pointer reaches its depth (`g_weight_buffer_depth` or `g_bias_buffer_depth`). |
 | `fill_start` | in | `std_ulogic := '0'` | Pulse: starts a new fill session — resets the weight and bias write row pointers/lane indices/row-assembly registers to 0. Must be pulsed once before streaming a new output-channel pass's weight/bias set (replaces the old `fill_bank_sel`-edge-triggered "new fill session" detector — proposal doc §3.4). A beat presented the same cycle as `fill_start` is not accepted. |
-| `fill_is_bias` | in | `std_ulogic` | Routes fill beats to the weight region (`'0'`) or bias region (`'1'`). |
+| `fill_is_bias` | in | `std_ulogic` | Routes fill beats to the weight region (`'0'`) or bias region (`'1'`), unless `fill_is_scale='1'`. |
+| `fill_is_scale` | in | `std_ulogic := '0'` | ISA v1.2 (H2): `'1'` routes fill beats to the per-channel scale region, overriding `fill_is_bias`. One `c_scale_entry_width` (40)-bit lane on `data(39 downto 0)` per accepted beat = the first 40 bits of one 8-byte little-endian DDR table entry (int32 multiplier, uint8 shift), so a 64-bit DMA beat carrying one entry needs no reshuffling. Left at `'0'` the region is never written and every other port is bit-identical to the pre-H2 buffer. |
 | `weight_rd_addr` | in | `std_ulogic_vector(num_bits_needed(g_weight_buffer_depth-1)-1 downto 0)` | Row (tile) address into the weight region, from `cnn_accel_pe_array`. |
 | `weight_rd_data` | out | `std_ulogic_vector(8*g_pe_rows*g_pe_cols-1 downto 0)` | One int8 weight per active PE, registered, 1-cycle read latency. |
 | `bias_rd_addr` | in | `std_ulogic_vector(num_bits_needed(g_bias_buffer_depth-1)-1 downto 0)` | Row (tile) address into the bias region, from `cnn_accel_bias_requant`. |
 | `bias_rd_data` | out | `std_ulogic_vector(g_accum_width*g_pe_rows-1 downto 0)` | One int32 (`g_accum_width`-bit) bias per output-channel lane, registered, 1-cycle read latency. |
+| `scale_rd_data` | out | `std_ulogic_vector(c_scale_entry_width*g_pe_rows-1 downto 0)` | ISA v1.2 (H2): one per-channel requant entry (multiplier `[31:0]`, shift `[39:32]` per lane, `cnn_accel_pkg.c_scale_entry_width`) per output-channel lane of the scale-region row addressed by `bias_rd_addr`, registered, 1-cycle read latency — same timing as `bias_rd_data`. |
 
 ## Clocking and reset
 
@@ -113,37 +117,46 @@ affects the other region's `ready`.
 ## Functional behavior
 
 - One weight region (`g_weight_buffer_depth` rows of
-  `g_pe_rows*g_pe_cols` int8 lanes) and one, independently-sized, bias
+  `g_pe_rows*g_pe_cols` int8 lanes), one, independently-sized, bias
   region (`g_bias_buffer_depth` rows of `g_pe_rows` `g_accum_width`-bit
-  lanes) — proposal doc §3.2/§3.3/§11.
+  lanes) — proposal doc §3.2/§3.3/§11 — and, since ISA v1.2 (H2), a
+  per-channel scale region of the **same** depth, lane count and read
+  address as the bias region (`g_bias_buffer_depth` rows of `g_pe_rows`
+  `c_scale_entry_width`-bit lanes), because the bias and the requant table
+  are tiled identically (`cnn_accel_model.pack_bias_for_hw` /
+  `pack_scale_table_for_hw`: entry `ot*g_pe_rows + r` -> row `ot`, lane
+  `r`) and consumed together per beat by `cnn_accel_bias_requant`.
 - **Fill path:** incoming `s_stream` lanes (optionally through the
   prefetch FIFO) auto-increment a lane index into a row-assembly register
-  for the region selected by `fill_is_bias` (`'0'` = weight, `'1'` =
-  bias); once a row's lanes are all written, the assembled row is
-  committed to that region's memory with one wide write, the lane index
-  wraps to 0 and the row pointer advances
-  (`cnn_accel_weight_buffer.vhd:287-333`).
-- **New fill session:** a `fill_start` pulse resets **both** regions' row
-  pointers, lane indices and row-assembly registers to 0 together
-  (`:277-286`) — not a single pointer shared across regions (that reading
-  of the requirement text would break bias addressing whenever a bias
-  fill starts mid-way through the weight pointer's count; proposal doc
-  §3.4). Within one fill session, the weight sub-fill and bias sub-fill
-  each advance their own independent row/lane counters, so fill order
-  (weight-then-bias, interleaved, or bias-only) does not matter. A beat
-  presented the same cycle as `fill_start` is not accepted.
+  for the region selected by `fill_is_scale`/`fill_is_bias` (`fill_is_scale
+  ='1'` = scale, else `fill_is_bias` `'0'` = weight, `'1'` = bias); once a
+  row's lanes are all written, the assembled row is committed to that
+  region's memory with one wide write, the lane index wraps to 0 and the
+  row pointer advances. A scale beat carries one whole table entry on
+  `data(c_scale_entry_width-1 downto 0)`.
+- **New fill session:** a `fill_start` pulse resets **all** regions' row
+  pointers, lane indices and row-assembly registers to 0 together — not a
+  single pointer shared across regions (that reading of the requirement
+  text would break bias addressing whenever a bias fill starts mid-way
+  through the weight pointer's count; proposal doc §3.4). Within one fill
+  session, the weight, bias and scale sub-fills each advance their own
+  independent row/lane counters, so fill order (weight-then-bias-then-
+  scale, interleaved, or bias-only) does not matter. A beat presented the
+  same cycle as `fill_start` is not accepted.
 - **Read path:** `weight_rd_addr`/`bias_rd_addr` are registered
   synchronous read addresses into their respective region, one cycle of
-  read latency (`:343-349`), matching `cnn_accel_pe_array`'s expected
-  weight-fetch latency.
+  read latency, matching `cnn_accel_pe_array`'s expected weight-fetch
+  latency; `bias_rd_addr` reads the bias and scale regions in lock-step
+  (`bias_rd_data`/`scale_rd_data`).
 - **Prefetch FIFO:** when `g_fill_fifo_depth > 0`, `s_stream` first drains
-  into hdl-modules' `fifo.fifo` (unmodified), carrying `fill_is_bias`
-  alongside the payload bits through the FIFO so a beat already accepted
-  into the FIFO is always routed to the region it was destined for at
-  accept time, regardless of any later `fill_is_bias` change while it is
-  still buffered (`:230-254`). With `g_fill_fifo_depth = 0` the fill
-  stream connects straight through with no FIFO instantiated at all
-  (`:223-228`).
+  into hdl-modules' `fifo.fifo` (unmodified), carrying `fill_is_bias` and
+  `fill_is_scale` alongside the payload bits (the payload is the widest
+  of a weight byte, a bias lane and a 40-bit scale entry) through the FIFO
+  so a beat already accepted into the FIFO is always routed to the region
+  it was destined for at accept time, regardless of any later region-
+  select change while it is still buffered. With `g_fill_fifo_depth = 0`
+  the fill stream connects straight through with no FIFO instantiated at
+  all.
 
 ## Weight row layout contract (D10, proposal doc §4)
 
@@ -322,6 +335,15 @@ Test cases (`lib.tb_cnn_accel_weight_buffer.<name>`), all 8 passing:
   is still in progress (single-buffered concurrent read/write — no
   second bank needed to make this safe, since the row-assembly register
   only ever touches the memory once a row is complete).
+
+The ISA v1.2 (H2) scale region has no dedicated case in this testbench:
+its fill/read path is the bias region's, reused with a third select and a
+wider lane, and it is exercised end to end (fill via `fill_is_scale` after
+the bias sub-fill, read through `bias_rd_addr`, consumed per lane by
+`cnn_accel_bias_requant`) by `tb_cnn_accel_conv_core`'s
+`conv3x3_per_channel` vector case in every `g_pe_rows` config; the
+`PER_CHANNEL_EN=0` cases of the same run prove the untouched region does
+not disturb the others.
 
 **`module_cnn_accel.py` / `setup_vunit` generics:** none recommended. This
 testbench exposes only `runner_cfg` (no `stall_probability_percent` or

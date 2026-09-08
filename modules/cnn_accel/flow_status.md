@@ -1017,3 +1017,87 @@ clamp (`[5,100]`) arrive via the compiler's own emitted descriptor
 **all passed**, `cases.txt` = `clamp_5_100_op0 conv_rescale_clamp_op0
 first_layer_cin3_op0 out_zp_relu_op0`. `pytest compiler/ modules/cnn_accel`:
 666 passed (330 in `compiler/`, incl. 14 IREE tests, none skipped).
+
+## H2 — ISA v1.2: per-channel requantization (2026-09-08)
+
+`doc/tosa_compiler_plan.md` §5 extension 2 / milestone H2. The ISA stays
+64 B; reserved W14 becomes `scale_addr` (u32 DDR byte address);
+`flags` bit5 = `PER_CHANNEL_EN`. With the flag set every output channel
+`oc` takes its own `(multiplier, shift)` from an 8-byte-per-entry table
+at `scale_addr` (`int32 LE multiplier | u8 shift | 3 zero bytes`,
+`SCALE_TABLE_ENTRY_BYTES = 8`) instead of W9/W10, which are then ignored;
+nothing else in the epilogue changes. All new fields default to 0, so a
+v1.0/v1.1 program is bit-identical under v1.2 (proved: every pre-existing
+`conv_core` vector file is byte-identical after regeneration; `desc.txt`
+gains exactly one `scale_addr 0` record per case, no other file appears
+for pre-H2 cases).
+
+- `cnn_accel_constants.py`: `FLAGS["PER_CHANNEL_EN"] = 5`, `ISA_LAYOUT`
+  W14 `scale_addr`, `SCALE_TABLE_ENTRY_BYTES/MULTIPLIER_BYTES/SHIFT_BYTES`,
+  `SCALE_BUFFER_ENTRY_BITS = 40`; exported through `module_cnn_accel.py`
+  so the generated `cnn_accel_isa_pkg.vhd`/`regs_pkg` carry them.
+- `cnn_accel_model.py`: `LayerDesc.scale_addr`, `lane_requant_params()`
+  (per-oc `(scale, shift)` or the broadcast pair), `pack_scale_table_for_hw`
+  (mirrors `pack_bias_for_hw`: entry `ot*PE_ROWS + r` -> tile `ot`, row
+  `r`, zero-padded to whole tiles), `packed_scale_table_bytes`,
+  `unpack_scale_table_from_hw`; `conv2d`/`dwconv2d`/`fc` take an optional
+  `scale_table`; `run_layer` reads the table from DDR at `scale_addr` when
+  the flag is set. 8 new pytest (broadcast/table selection, distinct
+  per-lane scale+shift, `PER_CHANNEL_EN=0` bit-identical to v1.1, DDR
+  round-trip through `run_layer`, pack format/padding/round-trip,
+  rejects, W14 stays zero for a v1.1-style descriptor).
+- `cnn_accel_pkg.vhd`: `layer_desc_t.scale_addr`,
+  `c_scale_entry_{mult,shift,}_width` (32 + 8 = 40, the total taken from
+  the generated constant so it cannot drift from the model).
+- `cnn_accel_weight_buffer.vhd`: third, *scale* region selected by
+  `fill_is_scale` (overrides `fill_is_bias`) — same depth, lane count and
+  read address as the bias region because the two tables are tiled
+  identically; one 40-bit entry (`data(39 downto 0)` = the first 40 bits
+  of the 8-byte DDR entry, no reshuffling) per fill beat, filled through
+  the same stream in the same tile-load phase as the bias; `scale_rd_data`
+  output with `bias_rd_data`'s 1-cycle timing. The prefetch FIFO now
+  carries both region-select bits and the widest of the three payloads.
+  Leaving `fill_is_scale` at `'0'` is bit-identical to the pre-H2 buffer.
+- `cnn_accel_bias_requant.vhd`: `cfg_per_channel_en`, `scale_rd_data`
+  ports; per-lane (multiplier, shift) mux at stage 1 with the beat
+  capture (`scale_p`/`shift_p` became lane arrays), so only the stage-3
+  multiplier operand and the stage-5 shift amount are lane-indexed —
+  still seven stages, same throughput and handshake. `conv_core` plumbs
+  `cfg_per_channel_en`/`fill_is_scale`.
+- `tb_cnn_accel_bias_requant`: `test_per_channel_lanes` (directed
+  1.0/0.5/1.0>>1/-1.0 lane multipliers -> `x, x/2, x/2, -x`, then random
+  per-lane pairs incl. per-lane ties) and
+  `test_per_channel_en_zero_is_legacy` (garbage table row ignored for
+  every flag combination). `tb_cnn_accel_conv_core` reads `scale_addr`/
+  `PER_CHANNEL_EN` from `desc.txt` and streams `scale_table_packed.txt`
+  with `fill_is_scale` after the bias; new `generate_vectors.py` case
+  `conv3x3_per_channel` (6 distinct pairs, one negative, descriptor
+  `requant_scale/shift` deliberately wrong for every lane; runs in every
+  `pe_rows` config). `scale_table_packed.txt` format:
+  `doc/cnn_accel_test_vectors.md`.
+- Compiler (pre-M12): discovery reports `isa_version 1.2`, `per_channel:
+  true` from the constants; `emit.Descriptor.scale_addr` (W14, encode
+  skips absent-but-zero, decode tolerates); `vectors.py` emits
+  `scale_table_packed.txt` for `PER_CHANNEL_EN` descriptors; `to_hir`
+  rejects a fused per-channel rescale loudly with a `CapabilityError`
+  naming M12 (`_H2_PER_CHANNEL_LOWERING_IMPLEMENTED = False`) rather than
+  lowering channel 0's pair. `conftest` gained `v11_target` (v1.2 minus
+  per-channel; `v10_target` derives from it) so the pre-H2 rejection path
+  stays tested. **Scope note (plan):** the DMA request for the table is
+  `cnn_accel_layer_ctrl`'s, still PENDING — H2's RTL ends at `conv_core`,
+  the table is presented on the fill stream by the testbench.
+- Docs: `doc/cnn_accel_arch.md` ISA table + v1.2 section (entry format,
+  tiling), `cnn_accel_bias_requant.md`, `cnn_accel_weight_buffer.md`,
+  `cnn_accel_test_vectors.md`, plan STATUS.
+
+### Verification
+
+`run.py -o vunit_out_h2 "cnn_accel.*"` (this clone): **all passed**,
+64/64, incl. `*bias_requant*` 15/15 per stall config (the two H2 tests
+included) and `*conv_core*` 5/5 with the new `conv3x3_per_channel` case
+in both `g_pe_rows_8` and `g_pe_rows_16`. `pytest modules/cnn_accel`: 344
+passed (336 + 8); `pytest compiler`: 298 passed / 7 IREE-skipped.
+Byte-identity: `generate_vectors.py` from the pre-H2 base (`bd693a2`) vs.
+this branch differs only by `desc.txt`'s appended `scale_addr 0` (13
+cases), `cases.txt`'s appended `conv3x3_per_channel`, and the new case
+directory.

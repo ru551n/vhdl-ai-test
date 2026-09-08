@@ -9,7 +9,13 @@ requant_scale) -> (>> requant_shift, rounded) -> (+ output_offset) ->
 clamp(lo, hi)`, where `(lo, hi)` is the general `[clamp_min, clamp_max]`
 when `cfg_clamp_en='1'` (ISA v1.1, HW milestone H1) or the legacy
 `(0 if relu_en else -128, 127)` (saturate to int8 with optional ReLU at
-0); when `requant_scale`/shift are bypassed
+0). The `(requant_scale, requant_shift)` pair is per lane since ISA v1.2
+(HW milestone H2): with `cfg_per_channel_en='1'` lane `l` takes its own
+(multiplier, shift) from `scale_rd_data` -- the row of
+`cnn_accel_weight_buffer`'s per-channel scale region addressed by this
+module's own `bias_rd_addr` -- otherwise the descriptor's
+`cfg_requant_scale`/`cfg_requant_shift` are broadcast to every lane (the
+pre-H2 datapath bit for bit). When `requant_scale`/shift are bypassed
 (`cfg_requant_en='0'`) the result is still saturated to int8, not wrapped
 (architectural decision D2: a single overflow semantic across both
 paths). Generic wrapper composing `math.saturate_signed` (genuinely
@@ -50,9 +56,11 @@ Constraints (enforced by `assert ... severity failure` at elaboration):
 | `cfg_output_offset` | in | `std_ulogic_vector(15 downto 0)` | Signed int16 (`layer_desc.output_offset`, W13[15:0], ISA v1.1/H1), added to the rounded requant result (or to the bypass sum) before the clamp. `0` = v1.0 behaviour. |
 | `cfg_clamp_min` | in | `std_ulogic_vector(7 downto 0)` | Signed int8 lower clamp bound (`layer_desc.clamp_min`, W13[23:16]); used only when `cfg_clamp_en='1'`. |
 | `cfg_clamp_max` | in | `std_ulogic_vector(7 downto 0)` | Signed int8 upper clamp bound (`layer_desc.clamp_max`, W13[31:24]); used only when `cfg_clamp_en='1'`. |
-| `cfg_requant_scale` | in | `std_ulogic_vector(31 downto 0)` | Signed Q15 fixed-point multiplier. |
-| `cfg_requant_shift` | in | `std_ulogic_vector(7 downto 0)` | Runtime arithmetic-right-shift amount, folded with the fixed Q15 shift (15) into one combined rounding step. |
-| `bias_rd_addr` | out | `std_ulogic_vector(g_bias_addr_width - 1 downto 0)` | Always all-zeros (v1 single-bias-row design decision). |
+| `cfg_requant_scale` | in | `std_ulogic_vector(31 downto 0)` | Signed Q15 fixed-point multiplier, broadcast to every lane while `cfg_per_channel_en='0'`; ignored otherwise. |
+| `cfg_requant_shift` | in | `std_ulogic_vector(7 downto 0)` | Runtime arithmetic-right-shift amount, folded with the fixed Q15 shift (15) into one combined rounding step; broadcast/ignored like `cfg_requant_scale`. |
+| `cfg_per_channel_en` | in | `std_ulogic := '0'` | `flags` bit5 `PER_CHANNEL_EN` (ISA v1.2/H2). `'1'` selects the lane-wise (multiplier, shift) from `scale_rd_data` instead of the two `cfg_requant_*` ports. Sampled per beat like every other `cfg_*` port. |
+| `scale_rd_data` | in | `std_ulogic_vector(c_scale_entry_width*g_pe_rows - 1 downto 0) := (others => '0')` | From `cnn_accel_weight_buffer`'s scale region, the row at `bias_rd_addr` (same tiling and 1-cycle timing as `bias_rd_data`); per lane `c_scale_entry_width` (40) bits = int32 multiplier `[31:0]` then uint8 shift `[39:32]` (`cnn_accel_pkg`). Only read while `cfg_per_channel_en='1'`; may be stale or unconnected otherwise. |
+| `bias_rd_addr` | out | `std_ulogic_vector(g_bias_addr_width - 1 downto 0)` | Always all-zeros (v1 single-bias-row design decision). Also addresses the scale region. |
 | `bias_rd_data` | in | `std_ulogic_vector(g_accum_width*g_pe_rows - 1 downto 0)` | From `cnn_accel_weight_buffer`; one `g_accum_width`-bit signed bias per lane, lane 0 = low bits. |
 | `s_accum_m2s` | in | `axi_stream_pkg.axi_stream_m2s_t` | Accumulator input stream; low `g_accum_width*g_pe_rows` bits of `data` used. |
 | `s_accum_s2m` | out | `axi_stream_pkg.axi_stream_s2m_t` | |
@@ -77,10 +85,15 @@ simple, non-handshaked read-address/read-data pair toward
 
 Per lane `l` (0 to `g_pe_rows - 1`), per accepted `s_accum` beat:
 
+0. `(scale_l, shift_l) = (scale_rd_data lane l's multiplier, shift)` when
+   `cfg_per_channel_en='1'` (ISA v1.2, H2), else `(cfg_requant_scale,
+   cfg_requant_shift)`. The `g_max_requant_shift` clamp and the `+15` Q15
+   fold below are applied to whichever was selected, so both modes see
+   exactly the same shift arithmetic.
 1. `total_l = accum_l + (bias_l when cfg_bias_en='1' else 0)`.
-2. If `cfg_requant_en='1'`: `product_l = total_l * cfg_requant_scale`
+2. If `cfg_requant_en='1'`: `product_l = total_l * scale_l`
    (exact width, no truncation); `scaled_l = round_half_up(product_l >>
-   (15 + clamp(cfg_requant_shift, g_max_requant_shift)))` = `floor((product_l
+   (15 + clamp(shift_l, g_max_requant_shift)))` = `floor((product_l
    + 2^(S-1)) / 2^S)` with `S` the combined shift — ties round towards
    +infinity, identical to TOSA `apply_scale_32` SINGLE_ROUND (HW
    milestone H0, 2026-09-07; previously round-to-even);
@@ -141,7 +154,7 @@ critical path of `cnn_accel_conv_core`):
 
 | Stage | Work |
 |---|---|
-| 1 | capture the accepted beat, its bias word and its `cfg_*` values |
+| 1 | capture the accepted beat, its bias word, its `cfg_*` values and the per-lane (multiplier, shift) selected from `scale_rd_data` vs. `cfg_requant_*` (H2) |
 | 2 | bias add (`total = accum + bias`) |
 | 3 | requant multiply (DSP48E1 MREG) + the bypass sum saturated to 17 bits |
 | 4 | product pipeline register (bare DSP48E1 PREG, no logic); bypass: `+ cfg_output_offset` (18 bits) |
@@ -154,6 +167,12 @@ the 16-bit offset is folded into the stage-6 rounding adder
 (`round + offset == round_up + offset` pre-added at stage 5, exact on the
 full-width quotient), and the clamp reuses the stage-7 saturate cone with
 muxed bounds. Latency stays seven cycles.
+H2 (ISA v1.2) made the multiplier and shift per lane without touching the
+stage structure either: the per-channel/scalar select is a stage-1 mux
+ahead of the existing capture registers, so only the stage-3 multiplier
+operand and the stage-5 shift amount became lane-indexed (`scale_p`/
+`shift_p` are now arrays of `g_pe_rows` lanes). Depth, throughput and
+handshake are unchanged from v1.1.
 Per-beat `cfg_*` values are captured *with* the beat at stage 1 rather
 than read live at the stage that consumes them, because the module is
 seven cycles deep: `cfg_*` may therefore change as soon as a beat has
@@ -240,9 +259,19 @@ saturates both ways, bypass path, random int16 offsets),
 offset + clamp together, `min = max`, full-range bounds == saturate,
 random bounds, `min > max` pinned to `hi`) and
 `test_clamp_en_zero_is_legacy` (garbage `clamp_min/max` with
-`cfg_clamp_en='0'` has no effect). `tb_cnn_accel_conv_core`'s
-`conv3x3_offset_clamp` vector case (offset -7, clamp [-100, 90], both
-bounds hit) covers the descriptor plumbing end to end. Expected
+`cfg_clamp_en='0'` has no effect), and the ISA v1.2 (H2) per-channel
+select: `test_per_channel_lanes` (same accumulator on every lane with
+lane-distinct multipliers 1.0/0.5/1.0>>1/-1.0 -> `x, x/2, x/2, -x`, so a
+lane mix-up or a broadcast of the scalar cfg is visible immediately; then
+randomized per-lane pairs incl. round-half-up ties per lane) and
+`test_per_channel_en_zero_is_legacy` (a fully populated garbage table row
+with `cfg_per_channel_en='0'` has no effect for every flag combination).
+`tb_cnn_accel_conv_core`'s `conv3x3_offset_clamp` vector case (offset -7,
+clamp [-100, 90], both bounds hit) and `conv3x3_per_channel` (six
+distinct per-lane pairs from `scale_table_packed.txt`, one negative, with
+the descriptor's own `requant_scale/shift` set to values that would be
+wrong on any lane) cover the descriptor and scale-region plumbing end to
+end. Expected
 values are computed by a testbench-local reference function independently
 transliterated from `cnn_accel_model.py` (not copied from this module's
 own RTL structure).

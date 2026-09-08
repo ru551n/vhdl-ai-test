@@ -128,7 +128,7 @@ module below for `vhsynth`/resource-estimation purposes:
 - `cnn_accel_window_gen`, `cnn_accel_weight_buffer`: BRAM-inference intent
   for line buffers / weight banks.
 
-## Instruction Set (v1, current ISA version 1.1)
+## Instruction Set (v1, current ISA version 1.2)
 
 Fixed-width **64-byte (16 x 32-bit word) descriptor**, byte-addressed,
 naturally aligned, stored contiguously in DDR unless redirected by its own
@@ -139,7 +139,7 @@ this_addr + 64` for straight-line programs today).
 | Word | Bits | Field | Notes |
 |---|---|---|---|
 | W0 | [7:0] | `opcode` | `0x00 HALT`, `0x01 CONV2D`, `0x02 DWCONV2D`, `0x03 POOL_MAX`, `0x04 POOL_AVG`, `0x05 FC` |
-| W0 | [15:8] | `flags` | bit0 `relu_en`, bit1 `bias_en`, bit2 `requant_en`, bit3 `pad_en`, bit4 `clamp_en` (ISA v1.1, H1), bits5-7 reserved(0) |
+| W0 | [15:8] | `flags` | bit0 `relu_en`, bit1 `bias_en`, bit2 `requant_en`, bit3 `pad_en`, bit4 `clamp_en` (ISA v1.1, H1), bit5 `per_channel_en` (ISA v1.2, H2), bits6-7 reserved(0) |
 | W0 | [31:16] | reserved | must be 0 |
 | W1 | [31:0] | `in_addr` | DDR byte address, input activations |
 | W2 | [31:0] | `out_addr` | DDR byte address, output activations |
@@ -155,7 +155,8 @@ this_addr + 64` for straight-line programs today).
 | W12 | [31:0] | `next_instr_addr` | DDR byte address of the next instruction; program's own linear default is `+64` |
 | W13 | [15:0] | `output_offset` | ISA v1.1 (H1): signed int16 added to the rounded, shifted requant result *before* the clamp (TOSA `output_zp`); 0 = v1.0 behaviour |
 | W13 | [23:16]/[31:24] | `clamp_min` / `clamp_max` | ISA v1.1 (H1): signed int8 clamp bounds, used only when `clamp_en=1` (then `relu_en` is ignored); encoder rejects `clamp_min > clamp_max` |
-| W14-W15 | [31:0]x2 | reserved | must be 0 |
+| W14 | [31:0] | `scale_addr` | ISA v1.2 (H2): DDR byte address of the per-channel requant table, read only when `per_channel_en=1`; must be 0 in a v1.0/v1.1 program |
+| W15 | [31:0] | reserved | must be 0 |
 
 ISA v1.1 (HW milestone H1, `doc/tosa_compiler_plan.md` §5 extension 1)
 added `clamp_en` and W13 with all-zero defaults, so every v1.0 program is
@@ -166,6 +167,30 @@ output_offset, lo, hi)` with `(lo, hi) = (clamp_min, clamp_max)` when
 compiler reads `isa_version 1.1`, `output_zp: true`, `clamp_ranges: "any"`
 from these constants (`compiler/cnnc/target/discover.py`); lowering onto
 them is compiler milestone M11.
+
+ISA v1.2 (HW milestone H2, `doc/tosa_compiler_plan.md` §5 extension 2)
+added `per_channel_en` and W14 `scale_addr`, again all-zero by default so
+every v1.0/v1.1 program is bit-identical under v1.2. With
+`per_channel_en=1` each output channel `oc` takes its own `(requant_scale,
+requant_shift)` from a DDR table at `scale_addr` instead of W9/W10 (which
+are then ignored); everything else in the epilogue is unchanged. Table
+entry format (`SCALE_TABLE_ENTRY_BYTES = 8`, little-endian):
+
+| Byte | Field | Notes |
+|---|---|---|
+| 0-3 | `multiplier` | signed int32, same Q15 semantics as `requant_scale` |
+| 4 | `shift` | uint8, same semantics as `requant_shift` |
+| 5-7 | reserved | must be 0 |
+
+The table is tiled exactly like the bias (`cnn_accel_model.
+pack_scale_table_for_hw` mirrors `pack_bias_for_hw`): entry `ot*PE_ROWS +
+r` feeds PE row `r` of output-channel tile `ot`, zero-padded to whole
+`PE_ROWS` tiles, so the image is `ceil(out_channels/PE_ROWS) * PE_ROWS * 8`
+bytes. In hardware it is streamed into `cnn_accel_weight_buffer`'s scale
+region in the same tile-load phase as the bias (one entry per fill beat,
+40 payload bits = multiplier | shift) and consumed per lane by
+`cnn_accel_bias_requant`. The compiler discovers `isa_version 1.2`,
+`per_channel: true`; emitting the table is compiler milestone M12.
 
 `FC` is decoded and executed identically to `CONV2D` with
 `in_width=in_height=1`, `kernel_h=kernel_w=1` — a degenerate 1x1-spatial

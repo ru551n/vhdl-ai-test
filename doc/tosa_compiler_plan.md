@@ -703,6 +703,22 @@ ACCEPTANCE: vunit-mcp green incl. new tests `test_per_channel_lanes`
 `test_per_channel_en_zero_is_legacy`; model pytest green; `conv_core`
 vectors regenerated with a per-channel case and bit-exact; JSON →
 `isa_version 1.2`, `per_channel: true`.
+STATUS: DONE (2026-09-08). `cnn_accel.*` VUnit all green (real run, incl.
+`test_per_channel_lanes`/`test_per_channel_en_zero_is_legacy` and the new
+`conv3x3_per_channel` `conv_core` case in every `pe_rows` config); model +
+compiler pytest green; pre-existing vector data byte-identical (`desc.txt`
++1 zero `scale_addr` record per case). W14 = `scale_addr`, `flags` bit5 =
+`PER_CHANNEL_EN`, table entry `int32 LE multiplier | u8 shift | 3 zero
+bytes`, tiled like the bias (`pack_scale_table_for_hw`). The RTL scope
+ends at `conv_core` as planned: `weight_buffer` gained a third, `fill_is_
+scale`-selected region with the bias region's depth/read address and the
+table arrives on the existing fill stream in the bias tile-load phase;
+`layer_ctrl` (PENDING) issues the DMA when it is designed. The target is
+discovered, not a JSON file: `discover.py` reports `isa_version 1.2`,
+`per_channel: true`. Until M12 the compiler rejects a fused per-channel
+rescale with a `CapabilityError` naming M12
+(`to_hir._H2_PER_CHANNEL_LOWERING_IMPLEMENTED`). Details:
+`modules/cnn_accel/flow_status.md` §H2.
 
 **M12 — compiler: per-channel rescale (after H2)**
 INPUT: M11, H2.
