@@ -10,12 +10,48 @@ resolve for the reuse decisions in ``doc/cnn_accel_arch.md``. Kept as
 default (``VUNIT_MCP_RUN_SCRIPT``).
 """
 
+import resource
 from pathlib import Path
 
 from tsfpga.module import get_modules
 from vunit import VUnit
 
 ROOT = Path(__file__).resolve().parent
+
+
+def _raise_stack_limit() -> None:
+    """Raise the soft stack limit so GHDL (mcode) can allocate large DDR models.
+
+    VUnit's ``memory_pkg.allocate()`` resizes the backing
+    ``integer_vector_ptr`` to ``2*num_bytes + 1`` *integers*, which GHDL's
+    mcode backend materializes on the stack. With the common 8 MiB default
+    soft limit that segfaults (exit 139, no VHDL error message) for any
+    allocation of roughly 1 MiB or more -- exactly the size range
+    ``tb_cnn_accel_top``'s ``g_ddr_bytes`` DDR model needs. Simulator
+    processes inherit this limit, so raising it here fixes every test run
+    without every developer needing a manual ``ulimit -s``.
+    """
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+    except (AttributeError, OSError, ValueError):
+        return
+
+    if soft == resource.RLIM_INFINITY:
+        return
+
+    wanted = 512 * 1024 * 1024
+    if hard != resource.RLIM_INFINITY:
+        wanted = min(wanted, hard)
+    if wanted <= soft:
+        return
+
+    try:
+        resource.setrlimit(resource.RLIMIT_STACK, (wanted, hard))
+    except (OSError, ValueError):
+        pass
+
+
+_raise_stack_limit()
 
 vu = VUnit.from_argv()
 vu.add_vhdl_builtins()
