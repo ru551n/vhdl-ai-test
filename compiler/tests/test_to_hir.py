@@ -269,16 +269,16 @@ def test_per_channel_rescale_stays_unfused_and_rejected_on_isa_v11_target(target
     assert "%4" in str(exc_info.value)
 
 
-def test_per_channel_fused_but_rejected_until_m11(target):
+def test_per_channel_fused_but_rejected_until_m12(target):
     # Real ISA v1.2 target (H2, `per_channel: true`): the per-channel
     # rescale IS fused, and `to_hir` must still reject it -- loudly, at the
-    # fused op -- until M11 emits the scale table and `scale_addr`.
+    # fused op -- until M12 emits the scale table and `scale_addr`.
     # Silently lowering channel 0's pair would compile a numerically wrong
     # program.
     with pytest.raises(CapabilityError) as exc_info:
         _to_hir(target, per_channel=True, mult=(1073741824,) * 8, shift=(38,) * 8)
     assert exc_info.value.constraint == "rescale.per_channel"
-    assert "M11" in str(exc_info.value)
+    assert "M12" in str(exc_info.value)
     assert "%10" in str(exc_info.value)
 
 
@@ -397,8 +397,8 @@ def _direct_fused_graph(rescale: RescaleParams, clamp: ClampAttrs | None = Clamp
 
 def test_to_hir_rejects_per_channel_directly(target):
     # Capability path (`caps.per_channel=False`, ISA v1.1 target); the
-    # real v1.2 target's M11 gate is `test_per_channel_fused_but_rejected_
-    # until_m11` above.
+    # real v1.2 target's M12 gate is `test_per_channel_fused_but_rejected_
+    # until_m12` above.
     from conftest import v11_target
 
     rescale = RescaleParams(

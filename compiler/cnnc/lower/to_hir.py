@@ -52,10 +52,10 @@ _W13_ISA_VERSION = "1.1"
 _INT8_RANGE = (-128, 127)
 # ISA v1.2 (HW milestone H2) added PER_CHANNEL_EN/`scale_addr`: a per-
 # output-channel (multiplier, shift) table in DDR. Emitting that table as a
-# constant buffer and pointing `scale_addr` at it is a later compiler
-# milestone (M12); until then a per-channel rescale the target CAN take is
-# rejected here, at the fused op, rather than silently lowered with only
-# channel 0's pair.
+# constant buffer and pointing `scale_addr` at it is compiler milestone M12
+# (after M11, doc/tosa_compiler_plan.md); until then a
+# per-channel rescale the target CAN take is rejected here, at the fused op,
+# rather than silently lowered with only channel 0's pair.
 _H2_PER_CHANNEL_LOWERING_IMPLEMENTED = False
 
 _ENV_FIELDS = (
