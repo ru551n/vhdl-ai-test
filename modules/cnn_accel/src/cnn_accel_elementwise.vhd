@@ -619,8 +619,16 @@ begin
                 in_c64 := resize(in_channels, 64);
                 n_tiles64 := (in_c64 + to_unsigned(c_bytes_per_beat, 64) - 1) /
                              to_unsigned(c_bytes_per_beat, 64);
-                out_w64 := in_w64 * 2;
-                out_h64 := in_h64 * 2;
+                -- 'unsigned "*" natural' (numeric_std A.17) converts the
+                -- natural to an unsigned of L'length bits before
+                -- multiplying, so a bare 'in_w64 * 2' produces a
+                -- 64+64 = 128-bit result -- a length mismatch against
+                -- these 64-bit variables that GHDL only catches at
+                -- runtime (bound check failure), not at analysis time.
+                -- Route through 'mul64' like every other product in this
+                -- process, for the same reason its own comment gives.
+                out_w64 := mul64(in_w64, to_unsigned(2, 64));
+                out_h64 := mul64(in_h64, to_unsigned(2, 64));
                 total64 := mul64(mul64(mul64(n_tiles64, out_h64), out_w64),
                                   to_unsigned(c_bytes_per_beat, 64));
                 bad := in_w64 = 0 or in_h64 = 0 or in_c64 = 0 or
