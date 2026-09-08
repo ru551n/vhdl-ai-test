@@ -2082,19 +2082,32 @@ class Module(BaseModule):
         # needed to register these configs, and `module_cnn_accel.py` is
         # also loaded by `build_fpga.py` (the synthesis env), where
         # dragging in the whole model/planner/reference stack buys nothing.
-        from accel_v2 import cases, cases_concat_split, cases_pool_pad  # noqa: PLC0415
+        from accel_v2 import (  # noqa: PLC0415
+            cases,
+            cases_concat_split,
+            cases_pool_pad,
+            cases_yolo,
+        )
 
         tb = library.test_bench("tb_cnn_accel_top")
 
-        # Three catalogues, one registration loop. `cases_pool_pad.py`
+        # Four catalogues, one registration loop. `cases_pool_pad.py`
         # holds the ISA v2.1 pooling cases (padding, the zero-point pad
         # value, the 5x5 SPPF kernel); `cases_concat_split.py` holds the
         # channel CONCAT/SPLIT cases (which add no opcode at all -- they
-        # are buffer aliasing, see that file's docstring). Both follow
-        # exactly the same contract as `cases.py` and are separate files
-        # only so the three can be edited independently. Case names are
-        # unique across all of them.
-        for case in cases.all_cases() + cases_pool_pad.all_cases() + cases_concat_split.all_cases():
+        # are buffer aliasing, see that file's docstring); `cases_yolo.py`
+        # tests by *topology* rather than by feature -- Bottleneck, C2f,
+        # SPPF, backbone stage, FPN/PAN merge, the three-scale head
+        # boundary and a small end-to-end YOLOv8n-shaped network. All
+        # follow exactly the same contract as `cases.py` and are separate
+        # files only so the four can be edited independently. Case names
+        # are unique across all of them.
+        for case in (
+            cases.all_cases()
+            + cases_pool_pad.all_cases()
+            + cases_concat_split.all_cases()
+            + cases_yolo.all_cases()
+        ):
             # VUnit's own `add_config` rather than tsfpga's
             # `add_vunit_config` helper: the helper always appends every
             # generic to the config name, and these configs carry ten of

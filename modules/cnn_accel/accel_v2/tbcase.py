@@ -620,6 +620,18 @@ def build_case(
     (inputs, weights, biases, per-channel scale tables) comes from it, so
     a failing case is reproducible from its name alone.
     """
+    # `cnn_accel_tensor_mem` requires a power-of-two `g_bank_words` (it
+    # decodes bank/offset as bit slices of the word address) and asserts
+    # it at elaboration. Caught here instead, because otherwise a case
+    # that gets it wrong compiles, plans, emits and only dies inside GHDL
+    # minutes later with an assertion that names the generic but not the
+    # case -- which is exactly how it was found.
+    if bank_words & (bank_words - 1) != 0:
+        raise ValueError(
+            f"case '{name}': bank_words must be a power of two "
+            f"(cnn_accel_tensor_mem asserts it), got {bank_words}"
+        )
+
     model = Model(seed=seed, name=name)
     build(model)
 
