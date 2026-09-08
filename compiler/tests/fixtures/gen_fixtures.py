@@ -1,13 +1,16 @@
 """Reproducible generator for the M9 multi-layer fixtures
 (doc/tosa_compiler_plan.md M9): `two_layer.mlir` (16->32->32 channels,
-3x3 s1 then 3x3 s2) and `first_layer_cin3.mlir` (Cin=3, 3x3 s2).
+3x3 s1 then 3x3 s2) and `first_layer_cin3.mlir` (Cin=3, 3x3 s2), and the
+M11 epilogue fixtures: `out_zp_relu.mlir` (`rescale.output_zp = -128`,
+identity clamp `[-128,127]` -- the asymmetric-output ReLU idiom) and
+`clamp_5_100.mlir` (general clamp `[5,100]`, `output_zp = 0`).
 
 Run with the repo's compiler venv from anywhere:
 
     .venv-compiler/bin/python compiler/tests/fixtures/gen_fixtures.py
 
 It is pure stdlib + numpy (only used for the deterministic PRNG and
-flattening, not for any conv/rescale math) and re-writes the two
+flattening, not for any conv/rescale math) and re-writes the four
 `.mlir` files byte-identically every time it's run -- weights/bias are
 derived from fixed `numpy.random.default_rng` seeds so the fixtures are
 reproducible without checking in a separate data file.
@@ -91,6 +94,7 @@ class LayerSpec:
         mult: int,
         shift: int,
         clamp: tuple[int, int],
+        out_zp: int = 0,
     ) -> None:
         self.in_shape = in_shape
         self.out_channels = out_channels
@@ -102,6 +106,7 @@ class LayerSpec:
         self.mult = mult
         self.shift = shift
         self.clamp = clamp
+        self.out_zp = out_zp
 
     @property
     def in_channels(self) -> int:
@@ -153,7 +158,7 @@ def _emit_layer(spec: LayerSpec, input_value: str, counter: _ValueCounter, lines
         f'    {v_mult} = "tosa.const"() <{{values = dense<{spec.mult}> : tensor<1xi32>}}> : () -> tensor<1xi32>',
         f'    {v_shift} = "tosa.const"() <{{values = dense<{spec.shift}> : tensor<1xi8>}}> : () -> tensor<1xi8>',
         f'    {v_rescale_in_zp} = "tosa.const"() <{{values = dense<0> : tensor<1xi32>}}> : () -> tensor<1xi32>',
-        f'    {v_rescale_out_zp} = "tosa.const"() <{{values = dense<0> : tensor<1xi8>}}> : () -> tensor<1xi8>',
+        f'    {v_rescale_out_zp} = "tosa.const"() <{{values = dense<{spec.out_zp}> : tensor<1xi8>}}> : () -> tensor<1xi8>',
         f'    {v_rescale} = "tosa.rescale"({v_conv}, {v_mult}, {v_shift}, {v_rescale_in_zp}, {v_rescale_out_zp}) '
         f'<{{input_unsigned = false, output_unsigned = false, per_channel = false, '
         f'rounding_mode = #tosa.rounding_mode<SINGLE_ROUND>, scale32 = true}}> : '
@@ -235,9 +240,55 @@ def first_layer_cin3_text() -> str:
     return build_module([layer])
 
 
+def out_zp_relu_text() -> str:
+    """M11: `output_zp = -128` with the identity clamp `[-128,127]`. In TOSA
+    `y = clamp_i8(s - 128)`: everything the requantizer rounds to `<= 0`
+    lands on -128 and the positive range maps onto `(-128, 127]` -- the
+    asymmetric (uint8-style) quantized-ReLU idiom, which the v1.0 RELU_EN
+    flag cannot express. Lowered as `output_offset=-128, CLAMP_EN,
+    [-128,127]`. `shift=34` was picked (same one-off search as M9) so seeds
+    0-2 give >= 100 distinct int8 outputs with ~half at the -128 floor."""
+    layer = LayerSpec(
+        in_shape=(1, 8, 8, 8),
+        out_channels=8,
+        kernel=3,
+        stride=(1, 1),
+        pad=(1, 1, 1, 1),
+        weight_seed=401,
+        bias_seed=402,
+        mult=1073741824,
+        shift=34,
+        clamp=(-128, 127),
+        out_zp=-128,
+    )
+    return build_module([layer])
+
+
+def clamp_5_100_text() -> str:
+    """M11: general clamp `[5,100]` (`output_zp = 0`), lowered as
+    `CLAMP_EN, [5,100]`. `shift=35` gives seeds 0-2 ~75 distinct values with
+    both bounds hit (~55% of outputs at 5 or 100), so neither bound is
+    dead in the RTL cross-check."""
+    layer = LayerSpec(
+        in_shape=(1, 8, 8, 8),
+        out_channels=8,
+        kernel=3,
+        stride=(1, 1),
+        pad=(1, 1, 1, 1),
+        weight_seed=501,
+        bias_seed=502,
+        mult=1073741824,
+        shift=35,
+        clamp=(5, 100),
+    )
+    return build_module([layer])
+
+
 def main() -> None:
     (FIXTURES_DIR / "two_layer.mlir").write_text(two_layer_text())
     (FIXTURES_DIR / "first_layer_cin3.mlir").write_text(first_layer_cin3_text())
+    (FIXTURES_DIR / "out_zp_relu.mlir").write_text(out_zp_relu_text())
+    (FIXTURES_DIR / "clamp_5_100.mlir").write_text(clamp_5_100_text())
 
 
 if __name__ == "__main__":
