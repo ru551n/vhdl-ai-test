@@ -990,3 +990,30 @@ after regeneration; `desc.txt` gains exactly three zero records per case).
 `*bias_requant*` 13/13 and `*conv_core*` 5/5 with the new case. `pytest
 --ignore=verify-stride` at the root: 630 passed / 7 skipped; `pytest
 compiler`: 294 passed / 7 IREE-skipped.
+
+## M11 — compiler lowers `output_zp` + general clamp onto ISA v1.1 (2026-09-08)
+
+`doc/tosa_compiler_plan.md` §M11 — compiler-side follow-up to H1; no RTL,
+model or constants change. `to_hir` now emits `output_offset = out_zp`,
+`CLAMP_EN=1`, `clamp_min/max` = the fused clamp's bounds (else
+`[-128,127]`) and `relu_en=0` for `isa_version >= 1.1`; v1.0 targets keep
+the legacy `RELU_EN` encoding and reject `out_zp != 0` / general clamps
+with a `CapabilityError`. New fixtures `out_zp_relu` / `clamp_5_100` with
+goldens and `compiler/tests/test_fixtures_m11.py` (`interp == run_program
+== IREE`, ×3 seeds; `CLAMP_EN,[0,127]` vs `RELU_EN` bit-identical
+behaviour).
+
+RTL touchpoint: `module_cnn_accel._COMPILER_VECTORS_FIXTURES` gains both
+M11 fixtures (1×8×8×8, 8 out channels = `PE_ROWS`), so
+`tb_cnn_accel_conv_core.test_bitexact_compiler_cases` now checks 4 cases
+and is the first RTL run in which `output_offset` (-128) and a general
+clamp (`[5,100]`) arrive via the compiler's own emitted descriptor
+(`flags 30`) rather than a hand-authored `generate_vectors.py` case.
+`doc/cnn_accel_test_vectors.md` updated.
+
+### Verification
+
+`run.py -o vunit_out_m11 "*conv_core*compiler_cases*"` (real GHDL run):
+**all passed**, `cases.txt` = `clamp_5_100_op0 conv_rescale_clamp_op0
+first_layer_cin3_op0 out_zp_relu_op0`. `pytest compiler/ modules/cnn_accel`:
+666 passed (330 in `compiler/`, incl. 14 IREE tests, none skipped).
