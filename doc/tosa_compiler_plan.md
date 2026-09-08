@@ -614,6 +614,7 @@ ACCEPTANCE: real vunit-mcp result all green; pytest for the model green; M8 e2e 
 INPUT: M8, `generate_vectors.py` format, `tb_cnn_accel_conv_core`.
 TASK: `backend/cnn_accel_v1/vectors.py` writes the compiler's program's per-layer stimulus/expected vectors in the format `tb_cnn_accel_conv_core` consumes; one VUnit config fed from a compiler-generated case.
 ACCEPTANCE: VUnit test passes bit-exact against compiler-produced expected data (real vunit-mcp result).
+STATUS: DONE. `test_bitexact_compiler_cases` (one config, `g_pe_rows=PE_ROWS`) covers `conv_rescale_clamp`/`first_layer_cin3`; all 5 `*conv_core*` VUnit configs pass (real vunit-mcp result), 291 compiler pytest pass / 7 IREE-skipped, and the missing/empty-`cases.txt` fail-loud path was confirmed negatively. `two_layer` (32 out channels) is deferred — its second layer exceeds `PE_ROWS=8`, and `conv_core`/this testbench support only a single output-channel tile until layer-level output-channel tiling (re-streaming the ifmap once per output-channel tile) lands as a future HW milestone (see `flow_status.md` M10).
 
 **H1 — HW track: ISA v1.1, output offset + general clamp (after H0)**
 INPUT: §5 extension 1.

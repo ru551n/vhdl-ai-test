@@ -101,3 +101,69 @@ gitignored):
 ```
 python modules/cnn_accel/generate_vectors.py <out_dir> [pe_rows]
 ```
+
+## M10 -- compiler-generated cases
+
+A second, independent producer of this same `<case>/` directory contract
+(doc/tosa_compiler_plan.md M10, ~line 613):
+`cnnc.backend.cnn_accel_v1.vectors.write_conv_core_vectors` writes one
+case directory per `conv_layer` op in a real compiled `Program`, using the
+compiler's OWN emitted bytes -- not `cnn_accel_model.py` called directly
+the way `generate_vectors.py` is. Exercised by `tb_cnn_accel_conv_core.vhd`'s
+`test_bitexact_compiler_cases` test/`run_compiler_cases` procedure, which
+is bit-exact-checking the compiler's real output, not a hand-authored
+golden-model fixture.
+
+CLI: `python -m cnnc vectors <x.mlir> --target cnn_accel_v1 --out <dir>
+[--seed N] [--max-out-channels N] [--case-prefix P]` (`compiler/cnnc/cli.py`)
+compiles `<x.mlir>` in memory and calls `write_conv_core_vectors` with
+seeded random int8 input(s).
+
+VUnit wiring: `module_cnn_accel.py`'s `_compiler_vectors_pre_config` hook
+(the `test_bitexact_compiler_cases` config's `pre_config`, one config only,
+at the default `g_pe_rows=PE_ROWS` -- the compiler always packs weights at
+its target's own discovered `internal_tiling`, not parameterizable by a
+`pe_rows` argument) compiles each of two fixed compiler fixtures
+(`conv_rescale_clamp`, `first_layer_cin3`) against the real `cnn_accel_v1`
+target and writes both fixtures' vectors into that config's own VUnit
+`output_path`, each fixture's case names prefixed `'<fixture>_'` so they
+cannot collide, plus one combined `cases.txt` covering every case from
+every fixture.
+
+Directory contents differ slightly from the hand-authored cases above --
+same field names/order, but no separate logical `weights.txt` and no
+`pe_array_raw_accum.txt`:
+
+- `desc.txt` -- same `LayerDesc` field list (read off `dataclasses.
+  fields(LayerDesc)`, never hard-coded) plus the same appended
+  `tile_channels`/`pe_rows` lines.
+- `weights_packed.txt` -- sliced directly out of `program.constants_bytes`
+  (already tile-packed at `to_hir` time by `lower.layout.
+  pack_weights_tiled`); no logical `weights.txt` companion is written.
+- `bias.txt` -- LOGICAL, unpadded, one `int32` per output channel (first
+  `out_channels` values of the constants-blob bias, which is only
+  zero-padded after them within one output-channel tile).
+- `input.txt`/`expected.txt` -- LOGICAL flat HWC, decoded straight out of
+  the DDR memory image `cnn_accel_model.run_program` was run against
+  (`run.prepare_memory_image`/`read_activation_buffer`, factored out of
+  `run_program` so `vectors.py` never re-derives that provenance/shape
+  logic), i.e. every layer's own input/output buffer, not just the
+  graph's entry/exit tensors.
+
+Constraint: `conv_core` (and this testbench) supports only a single
+output-channel tile, so any `conv_layer` op with `out_channels >
+max_out_channels` (`PE_ROWS` in the VUnit hook) is recorded in
+`VectorsResult.skipped` with a reason and NOT written -- e.g. the
+compiler's `two_layer` fixture's second layer (32 out channels > `PE_ROWS
+= 8`) is excluded this way; layer-level output-channel tiling is a future
+milestone (see `tb_cnn_accel_conv_core.vhd`'s own header comment and
+`flow_status.md`).
+
+Fail-loud guarantee: before writing anything, `write_conv_core_vectors`
+cross-checks `cnn_accel_model.run_program`'s output against
+`gir.interp.run` on the same (unlowered) graph and raises `CompilerError`
+rather than write vectors a model/interp disagreement could have produced.
+On the RTL side, `run_compiler_cases` in `tb_cnn_accel_conv_core.vhd` opens
+`cases.txt` with `severity failure` if it is missing, and asserts (also
+`severity failure`) if it lists zero cases -- a `pre_config` hook that
+silently wrote nothing must not report a green test.

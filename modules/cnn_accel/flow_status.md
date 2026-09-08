@@ -894,3 +894,51 @@ address and byte size is a multiple of `ACTIVATION_PLANE_CHANNELS`).
 whereas issuing one DMA request per plane per row yields `(row, tile,
 col)` order; `layer_ctrl`/`window_gen` must reconcile the beat order with
 the S6 plane reads.
+
+## M10 — RTL `conv_core` cross-check of compiler-generated vectors (2026-09-07)
+
+Closed the last open item from `doc/tosa_compiler_plan.md` §M10 (~line
+613): the compiler's OWN emitted per-layer bytes, not `cnn_accel_model.py`
+called directly, are now bit-exact-checked against `cnn_accel_conv_core`.
+
+- `compiler/cnnc/backend/cnn_accel_v1/vectors.py` (new):
+  `write_conv_core_vectors` writes one `tb_cnn_accel_conv_core`-shaped case
+  directory per `conv_layer` op in a compiled `Program` (`desc.txt`/
+  `weights_packed.txt`/`bias.txt`/`input.txt`/`expected.txt` +
+  `cases.txt`), sliced straight out of `program.constants_bytes` and the
+  DDR memory image `run_program` executed against, after cross-checking
+  `cnn_accel_model.run_program`'s output against `gir.interp.run` byte-exact
+  (refuses to write on any disagreement). Layers with `out_channels >
+  max_out_channels` are skipped with a reason, not written — `conv_core`
+  supports only a single output-channel tile.
+- `run.py`: `prepare_memory_image`/`read_activation_buffer` factored out of
+  `run_program` so `vectors.py` can read every layer's own activation
+  buffers (not just the graph's entry/exit tensors) without duplicating
+  the provenance/shape-checking logic or running the model twice.
+- `cli.py`: new `cnnc vectors <mlir> --target T --out DIR [--seed N]
+  [--max-out-channels N] [--case-prefix P]` subcommand.
+- `module_cnn_accel.py`: `_compiler_vectors_pre_config` hook compiles two
+  fixed compiler fixtures (`conv_rescale_clamp`, `first_layer_cin3`)
+  against the real `cnn_accel_v1` target and writes both fixtures' cases
+  (prefixed `<fixture>_`) plus one combined `cases.txt` into the new
+  `test_bitexact_compiler_cases` VUnit config's own `output_path` — one
+  config only, at the default `g_pe_rows = PE_ROWS` (the compiler packs
+  weights at the target's own discovered `internal_tiling`, not
+  parameterizable by a `pe_rows` argument the way `generate_vectors.py`
+  is). `two_layer` (32 out channels > `PE_ROWS = 8`) is not included since
+  `conv_core` cannot exercise more than one output-channel tile.
+- `tb_cnn_accel_conv_core.vhd`: new `test_bitexact_compiler_cases`
+  test/`run_compiler_cases` procedure, reading `vectors_root & "/cases.
+  txt"`. Fails loudly (`severity failure`), not vacuously, if `cases.txt`
+  is missing or lists zero cases.
+- Docs: `doc/cnn_accel_test_vectors.md` M10 section (file format, CLI,
+  constraint, fail-loud guarantee), `doc/tosa_compiler_plan.md` M10 marked
+  done.
+
+### Verification
+
+vunit-mcp, this clone: all 5 `*conv_core*` configs pass, incl.
+`test_bitexact_compiler_cases`. `.venv/bin/python -m pytest -q` under
+`compiler/`: 291 passed, 7 IREE-skipped (unrelated, pre-existing).
+Negative-path check: emptying `cases.txt` reproduces the intended
+`severity failure` (confirmed the fail-loud guarantee is not dead code).
