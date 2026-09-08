@@ -165,6 +165,42 @@ def case_forced_spill() -> TbCase:
     return build_case("forced_spill", build, seed=6, num_banks=1, bank_words=128)
 
 
+def case_bank_boundary_straddle() -> TbCase:
+    """Two live buffers whose size does not divide the bank size, in a
+    scratchpad of two 1 KiB banks -- the geometry a *flat* (bank-unaware)
+    allocator gets wrong.
+
+    `h1` and `a` are 8x12x8 = 768 bytes each and both live across the
+    closing `add`. A flat first-fit allocator puts `h1` at 0 and `a` at
+    768, so `a` spans 768..1536 and straddles the boundary between bank 0
+    and bank 1. `cnn_accel_tensor_mem` serves each transfer from exactly
+    one bank and clamps anything that would run past its end, so every
+    access to `a` would have been silently truncated to its first 256
+    bytes -- with no error anywhere, because the descriptor's address and
+    `reference.py`'s address agree (they come from the same planner) and
+    only the hardware knows the boundary is there.
+
+    The bank-aware planner places `a` in bank 1 instead; the 256-byte
+    hole below the boundary stays on the free list. This case runs that
+    placement against the real RTL, so a regression shows up as either a
+    data mismatch or -- since the crossing assertion is severity
+    'failure' -- an aborted simulation, not as a quietly passing test.
+
+    `bank_words=128` (1 KiB banks, 2 KiB total) rather than the default
+    8 KiB banks: the straddle has to be reachable with tensors small
+    enough to keep the simulation short.
+    """
+
+    def build(model: Model) -> None:
+        x = model.input(8, 12, _C, name="x")
+        h1 = model.conv2d(x, _C, kernel=(3, 3), padding=(1, 1, 1, 1), name="h1")
+        a = model.conv2d(h1, _C, kernel=(3, 3), padding=(1, 1, 1, 1), name="a")
+        y = model.add(a, h1, name="y")
+        model.output(y)
+
+    return build_case("bank_boundary_straddle", build, seed=77, num_banks=2, bank_words=128)
+
+
 # ---------------------------------------------------------------------------
 # 5. Feature coverage: one case per engine path, all local-resident.
 # ---------------------------------------------------------------------------
@@ -299,6 +335,7 @@ CASE_BUILDERS = (
     case_explicit_load,
     case_residual_add,
     case_forced_spill,
+    case_bank_boundary_straddle,
     case_conv_stride2,
     case_conv_1x1_no_bias,
     case_conv_per_channel_scale,

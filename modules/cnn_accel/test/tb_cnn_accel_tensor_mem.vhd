@@ -52,7 +52,18 @@ use axi_stream.axi_stream_pkg.all;
 -- process issues 'rN_req'/'wN_req' DMA requests and then drains/checks
 -- those queues once 'rN_done' pulses.
 entity tb_cnn_accel_tensor_mem is
-  generic (runner_cfg : string);
+  generic (
+    runner_cfg : string;
+    -- Lowers the DUT's 'g_illegal_request_severity' from its 'failure'
+    -- default to 'error' -- set ONLY by
+    -- 'test_bank_crossing_request_is_detected', which has to survive the
+    -- assertion in order to check what the assertion cannot: that the
+    -- crossing transfer really is clamped to the addressed bank and that
+    -- the neighbouring bank is left untouched. A boolean rather than a
+    -- 'severity_level' generic so VUnit only ever has to pass a value
+    -- type it handles natively.
+    g_illegal_request_severity_error : boolean := false
+  );
 end entity tb_cnn_accel_tensor_mem;
 
 architecture tb of tb_cnn_accel_tensor_mem is
@@ -108,6 +119,35 @@ architecture tb of tb_cnn_accel_tensor_mem is
   -- disjoint offset ranges within bank 0, so a subsequent read can check
   -- each channel's data independently).
   constant c_write_contend_words : natural := 20;
+
+  -- test_bank_crossing_request_is_detected: a request for
+  -- 'c_cross_words' words starting 'c_cross_fit_words' words before the
+  -- end of bank 0, i.e. one that runs 'c_cross_words - c_cross_fit_words'
+  -- words past the boundary and must be clamped to 'c_cross_fit_words'.
+  constant c_cross_fit_words : natural := 4;
+  constant c_cross_words : natural := 8;
+  constant c_cross_offset : natural := c_bank_words - c_cross_fit_words;
+
+  -- test_reset_mid_transfer_no_stale_beat: how far into the read burst
+  -- (in cycles after the request is accepted) the one-cycle reset lands.
+  -- Anything past 'c_read_pipeline_cycles' works; the defect needs only
+  -- that a bank read is granted on the cycle 'reset' first goes high,
+  -- which is true of every cycle of a full-speed burst.
+  constant c_reset_at_cycle : natural := 6;
+
+  -- test_reset_mid_transfer_no_stale_beat: how long to watch for a
+  -- spurious beat after reset is released. The stale beat the missing
+  -- reset produced appeared exactly one cycle after release, so this is
+  -- a wide margin.
+  constant c_post_reset_watch_cycles : natural := 12;
+
+  function illegal_request_severity return severity_level is
+  begin
+    if g_illegal_request_severity_error then
+      return error;
+    end if;
+    return failure;
+  end function;
 
   signal clk : std_ulogic := '0';
   signal reset : std_ulogic := '0';
@@ -199,7 +239,8 @@ begin
     generic map (
       g_num_banks => c_num_banks,
       g_bank_words => c_bank_words,
-      g_data_width => c_data_width
+      g_data_width => c_data_width,
+      g_illegal_request_severity => illegal_request_severity
     )
     port map (
       clk => clk,
@@ -942,6 +983,145 @@ begin
       wait until rising_edge(clk) and r0_done = '1';
       wait for c_settle;
       check_captured(r0_captured_q, 4, 900, "post-zero-length-request sanity readback");
+
+    elsif run("test_bank_crossing_request_is_detected") then
+      -- A request whose (offset + beats) runs past the end of the bank
+      -- its address decodes to is a caller bug that no bank-aware caller
+      -- can produce (accel_v2/planner.py never places a buffer across a
+      -- bank boundary), and the DUT reports it at severity
+      -- 'g_illegal_request_severity' -- 'failure' everywhere except this
+      -- one config, which lowers it to 'error' (plus
+      -- 'vhdl_assert_stop_level => failure' in module_cnn_accel.py) so
+      -- the simulation survives long enough to check what the assertion
+      -- itself cannot: that the transfer is CLAMPED to the addressed
+      -- bank, and that the bank next door is not touched.
+      --
+      -- This is the RTL half of the bug that made the whole exercise
+      -- necessary: the planner used to allocate the scratchpad as one
+      -- flat range, so a large enough buffer straddled a bank boundary,
+      -- every access to it was clamped, and the tail of the tensor was
+      -- silently never moved.
+
+      -- Seed bank 1 (the neighbour) with a distinctive pattern, and the
+      -- crossing range of bank 0 with another.
+      write_words(w1_req_m2s, w1_req_s2m, s_w1_m2s, s_w1_s2m, 1, 0, c_cross_words, 2000);
+      write_words(
+        w0_req_m2s, w0_req_s2m, s_w0_m2s, s_w0_s2m, 0, c_cross_offset, c_cross_fit_words, 1000
+      );
+
+      -- (1) Crossing READ: ask for 'c_cross_words' words from
+      -- 'c_cross_offset' in bank 0, of which only 'c_cross_fit_words'
+      -- fit. Exactly that many beats must come out, the last of them
+      -- carrying 'last' (which is what makes 'r0_done' pulse at all --
+      -- an unclamped design would either run off the end of the bank or
+      -- keep reading into the neighbour).
+      r0_mode <= c_mode_full_speed;
+      wait until rising_edge(clk);
+      issue_read(r0_req_m2s, r0_req_s2m, 0, c_cross_offset, c_cross_words);
+      wait until rising_edge(clk) and r0_done = '1';
+      wait for c_settle;
+      check_captured(
+        r0_captured_q, c_cross_fit_words, 1000,
+        "bank-crossing read is clamped to the addressed bank"
+      );
+
+      -- (2) Crossing WRITE: same geometry. Only 'c_cross_fit_words'
+      -- beats are ever accepted (streaming more would hang this process
+      -- on a 'ready' that never comes, since the DUT leaves 'busy' as
+      -- soon as the clamped count is done -- itself a check that the
+      -- clamp happened).
+      issue_write(w0_req_m2s, w0_req_s2m, 0, c_cross_offset, c_cross_words);
+      for i in 0 to c_cross_fit_words - 1 loop
+        push_write_beat(clk, s_w0_m2s, s_w0_s2m, word_value(3000, i));
+      end loop;
+      wait until rising_edge(clk) and w0_done = '1';
+      wait for c_settle;
+
+      -- The clamped write landed where it should have...
+      wait until rising_edge(clk);
+      issue_read(r0_req_m2s, r0_req_s2m, 0, c_cross_offset, c_cross_fit_words);
+      wait until rising_edge(clk) and r0_done = '1';
+      wait for c_settle;
+      check_captured(
+        r0_captured_q, c_cross_fit_words, 3000,
+        "bank-crossing write is clamped to the addressed bank"
+      );
+
+      -- ...and the neighbouring bank still holds exactly what was
+      -- written into it before: a clamped transfer must never wrap into,
+      -- or spill over into, the next bank.
+      wait until rising_edge(clk);
+      issue_read(r0_req_m2s, r0_req_s2m, 1, 0, c_cross_words);
+      wait until rising_edge(clk) and r0_done = '1';
+      wait for c_settle;
+      check_captured(
+        r0_captured_q, c_cross_words, 2000,
+        "bank-crossing transfers left the neighbouring bank untouched"
+      );
+
+    elsif run("test_reset_mid_transfer_no_stale_beat") then
+      -- 'bank_rd_valid_q' (the per-bank read-result valid flag) used to
+      -- have no reset. A read granted on the very cycle 'reset' goes
+      -- high -- the grant is combinational from 'rN_busy', which only
+      -- clears at that same edge -- still latched that flag, so one
+      -- cycle later, with reset already released and 'rN_bank'/
+      -- 'bank_rd_owner_q' likewise unreset, 'rN_capture' fired and the
+      -- channel emitted a beat belonging to no request at all.
+      --
+      -- The pattern below is the minimal reproduction: a full-speed read
+      -- burst (so a bank read is granted on every cycle), a one-cycle
+      -- reset in the middle of it, and then a watch for any beat at all
+      -- on r0 while no request is outstanding. The consumer holds
+      -- 'ready' high throughout, so a spurious beat is necessarily
+      -- accepted and lands in the queue -- there is nowhere for it to
+      -- hide.
+      write_words(w0_req_m2s, w0_req_s2m, s_w0_m2s, s_w0_s2m, 0, 0, c_bank_words, 400);
+
+      r0_mode <= c_mode_full_speed;
+      wait until rising_edge(clk);
+      issue_read(r0_req_m2s, r0_req_s2m, 0, 0, c_bank_words);
+
+      for i in 1 to c_reset_at_cycle loop
+        wait until rising_edge(clk);
+      end loop;
+
+      -- Exactly one cycle of reset: 'reset' is sampled high on the next
+      -- rising edge and low on the one after, which is the case that
+      -- leaves the stale beat behind.
+      reset <= '1';
+      wait until rising_edge(clk);
+      wait for c_settle;
+      reset <= '0';
+
+      -- Everything captured up to here was a legitimate beat of the
+      -- aborted burst. Flush, then anything that turns up is spurious.
+      -- Done before the next edge, so the stale beat (which appears one
+      -- cycle after release) cannot be flushed away with them.
+      flush(r0_captured_q);
+
+      for i in 1 to c_post_reset_watch_cycles loop
+        wait until rising_edge(clk);
+        check_equal(
+          r0_done, '0',
+          "reset mid-transfer: r0 pulsed 'done' after reset with no request outstanding"
+        );
+      end loop;
+      wait for c_settle;
+      check_true(
+        is_empty(r0_captured_q),
+        "reset mid-transfer: a stale beat was emitted after reset was released " &
+        "(bank_rd_valid_q not reset)"
+      );
+
+      -- The reset must abort the transfer, not merely pause it: the DUT
+      -- has to accept a brand-new request and serve it correctly.
+      issue_read(r0_req_m2s, r0_req_s2m, 0, 0, c_bank_words / 2);
+      wait until rising_edge(clk) and r0_done = '1';
+      wait for c_settle;
+      check_captured(
+        r0_captured_q, c_bank_words / 2, 400,
+        "post-reset readback: the DUT recovers and serves a fresh request"
+      );
     end if;
 
     test_runner_cleanup(runner);

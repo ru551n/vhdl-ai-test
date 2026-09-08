@@ -54,11 +54,23 @@ from accel_v2.ddrmap import DdrMap
 from accel_v2.model import Conv2dOp, Model, Op, Tensor, alias_byte_offset, alias_root
 
 #: Section 4 default: `g_num_banks=2 * g_bank_words=1024 * 8 bytes`.
-#: The planner treats the scratchpad as one flat byte-addressable range
-#: (bank interleaving/arbitration is a `cnn_accel_tensor_mem` RTL concern
-#: with no Python-visible effect on which bytes land where -- see the
-#: module docstring of `reference.py` for the same scoping note).
 DEFAULT_TENSOR_MEM_BYTES = 2 * 1024 * 8
+
+#: Section 4 default bank size: `g_bank_words=1024 * 8 bytes`.
+#:
+#: The scratchpad is byte-addressed as one flat range, but it is NOT one
+#: flat memory: it is `tensor_mem_bytes / bank_bytes` independent banks,
+#: and `cnn_accel_tensor_mem` serves each `(addr, length)` request from
+#: the single bank `addr` decodes to. A request with
+#: `offset + beats > bank_words` is a caller bug that the hardware
+#: reports and then *clamps* -- the part of the transfer past the bank
+#: boundary is simply never done. So a local buffer must never straddle
+#: a bank boundary, which is this module's job to guarantee (see
+#: `_LocalAllocator`); nothing else in the toolchain checks it, and
+#: neither `reference.py` (a flat `bytearray`) nor a value-only DUT
+#: comparison can see the difference, because the program and the
+#: reference both take their addresses from the same planner.
+DEFAULT_BANK_BYTES = 1024 * 8
 
 
 @dataclass
@@ -139,28 +151,92 @@ class PlannedProgram:
     #: input data and where outputs land; `reference.py` uses it to seed
     #: and to read back results.
     tensor_ddr_addr: dict[str, int] = field(default_factory=dict)
+    #: Bank size of the scratchpad this program was planned for, in
+    #: bytes. `tensor_mem_bytes // bank_bytes` is the bank count.
+    bank_bytes: int = DEFAULT_BANK_BYTES
+    #: Every local allocation this plan made, in order, as
+    #: `(alias-root tensor name, byte address, byte size)`. Recorded so a
+    #: test can assert the *geometry* of a placement directly (e.g. that
+    #: a buffer lies within one bank) rather than only its data: the
+    #: emitted program and `reference.py` take their addresses from the
+    #: same plan, so a placement bug is self-consistently wrong on both
+    #: sides and invisible to a value-only comparison.
+    local_placements: list[tuple[str, int, int]] = field(default_factory=list)
 
 
 class _LocalAllocator:
-    """First-fit free-list allocator over `[0, capacity)`. Buffers are
-    freed the instant their last consumer has run (section 3.1: "Buffer
-    reuse... [is] the producer's [compiler's] responsibility"), so the
-    free list is usually fragmented in the same way a real heap is; the
-    planner's job is only to decide *which* tensor to evict when
-    first-fit fails, not to defragment."""
+    """First-fit free-list allocator over `[0, capacity)` that never
+    places a buffer across a bank boundary. Buffers are freed the instant
+    their last consumer has run (section 3.1: "Buffer reuse... [is] the
+    producer's [compiler's] responsibility"), so the free list is usually
+    fragmented in the same way a real heap is; the planner's job is only
+    to decide *which* tensor to evict when first-fit fails, not to
+    defragment.
 
-    def __init__(self, capacity: int) -> None:
+    **Bank awareness.** `cnn_accel_tensor_mem` is `capacity / bank_bytes`
+    *independent* banks and serves any one request entirely from the
+    single bank its address decodes to; a request that would run past the
+    end of that bank is clamped by the hardware (see `DEFAULT_BANK_BYTES`),
+    silently truncating the transfer. Every allocation here is therefore
+    required to satisfy `addr // bank_bytes == (addr + size - 1) //
+    bank_bytes`.
+
+    The strategy is **"skip to the next bank boundary on straddle"**,
+    not "align every buffer to a bank":
+
+    * scan the free list first-fit exactly as before, but if the naturally
+      aligned candidate inside a free block would straddle the boundary,
+      retry at that boundary (still inside the same free block) and move
+      on to the next block if it no longer fits there;
+    * the skipped bytes are not lost -- they stay on the free list as an
+      ordinary leading hole and are handed to the next buffer small enough
+      to fit in them.
+
+    The rejected alternative, rounding every buffer's *base* (or size) up
+    to a whole bank, is what makes bank-awareness expensive: with the
+    section-4 default geometry (8 KiB banks) and this project's tensors
+    (0.5-2 KiB), it would put one tensor in each bank and cut the usable
+    scratchpad by up to 16x, turning ordinary programs into spilling ones.
+    The rule above costs *nothing at all* until a buffer would actually
+    straddle, and even then wastes at most `size - 1` bytes, reusable by
+    anything smaller. Its one real cost is a mild bias towards leaving
+    small holes just below bank boundaries; with no defragmenter that
+    bias is permanent, which is the tradeoff accepted here (measured on
+    the whole `tb_cnn_accel_top` catalogue: zero placement changes,
+    because no case ever straddled to begin with).
+
+    A buffer larger than one bank cannot be placed legally at all --
+    `Planner.plan` rejects it with an actionable message rather than
+    splitting it across banks, since the hardware has no notion of a
+    multi-bank transfer."""
+
+    def __init__(self, capacity: int, bank_bytes: int) -> None:
+        if bank_bytes <= 0:
+            raise ValueError(f"bank_bytes must be positive, got {bank_bytes}")
         self.capacity = capacity
+        self.bank_bytes = bank_bytes
         self._free: list[tuple[int, int]] = [(0, capacity)] if capacity > 0 else []
 
     def try_alloc(self, size: int, align: int = 8) -> int | None:
         if size <= 0:
             raise ValueError(f"allocation size must be positive, got {size}")
+        if size > self.bank_bytes:
+            # Caller (`Planner.alloc_local`) is expected to have rejected
+            # this already with a much more actionable message; belt and
+            # braces, since silently returning an illegal address is the
+            # exact failure mode this class exists to prevent.
+            return None
         for i, (start, length) in enumerate(self._free):
-            pad = (-start) % align
+            aligned_start = start + (-start) % align
+            # Bank boundaries are whole multiples of `align` (a bank is a
+            # whole number of 8-byte words), so bumping to one keeps the
+            # alignment guarantee.
+            bank_end = (aligned_start // self.bank_bytes + 1) * self.bank_bytes
+            if aligned_start + size > bank_end:
+                aligned_start = bank_end
+            pad = aligned_start - start
             if length - pad < size:
                 continue
-            aligned_start = start + pad
             end = aligned_start + size
             replacement = []
             if pad > 0:
@@ -184,12 +260,35 @@ class _LocalAllocator:
 
 
 class Planner:
-    def __init__(self, tensor_mem_bytes: int = DEFAULT_TENSOR_MEM_BYTES, ddr_map: DdrMap | None = None) -> None:
+    def __init__(
+        self,
+        tensor_mem_bytes: int = DEFAULT_TENSOR_MEM_BYTES,
+        ddr_map: DdrMap | None = None,
+        bank_bytes: int | None = None,
+    ) -> None:
+        """`bank_bytes` is `g_bank_words * 8`, i.e. the size of ONE
+        `cnn_accel_tensor_mem` bank -- the largest transfer the hardware
+        can serve, and therefore the largest buffer this planner may
+        place (see `_LocalAllocator`). It defaults to the section-4
+        default bank, narrowed to `tensor_mem_bytes` for a scratchpad
+        smaller than one default bank (which is then a single bank, the
+        only geometry that makes sense for it -- and what the small-mem
+        cases in `cases.py` actually instantiate)."""
+        if bank_bytes is None:
+            bank_bytes = min(DEFAULT_BANK_BYTES, tensor_mem_bytes)
+        if bank_bytes <= 0 or tensor_mem_bytes % bank_bytes != 0:
+            raise ValueError(
+                f"planner: tensor_mem_bytes={tensor_mem_bytes} must be a positive "
+                f"whole multiple of bank_bytes={bank_bytes} (the scratchpad is a "
+                "whole number of equally sized cnn_accel_tensor_mem banks)"
+            )
         self.tensor_mem_bytes = tensor_mem_bytes
+        self.bank_bytes = bank_bytes
         self.ddr_map = ddr_map if ddr_map is not None else DdrMap()
 
     def plan(self, model: Model) -> PlannedProgram:
-        alloc = _LocalAllocator(self.tensor_mem_bytes)
+        alloc = _LocalAllocator(self.tensor_mem_bytes, self.bank_bytes)
+        local_placements: list[tuple[str, int, int]] = []
         traffic = DdrTraffic()
         steps: list[Step] = []
         tensor_ddr_addr: dict[str, int] = {}
@@ -303,16 +402,29 @@ class Planner:
             tensor_ddr_addr[best_name] = ddr_addr
             return True
 
-        def alloc_local(size: int, exclude: set[str]) -> int:
+        def alloc_local(root_name: str, size: int, exclude: set[str]) -> int:
+            if size > self.bank_bytes:
+                raise ValueError(
+                    f"planner: '{root_name}' needs {size} bytes, which is more than "
+                    f"one {self.bank_bytes}-byte cnn_accel_tensor_mem bank "
+                    f"(g_bank_words={self.bank_bytes // 8}); a local buffer must fit "
+                    "in a single bank because the hardware serves each transfer from "
+                    "exactly one bank and clamps anything that would cross a bank "
+                    "boundary. Either enlarge g_bank_words, or keep this tensor in "
+                    "DDR -- it is never split across banks."
+                )
             addr = alloc.try_alloc(size)
             while addr is None:
                 if not evict_one(exclude):
                     raise ValueError(
-                        f"planner: {size} bytes do not fit in the "
-                        f"{self.tensor_mem_bytes}-byte tensor memory even "
-                        "after evicting every evictable buffer"
+                        f"planner: {size} bytes for '{root_name}' do not fit in the "
+                        f"{self.tensor_mem_bytes}-byte tensor memory "
+                        f"({self.tensor_mem_bytes // self.bank_bytes} x "
+                        f"{self.bank_bytes}-byte banks, and a buffer may not cross a "
+                        "bank boundary) even after evicting every evictable buffer"
                     )
                 addr = alloc.try_alloc(size)
+            local_placements.append((root_name, addr, size))
             return addr
 
         def resolve_input(t: Tensor, exclude: set[str]) -> tuple[int, int]:
@@ -362,7 +474,7 @@ class Planner:
             was_spilled = root.name in spilled
             if was_spilled or remaining_uses(root.name, op_index) > 1:
                 size = nbytes(root)
-                addr = alloc_local(size, exclude)
+                addr = alloc_local(root.name, size, exclude)
                 steps.append(
                     MoveStep(
                         tensor=root,
@@ -435,7 +547,9 @@ class Planner:
                         "half-written concat buffer must never be evicted (see evict_one)"
                     )
                 if out_root.name not in local_addr:
-                    local_addr[out_root.name] = alloc_local(nbytes(out_root), exclude_this_op)
+                    local_addr[out_root.name] = alloc_local(
+                        out_root.name, nbytes(out_root), exclude_this_op
+                    )
                 out_addr = local_addr[out_root.name] + out_offset
                 output_space = isa.SPACE_LOCAL_TENSOR
                 traffic.local_write_bytes += nbytes(out_t)
@@ -482,10 +596,13 @@ class Planner:
             tensor_mem_bytes=self.tensor_mem_bytes,
             ddr_map=self.ddr_map,
             tensor_ddr_addr=tensor_ddr_addr,
+            bank_bytes=self.bank_bytes,
+            local_placements=local_placements,
         )
 
 
 __all__ = [
+    "DEFAULT_BANK_BYTES",
     "DEFAULT_TENSOR_MEM_BYTES",
     "DdrTraffic",
     "ComputeStep",

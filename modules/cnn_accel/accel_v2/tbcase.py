@@ -636,7 +636,15 @@ def build_case(
     build(model)
 
     tensor_mem_bytes = num_banks * bank_words * WORD_BYTES
-    planned = Planner(tensor_mem_bytes=tensor_mem_bytes).plan(model)
+    # `bank_words` is passed on, not just multiplied in: the scratchpad is
+    # `num_banks` INDEPENDENT banks, and `cnn_accel_tensor_mem` clamps any
+    # transfer that would run past the end of the bank its address decodes
+    # to, so the planner has to know where those boundaries are or it will
+    # happily place a buffer across one and have the hardware silently
+    # truncate every access to it.
+    planned = Planner(
+        tensor_mem_bytes=tensor_mem_bytes, bank_bytes=bank_words * WORD_BYTES
+    ).plan(model)
     program = emit_program(planned)
 
     export_base, export_bytes = _export_window(model, planned)

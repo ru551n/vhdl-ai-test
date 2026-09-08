@@ -2285,6 +2285,28 @@ class Module(BaseModule):
             name="default", sim_options={"vhdl_assert_stop_level": "failure"}
         )
 
+        # 'test_bank_crossing_request_is_detected' deliberately issues a
+        # request that runs past the end of the bank its address decodes
+        # to. That assertion is severity 'failure' in every real
+        # instantiation (cnn_accel_tensor_mem.vhd's header explains why it
+        # was raised from 'error': no bank-aware caller can produce one,
+        # and the hardware's response -- clamping -- silently truncates
+        # the transfer, so the run must stop). The test's whole job,
+        # though, is to check the two things the assertion itself cannot
+        # state: that the clamp really is to the addressed bank, and that
+        # the neighbouring bank is untouched. So this ONE config lowers
+        # the DUT's assertion to 'error' via the testbench's
+        # 'g_illegal_request_severity_error' generic and lowers VUnit's
+        # stop level to 'failure' to match, exactly as the zero-length
+        # test above does -- the shipped severity is unchanged, and every
+        # other config (including tb_cnn_accel_top's) still dies
+        # immediately on a bank crossing.
+        tb.test("test_bank_crossing_request_is_detected").add_config(
+            name="default",
+            generics={"g_illegal_request_severity_error": True},
+            sim_options={"vhdl_assert_stop_level": "failure"},
+        )
+
     def _setup_cnn_accel_pool(self, library) -> None:
         tb = library.test_bench("tb_cnn_accel_pool")
 

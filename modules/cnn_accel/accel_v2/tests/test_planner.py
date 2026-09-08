@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import pytest
 
-from accel_v2 import isa
+from accel_v2 import cases, cases_concat_split, cases_pool_pad, cases_yolo, isa
 from accel_v2.model import Activation, Model
-from accel_v2.planner import ComputeStep, MoveStep, Planner
+from accel_v2.planner import ComputeStep, MoveStep, PlannedProgram, Planner
 
 
 def _linear_chain(seed: int = 1) -> Model:
@@ -37,6 +37,43 @@ def _fanout_chain(seed: int = 7) -> Model:
     h3 = m.add(h2a, h2b)
     m.output(h3)
     return m
+
+
+
+
+def _straddling_buffers_model(seed: int = 77) -> Model:
+    """input -> h1 -> a -> add(a, h1) -> output, with 8x12x8 tensors, i.e.
+    768 bytes each. `h1` and `a` are live at the same time (the `add`
+    reads both), and 768 does not divide a 1024-byte bank, so a flat
+    first-fit allocator puts the second buffer at 768..1536 -- straddling
+    the boundary between bank 0 and bank 1."""
+    m = Model(seed=seed)
+    x = m.input(8, 12, 8, name="x")
+    h1 = m.conv2d(x, out_channels=8, kernel=(3, 3), padding=(1, 1, 1, 1), name="h1")
+    a = m.conv2d(h1, out_channels=8, kernel=(3, 3), padding=(1, 1, 1, 1), name="a")
+    m.output(m.add(a, h1, name="y"))
+    return m
+
+
+def _assert_every_buffer_lies_in_one_bank(planned: PlannedProgram) -> None:
+    """The geometric invariant `cnn_accel_tensor_mem` needs and cannot
+    check for itself in a value comparison.
+
+    Asserted on the placement directly, on purpose: the emitted program
+    and `reference.py` both take their addresses from this same plan, so
+    a straddling buffer is *self-consistently* wrong on both sides of any
+    value-only DUT-versus-reference check and shows up there as nothing
+    at all. Only the geometry gives it away."""
+    bank_bytes = planned.bank_bytes
+    for name, addr, size in planned.local_placements:
+        assert addr // bank_bytes == (addr + size - 1) // bank_bytes, (
+            f"local buffer '{name}' at {addr}..{addr + size} straddles the boundary "
+            f"between bank {addr // bank_bytes} and bank {(addr + size - 1) // bank_bytes} "
+            f"of a {bank_bytes}-byte-per-bank scratchpad; cnn_accel_tensor_mem serves "
+            "every transfer from a single bank and would silently clamp (truncate) "
+            "every access to this buffer"
+        )
+        assert addr + size <= planned.tensor_mem_bytes
 
 
 def test_linear_chain_stays_local_no_spills_with_ample_memory() -> None:
@@ -67,9 +104,113 @@ def test_forced_small_memory_produces_explicit_spill_and_reload() -> None:
 def test_too_small_memory_raises() -> None:
     """A single tensor that does not fit in the scratchpad at all (even
     after evicting everything else) is a hard planner error, not a
-    silent truncation."""
-    with pytest.raises(ValueError, match="do not fit"):
+    silent truncation.
+
+    With a 64-byte scratchpad the failure is specifically "bigger than
+    one bank" (a 64-byte scratchpad is one 64-byte bank), which is the
+    stricter of the two hard errors: the hardware serves a transfer from
+    exactly one bank, so a buffer that exceeds a bank can never be placed
+    legally no matter how much of the scratchpad is free. See
+    `test_buffer_larger_than_one_bank_is_a_hard_error` for the case where
+    the scratchpad as a whole is ample and only the bank is not."""
+    with pytest.raises(ValueError, match="more than one 64-byte"):
         Planner(tensor_mem_bytes=64).plan(_linear_chain())
+
+
+def test_capacity_exhaustion_still_raises_do_not_fit() -> None:
+    """The other hard error: the buffer fits in a bank, but the whole
+    scratchpad is too small to hold it alongside everything that cannot
+    be evicted."""
+    with pytest.raises(ValueError, match="do not fit"):
+        Planner(tensor_mem_bytes=512, bank_bytes=512).plan(_fanout_chain())
+
+
+def test_local_buffers_never_straddle_a_bank_boundary() -> None:
+    """The regression test for the bug this whole bank-awareness change
+    exists for: the planner used to treat the scratchpad as one flat
+    range, so a buffer could be placed across a bank boundary and every
+    hardware access to it was silently truncated to the addressed bank.
+
+    The two `Planner` calls below differ *only* in `bank_bytes`, and the
+    second one -- one bank as wide as the whole scratchpad -- is exactly
+    the pre-fix flat allocator. It is here so this test cannot quietly go
+    vacuous: it asserts that this geometry really does straddle when
+    allocated flat, before asserting that the real, 2-bank planner does
+    not."""
+    m = _straddling_buffers_model()
+
+    flat = Planner(tensor_mem_bytes=2048, bank_bytes=2048).plan(m)
+    assert [(a, s) for _, a, s in flat.local_placements] == [(0, 768), (768, 768)], (
+        "this model no longer reproduces the flat-allocator straddle it was "
+        "written to reproduce"
+    )
+    assert any(
+        addr // 1024 != (addr + size - 1) // 1024 for _, addr, size in flat.local_placements
+    ), "flat allocation of this model must straddle the real 1024-byte bank boundary"
+
+    planned = Planner(tensor_mem_bytes=2048, bank_bytes=1024).plan(_straddling_buffers_model())
+    _assert_every_buffer_lies_in_one_bank(planned)
+    # Skipped to the next bank rather than bank-aligning everything: the
+    # 256 bytes left behind at 768..1024 stay on the free list.
+    assert [(a, s) for _, a, s in planned.local_placements] == [(0, 768), (1024, 768)]
+    assert planned.traffic.spill_count == 0, (
+        "bank-awareness must not turn a program that fits into a spilling one"
+    )
+
+
+def test_skipped_bytes_below_a_bank_boundary_are_still_usable() -> None:
+    """The cost of "skip to the next bank" over "bank-align everything":
+    the hole left below the boundary is an ordinary free block, handed to
+    the next buffer small enough for it. If it were lost, this model
+    (768 + 768 + 256 bytes live) would not fit in 2 KiB and would spill."""
+    m = Model(seed=78)
+    x = m.input(8, 12, 8, name="x")
+    sx = m.input(4, 8, 8, name="sx")
+    h1 = m.conv2d(x, out_channels=8, kernel=(3, 3), padding=(1, 1, 1, 1), name="h1")
+    a = m.conv2d(h1, out_channels=8, kernel=(3, 3), padding=(1, 1, 1, 1), name="a")
+    # 4x8x8 = 256 bytes: exactly the hole left below the bank boundary,
+    # and allocated while both 768-byte buffers are still live.
+    s1 = m.conv2d(sx, out_channels=8, kernel=(1, 1), name="s1")
+    m.output(m.add(a, h1, name="y"))
+    m.output(m.conv2d(s1, out_channels=8, kernel=(1, 1), name="s2"))
+
+    planned = Planner(tensor_mem_bytes=2048, bank_bytes=1024).plan(m)
+    _assert_every_buffer_lies_in_one_bank(planned)
+    assert ("s1", 768, 256) in planned.local_placements, (
+        f"the 256-byte hole below the bank boundary was not reused: "
+        f"{planned.local_placements}"
+    )
+
+
+def test_buffer_larger_than_one_bank_is_a_hard_error() -> None:
+    """A buffer bigger than one bank cannot be placed legally at all, no
+    matter how much scratchpad is free -- the hardware has no multi-bank
+    transfer. That is a hard error with an actionable message, never a
+    split across banks."""
+    m = _straddling_buffers_model()
+    with pytest.raises(ValueError, match="more than one 512-byte"):
+        # 8 KiB of scratchpad, ample -- but in 512-byte banks, and the
+        # tensors are 768 bytes.
+        Planner(tensor_mem_bytes=8192, bank_bytes=512).plan(m)
+
+
+def test_every_catalogue_case_places_every_buffer_inside_one_bank() -> None:
+    """The same geometric invariant over the whole `tb_cnn_accel_top`
+    catalogue, so a future case with bigger tensors (or a smaller
+    `bank_words`) cannot reintroduce a straddle unnoticed. It would
+    otherwise show up only as a data mismatch in GHDL, or -- since the
+    program and the reference agree on the wrong address -- not at all."""
+    catalogue = (
+        cases.all_cases()
+        + cases_pool_pad.all_cases()
+        + cases_concat_split.all_cases()
+        + cases_yolo.all_cases()
+    )
+    assert catalogue
+    for case in catalogue:
+        assert case.planned.bank_bytes == case.bank_words * 8, case.name
+        assert case.planned.tensor_mem_bytes == case.tensor_mem_bytes, case.name
+        _assert_every_buffer_lies_in_one_bank(case.planned)
 
 
 def test_graph_output_always_lands_in_ddr_never_local() -> None:

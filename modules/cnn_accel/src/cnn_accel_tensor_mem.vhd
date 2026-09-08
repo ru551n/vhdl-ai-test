@@ -29,14 +29,42 @@ use math.math_pkg.is_power_of_two;
 -- readability -- see 'decode_addr'.
 --
 -- A request that would cross a bank boundary (offset + beats >
--- g_bank_words) is a caller bug: this entity never corrupts a
--- neighbouring bank's contents in that case, but it also does not try to
--- "do the right thing" -- it reports the error (simulation-only 'assert',
--- severity 'error' so the run keeps going and the bug is visible in the
--- log) and silently clamps the transfer length to what still fits in the
--- targeted bank. Same treatment for a totally out-of-range bank index
--- (decodes to 'bank >= g_num_banks'): asserted, then wrapped modulo
--- 'g_num_banks' so no array bound is ever violated.
+-- g_bank_words) is a caller bug. This entity never corrupts a
+-- neighbouring bank's contents in that case -- it clamps the transfer
+-- length to what still fits in the targeted bank -- but a clamped
+-- transfer is a SILENTLY TRUNCATED one: the beats past the boundary are
+-- simply never moved, and nothing downstream can tell the difference
+-- between that and a short tensor. Same treatment for a totally
+-- out-of-range bank index (decodes to 'bank >= g_num_banks'): reported,
+-- then wrapped modulo 'g_num_banks' so no array bound is ever violated.
+--
+-- Both are therefore reported at severity 'failure' (see
+-- 'g_illegal_request_severity'), not 'error'. The reasoning, since this
+-- was deliberately changed from 'error':
+--
+--   * No legitimate caller can produce either one. The only producer of
+--     scratchpad addresses is accel_v2/planner.py, and it is bank-aware:
+--     it never places a buffer across a bank boundary, and raises a hard
+--     Python error for a buffer bigger than one bank. A request that
+--     gets here is a compiler bug, not a data-dependent condition, so
+--     there is nothing to be gained from letting the run continue.
+--   * 'error' does not reliably keep a run going anyway. VUnit's GHDL
+--     backend defaults 'vhdl_assert_stop_level' to 'error' (it passes
+--     GHDL '--assert-level=error'), so severity 'error' already aborts
+--     in every config that does not opt out -- and the one config in
+--     this project that DOES opt out (tb_cnn_accel_tensor_mem's
+--     'test_zero_length_request_asserts', lowered to 'failure') is
+--     exactly a config where an 'error'-severity bank crossing would
+--     have gone unnoticed. 'failure' cannot be lowered away by that
+--     knob: it stops the run in every configuration.
+--   * The clamp stays regardless. It is what keeps the neighbouring
+--     bank's contents intact, and it is the only thing left in
+--     synthesis, where assertions do not exist at all.
+--
+-- A zero-length request keeps severity 'error': unlike a bank crossing
+-- it damages nothing, and the run continuing is what lets
+-- 'test_zero_length_request_asserts' prove the DUT stays healthy after
+-- one.
 --
 -- Arbitration: each bank has exactly one physical write port and one
 -- physical read port (simple dual-port RAM, 1-cycle synchronous read
@@ -67,7 +95,21 @@ entity cnn_accel_tensor_mem is
   generic (
     g_num_banks : positive := 2;
     g_bank_words : positive := 1024;
-    g_data_width : positive := 64
+    g_data_width : positive := 64;
+    -- Simulation-only severity for the two "this request is impossible"
+    -- caller-bug assertions: a bank-crossing request and an
+    -- out-of-range bank index (see the header comment). 'failure' in
+    -- every real instantiation, so the bug cannot be missed and cannot
+    -- be downgraded by 'vhdl_assert_stop_level'.
+    --
+    -- The one intended override is tb_cnn_accel_tensor_mem's
+    -- 'test_bank_crossing_request_is_detected', which lowers it to
+    -- 'error' precisely so the simulation SURVIVES the assertion and can
+    -- then check the two guarantees the assertion cannot make on its own:
+    -- that the transfer really is clamped to the addressed bank, and
+    -- that the neighbouring bank's contents are untouched. Nothing else
+    -- may lower it.
+    g_illegal_request_severity : severity_level := failure
   );
   port (
     clk : in std_ulogic;
@@ -149,7 +191,7 @@ architecture a of cnn_accel_tensor_mem is
       report "cnn_accel_tensor_mem: address decodes to bank " & natural'image(bank_raw) &
         ", outside g_num_banks=" & natural'image(g_num_banks) &
         " (validation should have rejected this address before dispatch)"
-      severity error;
+      severity g_illegal_request_severity;
 
     result.bank := bank_raw mod g_num_banks;
     result.offset := word_addr mod g_bank_words;
@@ -310,8 +352,10 @@ begin
 
         if decode.offset + raw_beats > g_bank_words then
           assert false
-            report "cnn_accel_tensor_mem: w0 request crosses a bank boundary; clamping"
-            severity error;
+            report "cnn_accel_tensor_mem: w0 request crosses a bank boundary " &
+              "(a bank-aware caller cannot produce this); the transfer is clamped " &
+              "to the addressed bank, silently truncating it"
+            severity g_illegal_request_severity;
           beats := g_bank_words - decode.offset;
         else
           beats := raw_beats;
@@ -365,8 +409,10 @@ begin
 
         if decode.offset + raw_beats > g_bank_words then
           assert false
-            report "cnn_accel_tensor_mem: w1 request crosses a bank boundary; clamping"
-            severity error;
+            report "cnn_accel_tensor_mem: w1 request crosses a bank boundary " &
+              "(a bank-aware caller cannot produce this); the transfer is clamped " &
+              "to the addressed bank, silently truncating it"
+            severity g_illegal_request_severity;
           beats := g_bank_words - decode.offset;
         else
           beats := raw_beats;
@@ -546,7 +592,29 @@ begin
     begin
       if rising_edge(clk) then
         rd_en := false;
-        if r0_grant = '1' and r0_bank = b then
+        -- 'bank_rd_valid_q' is the one bit in this process that must be
+        -- reset, for the same reason the read FSMs reset 'rN_out_valid'/
+        -- 'rN_skid_valid': it is a VALID flag, and a stale one is a
+        -- fabricated beat. Concretely, without this branch: a read is
+        -- granted on the cycle 'reset' first goes high (the grant is
+        -- combinational from 'rN_busy', which only clears at that same
+        -- edge), so this process latches 'bank_rd_valid_q(b) <= 1' at the
+        -- very edge the owning channel is being reset. One cycle later,
+        -- with reset already released, 'rN_capture' is still
+        -- 'bank_rd_valid_q(bank) and owner = N' -- neither 'rN_bank' nor
+        -- 'bank_rd_owner_q' is reset either -- so the channel captures
+        -- that leftover word into its output register and emits it as a
+        -- beat belonging to no request at all. Everything else here
+        -- ('bank_rd_data_q', 'bank_rd_last_q', 'bank_rd_owner_q',
+        -- 'r_last_granted_bank', and the RAM contents themselves) is
+        -- payload or arbitration state that is only ever consumed while
+        -- this valid bit is set, so clearing the valid bit is both
+        -- necessary and sufficient -- and it keeps the RAM's write/read
+        -- ports free of any reset logic, which is what memory inference
+        -- requires (a reset on 'bank_mem' would cost the BRAM).
+        if reset = '1' then
+          bank_rd_valid_q(b) <= '0';
+        elsif r0_grant = '1' and r0_bank = b then
           rd_addr := r0_offset_next;
           rd_en := true;
           bank_rd_owner_q(b) <= 0;
@@ -668,8 +736,10 @@ begin
 
           if decode.offset + raw_beats > g_bank_words then
             assert false
-              report "cnn_accel_tensor_mem: r0 request crosses a bank boundary; clamping"
-              severity error;
+              report "cnn_accel_tensor_mem: r0 request crosses a bank boundary " &
+                "(a bank-aware caller cannot produce this); the transfer is clamped " &
+                "to the addressed bank, silently truncating it"
+              severity g_illegal_request_severity;
             beats := g_bank_words - decode.offset;
           else
             beats := raw_beats;
@@ -753,8 +823,10 @@ begin
 
           if decode.offset + raw_beats > g_bank_words then
             assert false
-              report "cnn_accel_tensor_mem: r1 request crosses a bank boundary; clamping"
-              severity error;
+              report "cnn_accel_tensor_mem: r1 request crosses a bank boundary " &
+                "(a bank-aware caller cannot produce this); the transfer is clamped " &
+                "to the addressed bank, silently truncating it"
+              severity g_illegal_request_severity;
             beats := g_bank_words - decode.offset;
           else
             beats := raw_beats;
