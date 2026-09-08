@@ -21,9 +21,11 @@ ROLES = ("input", "output", "const", "intermediate", "program")
 STAGES = ("mapped", "scheduled", "planned")
 
 # HIR op kinds don't always match the target Unit.ops vocabulary 1:1 --
-# `conv_layer` (a fused conv+bias+requant+relu HIR op) maps to the
-# `conv2d` capability a Unit advertises.
-KIND_TO_OP = {"conv_layer": "conv2d"}
+# `conv_layer` (a fused conv+bias+requant+relu HIR op) maps to the `conv2d`
+# capability a Unit advertises, and `max_pool` to `max_pool2d` -- the HIR
+# kind names the instruction shape, the capability names what the unit can
+# do, and the two only coincide by accident.
+KIND_TO_OP = {"conv_layer": "conv2d", "max_pool": "max_pool2d"}
 
 
 @dataclasses.dataclass(frozen=True)

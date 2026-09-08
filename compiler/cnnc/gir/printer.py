@@ -9,7 +9,7 @@ import dataclasses
 import hashlib
 import json
 
-from cnnc.gir.ir import Attrs, ConvAttrs, FusedConvAttrs, Graph, Op, RescaleParams, Tensor
+from cnnc.gir.ir import Attrs, ConvAttrs, FusedConvAttrs, Graph, Op, PoolAttrs, RescaleParams, Tensor
 
 
 def _shape_dtype(shape: tuple[int, ...], dtype: str) -> str:
@@ -73,6 +73,13 @@ def _format_op(graph: Graph, op: Op) -> str:
         return f"{op.id} = rescale {operands} {{{_rescale_attrs_str(op.attrs, with_scale32=True)}}} : {shape_str}"
     if op.kind == "clamp":
         return f"{op.id} = clamp {operands} {{min={op.attrs.min} max={op.attrs.max}}} : {shape_str}"
+    if op.kind == "pool":
+        a: PoolAttrs = op.attrs
+        return (
+            f"{op.id} = pool_{a.mode} {operands} "
+            f"{{kernel={_fmt_list(a.kernel)} stride={_fmt_list(a.stride)} pad={_fmt_list(a.pad)} "
+            f"pad_value={a.pad_value}}} : {shape_str}"
+        )
     if op.kind == "fused_conv":
         a: FusedConvAttrs = op.attrs
         conv_part = _conv_attrs_str(a.conv, with_acc=False)

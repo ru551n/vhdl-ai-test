@@ -110,6 +110,56 @@ def _probe_rounding(bias_requantize_relu, implicit_shift: int) -> str:
     raise TargetError(f"unrecognised rounding: tie-break probe samples {samples}")
 
 
+def _field_ladder_isa_version(has_output_offset: bool, has_scale_addr: bool, has_pad_value: bool) -> str:
+    """Lower bound on the ISA revision implied by which W-fields exist.
+
+    Each rung is the field the corresponding HW milestone added: W13
+    `output_offset` (v1.1/H1), W14 `scale_addr` (v1.2/H2), W10 byte 41
+    `pad_value` (v2.1). The rungs are cumulative -- `pad_value` is only
+    reached through the two below it -- because a descriptor layout that
+    skipped one would not be any revision of this ISA."""
+    if not has_output_offset:
+        return "1.0"
+    if not has_scale_addr:
+        return "1.1"
+    if not has_pad_value:
+        return "1.2"
+    return "2.1"
+
+
+def _discover_isa_version(constants, has_output_offset: bool, has_scale_addr: bool, has_pad_value: bool) -> str:
+    """The accelerator's ISA revision as `"<major>.<minor>"`.
+
+    `cnn_accel_constants.ISA_VERSION` is the authority -- it is the exact
+    value the RTL reports in `CSR.HW_INFO2.ISA_VERSION`, packed as
+    `(major << 8) | minor` -- and the field ladder is a cross-check, not
+    an independent opinion. Before this, only the ladder existed and it
+    stopped at `"1.2"`, so hardware announcing `0x0201` was read as ISA
+    v1.2 and every v2.1-gated capability (`pad_value` above all) looked
+    unavailable to the compiler.
+
+    A ladder result ABOVE the announced version is a real inconsistency
+    (the descriptor layout carries fields the announced revision does not
+    define) and fails loudly rather than being papered over. Below is
+    fine: a newer revision may add behaviour without adding a W-field."""
+    announced = getattr(constants, "ISA_VERSION", None)
+    ladder = _field_ladder_isa_version(has_output_offset, has_scale_addr, has_pad_value)
+    if announced is None:
+        return ladder
+    version = f"{(int(announced) >> 8) & 0xFF}.{int(announced) & 0xFF}"
+    if _version_tuple(ladder) > _version_tuple(version):
+        raise TargetError(
+            f"cnn_accel_constants.ISA_VERSION announces v{version}, but ISA_LAYOUT carries the "
+            f"W-fields of v{ladder} (output_offset={has_output_offset}, scale_addr={has_scale_addr}, "
+            f"pad_value={has_pad_value})"
+        )
+    return version
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
 def discover_cnn_accel(accel_root: Path | None = None) -> Target:
     root = Path(accel_root) if accel_root is not None else _resolve_accel_root()
     constants_path = root / "cnn_accel_constants.py"
@@ -134,6 +184,95 @@ def discover_cnn_accel(accel_root: Path | None = None) -> Target:
                 sys.modules[name] = module
 
 
+def _pool_unit(constants, field_max_by_width, epilogue, isa_version: str, has_pad_value: bool) -> Unit | None:
+    """The `window_gen` + `pool` datapath as its own `Unit`.
+
+    A separate unit from `conv_engine` because it genuinely is one: it
+    shares the descriptor stream and the DDR activation layout, but not
+    the MAC array, and its bounds are its own -- `MAX_POOL_KERNEL_SIZE`
+    (5, sized for YOLOv8n's SPPF) rather than `MAX_KERNEL_SIZE`, and no
+    `PE_ROWS` output-channel divisibility at all, since pooling is
+    channel-preserving and never tiles output channels.
+
+    `POOL_AVG` is advertised even though `frontend.tosa_import` refuses
+    `tosa.avg_pool2d` today: the capability describes the hardware, and
+    the refusal is a statement about TOSA equivalence (see
+    `_import_avg_pool2d`), not about the opcode's existence. Returns
+    `None` for a constants file with no pooling opcodes at all."""
+    ops = tuple(
+        name for opcode, name in (("POOL_MAX", "max_pool2d"), ("POOL_AVG", "avg_pool2d"))
+        if opcode in constants.OPCODES
+    )
+    if not ops:
+        return None
+
+    def max_constraint(expr: str, value: int, source: str) -> Constraint:
+        return Constraint(kind="max", expr=expr, value=value, source=source)
+
+    constraints = [
+        max_constraint(
+            f"in_width * ceil(in_channels / {constants.TILE_CHANNELS})",
+            constants.MAX_ROW_TILE_WORDS,
+            "cnn_accel_constants.MAX_ROW_TILE_WORDS, sizes cnn_accel_window_gen's "
+            "g_max_row_tile_words row-bank depth -- pooling streams through the same "
+            "window generator as convolution (doc/cnn_accel_top_v2_arch.md section 5.2)",
+        ),
+    ]
+    for name in ("in_width", "in_height", "in_channels"):
+        constraints.append(
+            max_constraint(name, field_max_by_width(name), f"cnn_accel_constants.ISA_LAYOUT field {name!r} width")
+        )
+    for name in ("pool_kernel_h", "pool_kernel_w"):
+        constraints.append(
+            max_constraint(
+                name,
+                constants.MAX_POOL_KERNEL_SIZE,
+                "cnn_accel_constants.MAX_POOL_KERNEL_SIZE -- a separate, larger bound than "
+                "MAX_KERNEL_SIZE because SPPF pools 5x5 while no convolution does "
+                "(doc/cnn_accel_top_v2_arch.md section 12a)",
+            )
+        )
+    for name in ("pool_stride_h", "pool_stride_w"):
+        constraints.append(
+            max_constraint(name, field_max_by_width(name), f"cnn_accel_constants.ISA_LAYOUT field {name!r} width")
+        )
+    for name in ("pad_top", "pad_bottom", "pad_left", "pad_right"):
+        constraints.append(
+            max_constraint(name, field_max_by_width(name), f"cnn_accel_constants.ISA_LAYOUT field {name!r} width")
+        )
+
+    pool_kernels = tuple(
+        (kh, kw)
+        for kh in range(1, constants.MAX_POOL_KERNEL_SIZE + 1)
+        for kw in range(1, constants.MAX_POOL_KERNEL_SIZE + 1)
+    )
+    return Unit(
+        name="pool_engine",
+        ops=ops,
+        dtypes={"input": "i8", "output": "i8"},
+        kernels=pool_kernels,
+        strides="any",
+        dilation=((1, 1),),
+        # v2.1 pads with the descriptor's `pad_value` byte; before it, a
+        # padded tap was a literal zero, which for MAX pooling wins the
+        # window on every border of a tensor whose values are mostly
+        # negative. "zero" here is therefore a real capability statement.
+        padding="pad_value" if has_pad_value else "zero",
+        batch=1,
+        # `cin` is the real window-generator channel tile. `cout` has no
+        # meaning here -- pooling is channel-preserving and never runs the
+        # output-channel tile loop -- so it is set to the activation
+        # plane width (the granularity the pooled tensor is actually
+        # stored in) rather than PE_ROWS, which would suggest a weight
+        # tiling this unit has no weights for.
+        internal_tiling=InternalTiling(cin=constants.TILE_CHANNELS, cout=constants.ACTIVATION_PLANE_CHANNELS),
+        constraints=tuple(constraints),
+        epilogue=epilogue,
+        isa_version=isa_version,
+        partial_sum_io=False,
+    )
+
+
 def _build_target(root: Path, constants, model, constants_path: Path, model_path: Path) -> Target:
     field_specs = {
         f.name: (f.offset_bytes, f.width_bytes, f.signed) for f in constants.isa_field_offsets()
@@ -154,11 +293,8 @@ def _build_target(root: Path, constants, model, constants_path: Path, model_path
     isa_fields = set(field_specs)
     has_output_offset = "output_offset" in isa_fields
     has_scale_addr = "scale_addr" in isa_fields
-    isa_version = "1.0"
-    if has_output_offset:
-        isa_version = "1.1"
-        if has_scale_addr:
-            isa_version = "1.2"
+    has_pad_value = "pad_value" in isa_fields
+    isa_version = _discover_isa_version(constants, has_output_offset, has_scale_addr, has_pad_value)
 
     per_channel = "PER_CHANNEL_EN" in constants.FLAGS
     clamp_en = "CLAMP_EN" in constants.FLAGS
@@ -272,6 +408,11 @@ def _build_target(root: Path, constants, model, constants_path: Path, model_path
         partial_sum_io="PSUM_IN" in constants.FLAGS,
     )
 
+    units = [unit]
+    pool_unit = _pool_unit(constants, field_max_by_width, epilogue, isa_version, has_pad_value)
+    if pool_unit is not None:
+        units.append(pool_unit)
+
     ddr_size = 2 ** (8 * field_width_bytes("in_addr"))
     memory = Memory(
         spaces={
@@ -328,7 +469,7 @@ def _build_target(root: Path, constants, model, constants_path: Path, model_path
         name="cnn_accel_v1",
         program_model="instruction_stream",
         memory=memory,
-        units=(unit,),
+        units=tuple(units),
         isa=isa,
         provenance=provenance,
     )

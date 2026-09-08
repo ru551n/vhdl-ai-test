@@ -3,6 +3,7 @@ checks, doc/tosa_compiler_plan.md §2.2, §4, §6, §13 M6)."""
 
 from __future__ import annotations
 
+import struct
 from pathlib import Path
 
 import pytest
@@ -259,13 +260,41 @@ def test_stride_3_passes_capability_checks(target):
     assert module.ops[0].params["stride_h"] == 3
 
 
-def test_conv_in_zp_rejected(target):
+def test_conv_in_zp_lowers_to_pad_value_plus_a_folded_bias(target):
+    """A non-zero conv input zero-point is no longer rejected: on an ISA
+    v2.1 target it becomes `pad_value = in_zp` plus the matching
+    `bias' = bias - in_zp * sum(w)` fold. Both halves, or neither -- see
+    `lower.to_hir._zero_point_bias_delta`."""
+    module = _to_hir(target, conv_in_zp=3)
+    op = module.ops[0]
+    assert op.params["pad_value"] == 3
+    # The fixture's weights are a splat of 1 over 3x3x4 taps, so
+    # sum(w[o]) == 36 for every output channel and bias' == 0 - 3*36.
+    bias_buf = module.buffer(op.reads[2])
+    folded = struct.unpack(f"<{bias_buf.size_bytes // 4}i", bias_buf.data)
+    assert set(folded[: op.params["out_channels"]]) == {-108}
+
+
+def test_conv_w_zp_still_rejected(target):
     with pytest.raises(CapabilityError) as exc_info:
-        _to_hir(target, conv_in_zp=1)
+        _to_hir(target, conv_w_zp=1)
     # Nonzero zero points don't block fusion, so this reaches to_hir as a
     # fused_conv whose id is the fused chain's output id (clamp's %10).
     assert "%10" in str(exc_info.value)
-    assert exc_info.value.constraint == "conv.zero_point"
+    assert exc_info.value.constraint == "conv.w_zp"
+
+
+def test_conv_in_zp_with_padding_rejected_before_isa_v21(target):
+    data = target.to_dict()
+    for unit in data["units"]:
+        unit["isa_version"] = "1.2"
+    data["isa"]["fields"].pop("pad_value", None)
+    from cnnc.target.contract import Target
+
+    with pytest.raises(CapabilityError) as exc_info:
+        _to_hir(Target.from_dict(data), conv_in_zp=3)
+    assert exc_info.value.constraint == "conv.in_zp"
+    assert "pad_value" in str(exc_info.value)
 
 
 def test_per_channel_rescale_stays_unfused_and_rejected_on_isa_v11_target(target):

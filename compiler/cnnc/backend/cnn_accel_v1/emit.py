@@ -59,6 +59,20 @@ _CORE_FIELD_PARAMS = (
 # any nonzero value (a v1.0 `to_hir` never produces one).
 _W13_FIELD_PARAMS = ("output_offset", "clamp_min", "clamp_max")
 
+# `HirOp.params` keys a `max_pool` op sets, likewise copied verbatim onto
+# the same-named ISA field. Disjoint from `_CORE_FIELD_PARAMS` except for
+# the shared geometry/padding fields: pooling has no out_channels, no
+# weights and no requant, and uses the separate `pool_*` W11 fields rather
+# than the convolution's `kernel_*`/`stride_*`.
+_POOL_FIELD_PARAMS = (
+    "in_width", "in_height", "in_channels",
+    "pool_kernel_h", "pool_kernel_w", "pool_stride_h", "pool_stride_w",
+    "pad_top", "pad_bottom", "pad_left", "pad_right",
+)
+
+# ISA v2.1 W10 byte 41, opcode-agnostic (see `Descriptor.pad_value`).
+_PAD_VALUE_PARAM = "pad_value"
+
 _LAYOUT_NOTE = (
     '"ddr_layouts": "activations are S6 channel-tiled planes (memory.activation_plane_channels); '
     'weights/bias are the D10/D11 tile-major images of cnn_accel_model.pack_weights_for_hw/'
@@ -110,29 +124,29 @@ class Descriptor:
     # Meaningful only with FLAG_PER_CHANNEL_EN; always 0 until a lowering
     # writes the table (same v1.0/v1.1 reserved-zero rule as W13 above).
     scale_addr: int = 0
-    # ISA v2.1, W10 byte 41: the int8 value padded taps take (the input
-    # tensor's zero-point). Kept field-for-field identical to
-    # `cnn_accel_model.LayerDesc` (see this class' docstring, and
-    # `vectors.py`, which walks `LayerDesc`'s fields to write `desc.txt`).
+    # ISA v2.1, W10 byte 41: the int8 value padded taps take. Kept
+    # field-for-field identical to `cnn_accel_model.LayerDesc` (see this
+    # class' docstring, and `vectors.py`, which walks `LayerDesc`'s fields
+    # to write `desc.txt`), and opcode-agnostic in the hardware: `POOL_*`
+    # and `CONV2D`/`DWCONV2D`/`FC` all fill their padded taps from it.
     #
-    # ALWAYS 0 today, and correctly so -- not because the hardware cannot
-    # do better. Both `POOL_*` and, since the convolution half landed,
-    # `CONV2D`/`DWCONV2D`/`FC` fill their padded taps with this field, and
-    # `target.discover` already surfaces byte 41 as a real signed ISA
-    # field, so `encode_descriptor` would encode a non-zero value
-    # correctly. What is missing is upstream: `lower/to_hir.py` REJECTS
-    # `conv.in_zp != 0` outright ("zero points not supported: padding is
-    # literal 0 in HW", constraint `conv.zero_point`), so every conv this
-    # backend ever sees has a zero input zero-point, for which 0 is the
-    # right pad value.
+    # Two lowerings write it, for the same underlying reason -- TOSA's
+    # padding value is not 0 -- and both are only correct as a pair with
+    # something else:
     #
-    # Lifting that rejection is `doc/tosa_compiler_plan.md`'s extension 5
-    # and is NOT just "set this field": TOSA pads with `input_zp` and then
-    # subtracts it, so an exact lowering must ALSO fold
-    # `bias'[o] = bias[o] - input_zp * sum(w[o])` into the packed bias,
-    # and `target/discover.py`'s isa_version ladder (which stops at "1.2"
-    # and never looks at `pad_value`) has to learn the field exists.
-    # Setting `pad_value` without the bias fold would be silently wrong.
+    #   * `max_pool`: TOSA pads MAX_POOL2D with the element type's minimum
+    #     (-128 for int8) so a padded tap can never win the max. Paired
+    #     with `gir.verify._verify_pool`, which refuses any other value.
+    #   * `conv_layer`: TOSA pads with the input zero-point and then
+    #     subtracts it, so `pad_value = in_zp` is paired with the
+    #     `bias'[o] = bias[o] - in_zp * sum(w[o])` fold that
+    #     `lower.to_hir._zero_point_bias_delta` derives. Either half alone
+    #     is silently wrong (`tests/test_conv_zero_point.py` demonstrates
+    #     both failure modes).
+    #
+    # On a pre-v2.1 target byte 41 is not an ISA field at all, so
+    # `encode_descriptor` accepts it only as 0 -- and `lower.to_hir`
+    # refuses the lowerings that would need it, naming `pad_value`.
     pad_value: int = 0
 
 
@@ -200,7 +214,13 @@ def _assemble_flags(op: HirOp, target: "Target") -> int:
 
 
 def _reject_unknown_params(op: HirOp, isa_version: str) -> None:
-    handled = set(_CORE_FIELD_PARAMS) | set(_W13_FIELD_PARAMS) | set(_FLAG_PARAM_TO_FLAG_NAME)
+    handled = (
+        set(_CORE_FIELD_PARAMS)
+        | set(_W13_FIELD_PARAMS)
+        | set(_POOL_FIELD_PARAMS)
+        | set(_FLAG_PARAM_TO_FLAG_NAME)
+        | {_PAD_VALUE_PARAM}
+    )
     for key in op.params:
         if key not in handled:
             raise CapabilityError(
@@ -299,7 +319,61 @@ def _build_conv_descriptor(
         requant_shift=params["requant_shift"],
         next_instr_addr=program_addr + (index + 1) * target.isa.instr_word_bytes,
         scale_addr=scale_buf.addr if scale_buf is not None else 0,
+        # ISA v2.1: the value padded taps take. `lower.to_hir` sets it only
+        # for a conv whose TOSA `in_zp` is non-zero, and *only together
+        # with* the matching `bias -= in_zp * sum(w)` fold -- see
+        # `_zero_point_bias_delta`. 0 (the default) is the correct pad for
+        # every zero-point-free convolution and is what a pre-v2.1 target,
+        # which has no such ISA field, requires.
+        pad_value=int(params.get(_PAD_VALUE_PARAM, 0)),
         **{key: params.get(key, 0) for key in _W13_FIELD_PARAMS},
+    )
+
+
+def _build_pool_descriptor(
+    op: HirOp, module: HirModule, target: "Target", program_addr: int, index: int, isa_version: str
+) -> Descriptor:
+    """One `POOL_MAX` instruction. Reads one buffer and writes one; there
+    are no weights, no bias and no scale table, so `weight_addr`/
+    `bias_addr`/`scale_addr` stay 0 and no flag but `PAD_EN` is set (the
+    `bias_en`/`requant_en` a convolution always sets would enable an
+    epilogue `cnn_accel_model.pool_max` deliberately bypasses)."""
+    _reject_unknown_params(op, isa_version)
+
+    params = op.params
+    if len(op.reads) != 1:
+        raise CompilerError(
+            f"max_pool op must read exactly 1 buffer (input), got {len(op.reads)}", op_id=op.id, stage=_STAGE
+        )
+    if len(op.writes) != 1:
+        raise CompilerError(
+            f"max_pool op must write exactly 1 buffer, got {len(op.writes)}", op_id=op.id, stage=_STAGE
+        )
+    in_buf = module.buffer(op.reads[0])
+    out_buf = module.buffer(op.writes[0])
+    for label, buf in (("in", in_buf), ("out", out_buf)):
+        if buf.addr is None:
+            raise CompilerError(f"buffer {buf.id!r} ({label}) has no addr", op_id=op.id, stage=_STAGE)
+
+    opcode = target.isa.opcodes.get("POOL_MAX")
+    if opcode is None:
+        raise CapabilityError("target ISA has no POOL_MAX opcode", op_id=op.id, stage=_STAGE)
+
+    for key in _POOL_FIELD_PARAMS:
+        if key not in params:
+            raise CompilerError(f"max_pool op missing required param {key!r}", op_id=op.id, stage=_STAGE)
+
+    return Descriptor(
+        opcode=opcode,
+        flags=_assemble_flags(op, target),
+        in_addr=in_buf.addr,
+        out_addr=out_buf.addr,
+        # A pooled tensor keeps its channel count; `out_channels` is a
+        # convolution field the pool datapath does not read, so leaving it
+        # 0 (rather than echoing in_channels) says "not applicable".
+        next_instr_addr=program_addr + (index + 1) * target.isa.instr_word_bytes,
+        pad_value=int(params.get(_PAD_VALUE_PARAM, 0)),
+        **{key: params[key] for key in _POOL_FIELD_PARAMS},
     )
 
 
@@ -404,13 +478,16 @@ def emit_program(module: HirModule, target: "Target") -> Program:
 
     descriptors: list[Descriptor] = []
     op_ids: list[str | None] = []
+    builders = {"conv_layer": _build_conv_descriptor, "max_pool": _build_pool_descriptor}
     for index, op in enumerate(ops_sorted):
-        if op.kind != "conv_layer":
+        builder = builders.get(op.kind)
+        if builder is None:
             raise CapabilityError(
-                f"HIR op kind {op.kind!r} has no cnn_accel_v1 instruction encoding",
+                f"HIR op kind {op.kind!r} has no cnn_accel_v1 instruction encoding "
+                f"(encodable kinds: {', '.join(sorted(builders))})",
                 op_id=op.id, stage=_STAGE, constraint=op.kind,
             )
-        descriptors.append(_build_conv_descriptor(op, module, target, program_buf.addr, index, isa_version))
+        descriptors.append(builder(op, module, target, program_buf.addr, index, isa_version))
         op_ids.append(op.id)
     descriptors.append(_halt_descriptor(target))
     op_ids.append(None)

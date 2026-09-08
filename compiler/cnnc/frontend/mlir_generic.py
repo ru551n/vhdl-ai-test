@@ -5,11 +5,33 @@ Supports the small subset of the grammar needed to ingest TOSA IR emitted by
 IREE: `builtin.module`, `func.func`, generic ops, and the attribute kinds used
 by the conv/rescale/clamp fusion group. Anything outside that subset raises a
 subclass of `MlirParseError`.
+
+Deliberately *syntax*-permissive, semantics-strict: the parser's job is to
+survive whatever real MLIR producers emit, and to let `frontend.tosa_import`
+be the one place that says "this program is not compilable, because <op> at
+<line:col> ...". Concretely, three things modern producers emit that this
+parser therefore accepts rather than rejects:
+
+* `!tosa.shape<N>` (TOSA-1.0 shape-typed operands: `tosa.const_shape`,
+  `tosa.reshape`'s shape operand, `tosa.slice`'s start/size operands),
+  modelled as `ShapeType`;
+* floating-point literals (`1.0 : f32`, `dense<1.0> : tensor<4xf32>`),
+  modelled as `FloatAttr` / a `DenseElementsAttr` whose `values` are
+  `float`. A pre-quantization fp32 model must *parse* -- it is the import
+  stage that reports "floating point dtype 'f32' is not supported", naming
+  the op, rather than the lexer dying on the first literal;
+* `dense_resource<key>` attributes plus the trailing
+  `{-# dialect_resources: { builtin: { key: "0x..." } } #-}` block that
+  torch-mlir emits by default for tensors above its inlining threshold.
+  The blobs are parsed into `MlirModule.resources` and decoded on demand
+  by `DenseResourceAttr.decode`, so a resource-carrying `tosa.const` is
+  real data, not an unsupported construct.
 """
 
 from __future__ import annotations
 
 import re
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Union
@@ -72,7 +94,20 @@ class TensorType:
         return n
 
 
-Type = Union[ScalarType, TensorType]
+@dataclass(frozen=True)
+class ShapeType:
+    """TOSA-1.0 `!tosa.shape<N>`: a rank-`N` list of `index` values used
+    for the shape/start/size operands of `tosa.reshape`, `tosa.slice`,
+    `tosa.tile` and friends, which in TOSA 0.x were plain attributes.
+    Carries no element type -- the elements are always `index`."""
+
+    rank: int
+
+    def __str__(self) -> str:
+        return f"!tosa.shape<{self.rank}>"
+
+
+Type = Union[ScalarType, TensorType, ShapeType]
 
 
 @dataclass(frozen=True)
@@ -90,6 +125,10 @@ class FunctionType:
             res = "(" + ", ".join(str(t) for t in self.results) + ")"
         return f"({ins}) -> {res}"
 
+
+# One `<digits>x` dimension prefix of a tensor-shape suffix; see
+# `Parser._parse_tensor_type` for why this is peeled rather than split.
+_LEADING_DIM_RE = re.compile(r"^(\d+)x")
 
 _INT_TYPE_RE = re.compile(r"^i\d+$")
 _FLOAT_TYPE_RE = re.compile(r"^f\d+$")
@@ -118,6 +157,19 @@ class IntAttr:
 
 
 @dataclass(frozen=True)
+class FloatAttr:
+    """A floating-point scalar literal (`1.0 : f32`). Never usable by the
+    importer -- this compiler is integer-only -- but represented so that a
+    pre-quantization model parses and is diagnosed at import."""
+
+    value: float
+    type: str
+
+    def __str__(self) -> str:
+        return f"{self.value} : {self.type}"
+
+
+@dataclass(frozen=True)
 class BoolAttr:
     value: bool
 
@@ -136,7 +188,7 @@ class TypeAttr:
 @dataclass(frozen=True)
 class DenseArrayAttr:
     elem_type: str
-    values: tuple[int, ...]
+    values: tuple[float, ...] | tuple[int, ...]
 
     def __str__(self) -> str:
         if not self.values:
@@ -163,18 +215,112 @@ def _nest_dense_values(values: tuple[int, ...], shape: tuple[int, ...]) -> str:
 
 @dataclass(frozen=True)
 class DenseElementsAttr:
+    """`dense<...> : tensor<...>` in any of its three printed forms: a
+    splat (`dense<0>`), a nested value list (`dense<[[1, 2], [3, 4]]>`),
+    or a raw hex blob (`dense<"0x7B7A...">`, which MLIR switches to above
+    a size threshold). Exactly one of `splat`/`values`/`blob` is set;
+    `elements()` normalises all three to a flat, row-major tuple."""
+
     tensor_type: TensorType
-    values: tuple[int, ...] | None
-    splat: int | None
+    values: tuple[float, ...] | tuple[int, ...] | None
+    splat: float | int | None
+    #: Raw little-endian element bytes for the `dense<"0x...">` form.
+    #: Unlike a `dense_resource` blob these carry no alignment header.
+    blob: bytes | None = None
 
     def __str__(self) -> str:
-        if self.splat is not None:
+        if self.blob is not None:
+            body = '"0x' + self.blob.hex().upper() + '"'
+        elif self.splat is not None:
             body = str(self.splat)
         elif not self.values:
             body = ""
         else:
             body = _nest_dense_values(self.values, self.tensor_type.shape)
         return f"dense<{body}> : {self.tensor_type}"
+
+    def elements(self) -> tuple[float, ...] | tuple[int, ...]:
+        """Flat, row-major elements, whichever form this attribute took.
+        Raises `ResourceDecodeError` for a blob whose length or element
+        type this decoder cannot make sense of."""
+        if self.blob is not None:
+            return _decode_elements(self.blob, self.tensor_type, f"dense<...> : {self.tensor_type}")
+        if self.splat is not None:
+            return tuple([self.splat] * self.tensor_type.numel)
+        return tuple(self.values) if self.values else ()
+
+
+# `struct` format character + byte width per MLIR element type, for
+# decoding a `dense_resource` blob. MLIR writes resources in the host's
+# (little-endian on every platform this compiler runs on) in-memory
+# representation; `i1` is one byte per element there, not a bit vector.
+_RESOURCE_ELEM_FORMAT = {
+    "i1": ("?", 1), "i8": ("b", 1), "i16": ("h", 2), "i32": ("i", 4), "i64": ("q", 8),
+    "index": ("q", 8), "f32": ("f", 4), "f64": ("d", 8),
+}
+
+# Every MLIR resource blob is prefixed by its alignment as a little-endian
+# uint32 (`0x04000000` = 4 in the artifacts here); the payload follows.
+_RESOURCE_HEADER_BYTES = 4
+
+
+class ResourceDecodeError(Exception):
+    """A binary element blob could not be decoded (missing `dense_resource`
+    key, element type this decoder does not know, or a blob whose length
+    disagrees with the tensor type it is attached to)."""
+
+
+def _decode_elements(payload: bytes, tensor_type: TensorType, what: str) -> tuple[float, ...] | tuple[int, ...]:
+    """`payload` (raw little-endian elements, no header) as Python scalars.
+
+    Raises `ResourceDecodeError` rather than returning something
+    plausible-but-wrong: a silently mis-decoded weight blob is far worse
+    than a refusal naming the blob."""
+    dtype = tensor_type.dtype.name
+    spec = _RESOURCE_ELEM_FORMAT.get(dtype)
+    if spec is None:
+        raise ResourceDecodeError(f"{what}: no decoder for element type {dtype!r}")
+    fmt, width = spec
+    numel = tensor_type.numel
+    if len(payload) != numel * width:
+        raise ResourceDecodeError(
+            f"{what}: blob payload is {len(payload)} bytes, but {tensor_type} needs "
+            f"{numel * width} ({numel} x {width}-byte {dtype})"
+        )
+    return tuple(struct.unpack(f"<{numel}{fmt}", payload))
+
+
+@dataclass(frozen=True)
+class DenseResourceAttr:
+    """`dense_resource<key> : tensor<...>`: the tensor's elements live in
+    the file-trailing `{-# dialect_resources ... #-}` block under `key`,
+    as one hex blob. torch-mlir emits every tensor above its inlining
+    threshold this way, so a real exported model is almost entirely made
+    of these.
+
+    The attribute itself carries only the key and the type; the blobs are
+    on `MlirModule.resources` (one dict for the whole file), so decoding
+    needs both -- see `decode`."""
+
+    key: str
+    tensor_type: TensorType
+
+    def __str__(self) -> str:
+        return f"dense_resource<{self.key}> : {self.tensor_type}"
+
+    def decode(self, resources: dict[str, bytes]) -> tuple[float, ...] | tuple[int, ...]:
+        """This resource's elements, row-major, as Python scalars.
+
+        Raises `ResourceDecodeError` rather than returning something
+        plausible-but-wrong: a silently mis-decoded weight blob is far
+        worse than a refusal naming the key."""
+        blob = resources.get(self.key)
+        if blob is None:
+            raise ResourceDecodeError(
+                f"dense_resource key {self.key!r} is not in the file's dialect_resources block "
+                f"(known keys: {sorted(resources)[:8]}{'...' if len(resources) > 8 else ''})"
+            )
+        return _decode_elements(blob[_RESOURCE_HEADER_BYTES:], self.tensor_type, f"dense_resource {self.key!r}")
 
 
 @dataclass(frozen=True)
@@ -205,7 +351,8 @@ class FunctionTypeAttr:
 
 
 Attr = Union[
-    IntAttr, BoolAttr, TypeAttr, DenseArrayAttr, DenseElementsAttr, EnumAttr, StringAttr, FunctionTypeAttr
+    IntAttr, FloatAttr, BoolAttr, TypeAttr, DenseArrayAttr, DenseElementsAttr, DenseResourceAttr,
+    EnumAttr, StringAttr, FunctionTypeAttr,
 ]
 
 
@@ -235,6 +382,10 @@ class MlirFunc:
 @dataclass
 class MlirModule:
     funcs: list[MlirFunc]
+    #: `dense_resource` key -> raw blob bytes (alignment header included),
+    #: from the file-trailing `{-# dialect_resources ... #-}` block. Empty
+    #: for a file that inlines all of its constants.
+    resources: dict[str, bytes] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------
@@ -242,6 +393,13 @@ class MlirModule:
 # --------------------------------------------------------------------------
 
 _PUNCT = set("(){}<>,:=#[]")
+
+# Delimiters of MLIR's file-scope metadata block (`{-# ... #-}`), which is
+# where `dialect_resources` lives. Lexed like a comment -- see
+# `Lexer._skip_ws_comments` -- with the raw text kept on the lexer so
+# `parse_module` can pull the resource blobs out of it.
+_METADATA_OPEN = "{-#"
+_METADATA_CLOSE = "#-}"
 
 
 @dataclass
@@ -261,6 +419,9 @@ class Lexer:
         self.i = 0
         self.line = 1
         self.col = 1
+        #: Raw text (delimiters excluded) of every `{-# ... #-}` file
+        #: metadata block skipped while lexing, in file order.
+        self.metadata_blocks: list[str] = []
 
     def _peek(self, off: int = 0) -> str:
         j = self.i + off
@@ -284,8 +445,26 @@ class Lexer:
             elif c == "/" and self._peek(1) == "/":
                 while self.i < self.n and self._peek() != "\n":
                     self._advance()
+            elif self.text.startswith(_METADATA_OPEN, self.i):
+                self._skip_metadata_block()
             else:
                 break
+
+    def _skip_metadata_block(self) -> None:
+        """Consume a `{-# ... #-}` file metadata block, keeping its body on
+        `metadata_blocks`. Skipped like a comment because it is not part of
+        the op grammar: it always sits *outside* the top-level op, and its
+        body (an attribute dictionary of dialect resources) uses a syntax
+        -- bare `key: "0x..."` entries -- the op parser has no production
+        for. `parse_module` mines the body for resource blobs afterwards."""
+        line, col = self.line, self.col
+        start = self.i + len(_METADATA_OPEN)
+        end = self.text.find(_METADATA_CLOSE, start)
+        if end < 0:
+            raise MlirParseError(f"unterminated '{_METADATA_OPEN}' file metadata block", line, col)
+        self.metadata_blocks.append(self.text[start:end])
+        while self.i < end + len(_METADATA_CLOSE):
+            self._advance()
 
     def tokenize(self) -> list[Token]:
         tokens: list[Token] = []
@@ -304,6 +483,10 @@ class Lexer:
                 tokens.append(self._lex_sigil("^", "BLOCK_LABEL", line, col))
             elif c == "@":
                 tokens.append(self._lex_sigil("@", "SYMBOL", line, col))
+            elif c == "!":
+                # A dialect type (`!tosa.shape<4>`). Lexed as one token so
+                # `parse_type` never has to re-join '!' with the ident.
+                tokens.append(self._lex_sigil("!", "DIALECT_TYPE", line, col))
             elif c.isdigit():
                 tokens.append(self._lex_number(line, col))
             elif c == "-" and self._peek(1).isdigit():
@@ -409,7 +592,7 @@ class Lexer:
                     self._advance()
         text = self.text[start : self.i]
         if is_float:
-            return Token("NUMBER", text, line, col, value=None, is_float=True)
+            return Token("NUMBER", text, line, col, value=float(text), is_float=True)
         return Token("NUMBER", text, line, col, value=int(text), is_float=False)
 
 
@@ -491,9 +674,23 @@ class Parser:
         if tok.kind == "IDENT" and _is_scalar_type_name(tok.text):
             self.advance()
             return ScalarType(tok.text)
+        if tok.kind == "DIALECT_TYPE":
+            return self._parse_dialect_type()
         if tok.kind == "?":
             raise UnsupportedConstruct("dynamic dimensions are not supported", tok.line, tok.col)
         raise MlirParseError(f"expected type, found {tok.text!r}", tok.line, tok.col)
+
+    def _parse_dialect_type(self) -> Type:
+        """`!tosa.shape<N>`; any other `!dialect.type` is out of subset."""
+        tok = self.advance()
+        if tok.text != "tosa.shape":
+            raise UnsupportedConstruct(f"unsupported dialect type '!{tok.text}'", tok.line, tok.col)
+        self.expect_op("<")
+        rank_tok = self.expect_kind("NUMBER")
+        if rank_tok.is_float:
+            raise MlirParseError("!tosa.shape rank must be an integer", rank_tok.line, rank_tok.col)
+        self.expect_op(">")
+        return ShapeType(rank=rank_tok.value)
 
     def _parse_tensor_type(self) -> TensorType:
         self.advance()  # 'tensor'
@@ -501,6 +698,12 @@ class Parser:
         first = self.peek()
         if first.kind == "?":
             raise UnsupportedConstruct("dynamic tensor dimensions are not supported", first.line, first.col)
+        if first.kind == "IDENT" and _is_scalar_type_name(first.text):
+            # Rank-0 tensor (`tensor<f32>`): no dimension list at all, just
+            # the element type. TOSA emits these for scalar operands.
+            self.advance()
+            self.expect_op(">")
+            return TensorType(shape=(), dtype=ScalarType(first.text))
         if first.kind != "NUMBER":
             raise MlirParseError("expected tensor dimension", first.line, first.col)
         if first.is_float:
@@ -511,14 +714,23 @@ class Parser:
         if rest_tok.kind != "IDENT" or not rest_tok.text.startswith("x"):
             raise MlirParseError("malformed tensor shape", rest_tok.line, rest_tok.col)
         self.advance()
-        parts = rest_tok.text[1:].split("x")
-        *more_dims, dtype_name = parts
-        for md in more_dims:
-            if md == "?":
-                raise UnsupportedConstruct("dynamic tensor dimensions are not supported", rest_tok.line, rest_tok.col)
-            if md == "" or not md.lstrip("-").isdigit():
-                raise MlirParseError("malformed tensor shape", rest_tok.line, rest_tok.col)
-            dims.append(int(md))
+        # `160x160xf32` lexes as one identifier, so the remaining dimensions
+        # and the element type have to be split back apart here. Peel off
+        # `<digits>x` prefixes one at a time rather than splitting on every
+        # 'x': element type names may CONTAIN an 'x' -- `tensor<4xindex>`,
+        # the type TOSA-1.0 gives `tosa.const_shape`'s value, splits into
+        # ('inde', '') under the naive rule and was rejected as a malformed
+        # shape.
+        rest = rest_tok.text[1:]
+        while True:
+            m = _LEADING_DIM_RE.match(rest)
+            if m is None:
+                break
+            dims.append(int(m.group(1)))
+            rest = rest[m.end():]
+        if rest.startswith("?"):
+            raise UnsupportedConstruct("dynamic tensor dimensions are not supported", rest_tok.line, rest_tok.col)
+        dtype_name = rest
         if not _is_scalar_type_name(dtype_name):
             raise MlirParseError(f"unknown tensor element type {dtype_name!r}", rest_tok.line, rest_tok.col)
         self.expect_op(">")
@@ -580,7 +792,7 @@ class Parser:
         if tok.kind == "IDENT" and tok.text == "dense":
             return self._parse_dense_attr()
         if tok.kind == "IDENT" and tok.text == "dense_resource":
-            raise UnsupportedConstruct("dense_resource attributes are not supported", tok.line, tok.col)
+            return self._parse_dense_resource_attr()
         if tok.kind == "IDENT" and tok.text == "array":
             return self._parse_array_attr()
         if tok.kind == "#":
@@ -589,56 +801,86 @@ class Parser:
             ft = self.parse_function_type()
             return FunctionTypeAttr(ft.inputs, ft.results)
         if tok.kind == "NUMBER":
-            return self._parse_int_attr()
-        if tok.kind == "IDENT":
+            return self._parse_scalar_attr()
+        if tok.kind in ("IDENT", "DIALECT_TYPE"):
             return TypeAttr(self.parse_type())
         raise MlirParseError(f"unexpected token in attribute value: {tok.text!r}", tok.line, tok.col)
 
-    def _parse_int_attr(self) -> IntAttr:
+    def _parse_scalar_attr(self) -> IntAttr | FloatAttr:
+        """`<number> : <scalar type>`. A float literal (or an integer
+        literal with a float type, which is how MLIR prints e.g. `0 :
+        f32`) becomes a `FloatAttr`; the importer, not the parser, decides
+        that this compiler cannot use one."""
         tok = self.advance()
-        if tok.is_float:
-            raise UnsupportedLiteral("floating point literals are not supported", tok.line, tok.col)
         self.expect_op(":")
         t = self.parse_type()
         if not isinstance(t, ScalarType):
-            raise MlirParseError("expected scalar type for integer literal", tok.line, tok.col)
-        if _is_float_type_name(t.name):
-            raise UnsupportedLiteral("floating point typed literals are not supported", tok.line, tok.col)
+            raise MlirParseError("expected scalar type for numeric literal", tok.line, tok.col)
+        if tok.is_float or _is_float_type_name(t.name):
+            return FloatAttr(float(tok.value), t.name)
         return IntAttr(tok.value, t.name)
+
+    def _parse_dense_resource_attr(self) -> DenseResourceAttr:
+        self.advance()  # 'dense_resource'
+        self.expect_op("<")
+        key_tok = self.expect_kind("IDENT")
+        self.expect_op(">")
+        self.expect_op(":")
+        type_tok = self.peek()
+        t = self.parse_type()
+        if not isinstance(t, TensorType):
+            raise MlirParseError("expected tensor type for dense_resource attribute", type_tok.line, type_tok.col)
+        return DenseResourceAttr(key=key_tok.text, tensor_type=t)
 
     def _parse_array_attr(self) -> DenseArrayAttr:
         self.advance()  # 'array'
         self.expect_op("<")
         et_tok = self.expect_kind("IDENT")
-        values: list[int] = []
+        values: list[float | int] = []
         if self.peek_op(":"):
             self.advance()
-            values.append(self._parse_array_int())
+            values.append(self._parse_array_element())
             while self.peek_op(","):
                 self.advance()
-                values.append(self._parse_array_int())
+                values.append(self._parse_array_element())
         self.expect_op(">")
         return DenseArrayAttr(et_tok.text, tuple(values))
 
-    def _parse_array_int(self) -> int:
+    def _parse_array_element(self) -> float | int:
         tok = self.advance()
-        if tok.kind != "NUMBER" or tok.is_float:
-            raise UnsupportedLiteral("expected integer literal in array attribute", tok.line, tok.col)
+        if tok.kind != "NUMBER":
+            raise MlirParseError("expected numeric literal in array attribute", tok.line, tok.col)
         return tok.value
 
     def _parse_dense_attr(self) -> DenseElementsAttr:
         self.advance()  # 'dense'
         self.expect_op("<")
-        splat: int | None = None
-        values: list[int] | None = None
+        splat: float | int | None = None
+        values: list[float | int] | None = None
+        blob: bytes | None = None
         if self.peek_op("["):
             values = self._parse_dense_list()
+        elif self.peek().kind == "STRING":
+            # `dense<"0x7B7A...">`: MLIR switches to a raw little-endian
+            # hex blob above a size threshold, so any real (non-splat)
+            # inlined weight tensor arrives in this form, not as a value
+            # list. Kept as bytes and decoded on demand by `elements()`.
+            tok = self.advance()
+            if not tok.text.startswith("0x"):
+                raise UnsupportedLiteral(
+                    f"dense string literal {tok.text[:16]!r} is not a '0x...' hex blob", tok.line, tok.col
+                )
+            hex_text = tok.text[2:]
+            if len(hex_text) % 2:
+                raise MlirParseError("dense hex blob has an odd number of digits", tok.line, tok.col)
+            try:
+                blob = bytes.fromhex(hex_text)
+            except ValueError as exc:
+                raise MlirParseError(f"malformed dense hex blob: {exc}", tok.line, tok.col) from exc
         else:
             tok = self.advance()
             if tok.kind != "NUMBER":
                 raise MlirParseError("expected dense value", tok.line, tok.col)
-            if tok.is_float:
-                raise UnsupportedLiteral("floating point dense values are not supported", tok.line, tok.col)
             splat = tok.value
         self.expect_op(">")
         self.expect_op(":")
@@ -646,17 +888,15 @@ class Parser:
         t = self.parse_type()
         if not isinstance(t, TensorType):
             raise MlirParseError("expected tensor type for dense attribute", type_tok.line, type_tok.col)
-        if _is_float_type_name(t.dtype.name):
-            raise UnsupportedLiteral("floating point dense attributes are not supported", type_tok.line, type_tok.col)
         if values is not None and len(values) != t.numel:
             raise MlirParseError(
                 f"dense attribute has {len(values)} elements, expected {t.numel}", type_tok.line, type_tok.col
             )
-        return DenseElementsAttr(t, tuple(values) if values is not None else None, splat)
+        return DenseElementsAttr(t, tuple(values) if values is not None else None, splat, blob)
 
-    def _parse_dense_list(self) -> list[int]:
+    def _parse_dense_list(self) -> list[float | int]:
         self.expect_op("[")
-        out: list[int] = []
+        out: list[float | int] = []
         if not self.peek_op("]"):
             self._parse_dense_list_item(out)
             while self.peek_op(","):
@@ -665,15 +905,13 @@ class Parser:
         self.expect_op("]")
         return out
 
-    def _parse_dense_list_item(self, out: list[int]) -> None:
+    def _parse_dense_list_item(self, out: list[float | int]) -> None:
         if self.peek_op("["):
             out.extend(self._parse_dense_list())
             return
         tok = self.advance()
         if tok.kind != "NUMBER":
-            raise MlirParseError("expected integer literal in dense list", tok.line, tok.col)
-        if tok.is_float:
-            raise UnsupportedLiteral("floating point literals are not supported", tok.line, tok.col)
+            raise MlirParseError("expected numeric literal in dense list", tok.line, tok.col)
         out.append(tok.value)
 
     def _parse_enum_attr(self) -> EnumAttr:
@@ -790,13 +1028,13 @@ class Parser:
 # --------------------------------------------------------------------------
 
 
-def _build_module(root: RawOp) -> MlirModule:
+def _build_module(root: RawOp, resources: dict[str, bytes]) -> MlirModule:
     if root.name != "builtin.module":
         raise UnsupportedConstruct(f"expected top-level 'builtin.module', found {root.name!r}", *root.loc)
     if root.region is None or len(root.region.blocks) != 1:
         raise MlirParseError("module is missing its body region", *root.loc)
     funcs = [_build_func(raw) for raw in root.region.blocks[0].ops]
-    return MlirModule(funcs=funcs)
+    return MlirModule(funcs=funcs, resources=resources)
 
 
 def _build_func(raw: RawOp) -> MlirFunc:
@@ -850,12 +1088,41 @@ def _build_func(raw: RawOp) -> MlirFunc:
 # --------------------------------------------------------------------------
 
 
+# One `key: "0xABCD..."` entry of a `dialect_resources` block. Keys are
+# bare identifiers (torch-mlir puts '.' in them, e.g.
+# `torch_tensor_80_torch.float32_8`); the value is always a hex blob.
+_RESOURCE_ENTRY_RE = re.compile(r'([A-Za-z_$][\w$.]*)\s*:\s*"0x([0-9A-Fa-f]*)"')
+
+
+def parse_resources(block_text: str) -> dict[str, bytes]:
+    """Resource blobs from the body of a `{-# ... #-}` metadata block.
+
+    A regex rather than a grammar on purpose: the block is a nested
+    attribute dictionary whose only content this compiler can use is the
+    flat `key: "0x..."` leaves, and its outer structure (`dialect_resources
+    { builtin { ... } }`) carries no information we act on. An entry whose
+    key repeats across dialects would collide, so the *first* wins and
+    later ones are ignored -- MLIR itself requires resource keys to be
+    unique within a file, so a collision means a malformed file, not an
+    ambiguity to resolve."""
+    resources: dict[str, bytes] = {}
+    for key, hex_text in _RESOURCE_ENTRY_RE.findall(block_text):
+        if key in resources:
+            continue
+        resources[key] = bytes.fromhex(hex_text)
+    return resources
+
+
 def parse_module(text: str) -> MlirModule:
-    tokens = Lexer(text).tokenize()
+    lexer = Lexer(text)
+    tokens = lexer.tokenize()
     parser = Parser(tokens)
     root = parser.parse_op()
     parser.expect_eof()
-    return _build_module(root)
+    resources: dict[str, bytes] = {}
+    for block in lexer.metadata_blocks:
+        resources.update(parse_resources(block))
+    return _build_module(root, resources)
 
 
 def parse_file(path: str | Path) -> MlirModule:

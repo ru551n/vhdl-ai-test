@@ -73,6 +73,25 @@ class ClampAttrs:
 
 
 @dataclasses.dataclass(frozen=True)
+class PoolAttrs:
+    """TOSA `MAX_POOL2D`/`AVG_POOL2D` geometry.
+
+    `pad_value` is the value a padded tap takes and is NOT free: TOSA
+    defines MAX_POOL2D's padding as the *minimum representable value* of
+    the element type (so a padded tap can never win a max), which is what
+    the accelerator's ISA v2.1 `pad_value` field carries. It is stored
+    explicitly rather than re-derived at each stage so `interp` and the
+    emitted descriptor provably agree on one number.
+    """
+
+    mode: str  # "max" | "avg"
+    kernel: tuple[int, int]  # (h, w)
+    stride: tuple[int, int]  # (h, w)
+    pad: tuple[int, int, int, int]  # (top, bottom, left, right), TOSA order
+    pad_value: int
+
+
+@dataclasses.dataclass(frozen=True)
 class FusedConvAttrs:
     """Composition of conv2d + rescale + optional clamp (M5). Defined now
     so the `Op.attrs` union is stable; nothing produces `fused_conv` yet."""
@@ -82,13 +101,13 @@ class FusedConvAttrs:
     clamp: ClampAttrs | None
 
 
-Attrs = Union[ConvAttrs, RescaleParams, ClampAttrs, FusedConvAttrs, None]
+Attrs = Union[ConvAttrs, RescaleParams, ClampAttrs, PoolAttrs, FusedConvAttrs, None]
 
 
 @dataclasses.dataclass(frozen=True)
 class Op:
     id: str  # f"%{outputs[0]}", i.e. the MLIR SSA name of its first output
-    kind: str  # const | conv2d | rescale | clamp | fused_conv
+    kind: str  # const | conv2d | rescale | clamp | pool | fused_conv
     inputs: tuple[str, ...]
     outputs: tuple[str, ...]
     attrs: Attrs = None
@@ -142,3 +161,24 @@ def conv2d_output_shape(
     out_h = (in_h + pad_t + pad_b - dil_h * (kh - 1) - 1) // stride_h + 1
     out_w = (in_w + pad_l + pad_r - dil_w * (kw - 1) - 1) // stride_w + 1
     return (n, out_h, out_w, oc)
+
+
+def pool2d_output_shape(
+    in_shape: tuple[int, int, int, int],
+    attrs: PoolAttrs,
+) -> tuple[int, int, int, int]:
+    """TOSA MAX_POOL2D/AVG_POOL2D output shape, NHWC `[N, H, W, C]`:
+
+        out_dim = (in_dim + pad_lo + pad_hi - k) // stride + 1
+
+    i.e. `conv2d_output_shape` with dilation 1 and a channel count that is
+    carried through instead of coming from a weight tensor (pooling is
+    channel-preserving).
+    """
+    n, in_h, in_w, c = in_shape
+    kh, kw = attrs.kernel
+    pad_t, pad_b, pad_l, pad_r = attrs.pad
+    stride_h, stride_w = attrs.stride
+    out_h = (in_h + pad_t + pad_b - kh) // stride_h + 1
+    out_w = (in_w + pad_l + pad_r - kw) // stride_w + 1
+    return (n, out_h, out_w, c)

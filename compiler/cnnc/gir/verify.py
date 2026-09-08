@@ -14,10 +14,12 @@ from cnnc.gir.ir import (
     FusedConvAttrs,
     Graph,
     Op,
+    PoolAttrs,
     RescaleParams,
     Tensor,
     conv2d_output_shape,
     dtype_range,
+    pool2d_output_shape,
 )
 
 # TOSA v1.0 RESCALE: multiplier is a signed int32; MVP additionally
@@ -61,6 +63,8 @@ def verify(graph: Graph) -> None:
             _verify_rescale(graph, op)
         elif op.kind == "clamp":
             _verify_clamp(graph, op)
+        elif op.kind == "pool":
+            _verify_pool(graph, op)
         elif op.kind == "fused_conv":
             _verify_fused_conv(graph, op)
         else:
@@ -223,6 +227,39 @@ def _verify_clamp(graph: Graph, op: Op) -> None:
         _fail(op.id, f"clamp min {attrs.min} out of range for {x.dtype}")
     if not (lo <= attrs.max <= hi):
         _fail(op.id, f"clamp max {attrs.max} out of range for {x.dtype}")
+
+
+_POOL_MODES = ("max", "avg")
+
+
+def _verify_pool(graph: Graph, op: Op) -> None:
+    x = graph.tensors[op.inputs[0]]
+    out = graph.tensors[op.outputs[0]]
+    attrs: PoolAttrs = op.attrs
+    if attrs.mode not in _POOL_MODES:
+        _fail(op.id, f"pool mode {attrs.mode!r} not in {_POOL_MODES}")
+    if len(x.shape) != 4:
+        _fail(op.id, f"pool input rank {len(x.shape)} != 4")
+    if x.shape[0] != 1:
+        _fail(op.id, f"pool input batch {x.shape[0]} != 1")
+    if out.dtype != x.dtype:
+        _fail(op.id, f"pool output dtype {out.dtype} != input dtype {x.dtype}")
+    if any(p < 0 for p in attrs.pad):
+        _fail(op.id, f"pool pad {attrs.pad} has a negative element")
+    if any(k < 1 for k in attrs.kernel):
+        _fail(op.id, f"pool kernel {attrs.kernel} must be >= 1")
+    if any(s < 1 for s in attrs.stride):
+        _fail(op.id, f"pool stride {attrs.stride} must be >= 1")
+    lo, hi = dtype_range(x.dtype)
+    if not (lo <= attrs.pad_value <= hi):
+        _fail(op.id, f"pool pad_value {attrs.pad_value} out of range for {x.dtype}")
+    # TOSA MAX_POOL2D pads with the type minimum so a padded tap can never
+    # win the max; anything else silently corrupts every border output.
+    if attrs.mode == "max" and attrs.pad_value != lo:
+        _fail(op.id, f"max pool pad_value {attrs.pad_value} != {x.dtype} minimum {lo} (TOSA MAX_POOL2D padding)")
+    expected = pool2d_output_shape(x.shape, attrs)
+    if out.shape != expected:
+        _fail(op.id, f"pool output shape {out.shape} != computed {expected}")
 
 
 def _verify_fused_conv(graph: Graph, op: Op) -> None:

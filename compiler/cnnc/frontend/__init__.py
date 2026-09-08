@@ -1,11 +1,17 @@
-"""Frontend: MLIR generic-form parsing and printing for TOSA IR ingestion."""
+"""Frontend: MLIR generic-form parsing/printing and TOSA -> GIR import.
+
+`supported_ops()` is the authoritative list of TOSA ops the importer
+accepts; everything else is refused with a diagnostic that says whether
+it is a host-side detection-head op or simply not implemented."""
 
 from cnnc.frontend.mlir_generic import (
     Attr,
     BoolAttr,
     DenseArrayAttr,
     DenseElementsAttr,
+    DenseResourceAttr,
     EnumAttr,
+    FloatAttr,
     FunctionType,
     FunctionTypeAttr,
     GenericFormRequired,
@@ -14,7 +20,9 @@ from cnnc.frontend.mlir_generic import (
     MlirModule,
     MlirOp,
     MlirParseError,
+    ResourceDecodeError,
     ScalarType,
+    ShapeType,
     StringAttr,
     TensorType,
     Type,
@@ -23,17 +31,20 @@ from cnnc.frontend.mlir_generic import (
     UnsupportedConstruct,
     UnsupportedLiteral,
     parse_file,
+    parse_resources,
     parse_module,
     print_generic,
 )
-from cnnc.frontend.tosa_import import import_tosa, load_tosa_file
+from cnnc.frontend.tosa_import import import_tosa, load_tosa_file, supported_ops
 
 __all__ = [
     "Attr",
     "BoolAttr",
     "DenseArrayAttr",
     "DenseElementsAttr",
+    "DenseResourceAttr",
     "EnumAttr",
+    "FloatAttr",
     "FunctionType",
     "FunctionTypeAttr",
     "GenericFormRequired",
@@ -42,7 +53,9 @@ __all__ = [
     "MlirModule",
     "MlirOp",
     "MlirParseError",
+    "ResourceDecodeError",
     "ScalarType",
+    "ShapeType",
     "StringAttr",
     "TensorType",
     "Type",
@@ -51,8 +64,10 @@ __all__ = [
     "UnsupportedConstruct",
     "UnsupportedLiteral",
     "import_tosa",
+    "supported_ops",
     "load_tosa_file",
     "parse_file",
+    "parse_resources",
     "parse_module",
     "print_generic",
 ]

@@ -15,7 +15,16 @@ from __future__ import annotations
 import numpy as np
 
 from cnnc.errors import CompilerError
-from cnnc.gir.ir import ClampAttrs, ConvAttrs, FusedConvAttrs, Graph, RescaleParams, dtype_range
+from cnnc.gir.ir import (
+    ClampAttrs,
+    ConvAttrs,
+    FusedConvAttrs,
+    Graph,
+    PoolAttrs,
+    RescaleParams,
+    dtype_range,
+    pool2d_output_shape,
+)
 
 _NP_DTYPE: dict[str, type] = {"i8": np.int8, "i32": np.int32}
 
@@ -110,6 +119,39 @@ def _clamp(x: np.ndarray, attrs: ClampAttrs) -> np.ndarray:
     return np.clip(x.astype(np.int64), attrs.min, attrs.max)
 
 
+def _pool_int64(x: np.ndarray, attrs: PoolAttrs, op_id: str) -> np.ndarray:
+    """TOSA MAX_POOL2D over an NHWC `int64` view.
+
+    Padded taps take `attrs.pad_value` (the type minimum, pinned by
+    `gir.verify._verify_pool`), so they are indistinguishable from a real
+    minimum-valued element -- which is exactly TOSA's definition and
+    exactly what the accelerator does with its ISA v2.1 `pad_value` field.
+
+    AVG_POOL2D is deliberately absent: TOSA divides by the count of taps
+    that lie INSIDE the input (padding excluded) using its own
+    `reciprocal_scale`, while the accelerator sums padded taps too
+    (count-include-pad) and divides through the half-up requantizer. The
+    two agree only for unpadded windows whose area happens to requantize
+    exactly, so `frontend.tosa_import` refuses `tosa.avg_pool2d` rather
+    than letting a near-miss through here.
+    """
+    if attrs.mode != "max":
+        raise CompilerError(f"interp: pool mode {attrs.mode!r} is not implemented", op_id=op_id)
+    x64 = x.astype(np.int64)
+    pad_t, pad_b, pad_l, pad_r = attrs.pad
+    kh, kw = attrs.kernel
+    sh, sw = attrs.stride
+    _n, out_h, out_w, _c = pool2d_output_shape(x64.shape, attrs)
+    x_pad = np.pad(x64, ((0, 0), (pad_t, pad_b), (pad_l, pad_r), (0, 0)), constant_values=attrs.pad_value)
+
+    acc = np.full(x64.shape[:1] + (out_h, out_w) + x64.shape[3:], attrs.pad_value, dtype=np.int64)
+    for ky in range(kh):
+        for kx in range(kw):
+            patch = x_pad[:, ky : ky + sh * (out_h - 1) + 1 : sh, kx : kx + sw * (out_w - 1) + 1 : sw, :]
+            acc = np.maximum(acc, patch)
+    return acc
+
+
 def evaluate_all(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Execute every op in `graph` and return every tensor, keyed by tensor
     id (no `%`), cast to its declared GIR dtype's numpy type."""
@@ -139,6 +181,8 @@ def evaluate_all(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.nd
             result = rescale_array(values[op.inputs[0]], op.attrs, out_tensor.dtype)
         elif op.kind == "clamp":
             result = _clamp(values[op.inputs[0]], op.attrs)
+        elif op.kind == "pool":
+            result = _pool_int64(values[op.inputs[0]], op.attrs, op.id)
         elif op.kind == "fused_conv":
             fused: FusedConvAttrs = op.attrs
             x, w, b = (values[i] for i in op.inputs)

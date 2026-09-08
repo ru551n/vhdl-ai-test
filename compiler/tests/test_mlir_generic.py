@@ -13,12 +13,16 @@ from cnnc.frontend.mlir_generic import (
     BoolAttr,
     DenseArrayAttr,
     DenseElementsAttr,
+    DenseResourceAttr,
     EnumAttr,
+    FloatAttr,
     FunctionTypeAttr,
     GenericFormRequired,
     IntAttr,
     MlirParseError,
+    ResourceDecodeError,
     ScalarType,
+    ShapeType,
     StringAttr,
     TensorType,
     TypeAttr,
@@ -26,6 +30,7 @@ from cnnc.frontend.mlir_generic import (
     UnsupportedConstruct,
     UnsupportedLiteral,
     parse_module,
+    parse_resources,
     print_generic,
 )
 
@@ -220,16 +225,35 @@ def test_undefined_ssa_value_raises():
         parse_module(text)
 
 
-def test_float_dense_raises_unsupported_literal():
-    text = _wrap('%0 = "t.op"() <{v = dense<1.0> : tensor<1xf32>}> : () -> i32')
-    with pytest.raises(UnsupportedLiteral):
-        parse_module(text)
+def test_float_dense_parses_as_float_values():
+    """Float literals PARSE (they used to raise `UnsupportedLiteral` right
+    here). Being integer-only is a property of the compiler, not of MLIR,
+    so the refusal belongs to `tosa_import` -- which can name the op and
+    say "floating point dtype 'f32' is not supported" -- and not to a
+    lexer that dies on the first constant of a pre-quantization model."""
+    module = parse_module(_wrap('%0 = "t.op"() <{v = dense<1.0> : tensor<1xf32>}> : () -> i32'))
+    attr = module.funcs[0].ops[0].attrs["v"]
+    assert attr.splat == 1.0
+    assert attr.elements() == (1.0,)
 
 
-def test_float_int_attr_raises_unsupported_literal():
-    text = _wrap('%0 = "t.op"() <{v = 1.0 : f32}> : () -> i32')
+def test_float_scalar_attr_parses_as_float_attr():
+    module = parse_module(_wrap('%0 = "t.op"() <{v = 1.5 : f32}> : () -> i32'))
+    attr = module.funcs[0].ops[0].attrs["v"]
+    assert isinstance(attr, FloatAttr)
+    assert (attr.value, attr.type) == (1.5, "f32")
+
+
+def test_integer_literal_with_float_type_is_a_float_attr():
+    """MLIR prints `0 : f32` without a decimal point; the *type* is what
+    makes it a float, not the literal's spelling."""
+    module = parse_module(_wrap('%0 = "t.op"() <{v = 0 : f32}> : () -> i32'))
+    assert module.funcs[0].ops[0].attrs["v"] == FloatAttr(0.0, "f32")
+
+
+def test_float_literal_in_tensor_shape_still_raises():
     with pytest.raises(UnsupportedLiteral):
-        parse_module(text)
+        parse_module(_wrap('%0 = "t.op"() <{v = dense<1> : tensor<1.5xi8>}> : () -> i32'))
 
 
 def test_multi_result_raises_unsupported_construct():
@@ -282,3 +306,110 @@ def test_iree_opt_accepts_fixture_and_round_trip():
         timeout=60,
     )
     assert result2.returncode == 0, result2.stderr
+
+
+# --------------------------------------------------------------------------
+# Constructs real (non-IREE-hand-written) MLIR producers emit: TOSA-1.0
+# shape types, `dense_resource` + the trailing `{-# ... #-}` block,
+# `dense<"0x...">` hex blobs, and `index`-typed shapes. Every one of these
+# used to be a raw traceback or a hard parse error.
+# --------------------------------------------------------------------------
+
+
+def test_tosa_shape_type_parses():
+    text = _wrap(
+        '%0 = "tosa.const_shape"() <{values = dense<[1, 16, 160, 160]> : tensor<4xindex>}> '
+        ": () -> !tosa.shape<4>"
+    )
+    op = parse_module(text).funcs[0].ops[0]
+    assert op.results[0][1] == ShapeType(rank=4)
+    assert op.attrs["values"].tensor_type == TensorType((4,), ScalarType("index"))
+
+
+def test_tosa_shape_typed_operand_parses():
+    text = _wrap(
+        '%0 = "tosa.const_shape"() <{values = dense<0> : tensor<4xindex>}> : () -> !tosa.shape<4>\n'
+        '    %1 = "tosa.slice"(%0, %0, %0) : '
+        "(!tosa.shape<4>, !tosa.shape<4>, !tosa.shape<4>) -> tensor<1x8x8x4xi8>"
+    )
+    ops = parse_module(text).funcs[0].ops
+    assert ops[1].operands == ("0", "0", "0")
+
+
+def test_index_element_type_is_not_split_on_its_own_x():
+    """`tensor<4xindex>`: 'index' ends in an 'x', which the old
+    split-on-every-'x' shape parser turned into ('inde', '')."""
+    text = _wrap('%0 = "t.op"() <{v = dense<[1, 2]> : tensor<2xindex>}> : () -> i32')
+    attr = parse_module(text).funcs[0].ops[0].attrs["v"]
+    assert attr.tensor_type == TensorType((2,), ScalarType("index"))
+
+
+def test_rank_zero_tensor_type_parses():
+    text = _wrap('%0 = "t.op"() <{v = dense<3> : tensor<i32>}> : () -> i32')
+    attr = parse_module(text).funcs[0].ops[0].attrs["v"]
+    assert attr.tensor_type == TensorType((), ScalarType("i32"))
+    assert attr.elements() == (3,)
+
+
+_RESOURCE_MODULE = (
+    _wrap('%0 = "tosa.const"() <{values = dense_resource<w0> : tensor<4xi8>}> : () -> tensor<4xi8>')
+    + '\n{-#\n  dialect_resources: {\n    builtin: {\n      w0: "0x0400000001FF0207"\n    }\n  }\n#-}\n'
+)
+
+
+def test_dialect_resources_block_is_skipped_and_collected():
+    module = parse_module(_RESOURCE_MODULE)
+    assert set(module.resources) == {"w0"}
+    assert module.resources["w0"] == bytes.fromhex("0400000001FF0207")
+
+
+def test_dense_resource_decodes_to_signed_elements():
+    module = parse_module(_RESOURCE_MODULE)
+    attr = module.funcs[0].ops[0].attrs["values"]
+    assert isinstance(attr, DenseResourceAttr)
+    # The blob's leading 4 bytes are MLIR's alignment header, not data.
+    assert attr.decode(module.resources) == (1, -1, 2, 7)
+
+
+def test_dense_resource_missing_key_raises_resource_decode_error():
+    module = parse_module(_RESOURCE_MODULE)
+    attr = module.funcs[0].ops[0].attrs["values"]
+    with pytest.raises(ResourceDecodeError) as exc:
+        attr.decode({})
+    assert "w0" in str(exc.value)
+
+
+def test_dense_resource_wrong_blob_length_raises():
+    module = parse_module(_RESOURCE_MODULE)
+    attr = module.funcs[0].ops[0].attrs["values"]
+    with pytest.raises(ResourceDecodeError) as exc:
+        attr.decode({"w0": bytes.fromhex("0400000001FF")})
+    assert "2 bytes" in str(exc.value)
+
+
+def test_unterminated_metadata_block_raises_parse_error():
+    with pytest.raises(MlirParseError):
+        parse_module(_wrap('%0 = "t.op"() : () -> i32') + "\n{-#\n  dialect_resources: {\n")
+
+
+def test_dense_hex_blob_decodes():
+    text = _wrap('%0 = "t.op"() <{v = dense<"0x01FF0207"> : tensor<4xi8>}> : () -> i32')
+    attr = parse_module(text).funcs[0].ops[0].attrs["v"]
+    # An inline dense blob has NO alignment header, unlike a resource blob.
+    assert attr.blob == bytes.fromhex("01FF0207")
+    assert attr.elements() == (1, -1, 2, 7)
+
+
+def test_dense_hex_blob_i32_is_little_endian():
+    text = _wrap('%0 = "t.op"() <{v = dense<"0x01000000FFFFFFFF"> : tensor<2xi32>}> : () -> i32')
+    assert parse_module(text).funcs[0].ops[0].attrs["v"].elements() == (1, -1)
+
+
+def test_dense_hex_blob_odd_digit_count_raises():
+    with pytest.raises(MlirParseError):
+        parse_module(_wrap('%0 = "t.op"() <{v = dense<"0x01F"> : tensor<2xi8>}> : () -> i32'))
+
+
+def test_parse_resources_reads_flat_entries():
+    resources = parse_resources('dialect_resources: { builtin: { a.b_1: "0x00FF", c: "0x" } }')
+    assert resources == {"a.b_1": b"\x00\xff", "c": b""}
