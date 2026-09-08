@@ -2029,7 +2029,28 @@ class Module(BaseModule):
         # tb_cnn_accel_weight_buffer.vhd's identical no-generics-to-vary
         # precedent for this project's other non-PE_ROWS-parametric leaf
         # modules.
-        library.test_bench("tb_cnn_accel_tensor_mem")
+        tb = library.test_bench("tb_cnn_accel_tensor_mem")
+
+        # 'test_zero_length_request_asserts' deliberately triggers the
+        # entity's zero-length-request assertions (severity 'error',
+        # matching cnn_accel_tensor_mem.vhd's existing bank-crossing/
+        # out-of-range-bank style exactly). VUnit's GHDL backend defaults
+        # the 'vhdl_assert_stop_level' sim option to 'error'
+        # (vunit/sim_if/ghdl.py, via '--assert-level'), which aborts the
+        # whole simulation the instant the first assertion fires --
+        # contradicting this entity's own header comment, which assumes
+        # severity 'error' lets the run continue (true of the VHDL LRM's
+        # default, but not of VUnit's stricter default). Lowering the
+        # stop level to 'failure' for this ONE test case -- not project-
+        # wide, so every other test here still catches a real severity-
+        # 'failure' bug (e.g. a misaligned request) -- is VUnit's own
+        # supported knob for exactly this, and is what actually makes
+        # severity 'error' behave the way the RTL comments promise,
+        # rather than weakening the assertion itself or muting the
+        # message.
+        tb.test("test_zero_length_request_asserts").add_config(
+            name="default", sim_options={"vhdl_assert_stop_level": "failure"}
+        )
 
     def _setup_cnn_accel_pool(self, library) -> None:
         tb = library.test_bench("tb_cnn_accel_pool")

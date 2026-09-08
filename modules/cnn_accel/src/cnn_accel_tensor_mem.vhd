@@ -298,6 +298,16 @@ begin
         decode := decode_addr(w0_req_m2s.req.addr);
         raw_beats := to_integer(w0_req_m2s.req.length) / c_bytes_per_word;
 
+        -- A zero-length request is a caller bug (every producer is
+        -- expected to size its own transfers, never emit an empty one):
+        -- report it the same way as a bank-crossing/out-of-range-bank
+        -- request (severity 'error', run continues) rather than let it
+        -- vanish into the 'beats = 0' no-op path below.
+        assert raw_beats /= 0
+          report "cnn_accel_tensor_mem: w0 request has zero length; a zero-length " &
+            "request is a caller bug"
+          severity error;
+
         if decode.offset + raw_beats > g_bank_words then
           assert false
             report "cnn_accel_tensor_mem: w0 request crosses a bank boundary; clamping"
@@ -345,6 +355,13 @@ begin
 
         decode := decode_addr(w1_req_m2s.req.addr);
         raw_beats := to_integer(w1_req_m2s.req.length) / c_bytes_per_word;
+
+        -- See 'write_fsm_0' for why this is asserted rather than just
+        -- silently falling into the 'beats = 0' no-op path below.
+        assert raw_beats /= 0
+          report "cnn_accel_tensor_mem: w1 request has zero length; a zero-length " &
+            "request is a caller bug"
+          severity error;
 
         if decode.offset + raw_beats > g_bank_words then
           assert false
@@ -638,6 +655,17 @@ begin
           raw_beats := to_integer(r0_req_m2s.req.length) / c_bytes_per_word;
 
           -- A zero-length read is worse than the write-side equivalent:
+          -- there is no beat to carry a 'last', so 'r0_done' would never
+          -- pulse and a requester waiting on it would hang forever (see
+          -- 'beats /= 0' below). Asserted the same way as a bank-crossing/
+          -- out-of-range-bank request (severity 'error', run continues)
+          -- so the caller bug is visible without turning a bad program
+          -- into a stopped simulation.
+          assert raw_beats /= 0
+            report "cnn_accel_tensor_mem: r0 request has zero length; a zero-length " &
+              "request is a caller bug"
+            severity error;
+
           if decode.offset + raw_beats > g_bank_words then
             assert false
               report "cnn_accel_tensor_mem: r0 request crosses a bank boundary; clamping"
@@ -715,6 +743,13 @@ begin
 
           decode := decode_addr(r1_req_m2s.req.addr);
           raw_beats := to_integer(r1_req_m2s.req.length) / c_bytes_per_word;
+
+          -- See 'read_fsm_0' for why this is asserted -- a zero-length
+          -- read never pulses 'done' and would hang a waiting requester.
+          assert raw_beats /= 0
+            report "cnn_accel_tensor_mem: r1 request has zero length; a zero-length " &
+              "request is a caller bug"
+            severity error;
 
           if decode.offset + raw_beats > g_bank_words then
             assert false

@@ -225,6 +225,18 @@ fits in the addressed bank. An out-of-range bank index is likewise
 asserted and then wrapped modulo `g_num_banks`, so no array bound is ever
 violated.
 
+A zero-length request (`length = 0`, i.e. zero beats) is likewise a
+caller bug and is asserted the same way, on all four channels
+(`w0`/`w1`/`r0`/`r1`). It must never be sent: the write channels pulse
+`done` for it anyway (a zero-beat transfer trivially "completes"), but a
+zero-length *read* has no beat to carry `last` on, so `done` never
+pulses and a requester waiting on it would hang forever. Every producer
+in this design (`cnn_accel_cmd_proc`, and `cnn_accel_elementwise` for the
+`COPY`/`ACT`/`ADD`/`UPSAMPLE` opcodes it drives) validates its own
+transfer length against zero before ever issuing a request here, so this
+assertion is a last-resort guard against a new producer bug, not the
+first line of defense.
+
 ---
 
 ## 5 ISA v2.0 — command/program format

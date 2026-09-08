@@ -896,6 +896,52 @@ begin
       wait until rising_edge(clk) and r0_done = '1';
       wait for c_settle;
       check_captured(r0_captured_q, c_write_contend_words, 800, "w0/w1 same-bank contention: w1 data readback");
+
+    elsif run("test_zero_length_request_asserts") then
+      -- A zero-length request is a caller bug (see this file's header
+      -- comment and cnn_accel_tensor_mem.vhd's own header/FSM comments):
+      -- every one of w0/w1/r0/r1 now asserts (severity 'error', the same
+      -- severity/style used for a bank-crossing or out-of-range-bank
+      -- request) when one is accepted instead of silently falling into
+      -- the 'beats = 0' no-op path. 'error' -- unlike 'failure' -- does
+      -- not stop the simulation (GHDL/NVC's default assert-stop level is
+      -- 'failure'), so this is provable in-simulation without weakening
+      -- the assertion or needing to mock/suppress anything: issue a
+      -- zero-length request on every channel and confirm the DUT keeps
+      -- running normally afterward (a real 8-byte read/write on the same
+      -- channel still completes and returns correct data), which would
+      -- be impossible if the assert had aborted the run.
+      issue_write(w0_req_m2s, w0_req_s2m, 0, 0, 0);
+      wait until rising_edge(clk) and w0_done = '1';
+      wait for c_settle;
+
+      issue_write(w1_req_m2s, w1_req_s2m, 0, 0, 0);
+      wait until rising_edge(clk) and w1_done = '1';
+      wait for c_settle;
+
+      r0_mode <= c_mode_full_speed;
+      r1_mode <= c_mode_full_speed;
+      wait until rising_edge(clk);
+
+      issue_read(r0_req_m2s, r0_req_s2m, 0, 0, 0);
+      issue_read(r1_req_m2s, r1_req_s2m, 1, 0, 0);
+      -- Neither channel has anything to become busy over, so neither
+      -- 'done' will ever pulse for these two requests (see
+      -- cnn_accel_tensor_mem.vhd's read-FSM comment: a zero-length read
+      -- is a caller bug precisely because it can never signal
+      -- completion) -- wait a fixed margin instead of on 'done', then
+      -- prove the DUT is still alive and correct with a real transfer.
+      for i in 1 to 10 loop
+        wait until rising_edge(clk);
+      end loop;
+      check_equal(r0_done, '0', "zero-length r0 request must never pulse done");
+      check_equal(r1_done, '0', "zero-length r1 request must never pulse done");
+
+      write_words(w0_req_m2s, w0_req_s2m, s_w0_m2s, s_w0_s2m, 0, 0, 4, 900);
+      issue_read(r0_req_m2s, r0_req_s2m, 0, 0, 4);
+      wait until rising_edge(clk) and r0_done = '1';
+      wait for c_settle;
+      check_captured(r0_captured_q, 4, 900, "post-zero-length-request sanity readback");
     end if;
 
     test_runner_cleanup(runner);
