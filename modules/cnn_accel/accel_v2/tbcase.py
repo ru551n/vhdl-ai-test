@@ -210,9 +210,15 @@ class TbCase:
             # finishes in a few thousand cycles), so the entity defaults of
             # 1M/2M cycles only ever cost wall-clock time: a genuinely stuck
             # DUT sits in the simulator for ~12 minutes before its watchdog
-            # fires. These bounds are still ~20x the longest healthy case,
-            # so they cannot mask a slow-but-correct run, and they keep the
-            # "a stuck program must ERROR, never hang" contract intact.
+            # fires. The longest healthy case (local_chain_4op) measures
+            # 6,953 cycles, so the 100k testbench bound below is ~14x that.
+            # 'g_watchdog_cycles' is not a per-program bound at all: it is
+            # cmd_proc's per-state watchdog, reloaded on every state change
+            # (~13 reload sites in cmd_proc), so it only fires if a single
+            # state hangs, not from a long-but-healthy program accumulating
+            # many states. Together these bounds cannot mask a
+            # slow-but-correct run, and they keep the "a stuck program must
+            # ERROR, never hang" contract intact.
             "g_watchdog_cycles": 50_000,
             "g_timeout_cycles": 100_000,
         }
