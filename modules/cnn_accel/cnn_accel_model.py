@@ -135,10 +135,20 @@ class LayerDesc:
     pool_stride_h: int = 1
     pool_stride_w: int = 1
     next_instr_addr: int = 0
+    # ISA v1.1 (H1) epilogue fields, W13. Defaults of 0 make a v1.0-style
+    # `LayerDesc(...)` bit-identical to a v1.0 program (the bytes were
+    # reserved-must-be-0 before).
+    output_offset: int = 0
+    clamp_min: int = 0
+    clamp_max: int = 0
 
     @property
     def relu_en(self) -> bool:
         return bool((self.flags >> FLAG_RELU_EN) & 1)
+
+    @property
+    def clamp_en(self) -> bool:
+        return bool((self.flags >> FLAG_CLAMP_EN) & 1)
 
     @property
     def bias_en(self) -> bool:
@@ -154,7 +164,24 @@ class LayerDesc:
 
 
 def encode_instruction(desc: LayerDesc) -> bytes:
-    """Encode one `LayerDesc` as the 64-byte ISA word."""
+    """Encode one `LayerDesc` as the 64-byte ISA word.
+
+    Rejects `clamp_min > clamp_max` (an empty clamp range has no defined
+    HW result -- see `bias_requantize_relu`) and any W13 field outside
+    its signed width, rather than silently wrapping: these are the only
+    descriptor fields whose misuse cannot be caught by the RTL."""
+    if desc.clamp_min > desc.clamp_max:
+        raise ValueError(
+            f"clamp_min ({desc.clamp_min}) > clamp_max ({desc.clamp_max}): empty clamp range"
+        )
+    for name, value, lo, hi in (
+        ("output_offset", desc.output_offset, -(2**15), 2**15 - 1),
+        ("clamp_min", desc.clamp_min, -128, 127),
+        ("clamp_max", desc.clamp_max, -128, 127),
+    ):
+        if not lo <= value <= hi:
+            raise ValueError(f"{name}={value} outside signed range [{lo}, {hi}]")
+
     buf = bytearray(INSTR_WORD_BYTES)
     buf[OFF_OPCODE] = desc.opcode & 0xFF
     buf[OFF_FLAGS] = desc.flags & 0xFF
@@ -181,6 +208,9 @@ def encode_instruction(desc: LayerDesc) -> bytes:
     buf[OFF_POOL_STRIDE_H] = desc.pool_stride_h & 0xFF
     buf[OFF_POOL_STRIDE_W] = desc.pool_stride_w & 0xFF
     struct.pack_into("<I", buf, OFF_NEXT_INSTR_ADDR, desc.next_instr_addr & 0xFFFFFFFF)
+    struct.pack_into("<h", buf, OFF_OUTPUT_OFFSET, desc.output_offset)
+    struct.pack_into("<b", buf, OFF_CLAMP_MIN, desc.clamp_min)
+    struct.pack_into("<b", buf, OFF_CLAMP_MAX, desc.clamp_max)
     return bytes(buf)
 
 
@@ -216,6 +246,9 @@ def decode_instruction(data: bytes) -> LayerDesc:
         pool_stride_h=data[OFF_POOL_STRIDE_H],
         pool_stride_w=data[OFF_POOL_STRIDE_W],
         next_instr_addr=struct.unpack_from("<I", data, OFF_NEXT_INSTR_ADDR)[0],
+        output_offset=struct.unpack_from("<h", data, OFF_OUTPUT_OFFSET)[0],
+        clamp_min=struct.unpack_from("<b", data, OFF_CLAMP_MIN)[0],
+        clamp_max=struct.unpack_from("<b", data, OFF_CLAMP_MAX)[0],
     )
 
 
@@ -298,11 +331,27 @@ def bias_requantize_relu(
     relu_en: bool,
     requant_scale: int,
     requant_shift: int,
+    output_offset: int = 0,
+    clamp_en: bool = False,
+    clamp_min: int = -128,
+    clamp_max: int = 127,
 ) -> int:
     """`cnn_accel_bias_requant`'s per-lane reference function:
     `int32 accumulator -> (+ bias) -> (x requant_scale, Q15) ->
-    (>> requant_shift, arithmetic, rounded) -> saturate to int8 ->
-    (optional ReLU clamp at 0, applied before the int8 saturate)`.
+    (>> requant_shift, arithmetic, rounded) -> (+ output_offset) ->
+    clamp(lo, hi)`, where `(lo, hi) = (clamp_min, clamp_max)` when
+    `clamp_en` and otherwise the legacy `(0 if relu_en else -128, 127)`
+    -- i.e. the v1.0 `ReLU -> saturate to int8` (ISA v1.1, HW milestone
+    H1, doc/tosa_compiler_plan.md section 5 extension 1).
+
+    `output_offset` is added AFTER the rounded shift (so it is exact, not
+    scaled), on an unbounded value, before any clamping: `s + offset`
+    beyond int8 in either direction clamps to `hi`/`lo`. With
+    `output_offset=0, clamp_en=False` the function is bit-identical to
+    the v1.0 epilogue for every input (`relu_en` then selects `lo`;
+    `clamp_min`/`clamp_max` are ignored). `clamp_min > clamp_max` is
+    rejected by `encode_instruction`; here it is not checked, and the
+    result follows the RTL's `min(max(s, lo), hi)` order (= `hi`).
 
     `requant_scale` is a signed Q15 fixed-point multiplier (i.e. the
     "mathematical" scale factor is `requant_scale / 2**15`); the combined
@@ -348,9 +397,13 @@ def bias_requantize_relu(
     else:
         scaled = total
 
-    if relu_en:
-        scaled = max(scaled, 0)
-    return saturate_signed(scaled, 8)
+    scaled += output_offset
+
+    if clamp_en:
+        lo, hi = clamp_min, clamp_max
+    else:
+        lo, hi = (0 if relu_en else -128), 127
+    return min(max(scaled, lo), hi)
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +507,10 @@ def _conv2d_generic(
                         relu_en=desc.relu_en,
                         requant_scale=desc.requant_scale,
                         requant_shift=desc.requant_shift,
+                        output_offset=desc.output_offset,
+                        clamp_en=desc.clamp_en,
+                        clamp_min=desc.clamp_min,
+                        clamp_max=desc.clamp_max,
                     )
                 )
     return output
@@ -830,6 +887,10 @@ def pool_avg(input_values: list[int], desc: LayerDesc) -> list[int]:
                         relu_en=desc.relu_en,
                         requant_scale=desc.requant_scale,
                         requant_shift=desc.requant_shift,
+                        output_offset=desc.output_offset,
+                        clamp_en=desc.clamp_en,
+                        clamp_min=desc.clamp_min,
+                        clamp_max=desc.clamp_max,
                     )
                 )
                 idx += 1

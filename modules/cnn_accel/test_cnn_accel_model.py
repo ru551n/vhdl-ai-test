@@ -32,6 +32,8 @@ from cnn_accel_model import (
     OPCODE_POOL_AVG,
     OPCODE_POOL_MAX,
     OFF_BIAS_ADDR,
+    OFF_CLAMP_MAX,
+    OFF_CLAMP_MIN,
     OFF_FLAGS,
     OFF_IN_ADDR,
     OFF_IN_CHANNELS,
@@ -43,6 +45,7 @@ from cnn_accel_model import (
     OFF_OPCODE,
     OFF_OUT_ADDR,
     OFF_OUT_CHANNELS,
+    OFF_OUTPUT_OFFSET,
     OFF_PAD_BOTTOM,
     OFF_PAD_LEFT,
     OFF_PAD_RIGHT,
@@ -57,6 +60,7 @@ from cnn_accel_model import (
     OFF_STRIDE_W,
     OFF_WEIGHT_ADDR,
     FLAG_BIAS_EN,
+    FLAG_CLAMP_EN,
     FLAG_PAD_EN,
     FLAG_RELU_EN,
     FLAG_REQUANT_EN,
@@ -312,6 +316,151 @@ def test_bias_requantize_relu_33bit_sum_boundary_negative() -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# ISA v1.1 (H1): output_offset + general clamp, doc/tosa_compiler_plan.md
+# section 5 extension 1. `s = round_shift(total*scale); s += output_offset;
+# y = clamp(s, lo, hi)`.
+# ---------------------------------------------------------------------------
+
+
+def _legacy_bias_requantize_relu(acc, bias, *, bias_en, requant_en, relu_en, requant_scale, requant_shift):
+    """Verbatim v1.0 epilogue (pre-H1 `bias_requantize_relu` body), kept
+    here as the independent oracle for the `clamp_en=0` bit-identity
+    contract."""
+    total = acc + (bias if bias_en else 0)
+    scaled = round_shift_right_signed(total * requant_scale, 15 + requant_shift) if requant_en else total
+    if relu_en:
+        scaled = max(scaled, 0)
+    return saturate_signed(scaled, 8)
+
+
+def test_bias_requantize_relu_clamp_en_zero_is_legacy() -> None:
+    """With `output_offset=0, clamp_en=False` the H1 function must be
+    bit-identical to the v1.0 epilogue for every flag combination,
+    whatever `clamp_min`/`clamp_max` hold (they are ignored)."""
+    rng = random.Random(0x481)
+    for _ in range(2000):
+        kwargs = dict(
+            bias_en=rng.random() < 0.5,
+            requant_en=rng.random() < 0.5,
+            relu_en=rng.random() < 0.5,
+            requant_scale=rng.randint(-(2**31), 2**31 - 1),
+            requant_shift=rng.randint(0, 31),
+        )
+        acc = rng.choice([rng.randint(-(2**31), 2**31 - 1), rng.randint(-300, 300)])
+        bias = rng.choice([rng.randint(-(2**31), 2**31 - 1), rng.randint(-300, 300)])
+        expected = _legacy_bias_requantize_relu(acc, bias, **kwargs)
+        assert bias_requantize_relu(acc, bias, **kwargs) == expected
+        assert (
+            bias_requantize_relu(
+                acc, bias, **kwargs, output_offset=0, clamp_en=False,
+                clamp_min=rng.randint(-128, 127), clamp_max=rng.randint(-128, 127),
+            )
+            == expected
+        )
+
+
+_IDENTITY = dict(bias_en=False, requant_en=True, relu_en=False, requant_scale=1 << 15, requant_shift=0)
+
+
+def test_bias_requantize_relu_output_offset_added_after_shift() -> None:
+    # Offset is exact (not scaled): scale 0.5, acc=10 -> s=5, +3 -> 8.
+    r = bias_requantize_relu(10, 0, **{**_IDENTITY, "requant_scale": 1 << 14}, output_offset=3)
+    assert r == 8
+    # Offset is applied after the rounding: acc=1 at scale 0.5 is a tie
+    # rounding to 1; the offset must not turn it into 1.5-ish territory.
+    r = bias_requantize_relu(1, 0, **{**_IDENTITY, "requant_scale": 1 << 14}, output_offset=-1)
+    assert r == 0
+    # Offset also applies on the requant_en=0 bypass path.
+    r = bias_requantize_relu(5, 0, **{**_IDENTITY, "requant_en": False}, output_offset=-7)
+    assert r == -2
+    # Offset before the legacy ReLU/saturate: -5 + 10 survives ReLU.
+    r = bias_requantize_relu(-5, 0, **{**_IDENTITY, "relu_en": True}, output_offset=10)
+    assert r == 5
+    # ... and a positive s dragged negative by the offset is ReLU'd to 0.
+    r = bias_requantize_relu(5, 0, **{**_IDENTITY, "relu_en": True}, output_offset=-10)
+    assert r == 0
+
+
+@pytest.mark.parametrize(
+    ("acc", "offset", "expected"),
+    [
+        (100, 100, 127),        # s+offset above int8 -> hi
+        (127, 1, 127),
+        (0, 32767, 127),        # max offset
+        (-100, -100, -128),     # s+offset below int8 -> lo
+        (-128, -1, -128),
+        (0, -32768, -128),      # min offset
+        (200, -100, 100),       # s alone beyond int8, offset brings it back: NOT pre-saturated
+        (-200, 100, -100),
+        (1000, -1000, 0),
+    ],
+)
+def test_bias_requantize_relu_offset_beyond_int8_both_sides(acc: int, offset: int, expected: int) -> None:
+    """The offset add happens on the unbounded rounded value, before any
+    clamp: `s` beyond int8 is not saturated first (200-100 = 100, not
+    127-100 = 27)."""
+    assert bias_requantize_relu(acc, 0, **_IDENTITY, output_offset=offset) == expected
+
+
+def test_bias_requantize_relu_general_clamp() -> None:
+    clamp = dict(clamp_en=True, clamp_min=5, clamp_max=100)
+    assert bias_requantize_relu(50, 0, **_IDENTITY, **clamp) == 50
+    assert bias_requantize_relu(3, 0, **_IDENTITY, **clamp) == 5
+    assert bias_requantize_relu(-1000, 0, **_IDENTITY, **clamp) == 5
+    assert bias_requantize_relu(101, 0, **_IDENTITY, **clamp) == 100
+    assert bias_requantize_relu(10_000_000, 0, **_IDENTITY, **clamp) == 100
+    # Negative bounds, both sides.
+    clamp = dict(clamp_en=True, clamp_min=-100, clamp_max=-10)
+    assert bias_requantize_relu(0, 0, **_IDENTITY, **clamp) == -10
+    assert bias_requantize_relu(-128, 0, **_IDENTITY, **clamp) == -100
+    # CLAMP_EN overrides RELU_EN: relu would give 0, clamp gives lo=-20.
+    assert bias_requantize_relu(-50, 0, **{**_IDENTITY, "relu_en": True}, clamp_en=True, clamp_min=-20, clamp_max=20) == -20
+    # Offset then clamp: 90 + 20 = 110 -> hi=100.
+    assert bias_requantize_relu(90, 0, **_IDENTITY, output_offset=20, clamp_en=True, clamp_min=5, clamp_max=100) == 100
+    # Bypass path honours the clamp too.
+    assert bias_requantize_relu(3, 0, **{**_IDENTITY, "requant_en": False}, clamp_en=True, clamp_min=5, clamp_max=100) == 5
+
+
+def test_bias_requantize_relu_clamp_lo_equals_hi() -> None:
+    for value in (-1000, -1, 0, 1, 42, 1000):
+        assert bias_requantize_relu(value, 0, **_IDENTITY, clamp_en=True, clamp_min=42, clamp_max=42) == 42
+        assert bias_requantize_relu(value, 0, **_IDENTITY, clamp_en=True, clamp_min=-128, clamp_max=-128) == -128
+
+
+def test_encode_rejects_clamp_min_gt_max_and_out_of_range_w13() -> None:
+    base = dict(opcode=OPCODE_CONV2D, flags=1 << FLAG_CLAMP_EN)
+    with pytest.raises(ValueError, match="clamp_min"):
+        encode_instruction(LayerDesc(**base, clamp_min=10, clamp_max=9))
+    # lo > hi is rejected even when CLAMP_EN is clear (the bytes still land in W13).
+    with pytest.raises(ValueError, match="clamp_min"):
+        encode_instruction(LayerDesc(opcode=OPCODE_CONV2D, clamp_min=1, clamp_max=0))
+    # lo == hi is legal.
+    encode_instruction(LayerDesc(**base, clamp_min=9, clamp_max=9))
+    for bad in (dict(output_offset=32768), dict(output_offset=-32769), dict(clamp_max=128), dict(clamp_min=-129, clamp_max=0)):
+        with pytest.raises(ValueError, match="outside signed range"):
+            encode_instruction(LayerDesc(**base, **bad))
+
+
+def test_layer_desc_clamp_en_property_and_conv2d_uses_w13() -> None:
+    """`conv2d` (and hence `run_layer`) must actually read the new fields:
+    a 1x1 conv with weight 1, scale 1.0, offset -128, clamp_en and
+    clamp [-128, 0] maps x -> clamp(x - 128, -128, 0)."""
+    desc = LayerDesc(
+        opcode=OPCODE_CONV2D,
+        flags=(1 << FLAG_REQUANT_EN) | (1 << FLAG_CLAMP_EN) | (1 << FLAG_RELU_EN),
+        in_width=4, in_height=1, in_channels=1, out_channels=1,
+        requant_scale=1 << 15, requant_shift=0,
+        output_offset=-128, clamp_min=-128, clamp_max=0,
+    )
+    assert desc.clamp_en
+    assert conv2d([-128, -1, 0, 127], [1], [0], desc) == [-128, -128, -128, -1]
+    # Same descriptor with CLAMP_EN clear: RELU_EN then rules, offset still applies.
+    desc.flags &= ~(1 << FLAG_CLAMP_EN)
+    assert not desc.clamp_en
+    assert conv2d([-128, -1, 0, 127], [1], [0], desc) == [0, 0, 0, 0]
+
+
 def test_instruction_offsets_match_vhdl_pkg_literals() -> None:
     expected = {
         "OFF_OPCODE": 0,
@@ -339,6 +488,9 @@ def test_instruction_offsets_match_vhdl_pkg_literals() -> None:
         "OFF_POOL_STRIDE_H": 46,
         "OFF_POOL_STRIDE_W": 47,
         "OFF_NEXT_INSTR_ADDR": 48,
+        "OFF_OUTPUT_OFFSET": 52,
+        "OFF_CLAMP_MIN": 54,
+        "OFF_CLAMP_MAX": 55,
     }
     actual = {
         "OFF_OPCODE": OFF_OPCODE,
@@ -366,9 +518,13 @@ def test_instruction_offsets_match_vhdl_pkg_literals() -> None:
         "OFF_POOL_STRIDE_H": OFF_POOL_STRIDE_H,
         "OFF_POOL_STRIDE_W": OFF_POOL_STRIDE_W,
         "OFF_NEXT_INSTR_ADDR": OFF_NEXT_INSTR_ADDR,
+        "OFF_OUTPUT_OFFSET": OFF_OUTPUT_OFFSET,
+        "OFF_CLAMP_MIN": OFF_CLAMP_MIN,
+        "OFF_CLAMP_MAX": OFF_CLAMP_MAX,
     }
     assert actual == expected
     assert INSTR_WORD_BYTES == 64
+    assert FLAG_CLAMP_EN == 4
 
 
 def test_isa_layout_self_consistent() -> None:
@@ -377,8 +533,9 @@ def test_isa_layout_self_consistent() -> None:
     above, which cross-checks the model's *exported* `OFF_*` names against
     independently hand-typed literals): no two fields overlap, no field
     (named or reserved) crosses the 64-byte word boundary, and the
-    documented reserved gaps (W0 bytes 2-3, W10 bytes 41-43, W13-W15
-    bytes 52-63 -- doc/cnn_accel_arch.md's ISA table) land exactly where
+    documented reserved gaps (W0 bytes 2-3, W10 bytes 41-43, W14-W15
+    bytes 56-63 -- doc/cnn_accel_arch.md's ISA table; W13 became the ISA
+    v1.1 output_offset/clamp_min/clamp_max fields in H1) land exactly where
     specified. This is the guarantee that replaces the old hand-maintained
     "cnn_accel_model.py's encoder must agree with these byte-for-byte"
     comment with something a test actually enforces."""
@@ -401,7 +558,7 @@ def test_isa_layout_self_consistent() -> None:
     assert offset == cnn_accel_constants.INSTR_WORD_BYTES
     assert all(occupied), "instruction word has unaccounted-for byte(s)"
 
-    assert cnn_accel_constants.isa_reserved_ranges() == [(2, 3), (41, 43), (52, 63)]
+    assert cnn_accel_constants.isa_reserved_ranges() == [(2, 3), (41, 43), (56, 63)]
 
     # Every non-reserved field name is unique and does not collide with the
     # `RESERVED` sentinel.
@@ -436,10 +593,19 @@ def test_encode_decode_round_trip() -> None:
         pool_stride_h=2,
         pool_stride_w=2,
         next_instr_addr=0x100,
+        output_offset=-129,
+        clamp_min=-100,
+        clamp_max=100,
     )
     encoded = encode_instruction(desc)
     assert len(encoded) == INSTR_WORD_BYTES
     assert decode_instruction(encoded) == desc
+    # W13 byte placement (little-endian, signed).
+    assert encoded[52:54] == (-129).to_bytes(2, "little", signed=True)
+    assert encoded[54] == (-100) & 0xFF
+    assert encoded[55] == 100
+    # Reserved W14-W15 untouched.
+    assert encoded[56:64] == bytes(8)
 
 
 def test_encode_decode_round_trip_randomized() -> None:
@@ -471,6 +637,9 @@ def test_encode_decode_round_trip_randomized() -> None:
             pool_stride_h=rng.randint(0, 0xFF),
             pool_stride_w=rng.randint(0, 0xFF),
             next_instr_addr=rng.randint(0, 0xFFFFFFFF),
+            output_offset=rng.randint(-(2**15), 2**15 - 1),
+            clamp_min=(clamp_pair := sorted((rng.randint(-128, 127), rng.randint(-128, 127))))[0],
+            clamp_max=clamp_pair[1],
         )
         assert decode_instruction(encode_instruction(desc)) == desc
 

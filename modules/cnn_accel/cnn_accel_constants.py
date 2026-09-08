@@ -195,6 +195,11 @@ FLAGS: dict[str, int] = {
     "BIAS_EN": 1,
     "REQUANT_EN": 2,
     "PAD_EN": 3,
+    # ISA v1.1 (doc/tosa_compiler_plan.md section 5, extension 1 / HW
+    # milestone H1): when set, the epilogue clamps to [clamp_min, clamp_max]
+    # instead of the RELU_EN-derived [0 or -128, 127] range. RELU_EN is
+    # ignored while CLAMP_EN is set.
+    "CLAMP_EN": 4,
 }
 
 # ---------------------------------------------------------------------------
@@ -247,7 +252,14 @@ ISA_LAYOUT: tuple[IsaField, ...] = (
     IsaField("pool_stride_h", 1),
     IsaField("pool_stride_w", 1),
     IsaField("next_instr_addr", 4),
-    IsaField(RESERVED, 12),  # W13-W15 bytes 52-63
+    # W13 (ISA v1.1, H1): output offset added after the rounded requant
+    # shift, and the CLAMP_EN clamp bounds. All three are signed; all three
+    # must be 0 in a v1.0 program (which is exactly what the reserved-must-
+    # be-0 rule already guaranteed, so v1.0 programs run unchanged).
+    IsaField("output_offset", 2, signed=True),
+    IsaField("clamp_min", 1, signed=True),
+    IsaField("clamp_max", 1, signed=True),
+    IsaField(RESERVED, 8),  # W14-W15 bytes 56-63
 )
 
 
