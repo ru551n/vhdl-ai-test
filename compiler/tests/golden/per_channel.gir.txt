@@ -1,0 +1,8 @@
+gir.func @main(%arg0: 1x8x8x8xi8) -> 1x8x8x16xi8 {
+  %0 = const : 16x3x3x8xi8 (1152 values, min -4 max 4)
+  %1 = const : 16xi32 (16 values, min -20 max 19)
+  %4 = conv2d %arg0, %0, %1 {pad=[1,1,1,1] stride=[1,1] dil=[1,1] in_zp=0 w_zp=0 acc=i32} : 1x8x8x16xi32
+  %9 = rescale %4 {mult=[88,184,1475,82575,6291456,80530637,306016420,1095216660,58,338,614,70779,3271557,44291850,257698038,901943132] shift=[10,12,14,20,26,30,32,34,10,12,14,20,26,30,32,34] per_channel=1 in_zp=0 out_zp=0 round=SINGLE_ROUND scale32=1} : 1x8x8x16xi8
+  %10 = clamp %9 {min=-128 max=127} : 1x8x8x16xi8
+  return %10
+}

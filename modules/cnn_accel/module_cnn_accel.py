@@ -134,9 +134,14 @@ _VIVADO_PART = "xc7a200tfbg484-2"
 
 # M10 (doc/tosa_compiler_plan.md ~line 613): the real TOSA fixtures
 # compiled into tb_cnn_accel_conv_core's 'test_bitexact_compiler_cases'
-# config (the two M10 ones plus the two M11 ones, `out_zp_relu` /
+# config (the two M10 ones, the two M11 ones, `out_zp_relu` /
 # `clamp_5_100`, which exercise the ISA v1.1 `output_offset` /
-# `CLAMP_EN` epilogue fields end-to-end from compiler bytes into RTL), and the fixed seed each is compiled/run with (matches
+# `CLAMP_EN` epilogue fields end-to-end from compiler bytes into RTL, and
+# the M12 one, `per_channel_oc8`, whose ISA v1.2 `PER_CHANNEL_EN` scale
+# table -- the compiler's own SCALE_TABLE constant at `scale_addr` -- is
+# streamed from `scale_table_packed.txt`; the 16-channel `per_channel`
+# fixture exceeds this testbench's single output-channel tile and stays
+# compiler-side only), and the fixed seed each is compiled/run with (matches
 # compiler/tests/test_fixtures_m9.py's own `_seed_input` convention: one
 # `np.random.default_rng(seed)` per fixture's single graph input, keyed
 # "arg0" like every M8/M9 fixture). Shapes come from the compiler's own
@@ -148,6 +153,7 @@ _COMPILER_VECTORS_FIXTURES = {
     "first_layer_cin3": (1, 8, 8, 3),
     "out_zp_relu": (1, 8, 8, 8),
     "clamp_5_100": (1, 8, 8, 8),
+    "per_channel_oc8": (1, 8, 8, 8),
 }
 _COMPILER_VECTORS_SEED = 0
 

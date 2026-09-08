@@ -17,11 +17,14 @@ import numpy as np
 import pytest
 
 from cnnc.lower.layout import (
+    SCALE_TABLE_ENTRY_BYTES,
     activation_bytes,
     pack_activation_planes,
     pack_bias_tiled,
+    pack_scale_table,
     pack_weights_tiled,
     packed_bias_bytes,
+    packed_scale_table_bytes,
     packed_weight_bytes,
     unpack_activation_planes,
 )
@@ -95,8 +98,40 @@ def test_bias_tiled_matches_model(model, tiling, oc):
     assert list(np.frombuffer(ours, dtype="<i4")) == theirs
 
 
+@pytest.mark.parametrize("oc", [8, 3, 12, 16, 17])
+def test_scale_table_matches_model(model, tiling, oc):
+    # ISA v1.2 (H2/M12) per-channel requant table: the compiler's image must
+    # be byte-identical to `pack_scale_table_for_hw` -- including the
+    # all-zero padding lanes up to whole pe_rows tiles, which the weight
+    # buffer streams in the same tile-load phase as the bias.
+    _, _, pe_rows = tiling
+    rng = np.random.default_rng(1000 + oc)
+    mults = tuple(int(v) for v in rng.integers(-(2**31), 2**31, size=oc))
+    shifts = tuple(int(v) for v in rng.integers(0, 256, size=oc))
+    desc = model.LayerDesc(opcode=model.OPCODE_CONV2D, out_channels=oc)
+
+    ours = pack_scale_table(mults, shifts, pe_rows)
+    theirs = model.pack_scale_table_for_hw(list(zip(mults, shifts)), desc, pe_rows)
+    assert ours == theirs
+    assert len(ours) == packed_scale_table_bytes(oc, pe_rows) == model.packed_scale_table_bytes(desc, pe_rows)
+    assert model.unpack_scale_table_from_hw(ours, oc) == list(zip(mults, shifts))
+
+
+def test_scale_table_rejects_out_of_range_entries(tiling):
+    _, _, pe_rows = tiling
+    with pytest.raises(ValueError):
+        pack_scale_table((2**31,), (0,), pe_rows)
+    with pytest.raises(ValueError):
+        pack_scale_table((1,), (256,), pe_rows)
+    with pytest.raises(ValueError):
+        pack_scale_table((1,), (-1,), pe_rows)
+    with pytest.raises(ValueError):
+        pack_scale_table((1, 2), (0,), pe_rows)
+
+
 def test_model_plane_constant_is_what_target_discovered(model, tiling):
     plane_channels, tile_channels, pe_rows = tiling
     assert plane_channels == model.ACTIVATION_PLANE_CHANNELS
     assert tile_channels == model.TILE_CHANNELS
     assert pe_rows == model.PE_ROWS
+    assert SCALE_TABLE_ENTRY_BYTES == model.SCALE_TABLE_ENTRY_BYTES

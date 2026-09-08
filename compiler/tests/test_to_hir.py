@@ -269,16 +269,59 @@ def test_per_channel_rescale_stays_unfused_and_rejected_on_isa_v11_target(target
     assert "%4" in str(exc_info.value)
 
 
-def test_per_channel_fused_but_rejected_until_m12(target):
-    # Real ISA v1.2 target (H2, `per_channel: true`): the per-channel
-    # rescale IS fused, and `to_hir` must still reject it -- loudly, at the
-    # fused op -- until M12 emits the scale table and `scale_addr`.
-    # Silently lowering channel 0's pair would compile a numerically wrong
-    # program.
+def test_per_channel_lowers_to_scale_table_buffer(target):
+    # Real ISA v1.2 target (H2/M12, `per_channel: true`): the per-channel
+    # rescale is fused and lowered to a `conv_layer` that reads a 4th
+    # const SCALE_TABLE buffer (`pack_scale_table` image, padded to whole
+    # pe_rows tiles, descriptor shifts = TOSA shift - implicit_shift) and
+    # carries `per_channel_en`; the scalar W-fields are emitted as 0.
+    from cnnc.lower.layout import SCALE_TABLE_ENTRY_BYTES, pack_scale_table
+
+    out_c = 16  # two pe_rows tiles (`out_channels` must be PE_ROWS-divisible on this target)
+    mults = tuple(1073741824 - 1000 * i for i in range(out_c))
+    shifts = tuple(34 + (i % 4) for i in range(out_c))
+    module = _to_hir(target, out_c=out_c, per_channel=True, mult=mults, shift=shifts)
+    unit = target.units[0]
+    caps = unit.epilogue.rescale
+    pe_rows = unit.internal_tiling.cout
+
+    op = module.ops[0]
+    assert len(op.reads) == 4
+    scale_buf = module.buffer(op.reads[3])
+    assert scale_buf.role == "const" and scale_buf.layout == "SCALE_TABLE"
+    assert scale_buf.id == "%10.scale"
+    assert scale_buf.size_bytes == -(-out_c // pe_rows) * pe_rows * SCALE_TABLE_ENTRY_BYTES
+    assert scale_buf.data == pack_scale_table(mults, tuple(s - caps.implicit_shift for s in shifts), pe_rows)
+    assert scale_buf.shape == (out_c, 2)
+
+    assert op.params["per_channel_en"] is True
+    assert op.params["requant_scale"] == 0 and op.params["requant_shift"] == 0
+    assert op.params["requant_en"] is True
+
+    # The table row shows up in the HIR dump with its layout.
+    assert "%10.scale" in print_hir(module) and "SCALE_TABLE" in print_hir(module)
+
+
+def test_per_tensor_conv_layer_has_no_scale_table(target):
+    module = _to_hir(target)
+    op = module.ops[0]
+    assert len(op.reads) == 3
+    assert "per_channel_en" not in op.params
+    assert not any(b.layout == "SCALE_TABLE" for b in module.buffers.values())
+
+
+def test_per_channel_rejected_when_isa_predates_scale_table(target):
+    # Defensive: a target JSON claiming `per_channel: true` on an ISA < 1.2
+    # unit (no `scale_addr`) must not be lowered -- there is no field for
+    # the table address.
+    data = target.to_dict()
+    for unit in data["units"]:
+        unit["isa_version"] = "1.1"
+    bad_target = Target.from_dict(data)
     with pytest.raises(CapabilityError) as exc_info:
-        _to_hir(target, per_channel=True, mult=(1073741824,) * 8, shift=(38,) * 8)
+        _to_hir(bad_target, per_channel=True, mult=(1073741824,) * 8, shift=(38,) * 8)
     assert exc_info.value.constraint == "rescale.per_channel"
-    assert "M12" in str(exc_info.value)
+    assert "1.2" in str(exc_info.value)
     assert "%10" in str(exc_info.value)
 
 
