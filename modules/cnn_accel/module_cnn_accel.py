@@ -1762,6 +1762,7 @@ class Module(BaseModule):
         self._setup_cnn_accel_pe_array(library)
         self._setup_cnn_accel_pe_array_from_vectors(library)
         self._setup_cnn_accel_conv_core(library)
+        self._setup_cnn_accel_tensor_mem(library)
         self._setup_cnn_accel_top(library)
 
     def _setup_cnn_accel_top(self, library) -> None:
@@ -1935,6 +1936,16 @@ class Module(BaseModule):
                     },
                     pre_config=make_pre_config(pe_rows),
                 )
+
+    def _setup_cnn_accel_tensor_mem(self, library) -> None:
+        # Plain default-generic testbench (tb_cnn_accel_tensor_mem.vhd's own
+        # header comment has the verification plan): every test case picks
+        # its own read-consumer mode/stall percentage internally via live
+        # signals, so there is nothing to sweep here -- matches
+        # tb_cnn_accel_weight_buffer.vhd's identical no-generics-to-vary
+        # precedent for this project's other non-PE_ROWS-parametric leaf
+        # modules.
+        library.test_bench("tb_cnn_accel_tensor_mem")
 
     def _setup_cnn_accel_pool(self, library) -> None:
         tb = library.test_bench("tb_cnn_accel_pool")
