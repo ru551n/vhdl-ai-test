@@ -40,6 +40,14 @@ entity cnn_accel_csr is
     g_pe_cols : positive;
     g_tile_channels : positive;
     g_max_kernel_size : positive;
+    -- Pooling's own, separate kernel bound (cnn_accel_top's
+    -- 'g_max_pool_kernel_size'). Reported to the host via
+    -- HW_INFO3.MAX_POOL_KERNEL_SIZE -- distinct from HW_INFO.MAX_KERNEL_SIZE.
+    g_max_pool_kernel_size : positive;
+    -- Elaborated per-row activation tile depth (cnn_accel_top's
+    -- 'g_max_row_tile_words'). Reported to the host via
+    -- HW_INFO3.MAX_ROW_TILE_WORDS.
+    g_max_row_tile_words : positive;
     -- Size of the local tensor scratchpad (cnn_accel_tensor_mem), bytes.
     -- Reported to the host, in KiB, via HW_INFO2.TENSOR_MEM_KIB.
     g_tensor_bytes : positive;
@@ -245,6 +253,11 @@ begin
     to_unsigned(cnn_accel_constant_isa_version, cnn_accel_hw_info2_isa_version_width);
   regs_up.hw_info2.tensor_mem_kib <=
     to_unsigned(g_tensor_bytes / 1024, cnn_accel_hw_info2_tensor_mem_kib_width);
+
+  regs_up.hw_info3.max_pool_kernel_size <=
+    to_unsigned(g_max_pool_kernel_size, cnn_accel_hw_info3_max_pool_kernel_size_width);
+  regs_up.hw_info3.max_row_tile_words <=
+    to_unsigned(g_max_row_tile_words, cnn_accel_hw_info3_max_row_tile_words_width);
 
   -- Counters: pure pass-through from the consolidated 'counters' input
   -- (csr_counters_t, src/cnn_accel_v2_pkg.vhd) into the individual

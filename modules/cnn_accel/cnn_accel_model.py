@@ -1055,7 +1055,17 @@ def pool_avg(input_values: list[int], desc: LayerDesc) -> list[int]:
     """`OPCODE_POOL_AVG` reference: int32 sum over each window, then
     `bias_requantize_relu` with `bias_en=False` (division by the pool area
     is `requant_scale`/`requant_shift`, per
-    `cnn_accel_pool_req.md`/`doc/cnn_accel_arch.md`)."""
+    `cnn_accel_pool_req.md`/`doc/cnn_accel_arch.md`).
+
+    Padded taps (`_pool_windows`) are summed like any other, so a padded
+    average is **count-include-pad**: the divisor is the fixed
+    `requant_scale`/`requant_shift` the descriptor carries, not a
+    per-position count of real taps. This is a ratified design decision,
+    not an oversight -- it follows from dividing through the existing
+    `bias_requant` epilogue, which has no per-position divisor -- and it
+    diverges from TOSA's count-exclude-pad `avg_pool2d`. See
+    `doc/cnn_accel_top_v2_arch.md` §5.2a for the full rationale and what
+    an exclude-pad implementation would require."""
     windows = _pool_windows(input_values, desc)
     channels = desc.in_channels
     # windows is in (out_row, out_col, channel) raster order, see _pool_windows.

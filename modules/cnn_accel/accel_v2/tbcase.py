@@ -38,6 +38,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+import cnn_accel_constants
 import cnn_accel_model as golden
 from accel_v2 import isa
 from accel_v2.ddrmap import DdrMap
@@ -80,6 +81,7 @@ COUNTER_KEYS = (
     "err_pc_low",
     "hw_info",
     "hw_info2",
+    "hw_info3",
     "cmd_count",
     "cycle_count",
     "compute_cycles",
@@ -187,6 +189,12 @@ class TbCase:
     bank_words: int
     expect_error: bool = False
     expect_err_code: int | None = None
+    #: Expected `STATUS.ERR_PC_LOW` (the low 16 bits of the faulting
+    #: descriptor's byte address), checked verbatim against the counter
+    #: when set. `None` (the default) skips the check -- most
+    #: `expect_error` cases only care about the code, not exactly which
+    #: descriptor raised it.
+    expect_err_pc: int | None = None
     traffic: TrafficPolicy = field(default_factory=TrafficPolicy)
     #: Extra generic overrides merged last into `generics()`.
     generic_overrides: dict[str, object] = field(default_factory=dict)
@@ -279,7 +287,12 @@ class TbCase:
 
     def _post_check(self, output_path: str) -> None:
         counters = read_counters(os.path.join(output_path, COUNTERS_CSV))
+        # HW_INFO/HW_INFO2/HW_INFO3 are read unconditionally by the
+        # testbench regardless of how the program ends, so check them
+        # unconditionally too, before branching on expect_error.
+        self._check_hw_info(counters)
         self._check_status(counters)
+
         if self.expect_error:
             # A rejected program has no meaningful output tensors and no
             # meaningful traffic prediction: the whole point is that the
@@ -290,6 +303,85 @@ class TbCase:
             return
         self._check_outputs(output_path)
         self._check_traffic(counters)
+
+    def _check_hw_info(self, counters: dict[str, int]) -> None:
+        """`HW_INFO`/`HW_INFO2`/`HW_INFO3` are read-only capability
+        registers, driven straight from the elaborated generics
+        (`module_cnn_accel.py`'s `hw_info`/`hw_info2`/`hw_info3`); this is
+        the only place anything checks they actually read back what was
+        elaborated, rather than merely getting dumped into `counters.csv`
+        for a human to eyeball.
+
+        Field widths/offsets are the generated register layout
+        (`regs_src/cnn_accel_regs_pkg.vhd`): each register packs its
+        fields LSB-first in declaration order, so bit positions are
+        derived here from the field widths rather than hardcoded, to
+        avoid silently reading the wrong bits if a field is ever resized.
+        """
+        generics = self.generics()
+
+        def field(raw: int, lsb: int, width: int) -> int:
+            return (raw >> lsb) & ((1 << width) - 1)
+
+        expected_pe_rows = generics.get("g_pe_rows", cnn_accel_constants.PE_ROWS)
+        expected_pe_cols = generics.get("g_pe_cols", cnn_accel_constants.PE_COLS)
+        expected_tile_channels = generics.get("g_tile_channels", cnn_accel_constants.TILE_CHANNELS)
+        expected_max_kernel_size = generics.get("g_max_kernel_size", cnn_accel_constants.MAX_KERNEL_SIZE)
+
+        hw_info = counters["hw_info"]
+        got_pe_rows = field(hw_info, 0, 8)
+        got_pe_cols = field(hw_info, 8, 8)
+        got_tile_channels = field(hw_info, 16, 8)
+        got_max_kernel_size = field(hw_info, 24, 8)
+        if (got_pe_rows, got_pe_cols, got_tile_channels, got_max_kernel_size) != (
+            expected_pe_rows,
+            expected_pe_cols,
+            expected_tile_channels,
+            expected_max_kernel_size,
+        ):
+            raise CheckFailure(
+                f"HW_INFO=0x{hw_info:08x} decodes to "
+                f"pe_rows={got_pe_rows}, pe_cols={got_pe_cols}, "
+                f"tile_channels={got_tile_channels}, max_kernel_size={got_max_kernel_size}; "
+                f"expected pe_rows={expected_pe_rows}, pe_cols={expected_pe_cols}, "
+                f"tile_channels={expected_tile_channels}, max_kernel_size={expected_max_kernel_size}"
+            )
+
+        expected_isa_version = cnn_accel_constants.ISA_VERSION
+        expected_tensor_mem_kib = self.tensor_mem_bytes // 1024
+
+        hw_info2 = counters["hw_info2"]
+        got_isa_version = field(hw_info2, 0, 16)
+        got_tensor_mem_kib = field(hw_info2, 16, 16)
+        if (got_isa_version, got_tensor_mem_kib) != (expected_isa_version, expected_tensor_mem_kib):
+            raise CheckFailure(
+                f"HW_INFO2=0x{hw_info2:08x} decodes to "
+                f"isa_version=0x{got_isa_version:04x}, tensor_mem_kib={got_tensor_mem_kib}; "
+                f"expected isa_version=0x{expected_isa_version:04x}, "
+                f"tensor_mem_kib={expected_tensor_mem_kib}"
+            )
+
+        expected_max_pool_kernel_size = generics.get(
+            "g_max_pool_kernel_size", cnn_accel_constants.MAX_POOL_KERNEL_SIZE
+        )
+        expected_max_row_tile_words = generics.get(
+            "g_max_row_tile_words", cnn_accel_constants.MAX_ROW_TILE_WORDS
+        )
+
+        hw_info3 = counters["hw_info3"]
+        got_max_pool_kernel_size = field(hw_info3, 0, 8)
+        got_max_row_tile_words = field(hw_info3, 8, 16)
+        if (got_max_pool_kernel_size, got_max_row_tile_words) != (
+            expected_max_pool_kernel_size,
+            expected_max_row_tile_words,
+        ):
+            raise CheckFailure(
+                f"HW_INFO3=0x{hw_info3:08x} decodes to "
+                f"max_pool_kernel_size={got_max_pool_kernel_size}, "
+                f"max_row_tile_words={got_max_row_tile_words}; expected "
+                f"max_pool_kernel_size={expected_max_pool_kernel_size}, "
+                f"max_row_tile_words={expected_max_row_tile_words}"
+            )
 
     def _check_status(self, counters: dict[str, int]) -> None:
         if self.expect_error:
@@ -305,6 +397,15 @@ class TbCase:
                     f"0x{counters['err_code']:x} ({_err_name(counters['err_code'])}) "
                     f"at ERR_PC_LOW=0x{counters['err_pc_low']:04x}"
                 )
+            if self.expect_err_pc is not None:
+                expected_pc_low = self.expect_err_pc & 0xFFFF
+                if counters["err_pc_low"] != expected_pc_low:
+                    raise CheckFailure(
+                        f"expected ERR_PC_LOW=0x{expected_pc_low:04x} (from PC "
+                        f"0x{self.expect_err_pc:08x}), got "
+                        f"0x{counters['err_pc_low']:04x} -- ERR_CODE="
+                        f"0x{counters['err_code']:x} ({_err_name(counters['err_code'])})"
+                    )
             return
 
         if counters["error"] != 0:
@@ -608,6 +709,7 @@ def build_case(
     bank_words: int = 1024,
     expect_error: bool = False,
     expect_err_code: int | None = None,
+    expect_err_pc: int | None = None,
     traffic: TrafficPolicy | None = None,
     generic_overrides: dict[str, object] | None = None,
 ) -> TbCase:
@@ -660,6 +762,7 @@ def build_case(
         bank_words=bank_words,
         expect_error=expect_error,
         expect_err_code=expect_err_code,
+        expect_err_pc=expect_err_pc,
         traffic=traffic if traffic is not None else TrafficPolicy(),
         generic_overrides=dict(generic_overrides or {}),
     )

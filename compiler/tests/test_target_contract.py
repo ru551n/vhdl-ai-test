@@ -76,6 +76,49 @@ def test_derived_values_match_constants_directly(cnn_accel_constants):
     assert {"kernel_h", "kernel_w"} <= kernel_max
 
 
+def _cnn_accel_hw_info3_defaults() -> dict[str, int]:
+    """Read `HW_INFO3`'s elaborated-default field values straight out of
+    `module_cnn_accel.py`'s generated register list (the same
+    `hdl-registers` `RegisterList` that becomes `regs_src/cnn_accel_regs_pkg.vhd`
+    and `cnn_accel_csr`'s `regs_up.hw_info3.*` at build time), so this test
+    fails if the register and `cnn_accel_constants.py` ever disagree,
+    rather than only comparing the constants file against itself."""
+    from tsfpga.module import get_modules
+
+    modules = get_modules(modules_folders=[ACCEL_ROOT.parent.resolve()])
+    module = next(m for m in modules if m.name == "cnn_accel")
+    hw_info3 = module.registers.get_register("hw_info3")
+    return {field.name: int(field.default_value, 2) for field in hw_info3.fields}
+
+
+def test_pool_unit_bound_matches_hw_info3_register(cnn_accel_constants):
+    # `discover_cnn_accel` derives the pool_engine unit's kernel bound
+    # straight from `cnn_accel_constants.MAX_POOL_KERNEL_SIZE`/
+    # `MAX_ROW_TILE_WORDS` (the compile-time source of truth); the RTL's
+    # runtime-discoverable HW_INFO3 register is generated from the exact
+    # same constants (`module_cnn_accel.py`'s `registers_hook`). This test
+    # closes the loop between the two so a compiler/hardware disagreement
+    # here fails loudly instead of silently shipping a compiler that
+    # accepts programs the elaborated hardware cannot run.
+    target = load_target("cnn_accel")
+    pool_unit = target.unit("pool_engine")
+
+    pool_kernel_constraints = [
+        c for c in pool_unit.constraints if "MAX_POOL_KERNEL_SIZE" in c.source
+    ]
+    assert {c.expr for c in pool_kernel_constraints} == {"pool_kernel_h", "pool_kernel_w"}
+    assert all(c.value == cnn_accel_constants.MAX_POOL_KERNEL_SIZE for c in pool_kernel_constraints)
+
+    row_tile = next(
+        c for c in pool_unit.constraints if "MAX_ROW_TILE_WORDS" in c.source
+    )
+    assert row_tile.value == cnn_accel_constants.MAX_ROW_TILE_WORDS
+
+    hw_info3 = _cnn_accel_hw_info3_defaults()
+    assert hw_info3["max_pool_kernel_size"] == cnn_accel_constants.MAX_POOL_KERNEL_SIZE
+    assert hw_info3["max_row_tile_words"] == cnn_accel_constants.MAX_ROW_TILE_WORDS
+
+
 def test_rounding_and_implicit_shift_are_discovered_not_hardcoded(cnn_accel_model):
     target = load_target("cnn_accel")
     rescale = target.unit("conv_engine").epilogue.rescale

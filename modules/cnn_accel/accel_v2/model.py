@@ -677,7 +677,13 @@ class Model:
         overridden (matching `cnn_accel_model.pool_avg`'s documented
         "division via bias_requant"). `padding`/`pad_value` as for
         `pool_max`; note the padded taps are summed like any other, so a
-        padded average is a "count-include-pad" average."""
+        padded average is a "count-include-pad" average -- a ratified
+        decision (follows from dividing through the fixed-per-descriptor
+        `bias_requant` epilogue, which has no per-position divisor),
+        deliberately different from TOSA's count-exclude-pad
+        `avg_pool2d` (see `doc/cnn_accel_top_v2_arch.md` §5.2a, and
+        `cnnc.frontend.tosa_import._INEXACT_OPS["tosa.avg_pool2d"]` for
+        why the compiler refuses to lower onto this opcode)."""
         return self._pool(
             x, "avg", kernel, stride, padding, pad_value,
             activation, clamp, requant_scale, requant_shift, name,

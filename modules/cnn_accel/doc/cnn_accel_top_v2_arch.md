@@ -358,6 +358,57 @@ it is; `LOAD` vs `STORE` naming exists so that programs, traces and the
 performance counters are self-documenting. A "reload" is simply a `LOAD`
 whose source is the DDR address a previous `STORE` wrote.
 
+### 5.2a `POOL_AVG` padding semantics — ratified decision
+
+Padded `POOL_AVG` is **count-include-pad**: a padded tap enters the
+window's sum exactly like a real one (at the descriptor's `pad_value`,
+§5), and the divisor is the *fixed* `requant_scale`/`requant_shift` the
+descriptor carries — `1/(kh*kw)` by convention, never adjusted per
+output position. This is tested (`accel_v2/cases_pool_pad.py`'s
+`case_pool_avg_padded`) and implemented identically in both places that
+compute it: `cnn_accel_model.pool_avg` (the bit-exact hardware reference)
+and `accel_v2/model.py`'s `Model.pool_avg` (the compiler-facing golden
+model) — see their docstrings.
+
+**Why it follows from the design, not from a preference:** `POOL_AVG`
+has no adder/divider of its own — it is `POOL_MAX`'s window-sum datapath
+reused, with the actual division performed by `bias_requant`'s existing
+multiply-shift epilogue (`dst = round(sum * requant_scale) >> shift`,
+§5.3's fusion rule). That epilogue takes one scale value per descriptor,
+resolved at compile time from the *nominal* kernel area — it has no way
+to know, per output pixel, how many of that window's taps were real vs.
+padded, and so no way to divide by a *smaller* count at the border. Count-
+include-pad is not a rejected alternative here; it is what "divide by a
+fixed compile-time constant" necessarily means once padding exists at
+all.
+
+**This diverges from TOSA.** `tosa.avg_pool2d` is count-*exclude*-pad: it
+divides each window by the number of taps actually inside the input
+(`apply_scale_32(reciprocal_scale(count))`, a **per-position** divisor at
+every border), not the nominal `kh*kw`. `compiler/cnnc/frontend/
+tosa_import.py`'s `_INEXACT_OPS["tosa.avg_pool2d"]` refuses to lower
+`tosa.avg_pool2d` onto `POOL_AVG` specifically because of this — emitting
+the opcode would be silently wrong on every padded window (and differ by
+a rounding step even unpadded, see that entry's message). This is a
+**target capability gap**, not a compiler bug: `cnnc.target.discover`
+still advertises `POOL_AVG`/`padding` on `pool_engine` (the opcode and its
+zero/`pad_value` fill genuinely exist), it is only the TOSA *equivalence*
+that the frontend refuses.
+
+**What a future exclude-pad implementation would require:** a per-output-
+position divisor, which is a real datapath change, not a firmware fix --
+at minimum (a) a way to compute or supply the in-window tap count at each
+output position (cheap only in the corners/edges; the interior is always
+`kh*kw`), (b) either a second, position-dependent multiply-shift ahead of
+`bias_requant` or a per-position `requant_scale` override (today it is
+fixed for the whole descriptor), and (c) reciprocal/rounding behaviour
+matching TOSA's `apply_scale_32(reciprocal_scale(count))` closely enough
+for the compiler's numeric-equivalence bar in `_INEXACT_OPS`'s own
+comment ("these need a numeric equivalence argument, not more code") to
+be satisfiable. Until that lands, `tosa.avg_pool2d` stays refused and
+`POOL_AVG` remains a capability only a hand-written (non-TOSA-derived)
+program can use directly.
+
 ### 5.3 Fusion rule
 
 The epilogue is **not** a separate command. `CONV2D` with
@@ -454,16 +505,17 @@ CSR map (32-bit registers, AXI4-Lite):
 | `0x0C` | `IRQ_MASK` | RW | bit0 DONE, bit1 ERROR |
 | `0x10` | `HW_INFO` | RO | [7:0] `PE_ROWS`, [15:8] `PE_COLS`, [23:16] `TILE_CHANNELS`, [31:24] `MAX_KERNEL_SIZE` |
 | `0x14` | `HW_INFO2` | RO | [15:0] `ISA_VERSION` (`0x0200`), [31:16] `TENSOR_MEM_KIB` |
-| `0x18` | `CMD_COUNT` | RO | descriptors retired |
-| `0x1C` | `CYCLE_COUNT` | RO | cycles from `START` to `DONE` |
-| `0x20` | `COMPUTE_CYCLES` | RO | cycles with an engine active |
-| `0x24` | `STALL_CYCLES` | RO | cycles dispatched-but-blocked |
-| `0x28` | `DDR_RD_BYTES` | RO | **all** AXI read bytes (incl. descriptors and weights) |
-| `0x2C` | `DDR_WR_BYTES` | RO | all AXI write bytes |
-| `0x30` | `TENSOR_LOAD_COUNT` | RO | `LOAD` commands retired |
-| `0x34` | `TENSOR_STORE_COUNT` | RO | `STORE` commands retired |
-| `0x38` | `WEIGHT_LOAD_BYTES` | RO | bytes fetched by `LOADW` + OT-loop refills |
-| `0x3C` | `LOCAL_RD_BYTES` / `LOCAL_WR_BYTES` | RO | [15:0] KiB read / [31:16] KiB written in the scratchpad |
+| `0x18` | `HW_INFO3` | RO | [7:0] `MAX_POOL_KERNEL_SIZE`, [23:8] `MAX_ROW_TILE_WORDS` -- `HW_INFO`'s four 8-bit fields and `HW_INFO2`'s two 16-bit fields are both full, hence a third register (§12a) |
+| `0x1C` | `CMD_COUNT` | RO | descriptors retired |
+| `0x20` | `CYCLE_COUNT` | RO | cycles from `START` to `DONE` |
+| `0x24` | `COMPUTE_CYCLES` | RO | cycles with an engine active |
+| `0x28` | `STALL_CYCLES` | RO | cycles dispatched-but-blocked |
+| `0x2C` | `DDR_RD_BYTES` | RO | **all** AXI read bytes (incl. descriptors and weights) |
+| `0x30` | `DDR_WR_BYTES` | RO | all AXI write bytes |
+| `0x34` | `TENSOR_LOAD_COUNT` | RO | `LOAD` commands retired |
+| `0x38` | `TENSOR_STORE_COUNT` | RO | `STORE` commands retired |
+| `0x3C` | `WEIGHT_LOAD_BYTES` | RO | bytes fetched by `LOADW` + OT-loop refills |
+| `0x40` | `LOCAL_RD_BYTES` / `LOCAL_WR_BYTES` | RO | [15:0] KiB read / [31:16] KiB written in the scratchpad |
 
 Counters are the mechanism the residency tests use to prove that
 intermediates stayed local (§10). `DDR_WR_BYTES` is the decisive one: for a

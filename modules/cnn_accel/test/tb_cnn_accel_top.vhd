@@ -654,6 +654,7 @@ begin
     variable status : cnn_accel_status_t := cnn_accel_status_init;
     variable hw_info_slv : register_t := (others => '0');
     variable hw_info2_slv : register_t := (others => '0');
+    variable hw_info3_slv : register_t := (others => '0');
     variable cmd_count_slv : register_t := (others => '0');
     variable cycle_count_slv : register_t := (others => '0');
     variable compute_cycles_slv : register_t := (others => '0');
@@ -800,6 +801,7 @@ begin
       --------------------------------------------------------------------
       read_cnn_accel_hw_info(net, hw_info_slv);
       read_cnn_accel_hw_info2(net, hw_info2_slv);
+      read_cnn_accel_hw_info3(net, hw_info3_slv);
       read_cnn_accel_cmd_count(net, cmd_count_slv);
       read_cnn_accel_cycle_count(net, cycle_count_slv);
       read_cnn_accel_compute_cycles(net, compute_cycles_slv);
@@ -825,6 +827,7 @@ begin
       put_counter("err_pc_low", to_dec(status.err_pc_low));
       put_counter("hw_info", to_dec(u_unsigned(hw_info_slv)));
       put_counter("hw_info2", to_dec(u_unsigned(hw_info2_slv)));
+      put_counter("hw_info3", to_dec(u_unsigned(hw_info3_slv)));
       put_counter("cmd_count", to_dec(u_unsigned(cmd_count_slv)));
       put_counter("cycle_count", to_dec(u_unsigned(cycle_count_slv)));
       put_counter("compute_cycles", to_dec(u_unsigned(compute_cycles_slv)));

@@ -414,6 +414,8 @@ begin
       g_pe_cols => g_pe_cols,
       g_tile_channels => g_tile_channels,
       g_max_kernel_size => g_max_kernel_size,
+      g_max_pool_kernel_size => g_max_pool_kernel_size,
+      g_max_row_tile_words => g_max_row_tile_words,
       g_tensor_bytes => c_tensor_bytes,
       g_axi_addr_width => g_axi_addr_width
     )

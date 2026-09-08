@@ -457,12 +457,43 @@ class Module(BaseModule):
             default_value="0" * 16,
         )
 
-        # --- Performance counters (spec section 8, CSR 0x18-0x3C) ----------
+        hw_info3 = regs.append_register(
+            name="hw_info3",
+            mode=REGISTER_MODES["r"],
+            description="Third read-only hardware-info register (HW_INFO's four "
+            "8-bit fields and HW_INFO2's two 16-bit fields are both full): "
+            "pooling-specific and DMA-tiling bounds a host/compiler cannot "
+            "otherwise discover at runtime, per doc/cnn_accel_top_v2_arch.md "
+            "section 8.",
+        )
+        hw_info3.append_bit_vector(
+            name="max_pool_kernel_size",
+            description="Elaborated `g_max_pool_kernel_size` (largest pooling "
+            "K_h/K_w this datapath supports). Distinct from HW_INFO.MAX_KERNEL_SIZE "
+            "-- pooling is sized separately (ISA v2.1, SPPF needs 5x5 while no "
+            "convolution does). See cnn_accel_constants.MAX_POOL_KERNEL_SIZE.",
+            width=8,
+            default_value=format(cnn_accel_constants.MAX_POOL_KERNEL_SIZE, "08b"),
+        )
+        hw_info3.append_bit_vector(
+            name="max_row_tile_words",
+            description="Elaborated `g_max_row_tile_words` (per-row activation "
+            "tile depth `cnn_accel_window_gen` was sized to, in words). The "
+            "compiler's `in_width * ceil(in_channels / TILE_CHANNELS)` bound "
+            "(both conv and pool) must not exceed this; it has changed across "
+            "builds (512 -> 1920) and was previously invisible to the host/"
+            "compiler at runtime. See cnn_accel_constants.MAX_ROW_TILE_WORDS.",
+            width=16,
+            default_value=format(cnn_accel_constants.MAX_ROW_TILE_WORDS, "016b"),
+        )
+
+        # --- Performance counters (spec section 8, CSR 0x1C-0x3C) ----------
         # Plain 'r' registers: each is a single 32-bit hardware-maintained
         # counter, pass-through from 'cnn_accel_csr's 'counters' port
         # (csr_counters_t, src/cnn_accel_v2_pkg.vhd) into 'regs_up'. Appended
         # in this exact order (offset is assigned by append order) so their
-        # addresses match the spec's 0x18..0x38 table.
+        # addresses match the spec's 0x1C..0x3C table (shifted from
+        # 0x18..0x38 by HW_INFO3's addition ahead of them).
         cmd_count = regs.append_register(
             name="cmd_count",
             mode=REGISTER_MODES["r"],
@@ -2106,13 +2137,14 @@ class Module(BaseModule):
             cases,
             cases_concat_split,
             cases_conv_pad,
+            cases_error,
             cases_pool_pad,
             cases_yolo,
         )
 
         tb = library.test_bench("tb_cnn_accel_top")
 
-        # Five catalogues, one registration loop. `cases_pool_pad.py`
+        # Six catalogues, one registration loop. `cases_pool_pad.py`
         # holds the ISA v2.1 pooling cases (padding, the zero-point pad
         # value, the 5x5 SPPF kernel); `cases_conv_pad.py` holds the
         # convolution half of that same `pad_value` field (a padded conv
@@ -2123,16 +2155,22 @@ class Module(BaseModule):
         # are buffer aliasing, see that file's docstring); `cases_yolo.py`
         # tests by *topology* rather than by feature -- Bottleneck, C2f,
         # SPPF, backbone stage, FPN/PAN merge, the three-scale head
-        # boundary and a small end-to-end YOLOv8n-shaped network. All
-        # follow exactly the same contract as `cases.py` and are separate
-        # files only so the five can be edited independently. Case names
-        # are unique across all of them.
+        # boundary and a small end-to-end YOLOv8n-shaped network;
+        # `cases_error.py` holds the ISA v2.1 error-model coverage (each
+        # `c_err_*` code that can be provoked deterministically, by
+        # mutating one field of an otherwise-well-formed program's first
+        # descriptor -- see that file's docstring for which codes it
+        # deliberately does not attempt and why). All follow exactly the
+        # same contract as `cases.py` and are separate files only so the
+        # six can be edited independently. Case names are unique across
+        # all of them.
         for case in (
             cases.all_cases()
             + cases_pool_pad.all_cases()
             + cases_conv_pad.all_cases()
             + cases_concat_split.all_cases()
             + cases_yolo.all_cases()
+            + cases_error.all_cases()
         ):
             # VUnit's own `add_config` rather than tsfpga's
             # `add_vunit_config` helper: the helper always appends every
