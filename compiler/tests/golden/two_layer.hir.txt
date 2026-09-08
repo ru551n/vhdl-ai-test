@@ -6,12 +6,12 @@ buffers:
   %11   ddr TILED_OHWI 32x3x3x32xi8 9216 B align 64 addr - role const
   %12   ddr I32_TILED  32xi32        128 B align 64 addr - role const
   %10   ddr PLANES     1x8x8x32xi8  2048 B align 64 addr - role intermediate
-  %20   ddr PLANES     1x4x4x32xi8   512 B align 64 addr - role output
+  %21   ddr PLANES     1x4x4x32xi8   512 B align 64 addr - role output
 ops:
   #0 seq - unit conv_engine kind conv_layer gir %10
      reads [%arg0 %0 %1] writes [%10] deps []
      params {bias_en=1 in_channels=16 in_height=8 in_width=8 kernel_h=3 kernel_w=3 out_channels=32 pad_bottom=1 pad_en=1 pad_left=1 pad_right=1 pad_top=1 relu_en=1 requant_en=1 requant_scale=1073741824 requant_shift=19 stride_h=1 stride_w=1}
-  #1 seq - unit conv_engine kind conv_layer gir %20
-     reads [%10 %11 %12] writes [%20] deps [#0]
+  #1 seq - unit conv_engine kind conv_layer gir %21
+     reads [%10 %11 %12] writes [%21] deps [#0]
      params {bias_en=1 in_channels=32 in_height=8 in_width=8 kernel_h=3 kernel_w=3 out_channels=32 pad_bottom=0 pad_en=1 pad_left=1 pad_right=0 pad_top=1 relu_en=0 requant_en=1 requant_scale=1073741824 requant_shift=20 stride_h=2 stride_w=2}
 program: -

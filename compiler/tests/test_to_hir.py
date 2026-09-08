@@ -252,15 +252,43 @@ def test_per_channel_rescale_stays_unfused_and_rejected(target):
     assert "%4" in str(exc_info.value)
 
 
-def test_out_zp_stays_unfused_and_rejected(target):
+def test_out_zp_stays_unfused_and_rejected_on_isa_v10_target(target):
+    # Pre-H1 target (`output_zp: false`): FusePass leaves the rescale
+    # standalone, so `to_hir` rejects the bare conv2d `%4`.
+    from conftest import v10_target
+
     with pytest.raises(CapabilityError) as exc_info:
-        _to_hir(target, rescale_out_zp=5)
+        _to_hir(v10_target(target), rescale_out_zp=5)
     assert "%4" in str(exc_info.value)
 
 
-def test_unfused_clamp_5_100_rejected(target):
+def test_out_zp_fused_but_rejected_until_m11(target):
+    # Real ISA v1.1 target (H1): the out_zp rescale IS fused, and `to_hir`
+    # must still reject it -- loudly, at the fused op -- until M11 lowers
+    # it onto `output_offset`. Silently dropping out_zp would compile a
+    # numerically wrong program.
+    with pytest.raises(CapabilityError) as exc_info:
+        _to_hir(target, rescale_out_zp=5)
+    assert exc_info.value.constraint == "rescale.out_zp"
+    assert "M11" in str(exc_info.value)
+    assert "%10" in str(exc_info.value)
+
+
+def test_unfused_clamp_5_100_rejected_on_isa_v10_target(target):
+    from conftest import v10_target
+
+    with pytest.raises(CapabilityError) as exc_info:
+        _to_hir(v10_target(target), clamp=(5, 100))
+    assert "%10" in str(exc_info.value)
+
+
+def test_fused_clamp_5_100_rejected_until_m11(target):
+    # Real ISA v1.1 target: the general clamp is fused (clamp_ranges "any")
+    # but CLAMP_EN/clamp_min/clamp_max lowering is M11.
     with pytest.raises(CapabilityError) as exc_info:
         _to_hir(target, clamp=(5, 100))
+    assert exc_info.value.constraint == "clamp"
+    assert "M11" in str(exc_info.value)
     assert "%10" in str(exc_info.value)
 
 

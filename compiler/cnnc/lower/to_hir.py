@@ -29,6 +29,13 @@ from cnnc.target.contract import RescaleCaps, Target, Unit
 
 _STAGE = "to_hir"
 
+# ISA v1.1 (HW milestone H1) added `output_offset` and CLAMP_EN/`clamp_min`/
+# `clamp_max`; lowering TOSA `out_zp` and general clamps onto them is
+# compiler milestone M11 (doc/tosa_compiler_plan.md). Until M11 flips this,
+# both are rejected with a CapabilityError naming the op, rather than being
+# silently dropped (out_zp) or failing later in the emitter (clamp).
+_H1_FIELDS_LOWERING_IMPLEMENTED = False
+
 _ENV_FIELDS = (
     "in_width",
     "in_height",
@@ -107,6 +114,14 @@ def _check_clamp(op: Op, attrs: FusedConvAttrs, unit: Unit) -> dict:
             unit=unit.name,
             constraint="clamp",
         )
+    if not _H1_FIELDS_LOWERING_IMPLEMENTED:
+        raise CapabilityError(
+            f"general clamp {bounds}: clamp_en/clamp_min/clamp_max lowering not implemented yet (M11)",
+            op_id=op.id,
+            stage=_STAGE,
+            unit=unit.name,
+            constraint="clamp",
+        )
     return {"relu_en": False, "clamp_en": True, "clamp_min": clamp.min, "clamp_max": clamp.max}
 
 
@@ -164,6 +179,14 @@ def _check_capabilities(op: Op, x: Tensor, w: Tensor, b: Tensor, y: Tensor, unit
     if rescale.out_zp != 0 and not caps.output_zp:
         raise CapabilityError(
             f"rescale out_zp {rescale.out_zp} != 0 not supported by target",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="rescale.out_zp",
+        )
+    if rescale.out_zp != 0 and not _H1_FIELDS_LOWERING_IMPLEMENTED:
+        # The target has `output_offset` (ISA v1.1) but this lowering does
+        # not emit it yet: reject loudly rather than silently drop out_zp
+        # from the descriptor (a numerically wrong program).
+        raise CapabilityError(
+            f"rescale out_zp {rescale.out_zp} != 0: output_offset lowering not implemented yet (M11)",
             op_id=op.id, stage=_STAGE, unit=unit.name, constraint="rescale.out_zp",
         )
 

@@ -35,6 +35,11 @@ def decode_descriptor(data: bytes, target: "Target") -> Descriptor:
     for f in dataclasses.fields(Descriptor):
         spec = fields.get(f.name)
         if spec is None:
+            if f.default == 0:
+                # A later-ISA-version field (v1.1 W13) absent from this
+                # target: its bytes are reserved-zero there, so the
+                # `Descriptor` default (0) is the decoded value.
+                continue
             raise CompilerError(f"ISA field {f.name!r} missing from target {target.name!r}", stage=_STAGE)
         offset, width, signed = spec
         kwargs[f.name] = int.from_bytes(data[offset:offset + width], "little", signed=signed)

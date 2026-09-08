@@ -87,9 +87,12 @@ def test_fixture_fused_conv_matches_unfused_interp():
 # --------------------------------------------------------------------------
 
 
-def test_clamp_5_100_stays_unfused():
+def test_clamp_5_100_stays_unfused_on_isa_v10_target():
+    # Pre-H1 (ISA v1.0) target: only [-128,127] / [0,127] are fusable.
+    from conftest import v10_target
+
     g = _clamp_5_100_graph()
-    ctx = PassContext(target=load_target("cnn_accel"))
+    ctx = PassContext(target=v10_target(load_target("cnn_accel")))
     g2 = FusePass().run(g, ctx)
     verify(g2)
 
@@ -98,8 +101,21 @@ def test_clamp_5_100_stays_unfused():
     assert fused[0].attrs.clamp is None
     clamps = [op for op in g2.ops if op.kind == "clamp"]
     assert len(clamps) == 1
-    assert clamps[0].attrs.min == 5 and clamps[0].attrs.max == 100
-    assert clamps[0].inputs == fused[0].outputs  # clamp still consumes the fused rescale output
+
+
+def test_clamp_5_100_fuses_on_real_isa_v11_target():
+    # The real target is ISA v1.1 since H1 (`clamp_ranges: "any"`): the
+    # general clamp is admissible and fused into the conv chain. (Lowering
+    # it onto CLAMP_EN/clamp_min/clamp_max is M11; see test_to_hir.py.)
+    g = _clamp_5_100_graph()
+    ctx = PassContext(target=load_target("cnn_accel"))
+    g2 = FusePass().run(g, ctx)
+    verify(g2)
+
+    fused = [op for op in g2.ops if op.kind == "fused_conv"]
+    assert len(fused) == 1
+    assert fused[0].attrs.clamp == ClampAttrs(min=5, max=100)
+    assert not any(op.kind == "clamp" for op in g2.ops)
 
     inputs = _random_input(g)
     np.testing.assert_array_equal(_single_output(interp.run(g, inputs)), _single_output(interp.run(g2, inputs)))

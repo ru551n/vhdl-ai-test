@@ -91,6 +91,13 @@ class Descriptor:
     pool_stride_h: int = 1
     pool_stride_w: int = 1
     next_instr_addr: int = 0
+    # ISA v1.1 (HW milestone H1) epilogue fields, W13. Always 0 until the
+    # M11 lowering writes them; on an `isa_version 1.0` target they have no
+    # ISA field and `encode_descriptor` accepts them only as 0 (= the
+    # reserved bytes they occupy there).
+    output_offset: int = 0
+    clamp_min: int = 0
+    clamp_max: int = 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -116,13 +123,19 @@ def _check_range(name: str, value: int, width_bytes: int, signed: bool, *, op_id
 
 def encode_descriptor(desc: Descriptor, target: "Target", *, op_id: str | None = None) -> bytes:
     """Encode `desc` using `target.isa.fields` only (no RTL import).
-    Reserved bytes (absent from `target.isa.fields`) stay zero."""
+    Reserved bytes (absent from `target.isa.fields`) stay zero. A
+    `Descriptor` field the target's ISA version does not define (e.g. the
+    v1.1 W13 fields on a v1.0 target) is accepted only when it is 0 --
+    which is exactly what those reserved bytes must hold -- and otherwise
+    raises `CapabilityError` naming the field."""
     fields = target.isa.fields
     buf = bytearray(target.isa.instr_word_bytes)
     for f in dataclasses.fields(desc):
         name = f.name
         value = getattr(desc, name)
         spec = fields.get(name)
+        if spec is None and value == 0:
+            continue
         if spec is None:
             raise CapabilityError(
                 f"field {name!r} not in target ISA (isa_version-gated); refusing to emit",

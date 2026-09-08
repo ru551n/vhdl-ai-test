@@ -98,8 +98,13 @@ def _conv_rescale_graph(mult: int, shift: int, rounding: str = "SINGLE_ROUND") -
 
 
 def test_normalize_removes_identity_clamp_and_rewires_output():
+    # Identity-clamp removal is for targets WITHOUT `clamp_ranges: "any"`
+    # -- i.e. the pre-H1 ISA v1.0 target; the real target keeps it (see
+    # test_normalize_keeps_identity_clamp_when_target_admits_any_clamp).
+    from conftest import v10_target
+
     g = _fixture_graph_identity_clamp()
-    ctx = PassContext(target=load_target("cnn_accel"))
+    ctx = PassContext(target=v10_target(load_target("cnn_accel")))
     g2 = NormalizePass().run(g, ctx)
     assert all(op.kind != "clamp" for op in g2.ops)
     assert g2.outputs == ("9",)  # rewired from the removed clamp's output to its input
@@ -152,8 +157,10 @@ def test_normalize_drops_dead_const():
 
 
 def test_normalize_preserves_op_order():
-    g = _fixture_graph_identity_clamp()  # its clamp gets removed
-    g2 = NormalizePass().run(g, PassContext(target=load_target("cnn_accel")))
+    from conftest import v10_target
+
+    g = _fixture_graph_identity_clamp()  # its clamp gets removed (v1.0 target)
+    g2 = NormalizePass().run(g, PassContext(target=v10_target(load_target("cnn_accel"))))
     kinds_before = [op.kind for op in g.ops if op.kind != "clamp"]
     kinds_after = [op.kind for op in g2.ops]
     assert kinds_after == kinds_before
