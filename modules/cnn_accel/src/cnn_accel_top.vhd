@@ -354,9 +354,16 @@ begin
       "): one OT pass writes exactly one output activation plane"
     severity failure;
 
-  assert g_tile_channels * c_max_taps * 8 <= axi_stream_data_sz
+  -- 'cnn_accel_pool's own documented contract: one lane's window beat is
+  -- 'g_max_kernel_size**2' int8 taps packed into the low bits of the
+  -- fixed-width 'axi_stream_m2s_t.data'. It is deliberately NOT scaled by
+  -- 'g_tile_channels': the pool glue below gives each of the
+  -- 'g_tile_channels' lanes its own 'axi_stream_m2s_t' record (see
+  -- 'pool_lane_window_m2s'), so the lanes do not share one beat's width.
+  assert c_max_taps * 8 <= axi_stream_data_sz
     report "cnn_accel_top: the pool lane window (" &
-      integer'image(c_max_taps * 8) & " bits) must fit axi_stream_data_sz"
+      integer'image(c_max_taps * 8) & " bits) must fit axi_stream_data_sz (" &
+      integer'image(axi_stream_data_sz) & " bits)"
     severity failure;
 
   assert g_axi_data_width = 8 * g_tile_channels
