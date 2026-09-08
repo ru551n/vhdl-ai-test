@@ -18,6 +18,23 @@ that analysis is entirely this module's job. `Planner.plan` walks a
   docstring for the exact rule and why it differs from the always-reload
   rule for values that were *previously* spilled.
 
+Channel `concat`/`split` (`model.Model.concat`/`split`) add a second job:
+**buffer aliasing**. Those two operations produce no instruction at all --
+they only say that one tensor's bytes live inside another's buffer (see
+`Tensor.alias_parent`). This module is what makes that true:
+
+* every tensor is resolved to its `alias_root` -- the tensor that owns an
+  actual allocation -- and its address is that root's address plus
+  `alias_byte_offset`, which is always a whole number of `H*W*T`-byte
+  activation planes and therefore always 8-byte aligned;
+* allocation, spilling and freeing are done **per alias family**, never
+  per tensor. The family of a root is the root plus every tensor aliased
+  into it (transitively). A family's buffer is allocated when the first
+  of its members is produced or read, and freed only once *every* member
+  has been produced *and* every consumer of every member has run -- the
+  liveness rule that stops a concat buffer being recycled while one of
+  its slices is still live.
+
 The output is a `PlannedProgram`: an ordered list of `ComputeStep`/
 `MoveStep`s with every operand's space and address already resolved,
 plus a `DdrTraffic` prediction that `program.py`'s actual DDR-image
@@ -34,7 +51,7 @@ import cnn_accel_model as golden
 
 from accel_v2 import isa
 from accel_v2.ddrmap import DdrMap
-from accel_v2.model import Conv2dOp, Model, Op, Tensor
+from accel_v2.model import Conv2dOp, Model, Op, Tensor, alias_byte_offset, alias_root
 
 #: Section 4 default: `g_num_banks=2 * g_bank_words=1024 * 8 bytes`.
 #: The planner treats the scratchpad as one flat byte-addressable range
@@ -176,45 +193,93 @@ class Planner:
         traffic = DdrTraffic()
         steps: list[Step] = []
         tensor_ddr_addr: dict[str, int] = {}
-        tensor_by_name = {t.name: t for t in model.tensors}
 
-        #: tensor.name -> its current LOCAL_TENSOR byte offset, only
-        #: while resident.
+        # -- alias families (see the module docstring) ---------------------
+        #
+        # `root_of[name]` is the tensor that owns the buffer `name` lives
+        # in (itself, when it is not aliased). Everything below is keyed
+        # by ROOT name: residency, spill state, liveness and eviction all
+        # operate on whole buffers, because a concat buffer's slices have
+        # no independent existence.
+        root_of: dict[str, Tensor] = {t.name: alias_root(t) for t in model.tensors}
+        family: dict[str, list[Tensor]] = {}
+        for t in model.tensors:
+            family.setdefault(root_of[t.name].name, []).append(t)
+        root_by_name: dict[str, Tensor] = {name: root_of[name] for name in family}
+
+        #: root name -> its current LOCAL_TENSOR byte offset, only while
+        #: resident.
         local_addr: dict[str, int] = {}
-        #: tensor.name -> its DDR spill address, only while spilled
-        #: (evicted, not yet reloaded). Absent for a tensor that has
-        #: never been spilled.
+        #: root name -> its DDR spill address, only while spilled
+        #: (evicted, not yet reloaded). Absent for a root that has never
+        #: been spilled.
         spilled: dict[str, int] = {}
-        #: tensor.name -> number of not-yet-executed consumers.
-        remaining = {t.name: len(t.consumers) for t in model.tensors}
+        #: root name -> not-yet-executed consumer edges over the whole
+        #: family, and not-yet-run producers of family members. A buffer
+        #: is freed only when BOTH reach zero: a concat buffer is written
+        #: by several producers and read through several slices, and it
+        #: must outlive all of them.
+        pending_consumers: dict[str, int] = {}
+        pending_producers: dict[str, int] = {}
+        total_consumers: dict[str, int] = {}
+        for name, members in family.items():
+            pending_consumers[name] = sum(len(t.consumers) for t in members)
+            total_consumers[name] = pending_consumers[name]
+            pending_producers[name] = sum(1 for t in members if t.producer is not None)
 
         def nbytes(t: Tensor) -> int:
             return t.size_bytes
 
-        def next_use(t: Tensor, from_idx: int) -> int | None:
-            for c in t.consumers:
-                if c >= from_idx:
-                    return c
-            return None
+        def next_use(root_name: str, from_idx: int) -> int | None:
+            """First op index >= `from_idx` that reads any member of
+            `root_name`'s family."""
+            best: int | None = None
+            for member in family[root_name]:
+                for c in member.consumers:
+                    if c >= from_idx and (best is None or c < best):
+                        best = c
+            return best
+
+        def remaining_uses(root_name: str, from_idx: int) -> int:
+            return sum(
+                1 for member in family[root_name] for c in member.consumers if c >= from_idx
+            )
 
         def evict_one(exclude: set[str]) -> bool:
-            """Evict the resident, non-excluded tensor whose next use is
+            """Evict the resident, non-excluded buffer whose next use is
             furthest in the future (Belady's rule: minimizes the chance
             the very next allocation has to evict again). `exclude` is
-            the current op's own input set -- a value about to be read
-            can never be its own eviction victim."""
+            the current op's own input roots -- a value about to be read
+            can never be its own eviction victim.
+
+            A whole alias family is spilled and reloaded as one buffer:
+            its slices are byte ranges of it and have no separate
+            existence, so there is nothing finer to evict.
+
+            A buffer that is only *half written* -- a concat buffer whose
+            remaining parts are produced by commands still ahead of us --
+            is never a victim. Its later producers write straight to the
+            buffer's address and have no reload of their own to bring the
+            spilled bytes back, so evicting it would silently lose the
+            slices already in it. Spilling and reloading a buffer that is
+            about to be written again is also pure waste, so nothing is
+            given up by the restriction; if it makes an allocation
+            impossible, `alloc_local` says so rather than corrupting the
+            program."""
             best_name: str | None = None
             best_next = -1
             for name in local_addr:
                 if name in exclude:
                     continue
-                nxt = next_use(tensor_by_name[name], op_index)
+                if pending_producers[name]:
+                    continue
+                nxt = next_use(name, op_index)
                 score = nxt if nxt is not None else 1 << 62
                 if score > best_next:
                     best_next, best_name = score, name
             if best_name is None:
                 return False
-            victim = tensor_by_name[best_name]
+            victim = root_by_name[best_name]
             addr = local_addr.pop(best_name)
             size = nbytes(victim)
             ddr_addr = self.ddr_map.alloc(DdrMap.SPILL, size)
@@ -255,40 +320,52 @@ class Planner:
             the op currently being planned (`op_index`), doing whatever
             spill-bookkeeping / reload / local allocation that requires.
 
-            Rule: a tensor that is *currently* in DDR (never yet loaded,
-            or spilled) is reloaded into a fresh local buffer if it has
-            more than one remaining consumer (itself included) -- so
-            later consumers reuse the local copy for free -- with one
-            exception: a *previously spilled* tensor is **always**
-            reloaded explicitly, even with exactly one remaining
-            consumer, because "spill, then read directly from DDR at the
-            single remaining use" would silently skip the explicit
-            `LOAD` the residency policy requires for a value that once
-            left the scratchpad (section 10 R5's "no hidden traffic" is
-            about accounting, but the spec's own wording -- "an explicit
-            spill... and a later reload" -- names the LOAD as mandatory,
-            not merely one of several equally-valid lowerings). A
-            never-yet-loaded graph input has no such history, so its
-            single-remaining-consumer case is left as an ordinary direct
-            `DDR` operand read (identical AXI bytes, one fewer
-            instruction, and exactly the "DDR round trip for initial
-            inputs" the policy already allows)."""
-            if t.name in local_addr:
+            `t` may be an alias (a `split` view, or a `concat` operand):
+            everything below is decided for its `alias_root`'s BUFFER,
+            and only the final address adds `alias_byte_offset(t)`.
+
+            Rule: a buffer that is *currently* in DDR (never yet loaded,
+            or spilled) is reloaded into a fresh local buffer if its
+            family has more than one remaining consumer (this one
+            included) -- so later consumers reuse the local copy for free
+            -- with one exception: a *previously spilled* buffer is
+            **always** reloaded explicitly, even with exactly one
+            remaining consumer, because "spill, then read directly from
+            DDR at the single remaining use" would silently skip the
+            explicit `LOAD` the residency policy requires for a value
+            that once left the scratchpad (section 10 R5's "no hidden
+            traffic" is about accounting, but the spec's own wording --
+            "an explicit spill... and a later reload" -- names the LOAD
+            as mandatory, not merely one of several equally-valid
+            lowerings). A never-yet-loaded graph input has no such
+            history, so its single-remaining-consumer case is left as an
+            ordinary direct `DDR` operand read (identical AXI bytes, one
+            fewer instruction, and exactly the "DDR round trip for
+            initial inputs" the policy already allows)."""
+            root = root_of[t.name]
+            offset = alias_byte_offset(t)
+
+            if root.name in local_addr:
                 traffic.local_read_bytes += nbytes(t)
-                return isa.SPACE_LOCAL_TENSOR, local_addr[t.name]
+                return isa.SPACE_LOCAL_TENSOR, local_addr[root.name] + offset
 
-            if t.is_input and t.name not in tensor_ddr_addr:
-                tensor_ddr_addr[t.name] = self.ddr_map.alloc(DdrMap.INPUTS, nbytes(t))
-            ddr_addr = tensor_ddr_addr[t.name]
+            if root.is_input and root.name not in tensor_ddr_addr:
+                tensor_ddr_addr[root.name] = self.ddr_map.alloc(DdrMap.INPUTS, nbytes(root))
+            if root.name not in tensor_ddr_addr:
+                raise ValueError(
+                    f"planner: '{t.name}' is read by op {op_index} but its buffer "
+                    f"('{root.name}') is neither resident nor backed by DDR -- it was "
+                    "freed before this use, which is a liveness bug in the planner"
+                )
+            ddr_addr = tensor_ddr_addr[root.name]
 
-            was_spilled = t.name in spilled
-            remaining_from_here = sum(1 for c in t.consumers if c >= op_index)
-            if was_spilled or remaining_from_here > 1:
-                size = nbytes(t)
+            was_spilled = root.name in spilled
+            if was_spilled or remaining_uses(root.name, op_index) > 1:
+                size = nbytes(root)
                 addr = alloc_local(size, exclude)
                 steps.append(
                     MoveStep(
-                        tensor=t,
+                        tensor=root,
                         src_space=isa.SPACE_DDR,
                         src_addr=ddr_addr,
                         dst_space=isa.SPACE_LOCAL_TENSOR,
@@ -302,21 +379,36 @@ class Planner:
                 traffic.tensor_load_count += 1
                 if was_spilled:
                     traffic.reload_count += 1
-                    del spilled[t.name]
-                local_addr[t.name] = addr
+                    del spilled[root.name]
+                local_addr[root.name] = addr
                 # The reload above is its own DDR<->local transaction;
                 # the compute op then reads the now-resident copy as a
                 # second, separate local-memory transaction (mirrors
                 # reference.py, which always counts a ComputeStep's
                 # operand fetch regardless of how the operand got local).
-                traffic.local_read_bytes += size
-                return isa.SPACE_LOCAL_TENSOR, addr
+                traffic.local_read_bytes += nbytes(t)
+                return isa.SPACE_LOCAL_TENSOR, addr + offset
 
             traffic.read_bytes += nbytes(t)
-            return isa.SPACE_DDR, ddr_addr
+            return isa.SPACE_DDR, ddr_addr + offset
+
+        def release(root_name: str) -> None:
+            """Free `root_name`'s local buffer once its whole alias family
+            is dead: every member produced, and every consumer of every
+            member already run."""
+            if pending_consumers[root_name] or pending_producers[root_name]:
+                return
+            if total_consumers[root_name] == 0:
+                # Never read by anything: keep the (dead) buffer, exactly
+                # as this planner always has -- freeing it here would
+                # shuffle every later address for no benefit.
+                return
+            if root_name in local_addr:
+                freed_addr = local_addr.pop(root_name)
+                alloc.free(freed_addr, nbytes(root_by_name[root_name]))
 
         for op_index, op in enumerate(model.ops):
-            exclude_this_op = {t.name for t in op.inputs}
+            exclude_this_op = {root_of[t.name].name for t in op.inputs}
             input_spaces: list[int] = []
             input_addrs: list[int] = []
             for t in op.inputs:
@@ -325,17 +417,28 @@ class Planner:
                 input_addrs.append(addr)
 
             out_t = op.output
-            out_size = nbytes(out_t)
-            if out_t.is_output:
-                out_addr = self.ddr_map.alloc(DdrMap.OUTPUTS, out_size)
-                tensor_ddr_addr[out_t.name] = out_addr
+            out_root = root_of[out_t.name]
+            out_offset = alias_byte_offset(out_t)
+            if out_root.is_output:
+                if out_root.name not in tensor_ddr_addr:
+                    tensor_ddr_addr[out_root.name] = self.ddr_map.alloc(
+                        DdrMap.OUTPUTS, nbytes(out_root)
+                    )
+                out_addr = tensor_ddr_addr[out_root.name] + out_offset
                 output_space = isa.SPACE_DDR
-                traffic.write_bytes += out_size
+                traffic.write_bytes += nbytes(out_t)
             else:
-                out_addr = alloc_local(out_size, exclude_this_op)
-                local_addr[out_t.name] = out_addr
+                if out_root.name in spilled:  # pragma: no cover - see evict_one
+                    raise ValueError(
+                        f"planner: op {op_index} writes '{out_t.name}' into the buffer of "
+                        f"'{out_root.name}', which is currently spilled to DDR -- a "
+                        "half-written concat buffer must never be evicted (see evict_one)"
+                    )
+                if out_root.name not in local_addr:
+                    local_addr[out_root.name] = alloc_local(nbytes(out_root), exclude_this_op)
+                out_addr = local_addr[out_root.name] + out_offset
                 output_space = isa.SPACE_LOCAL_TENSOR
-                traffic.local_write_bytes += out_size
+                traffic.local_write_bytes += nbytes(out_t)
 
             steps.append(
                 ComputeStep(
@@ -361,11 +464,12 @@ class Planner:
                     traffic.read_bytes += scale_bytes
                     traffic.weight_bytes += scale_bytes
 
+            pending_producers[out_root.name] -= 1
             for t in op.inputs:
-                remaining[t.name] -= 1
-                if remaining[t.name] == 0 and t.name in local_addr:
-                    freed_addr = local_addr.pop(t.name)
-                    alloc.free(freed_addr, nbytes(t))
+                pending_consumers[root_of[t.name].name] -= 1
+            release(out_root.name)
+            for t in op.inputs:
+                release(root_of[t.name].name)
 
         # +1 for the closing HALT: every step corresponds to exactly one
         # fetched 64-byte descriptor (section 6/CSR "incl. descriptors").

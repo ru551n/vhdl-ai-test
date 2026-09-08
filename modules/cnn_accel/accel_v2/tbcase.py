@@ -515,6 +515,16 @@ class TbCase:
                     f"{_space_name(step.src_space)} 0x{step.src_addr:08x} -> "
                     f"{_space_name(step.dst_space)} 0x{step.dst_addr:08x}"
                 )
+        if tensor.alias_parts:
+            parts = ", ".join(
+                f"{part.name}@plane{part.alias_plane_offset}" for part in tensor.alias_parts
+            )
+            return f"(CONCAT buffer -- written in slices by {parts})"
+        if tensor.alias_parent is not None:
+            return (
+                f"(view of '{tensor.alias_parent.name}' at plane "
+                f"{tensor.alias_plane_offset}, {tensor.alias_role})"
+            )
         return "(graph input -- never produced by a command)"
 
     def _program_listing(self) -> str:

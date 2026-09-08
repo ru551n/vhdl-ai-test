@@ -38,6 +38,16 @@ test). Their *byte counts* are still charged against `DdrTraffic`
 the same calls `planner.py` makes), so the read/weight-byte totals stay
 meaningful.
 
+Channel `concat`/`split` execute no step at all -- they are pure buffer
+aliasing (`planner.py`'s module docstring), so the bytes they "produce"
+are already in memory, written there by the producers of their parts or
+by whoever produced their parent. What this module still owes such a
+tensor is its LOGICAL HWC value, for `tensor_data`; that is recovered
+after the step loop by `_materialize_alias_values`, which composes a
+concat result from its parts and slices a split view out of its parent
+rather than re-reading memory (the buffer may legitimately have been
+freed and reused by then).
+
 Bank interleaving/arbitration inside `cnn_accel_tensor_mem` (section 4)
 has no Python-visible effect on *which bytes end up where* -- every
 legal `(base, length)` job stays inside one bank by construction (the
@@ -54,7 +64,18 @@ import cnn_accel_model as golden
 
 from accel_v2 import isa
 from accel_v2.memimage import MemoryImage
-from accel_v2.model import AddOp, Conv2dOp, CopyOp, Op, PoolOp, Tensor, UpsampleOp, ActOp
+from accel_v2.model import (
+    ActOp,
+    AddOp,
+    Conv2dOp,
+    CopyOp,
+    Model,
+    Op,
+    PLANE_CHANNELS,
+    PoolOp,
+    Tensor,
+    UpsampleOp,
+)
 from accel_v2.planner import ComputeStep, DdrTraffic, MoveStep, PlannedProgram
 
 
@@ -192,6 +213,69 @@ def _charge_weight_traffic(op: Conv2dOp, traffic: DdrTraffic) -> None:
         traffic.weight_bytes += scale_bytes
 
 
+def _materialize_alias_values(model: Model, tensor_data: dict[str, list[int]]) -> None:
+    """Fill in `tensor_data` for every `concat`/`split` tensor.
+
+    Both are address arithmetic, not commands, so no step ever produced
+    them -- but a test still wants their values (a concat result is
+    frequently the graph output). Rules, mirroring `Tensor.alias_role`:
+
+    * a tensor with `alias_parts` (a CONCAT result that owns a buffer) is
+      the channel-wise concatenation of those parts, in plane order;
+    * a tensor with an `alias_parent` and no parts (a SPLIT view, or a
+      CONCAT that collapsed into a re-view) is the channel-wise slice of
+      its parent starting at `alias_plane_offset * T`.
+
+    Parts are resolved before parents, so a nested concat
+    (`concat([concat([a, b]), c])`) composes bottom-up and never
+    recurses into itself.
+    """
+
+    def value_of(t: Tensor) -> list[int]:
+        cached = tensor_data.get(t.name)
+        if cached is not None:
+            return cached
+        pixels = t.height * t.width
+
+        if t.alias_parts:
+            values = [0] * (pixels * t.channels)
+            for part in t.alias_parts:
+                part_values = value_of(part)
+                first_channel = part.alias_plane_offset * PLANE_CHANNELS
+                for pixel in range(pixels):
+                    dst = pixel * t.channels + first_channel
+                    src = pixel * part.channels
+                    values[dst : dst + part.channels] = part_values[src : src + part.channels]
+            tensor_data[t.name] = values
+            return values
+
+        if t.alias_parent is not None:
+            parent = t.alias_parent
+            parent_values = value_of(parent)
+            first_channel = t.alias_plane_offset * PLANE_CHANNELS
+            values = []
+            for pixel in range(pixels):
+                src = pixel * parent.channels + first_channel
+                values.extend(parent_values[src : src + t.channels])
+            tensor_data[t.name] = values
+            return values
+
+        raise KeyError(t.name)
+
+    for tensor in model.tensors:
+        if tensor.name in tensor_data:
+            continue
+        if tensor.alias_parts or tensor.alias_parent is not None:
+            try:
+                value_of(tensor)
+            except KeyError:
+                # A part that no step ever produced: the graph is dead
+                # here, and there is no value to report. Not an error --
+                # `planner.py` would already have refused anything that
+                # actually needed those bytes.
+                pass
+
+
 def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResult:
     """Execute `planned` against `image` (mutated in place, exactly like
     the real DDR memory model would be) plus a fresh local scratchpad
@@ -262,7 +346,13 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
             count(step.input_spaces[0], nbytes, is_read=True)
             write_to(step.output_space, step.output_addr, raw)
             count(step.output_space, nbytes, is_read=False)
-            tensor_data[op.output.name] = list(tensor_data[op.inputs[0].name])
+            # Unpacked from the bytes actually copied, not from the
+            # source tensor's `tensor_data` entry: a COPY's source may be
+            # a `split` view or a `concat` slice, whose logical values are
+            # only materialized at the end of the run
+            # (`_materialize_alias_values`). The byte image is authoritative
+            # and available right here.
+            tensor_data[op.output.name] = unpack(op.output, raw)
             continue
 
         input_values: list[list[int]] = []
@@ -292,6 +382,8 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
         tensor_data[op.output.name] = values
 
     traffic.read_bytes += (len(planned.steps) + 1) * isa.INSTR_WORD_BYTES
+
+    _materialize_alias_values(planned.model, tensor_data)
 
     return ExecutionResult(traffic=traffic, tensor_data=tensor_data)
 

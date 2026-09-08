@@ -130,11 +130,91 @@ class Tensor:
     #: hardware deliberately does not track (section 3.1).
     consumers: list[int] = field(default_factory=list)
 
+    # -- channel-plane aliasing (CONCAT / SPLIT, see `Model.concat`) -------
+    #
+    # The section-3 activation layout is channel-plane-major
+    # (`byte_offset = ((c_tile * H + y) * W + x) * T + t`, `T = 8`), so a
+    # tensor is exactly `ceil(C/T)` CONTIGUOUS planes of `H*W*T` bytes.
+    # Concatenating along channels is therefore nothing but placing the
+    # operands' planes back to back inside one buffer, and splitting
+    # along a multiple-of-`T` channel boundary is nothing but naming a
+    # sub-range of a parent's planes. Both are expressed here as an
+    # *alias edge* to a parent tensor and cost no opcode, no instruction
+    # and no byte of data movement.
+
+    #: The tensor whose buffer this one lives inside, or `None` when this
+    #: tensor owns its own allocation (it is an alias "root").
+    alias_parent: "Tensor | None" = None
+    #: This tensor's first plane, counted in `T`-channel planes from
+    #: `alias_parent`'s first plane. Meaningless when `alias_parent` is
+    #: `None`.
+    alias_plane_offset: int = 0
+    #: Which direction the alias edge carries data:
+    #:
+    #: * ``"part"``  -- this tensor's *producer writes into* the parent's
+    #:   buffer; the parent (a CONCAT result) has no producer of its own
+    #:   and its contents are the union of its parts.
+    #: * ``"slice"`` -- this tensor is a read-only view *derived from* the
+    #:   parent's contents (a SPLIT output, or a CONCAT that turned out to
+    #:   be a contiguous re-view of one existing tensor).
+    alias_role: str | None = None
+    #: The tensors aliased into this one with `alias_role == "part"`, in
+    #: ascending `alias_plane_offset` order. Non-empty exactly for a
+    #: CONCAT result that owns a buffer.
+    alias_parts: list["Tensor"] = field(default_factory=list)
+
     @property
     def size_bytes(self) -> int:
         """DDR/LOCAL_TENSOR byte footprint of this tensor in the
         section-3 channel-tiled-plane layout (identical in both spaces)."""
         return golden.activation_bytes(self.width, self.height, self.channels)
+
+    @property
+    def plane_bytes(self) -> int:
+        """Bytes in one `T`-channel activation plane of this tensor."""
+        return PLANE_CHANNELS * self.width * self.height
+
+    @property
+    def plane_count(self) -> int:
+        return golden.activation_plane_count(self.channels)
+
+
+PLANE_CHANNELS = golden.ACTIVATION_PLANE_CHANNELS
+
+
+def alias_root(tensor: Tensor) -> Tensor:
+    """The tensor that actually owns the buffer `tensor` lives in --
+    `tensor` itself when it is not aliased. Alias edges always point
+    "outward" to a larger buffer and can nest (a CONCAT of a CONCAT
+    result), so this walks the chain to its end."""
+    node = tensor
+    seen = 0
+    while node.alias_parent is not None:
+        node = node.alias_parent
+        seen += 1
+        if seen > 64:  # pragma: no cover - would mean a builder bug
+            raise ValueError(f"alias chain from '{tensor.name}' does not terminate")
+    return node
+
+
+def alias_plane_offset_total(tensor: Tensor) -> int:
+    """`tensor`'s first plane, counted from `alias_root(tensor)`'s first
+    plane."""
+    total = 0
+    node = tensor
+    while node.alias_parent is not None:
+        total += node.alias_plane_offset
+        node = node.alias_parent
+    return total
+
+
+def alias_byte_offset(tensor: Tensor) -> int:
+    """Byte offset of `tensor` inside `alias_root(tensor)`'s buffer.
+
+    Every alias edge preserves `height`/`width` (both `concat` and
+    `split` require it), so one plane is the same number of bytes
+    everywhere along the chain."""
+    return alias_plane_offset_total(tensor) * tensor.plane_bytes
 
 
 class Activation(Enum):
@@ -367,6 +447,15 @@ class Model:
         outputs"."""
         if tensor.is_output:
             return tensor
+        if tensor.alias_parent is not None:
+            raise ValueError(
+                f"cannot mark '{tensor.name}' a graph output: it is aliased into "
+                f"'{alias_root(tensor).name}''s buffer (as a "
+                f"{tensor.alias_role} at plane offset {alias_plane_offset_total(tensor)}), "
+                "and a graph output must own a DDR OUTPUTS allocation of its own. "
+                f"Use `model.output(model.copy({tensor.name!r}-tensor))` to materialize "
+                "an independent copy first."
+            )
         tensor.is_output = True
         self.outputs.append(tensor)
         return tensor
@@ -638,6 +727,206 @@ class Model:
         self._register_op(op)
         return out_t
 
+    # -- channel concatenation / splitting (no hardware, see below) --------
+
+    def split(self, x: Tensor, sizes: list[int], *, names: list[str] | None = None) -> list[Tensor]:
+        """Split `x` along channels into `len(sizes)` tensors -- **free**:
+        no opcode, no instruction, no byte moved.
+
+        The section-3 activation layout is channel-plane-major
+        (`((c_tile * H + y) * W + x) * T + t`, `T = 8`), so `x` is
+        `ceil(C/T)` contiguous planes of `H*W*T` bytes and a channel
+        range starting at a multiple of `T` is just a contiguous
+        sub-range of those planes. Each returned tensor is therefore a
+        *view* of `x` at `addr(x) + plane_index * H * W * T`, which
+        `planner.py` resolves and `program.py` then encodes as an
+        ordinary `in_addr` -- indistinguishable, to the hardware, from a
+        tensor that was produced there in the first place.
+
+        Every interior boundary (`sizes[0]`, `sizes[0]+sizes[1]`, ...)
+        must be a multiple of `T = 8`; only the *last* part may have a
+        channel count that is not, because only its trailing lanes
+        coincide with `x`'s own zero-padded lanes rather than with
+        another part's real data.
+
+        YOLOv8n's C2f splits a multiple-of-16 channel count in half, so
+        every boundary it needs is a multiple of 8.
+        """
+        if not sizes:
+            raise ValueError(f"split of '{x.name}': `sizes` must not be empty")
+        for index, size in enumerate(sizes):
+            if size <= 0:
+                raise ValueError(
+                    f"split of '{x.name}': every part must have at least one channel, "
+                    f"but sizes[{index}] = {size}"
+                )
+        if sum(sizes) != x.channels:
+            raise ValueError(
+                f"split of '{x.name}': sizes {list(sizes)} sum to {sum(sizes)}, but "
+                f"'{x.name}' has {x.channels} channels -- a split must cover the tensor exactly"
+            )
+        if names is not None and len(names) != len(sizes):
+            raise ValueError(
+                f"split of '{x.name}': {len(names)} names given for {len(sizes)} parts"
+            )
+
+        boundary = 0
+        parts: list[Tensor] = []
+        for index, size in enumerate(sizes):
+            if boundary % PLANE_CHANNELS != 0:
+                raise ValueError(
+                    f"split of '{x.name}': part {index} starts at channel {boundary}, which is "
+                    f"not a multiple of the {PLANE_CHANNELS}-channel activation plane. "
+                    f"A split is only free at a plane boundary; sizes {list(sizes)} would need "
+                    f"a channel shuffle. Round the preceding part(s) to a multiple of "
+                    f"{PLANE_CHANNELS}, or split into plane-aligned pieces and recombine them."
+                )
+            part = Tensor(
+                name=(names[index] if names is not None else self._auto_name("split")),
+                height=x.height,
+                width=x.width,
+                channels=size,
+                quant=x.quant,
+                alias_parent=x,
+                alias_plane_offset=boundary // PLANE_CHANNELS,
+                alias_role="slice",
+            )
+            self.tensors.append(part)
+            parts.append(part)
+            boundary += size
+        return parts
+
+    def concat(self, tensors: list[Tensor], *, name: str | None = None) -> Tensor:
+        """Concatenate `tensors` along channels -- **free** whenever the
+        planner can place each operand's producer output directly into
+        the right slice of one buffer.
+
+        Same layout argument as `split`: the result's plane list is
+        operand 0's planes followed by operand 1's, and so on, so if each
+        producer is simply told to write at `addr(result) + plane_offset
+        * H * W * T` the concatenation has already happened by the time
+        the last producer retires. No opcode, no instruction, and no
+        extra DDR traffic.
+
+        Two things stop an operand being placed that way, and both fall
+        back to an explicit `COPY` (`model.copy`) into the slice:
+
+        * it already lives inside some *other* buffer (it is a `split`
+          view, or an operand of an earlier `concat`) -- a tensor cannot
+          be in two places at once;
+        * it is a graph input or a graph output, whose address is fixed
+          by the DDR region layout rather than chosen by the planner.
+
+        The one exception is the round trip `concat(split(t))`: when the
+        operands are already contiguous, in order, inside one common
+        parent, the result is returned as a plain view of that parent and
+        still costs nothing.
+
+        Every operand but the last must have a channel count that is a
+        multiple of `T = 8`, for the same reason `split`'s interior
+        boundaries must be: a non-plane-aligned operand's producer would
+        zero the padding lanes it shares with the next operand's data.
+        """
+        if len(tensors) < 2:
+            raise ValueError(
+                f"concat needs at least two tensors, got {len(tensors)} -- "
+                "concatenating one tensor is a no-op, say nothing instead"
+            )
+        first = tensors[0]
+        for other in tensors[1:]:
+            if (other.height, other.width) != (first.height, first.width):
+                raise ValueError(
+                    f"concat: spatial shape mismatch -- '{first.name}' is "
+                    f"{first.height}x{first.width} (HxW) but '{other.name}' is "
+                    f"{other.height}x{other.width}. Channel concatenation requires every "
+                    "operand to have identical height and width."
+                )
+        for index, t in enumerate(tensors[:-1]):
+            if t.channels % PLANE_CHANNELS != 0:
+                raise ValueError(
+                    f"concat: operand {index} '{t.name}' has {t.channels} channels, which is "
+                    f"not a multiple of the {PLANE_CHANNELS}-channel activation plane. "
+                    f"Only the LAST operand may be unaligned, because every other operand's "
+                    f"padding lanes would overlap the next operand's real channels. "
+                    f"Pad '{t.name}' to {(-(-t.channels // PLANE_CHANNELS)) * PLANE_CHANNELS} "
+                    "channels, or reorder the concatenation so the unaligned operand is last."
+                )
+
+        total_channels = sum(t.channels for t in tensors)
+        out_name = name or self._auto_name("concat")
+
+        reviewed = self._concat_as_review(tensors, out_name, total_channels)
+        if reviewed is not None:
+            self.tensors.append(reviewed)
+            return reviewed
+
+        out_t = Tensor(
+            name=out_name,
+            height=first.height,
+            width=first.width,
+            channels=total_channels,
+            quant=first.quant,
+        )
+        self.tensors.append(out_t)
+
+        plane = 0
+        for t in tensors:
+            operand = t if self._can_be_concat_part(t) else self.copy(t, name=f"{out_name}_copy{plane}")
+            operand.alias_parent = out_t
+            operand.alias_plane_offset = plane
+            operand.alias_role = "part"
+            out_t.alias_parts.append(operand)
+            plane += golden.activation_plane_count(t.channels)
+        return out_t
+
+    @staticmethod
+    def _can_be_concat_part(t: Tensor) -> bool:
+        """Can `t`'s bytes simply *be* the concat result's slice?
+
+        Only if nothing else already dictates where those bytes live:
+        `t` must own its buffer (`alias_parent is None`), must be
+        produced by something whose output address the planner is free to
+        choose (an op, or -- for a nested concat -- its own parts), and
+        must not be pinned to a DDR region by being a graph input or a
+        graph output."""
+        if t.alias_parent is not None:
+            return False
+        if t.is_input or t.is_output:
+            return False
+        return t.producer is not None or bool(t.alias_parts)
+
+    @staticmethod
+    def _concat_as_review(tensors: list[Tensor], out_name: str, total_channels: int) -> Tensor | None:
+        """`concat(split(p))` and friends: if every operand is already a
+        view of one common parent and they sit contiguously, in order,
+        the concatenation is that byte range and needs no buffer of its
+        own. Returns the view tensor, or `None` when the general path
+        applies."""
+        first = tensors[0]
+        if first.alias_parent is None:
+            return None
+        root = alias_root(first)
+        start = alias_plane_offset_total(first)
+        expected = start
+        for t in tensors:
+            if t.alias_parent is None or alias_root(t) is not root:
+                return None
+            if alias_plane_offset_total(t) != expected:
+                return None
+            expected += golden.activation_plane_count(t.channels)
+        if expected * PLANE_CHANNELS > root.plane_count * PLANE_CHANNELS:
+            return None
+        return Tensor(
+            name=out_name,
+            height=first.height,
+            width=first.width,
+            channels=total_channels,
+            quant=first.quant,
+            alias_parent=root,
+            alias_plane_offset=start,
+            alias_role="slice",
+        )
+
     def act(self, x: Tensor, lut: list[int] | None = None, *, name: str | None = None) -> Tensor:
         """`OPCODE_ACT`. `lut[raw_byte] -> int8` for `raw_byte` in
         `0..255` (i.e. indexed by the *unsigned* byte representation of
@@ -678,6 +967,10 @@ class _Rng:
 
 
 __all__ = [
+    "PLANE_CHANNELS",
+    "alias_root",
+    "alias_plane_offset_total",
+    "alias_byte_offset",
     "QuantParams",
     "Tensor",
     "Activation",

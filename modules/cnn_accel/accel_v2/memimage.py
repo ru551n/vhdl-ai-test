@@ -51,6 +51,18 @@ class MemoryImage:
         for i, word in enumerate(words):
             self._words[addr + i * WORD_BYTES] = word & 0xFFFFFFFFFFFFFFFF
 
+    # -- inspection -------------------------------------------------------
+
+    def words(self) -> dict[int, int]:
+        """Copy of the sparse `byte address -> 64-bit word` contents.
+
+        Two images comparing equal here hold exactly the same bytes at
+        exactly the same addresses (absent words are zero by contract, so
+        an explicitly-written zero and an absent word are NOT equal -- a
+        deliberate strictness, since a program that writes a zero word is
+        a different program from one that never touches it)."""
+        return dict(self._words)
+
     # -- reads ------------------------------------------------------------
 
     def read_bytes(self, addr: int, length: int) -> bytes:
