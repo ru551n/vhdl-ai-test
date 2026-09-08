@@ -99,6 +99,13 @@ WEIGHT_BUFFER_DEPTH = 288
 BIAS_BUFFER_DEPTH = 8
 ACCUM_WIDTH = 32
 
+# ISA v2.0 (doc/cnn_accel_top_v2_arch.md sections 5 and 8): the version the
+# host reads back from CSR.HW_INFO2.ISA_VERSION, and the single source of
+# truth `accel_v2/isa.py`'s `ISA_VERSION` derives from -- previously that
+# module restated the `0x0200` literal itself, which this constant
+# replaces. Major.minor packed as `(major << 8) | minor`.
+ISA_VERSION = 0x0200
+
 # ISA v1.2 (doc/tosa_compiler_plan.md section 5, extension 2 / HW milestone
 # H2): per-channel requantization table in DDR at `scale_addr`, one entry
 # per output channel (zero-padded to whole PE_ROWS tiles exactly like the

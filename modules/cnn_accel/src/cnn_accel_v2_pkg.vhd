@@ -14,6 +14,7 @@ use ieee.numeric_std.all;
 -- restated with a literal here.
 library cnn_accel;
 use cnn_accel.cnn_accel_isa_pkg.all;
+use cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_isa_version;
 
 package cnn_accel_v2_pkg is
 
@@ -99,7 +100,12 @@ package cnn_accel_v2_pkg is
   constant c_err_axi             : err_code_t := x"8";
   constant c_err_timeout         : err_code_t := x"9";
 
-  constant c_isa_version : std_ulogic_vector(15 downto 0) := x"0200";
+  -- Reported to the host in HW_INFO2.ISA_VERSION. Derived from the same
+  -- generated constant 'cnn_accel_csr' drives that register from, so the
+  -- version this package's decoder implements and the version the host
+  -- reads out cannot disagree.
+  constant c_isa_version : std_ulogic_vector(15 downto 0) :=
+    std_ulogic_vector(to_unsigned(cnn_accel_constant_isa_version, 16));
 
   ------------------------------------------------------------------------
   -- Decoded ISA v2.0 descriptor. Every field of 'cnn_accel_pkg.layer_desc_t'

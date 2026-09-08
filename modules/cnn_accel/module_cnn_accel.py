@@ -270,6 +270,16 @@ class Module(BaseModule):
         for hardware for one cycle" (no readback contract implied by
         "self-clearing"), which `r_wpulse` expresses exactly, no
         approximation needed there.
+
+        Bit-position friction, same spirit: `hdl-registers` 8.1.0's
+        `Register.append_bit`/`.append_bit_vector` always place a new field
+        immediately after the previous one (`Register.bit_index` is a plain
+        running counter, see `hdl_registers.register.Register._append_field`)
+        -- there is no `skip_bits`/reserve-a-gap call. `STATUS.ERR_CODE`
+        (bits [7:4]) and `STATUS.ERR_PC_LOW` (bits [31:16]) are fixed by
+        `doc/cnn_accel_top_v2_arch.md` section 8, so the gaps before them are
+        filled with plain, unused `append_bit_vector(name="reservedN", ...)`
+        fields -- always reads '0', never referenced by `cnn_accel_csr`.
         """
         from hdl_registers.register_list import RegisterList
         from hdl_registers.register_modes import REGISTER_MODES
@@ -334,6 +344,44 @@ class Module(BaseModule):
             "(seq_error). Write-1-to-clear.",
             default_value="0",
         )
+        # `hdl-registers` 8.1.0 has no explicit padding/reserved-gap facility
+        # (`Register.append_bit`/`.append_bit_vector` are the only field
+        # constructors, and both place their field immediately after the
+        # previous one -- there is no `skip_bits`/`reserve` call to leave a
+        # gap). A plain, appended `reserved` `append_bit_vector` field is
+        # therefore the only way to push a later field to a specific bit
+        # position; it is otherwise unused (not read, not written
+        # meaningfully) and always reads back '0'. Used twice here to land
+        # `err_code` on [7:4] and `err_pc_low` on [31:16] per
+        # doc/cnn_accel_top_v2_arch.md section 8.
+        status.append_bit_vector(
+            name="reserved0",
+            description="Unused, reads '0'. Padding so `err_code` lands on bits [7:4].",
+            width=1,
+            default_value="0",
+        )
+        status.append_bit_vector(
+            name="err_code",
+            description="Latched `ERR_CODE` (doc/cnn_accel_top_v2_arch.md section 9): "
+            "the `err_code` input value at the moment `seq_error` first asserted. "
+            "Holds until `STATUS.ERROR` is cleared.",
+            width=4,
+            default_value="0000",
+        )
+        status.append_bit_vector(
+            name="reserved1",
+            description="Unused, reads '0'. Padding so `err_pc_low` lands on bits [31:16].",
+            width=8,
+            default_value="00000000",
+        )
+        status.append_bit_vector(
+            name="err_pc_low",
+            description="Low 16 bits of the faulting descriptor's byte address: the "
+            "`err_pc` input, bits [15:0], latched at the moment `seq_error` first "
+            "asserted. Holds until `STATUS.ERROR` is cleared.",
+            width=16,
+            default_value="0" * 16,
+        )
 
         irq_mask = regs.append_register(
             name="irq_mask",
@@ -374,6 +422,160 @@ class Module(BaseModule):
             description="Elaborated `g_tile_channels` (= pe_cols).",
             width=8,
             default_value=format(cnn_accel_constants.TILE_CHANNELS, "08b"),
+        )
+        hw_info.append_bit_vector(
+            name="max_kernel_size",
+            description="Elaborated `g_max_kernel_size` (largest K_h/K_w this "
+            "datapath supports).",
+            width=8,
+            default_value=format(cnn_accel_constants.MAX_KERNEL_SIZE, "08b"),
+        )
+
+        hw_info2 = regs.append_register(
+            name="hw_info2",
+            mode=REGISTER_MODES["r"],
+            description="Second read-only hardware-info register (HW_INFO's four "
+            "8-bit fields are full): ISA version and elaborated local tensor "
+            "scratchpad size, per doc/cnn_accel_top_v2_arch.md section 8.",
+        )
+        hw_info2.append_bit_vector(
+            name="isa_version",
+            description="Instruction-set version this build implements, "
+            "`(major << 8) | minor`; see `cnn_accel_constants.ISA_VERSION` / "
+            "`accel_v2/isa.py`.",
+            width=16,
+            default_value=format(cnn_accel_constants.ISA_VERSION, "016b"),
+        )
+        hw_info2.append_bit_vector(
+            name="tensor_mem_kib",
+            description="Elaborated `g_tensor_bytes` (the local tensor scratchpad, "
+            "doc/cnn_accel_top_v2_arch.md section 4), in KiB.",
+            width=16,
+            default_value="0" * 16,
+        )
+
+        # --- Performance counters (spec section 8, CSR 0x18-0x3C) ----------
+        # Plain 'r' registers: each is a single 32-bit hardware-maintained
+        # counter, pass-through from 'cnn_accel_csr's 'counters' port
+        # (csr_counters_t, src/cnn_accel_v2_pkg.vhd) into 'regs_up'. Appended
+        # in this exact order (offset is assigned by append order) so their
+        # addresses match the spec's 0x18..0x38 table.
+        cmd_count = regs.append_register(
+            name="cmd_count",
+            mode=REGISTER_MODES["r"],
+            description="Number of descriptors (instructions) retired since the "
+            "last START.",
+        )
+        cmd_count.append_bit_vector(
+            name="value", description="Count, full register width.", width=32,
+            default_value="0" * 32,
+        )
+
+        cycle_count = regs.append_register(
+            name="cycle_count",
+            mode=REGISTER_MODES["r"],
+            description="Clock cycles elapsed from the accepted START to DONE "
+            "(or to now, while still BUSY).",
+        )
+        cycle_count.append_bit_vector(
+            name="value", description="Count, full register width.", width=32,
+            default_value="0" * 32,
+        )
+
+        compute_cycles = regs.append_register(
+            name="compute_cycles",
+            mode=REGISTER_MODES["r"],
+            description="Cycles during which at least one compute engine (PE array, "
+            "pool, activation) was active.",
+        )
+        compute_cycles.append_bit_vector(
+            name="value", description="Count, full register width.", width=32,
+            default_value="0" * 32,
+        )
+
+        stall_cycles = regs.append_register(
+            name="stall_cycles",
+            mode=REGISTER_MODES["r"],
+            description="Cycles during which a command was dispatched but blocked "
+            "(waiting on DMA/weight-buffer/scratchpad availability).",
+        )
+        stall_cycles.append_bit_vector(
+            name="value", description="Count, full register width.", width=32,
+            default_value="0" * 32,
+        )
+
+        ddr_rd_bytes = regs.append_register(
+            name="ddr_rd_bytes",
+            mode=REGISTER_MODES["r"],
+            description="All AXI read bytes, including descriptor fetches and "
+            "weights (not just tensor payload).",
+        )
+        ddr_rd_bytes.append_bit_vector(
+            name="value", description="Byte count, full register width.", width=32,
+            default_value="0" * 32,
+        )
+
+        ddr_wr_bytes = regs.append_register(
+            name="ddr_wr_bytes",
+            mode=REGISTER_MODES["r"],
+            description="All AXI write bytes. The decisive residency-proof counter "
+            "(doc/cnn_accel_top_v2_arch.md section 8): for a multi-op local chain "
+            "it must equal exactly the final STORE size.",
+        )
+        ddr_wr_bytes.append_bit_vector(
+            name="value", description="Byte count, full register width.", width=32,
+            default_value="0" * 32,
+        )
+
+        tensor_load_count = regs.append_register(
+            name="tensor_load_count",
+            mode=REGISTER_MODES["r"],
+            description="Number of LOAD commands retired.",
+        )
+        tensor_load_count.append_bit_vector(
+            name="value", description="Count, full register width.", width=32,
+            default_value="0" * 32,
+        )
+
+        tensor_store_count = regs.append_register(
+            name="tensor_store_count",
+            mode=REGISTER_MODES["r"],
+            description="Number of STORE commands retired.",
+        )
+        tensor_store_count.append_bit_vector(
+            name="value", description="Count, full register width.", width=32,
+            default_value="0" * 32,
+        )
+
+        weight_load_bytes = regs.append_register(
+            name="weight_load_bytes",
+            mode=REGISTER_MODES["r"],
+            description="Bytes fetched by LOADW plus output-channel-tiling-loop "
+            "weight refills.",
+        )
+        weight_load_bytes.append_bit_vector(
+            name="value", description="Byte count, full register width.", width=32,
+            default_value="0" * 32,
+        )
+
+        local_bytes = regs.append_register(
+            name="local_bytes",
+            mode=REGISTER_MODES["r"],
+            description="KiB-granularity local tensor scratchpad traffic "
+            "(doc/cnn_accel_top_v2_arch.md section 8): finer byte counts are not "
+            "kept, only enough resolution to sanity-check scratchpad usage.",
+        )
+        local_bytes.append_bit_vector(
+            name="rd_kib",
+            description="KiB read from the scratchpad.",
+            width=16,
+            default_value="0" * 16,
+        )
+        local_bytes.append_bit_vector(
+            name="wr_kib",
+            description="KiB written to the scratchpad.",
+            width=16,
+            default_value="0" * 16,
         )
 
         # --- Accelerator HW properties, as plain constants -----------------
@@ -434,6 +636,15 @@ class Module(BaseModule):
             name="max_kernel_size",
             value=cnn_accel_constants.MAX_KERNEL_SIZE,
             description="Largest K_h/K_w this accelerator's datapath supports.",
+        )
+        regs.add_constant(
+            name="isa_version",
+            value=cnn_accel_constants.ISA_VERSION,
+            description="Instruction-set version, `(major << 8) | minor`; same value "
+            "as read back at runtime via CSR.HW_INFO2.ISA_VERSION. Exposed as a "
+            "generated constant too (`cnn_accel_constant_isa_version`) so "
+            "'src/cnn_accel_v2_pkg.vhd`'s `c_isa_version` derives from this single "
+            "source of truth instead of restating the `0x0200` literal.",
         )
         regs.add_constant(
             name="max_row_tile_words",

@@ -25,7 +25,7 @@ import cnn_accel_constants as _const
 # Version / word size.
 # ---------------------------------------------------------------------------
 
-ISA_VERSION = 0x0200
+ISA_VERSION = _const.ISA_VERSION
 INSTR_WORD_BYTES = _const.INSTR_WORD_BYTES
 
 # ---------------------------------------------------------------------------
