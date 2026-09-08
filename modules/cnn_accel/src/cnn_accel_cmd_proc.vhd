@@ -501,6 +501,14 @@ architecture a of cnn_accel_cmd_proc is
 
   type wgt_region_t is (rg_weight, rg_bias, rg_scale);
   signal wgt_region_q : wgt_region_t := rg_weight;
+  -- The region tag that belongs to the word currently in 'wgt_hold_q'.
+  -- 'wgt_region_q' is the region being *requested*, and it is advanced as
+  -- soon as the next sub-region's request is armed -- which can happen
+  -- while the serializer is still draining the previous region's last
+  -- word. Tagging the outgoing beats from 'wgt_region_q' would therefore
+  -- mislabel those trailing lanes (and shift the holding register by the
+  -- wrong lane width), so the tag travels with the data instead.
+  signal wgt_hold_region_q : wgt_region_t := rg_weight;
   signal wgt_hold_q : word_t := (others => '0');
   signal wgt_lanes_left_q : natural range 0 to 8 := 0;
   signal wgt_fill_active_q : std_ulogic := '0';
@@ -1610,6 +1618,7 @@ begin
       if wgt_lanes_left_q = 0 then
         if wgt_fill_active_q = '1' and side_m2s.valid = '1' then
           wgt_hold_q <= side_m2s.data(word_t'range);
+          wgt_hold_region_q <= wgt_region_q;
           case wgt_region_q is
             when rg_weight => wgt_lanes_left_q <= c_word_bytes;
             when rg_bias => wgt_lanes_left_q <= c_word_bytes / c_bias_entry_bytes;
@@ -1618,7 +1627,7 @@ begin
         end if;
       elsif m_conv_weight_s2m.ready = '1' then
         wgt_lanes_left_q <= wgt_lanes_left_q - 1;
-        case wgt_region_q is
+        case wgt_hold_region_q is
           when rg_weight =>
             wgt_hold_q <= std_ulogic_vector(shift_right(unsigned(wgt_hold_q), 8));
           when rg_bias =>
@@ -1638,6 +1647,13 @@ begin
   wgt_lane_m2s.valid <= '1' when wgt_lanes_left_q /= 0 else '0';
   wgt_lane_m2s.last <= '0';
   wgt_lane_m2s.user <= (others => '0');
+
+  -- Region tag presented to 'cnn_accel_weight_buffer' alongside every fill
+  -- beat: it samples these in the same cycle as the beat (see that entity's
+  -- 'fill_is_bias'/'fill_is_scale' contract), so they are decoded from the
+  -- tag that travels with the held word, not from the request-side region.
+  conv_fill_is_bias <= '1' when wgt_hold_region_q = rg_bias else '0';
+  conv_fill_is_scale <= '1' when wgt_hold_region_q = rg_scale else '0';
   -- The lane always sits in the low bits of the holding register, so the
   -- region only decides how far the register is shifted after a beat, not
   -- where the beat is read from -- 'cnn_accel_weight_buffer' itself picks
