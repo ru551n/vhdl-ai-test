@@ -246,7 +246,7 @@ readable from `CSR.HW_INFO2`.
 | W0 | [31:24] | reserved | must be 0 (`ERR_BAD_RESERVED`) |
 | W1 | [31:0] | `in_addr` / `src0_addr` | space = `space_src0` |
 | W2 | [31:0] | `out_addr` / `dst_addr` | space = `space_dst` |
-| W3 | [31:0] | `weight_addr` | space = `space_wgt` |
+| W3 | [31:0] | `weight_addr` | space = `space_wgt`; for `ACT` this is the 256-byte LUT's address |
 | W4 | [31:0] | `bias_addr` | space = `space_wgt` |
 | W5 | [15:0] / [31:16] | `in_width` / `in_height` | |
 | W6 | [15:0] / [31:16] | `in_channels` / `out_channels` | |
@@ -259,10 +259,30 @@ readable from `CSR.HW_INFO2`.
 | W13 | [15:0] | `output_offset` | signed int16 |
 | W13 | [23:16] / [31:24] | `clamp_min` / `clamp_max` | signed int8 |
 | W14 | [31:0] | `scale_addr` | space = `space_wgt` |
-| W15 | [31:0] | `xfer_bytes` / `src1_addr` | **v2.0**: byte count for `LOAD`/`STORE`/`COPY`; second source address for `ADD` (space = `space_src1`); must be 0 for v1.2 opcodes |
+| W15 | [31:0] | `xfer_bytes` / `src1_addr` | **v2.0**: byte count for `LOAD`/`STORE`/`COPY`/`ACT`; second source address for `ADD` (space = `space_src1`); must be 0 for v1.2 opcodes |
 
 `W15` was `reserved, must be 0` in v1.2 and is only consulted by the
 v2.0-only opcodes, preserving compatibility.
+
+**This field table is authoritative over §5.2's prose.** `W15` is a union,
+and for `ADD` it is `src1_addr`, *not* a byte count: `ADD` has two source
+operands and only one spare word to address the second one, so its length
+must come from somewhere else. It comes from the tensor geometry
+(`in_width` x `in_height` x `in_channels`, in the channel-tiled byte count
+of §6), exactly as it does for `UPSAMPLE`. An earlier revision of §5.2
+described `ADD` as "`xfer_bytes` long", which is unimplementable alongside
+`src1_addr` occupying the same bits; that wording has been corrected below.
+
+`ADD` also carries only **one** `(requant_scale, requant_shift)` pair, which
+is applied identically to both operands before the sum. Two residual
+branches with genuinely different scales must therefore be equalised by the
+compiler (fold the ratio into the producing convolution's requant), which is
+what a quantized residual add needs anyway.
+
+`ACT` needs a 256-entry LUT address and has no dedicated field for one, so
+it reuses `weight_addr`/`space_wgt` — the same "compile-time side table in
+local weight memory" role `scale_addr` plays for `CONV2D`. `ACT` keeps its
+`xfer_bytes` byte count, since it is a single-source streaming op.
 
 ### 5.2 Opcodes
 
@@ -277,10 +297,10 @@ v2.0-only opcodes, preserving compatibility.
 | `0x10` | `LOAD` | `xfer_bytes` from `src0` to `dst`; intended DDR->LOCAL_TENSOR | DMA |
 | `0x11` | `STORE` | `xfer_bytes` from `src0` to `dst`; intended LOCAL_TENSOR->DDR (this is the **spill**) | DMA |
 | `0x12` | `LOADW` | `xfer_bytes` from `src0` into `LOCAL_WEIGHT`; `flags.bias_en`/`per_channel_en` select the weight / bias / scale sub-region | DMA + `weight_buffer` |
-| `0x13` | `ADD` | `dst = sat_i8(requant(src0) + requant(src1))`, elementwise, `xfer_bytes` long | `elementwise` |
+| `0x13` | `ADD` | `dst = sat_i8(requant(src0) + requant(src1))`, elementwise; `src1` from W15, length from geometry (see §5.1) | `elementwise` |
 | `0x14` | `UPSAMPLE` | nearest-neighbour 2x2 replicate, `in_width`/`in_height`/`in_channels` | `elementwise` |
 | `0x15` | `COPY` | local-to-local byte copy, `xfer_bytes` long | `elementwise` |
-| `0x16` | `ACT` | standalone 256-entry int8->int8 LUT over `xfer_bytes` | `elementwise` |
+| `0x16` | `ACT` | standalone 256-entry int8->int8 LUT (at `weight_addr`) over `xfer_bytes` | `elementwise` |
 
 `LOAD`, `STORE` and `COPY` are one opcode family differing only in the
 space tags of their operands — the hardware does not care which direction
