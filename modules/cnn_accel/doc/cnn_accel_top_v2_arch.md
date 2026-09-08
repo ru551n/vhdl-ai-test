@@ -180,13 +180,25 @@ Each bank is one **simple-dual-port** RAM (1 write + 1 read per cycle,
 `ram_style` block) — the shape Vivado/Yosys infer as RAMB36 without
 hints, per the M7 lesson in `flow_status.md`.
 
-Front-end ports (all AXI-Stream `axi_stream_m2s_t`/`s2m_t`, 64-bit):
+Front-end ports: **2 write channels (`w0`/`w1`) and 2 read channels
+(`r0`/`r1`)**, all AXI-Stream `axi_stream_m2s_t`/`s2m_t`, 64-bit, each
+fronted by its own `dma_req_m2s_t`/`dma_req_s2m_t` request port.
 
-| Port | Requesters (fixed priority, highest first) |
+| Channel | Dedicated to |
 |---|---|
-| write | `engine_out`, `dma_load` |
-| read0 | `engine_in_a`, `dma_store` |
-| read1 | `engine_in_b` |
+| `w0` | `dma_load` — DDR -> LOCAL (`LOAD`, `LOADW`, reload) |
+| `w1` | `engine_out` — compute result -> LOCAL |
+| `r0` | `engine_in_a`, and `dma_store` (LOCAL -> DDR); muxed by `cmd_proc` |
+| `r1` | `engine_in_b` (the second `ADD` source) |
+
+Each channel is *dedicated*, not arbitrated at the front end. That is a
+deliberate correction to an earlier revision of this section, which had a
+single shared write port with fixed priority between `engine_out` and
+`dma_load` — that contradicted this section's own claim below that bank
+independence permits ping-pong double buffering, because two requesters
+sharing one front-end port serialize with each other no matter which
+banks they address. Two dedicated write channels cost only a per-bank
+arbiter and make the claim true.
 
 A read/write *job* is a linear burst: `(base, length_bytes)` presented on
 a `dma_req_m2s_t`-shaped request port, then `length/8` beats stream with
@@ -195,10 +207,23 @@ a `dma_req_m2s_t`-shaped request port, then `length/8` beats stream with
 engines are agnostic to whether their data came from DDR or the
 scratchpad.
 
-Because banks are independent, `dma_load` into bank 1 proceeds
+Contention is resolved **per bank, per direction**: each bank has one
+physical write port and one physical read port, so two channels aimed at
+different banks both proceed at full rate in the same cycle, and two
+aimed at the same bank are resolved by a round-robin arbiter (one
+"who-won-last" bit) that back-pressures the loser. Round-robin rather
+than fixed priority so neither channel can be starved by a long burst on
+the other. Because banks are independent, `dma_load` into bank 1 proceeds
 concurrently with `engine_in_a`/`engine_out` on bank 0 — the architecture
 does not prevent ping-pong double buffering, even though the rev-2
 `cmd_proc` issues commands sequentially (see §12 limitations).
+
+A request that crosses a bank boundary is a caller bug. The memory never
+corrupts the neighbouring bank: it asserts (severity `error`, so the run
+continues and the bug is visible in the log) and clamps the burst to what
+fits in the addressed bank. An out-of-range bank index is likewise
+asserted and then wrapped modulo `g_num_banks`, so no array bound is ever
+violated.
 
 ---
 
@@ -473,3 +498,10 @@ adding a test adds a Python function, never VHDL.
    needs), not general `resize`.
 6. `g_max_row_tile_words` stays at its current value in this phase; the
    H2 bump is a separate, independent change.
+7. `dma_store` shares read channel `r0` with `engine_in_a` (§4), so a
+   `STORE` cannot overlap a compute command's activation reads even once
+   limitation 1 is lifted. Overlapping writeback with compute — the
+   natural next optimisation after ping-pong loading — needs a third read
+   channel. This costs nothing today because `cmd_proc` is sequential
+   anyway, and it is a `cnn_accel_tensor_mem` port addition when wanted,
+   not an ISA or memory-map change.
