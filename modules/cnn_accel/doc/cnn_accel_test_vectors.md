@@ -126,9 +126,11 @@ VUnit wiring: `module_cnn_accel.py`'s `_compiler_vectors_pre_config` hook
 (the `test_bitexact_compiler_cases` config's `pre_config`, one config only,
 at the default `g_pe_rows=PE_ROWS` -- the compiler always packs weights at
 its target's own discovered `internal_tiling`, not parameterizable by a
-`pe_rows` argument) compiles each of two fixed compiler fixtures
-(`conv_rescale_clamp`, `first_layer_cin3`) against the real `cnn_accel_v1`
-target and writes both fixtures' vectors into that config's own VUnit
+`pe_rows` argument) compiles each of four fixed compiler fixtures
+(`conv_rescale_clamp`, `first_layer_cin3` from M10; `out_zp_relu`,
+`clamp_5_100` from M11, exercising the ISA v1.1 `output_offset` /
+`CLAMP_EN` W13 fields) against the real `cnn_accel_v1`
+target and writes every fixture's vectors into that config's own VUnit
 `output_path`, each fixture's case names prefixed `'<fixture>_'` so they
 cannot collide, plus one combined `cases.txt` covering every case from
 every fixture.

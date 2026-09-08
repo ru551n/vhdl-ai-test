@@ -132,9 +132,11 @@ _VIVADO_PART = "xc7a200tfbg484-2"
 # --------------------------------------------------------------------------
 
 
-# M10 (doc/tosa_compiler_plan.md ~line 613): the two real TOSA fixtures
+# M10 (doc/tosa_compiler_plan.md ~line 613): the real TOSA fixtures
 # compiled into tb_cnn_accel_conv_core's 'test_bitexact_compiler_cases'
-# config, and the fixed seed each is compiled/run with (matches
+# config (the two M10 ones plus the two M11 ones, `out_zp_relu` /
+# `clamp_5_100`, which exercise the ISA v1.1 `output_offset` /
+# `CLAMP_EN` epilogue fields end-to-end from compiler bytes into RTL), and the fixed seed each is compiled/run with (matches
 # compiler/tests/test_fixtures_m9.py's own `_seed_input` convention: one
 # `np.random.default_rng(seed)` per fixture's single graph input, keyed
 # "arg0" like every M8/M9 fixture). Shapes come from the compiler's own
@@ -144,6 +146,8 @@ _VIVADO_PART = "xc7a200tfbg484-2"
 _COMPILER_VECTORS_FIXTURES = {
     "conv_rescale_clamp": (1, 8, 8, 4),
     "first_layer_cin3": (1, 8, 8, 3),
+    "out_zp_relu": (1, 8, 8, 8),
+    "clamp_5_100": (1, 8, 8, 8),
 }
 _COMPILER_VECTORS_SEED = 0
 
@@ -158,7 +162,7 @@ def _compiler_vectors_pre_config(output_path: str) -> bool:
     this config's own VUnit `output_path` via
     `cnnc.backend.cnn_accel_v1.vectors.write_conv_core_vectors`, one case
     directory per fixture's conv layer, prefixed `'<fixture>_'` so the
-    two fixtures' case names cannot collide. Writes ONE combined
+    fixtures' case names cannot collide. Writes ONE combined
     `cases.txt` covering every case from every fixture (each
     `write_conv_core_vectors` call would otherwise overwrite the
     previous one's, since they share `output_path`).
@@ -170,8 +174,8 @@ def _compiler_vectors_pre_config(output_path: str) -> bool:
     `compiler/` directory at all, e.g. a synthesis-only clone).
 
     Returns `False` (fails the config, per `add_vunit_config`'s own
-    contract) if either fixture is unexpectedly skipped (both are single-
-    layer, `out_channels == PE_ROWS`, so neither should ever exceed
+    contract) if any fixture is unexpectedly skipped (all are single-
+    layer, `out_channels <= PE_ROWS`, so none should ever exceed
     `max_out_channels`) or if nothing was written at all -- a silently
     empty `cases.txt` must not report a green test (see
     `tb_cnn_accel_conv_core.vhd`'s own `run_compiler_cases` assertion for
