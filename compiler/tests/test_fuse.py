@@ -167,14 +167,26 @@ def test_conv_output_two_users_not_fused():
 # --------------------------------------------------------------------------
 
 
+def _stride_divides(dim: int, k: int, stride: int, pad: int) -> bool:
+    return (dim - 1 + 2 * pad - (k - 1)) % stride == 0
+
+
 def _build_random_graph(rng: np.random.Generator) -> tuple[Graph, np.ndarray]:
-    h = int(rng.integers(3, 7))
-    w = int(rng.integers(3, 7))
-    cin = int(rng.choice([1, 3, 8]))
-    cout = int(rng.choice([8, 16]))
-    k = int(rng.choice([1, 3]))
-    stride = int(rng.choice([1, 2]))
-    pad = int(rng.choice([0, 1]))
+    # `verify()` (compiler/cnnc/gir/verify.py) rejects conv2d shapes where the
+    # stride does not evenly divide the padded input extent minus the
+    # dilated kernel span. Reject-and-resample (h, w, k, stride, pad) from
+    # the same rng until both spatial dims satisfy that constraint, rather
+    # than special-casing the draw distribution.
+    while True:
+        h = int(rng.integers(3, 7))
+        w = int(rng.integers(3, 7))
+        cin = int(rng.choice([1, 3, 8]))
+        cout = int(rng.choice([8, 16]))
+        k = int(rng.choice([1, 3]))
+        stride = int(rng.choice([1, 2]))
+        pad = int(rng.choice([0, 1]))
+        if _stride_divides(h, k, stride, pad) and _stride_divides(w, k, stride, pad):
+            break
 
     conv_attrs = ConvAttrs(pad=(pad, pad, pad, pad), stride=(stride, stride), dilation=(1, 1), in_zp=0, w_zp=0, acc_dtype="i32")
 

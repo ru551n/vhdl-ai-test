@@ -10,7 +10,7 @@ import pytest
 
 from cnnc.errors import VerifyError
 from cnnc.frontend.tosa_import import load_tosa_file
-from cnnc.gir.ir import ClampAttrs, ConvAttrs, Graph, Op, RescaleParams, Tensor
+from cnnc.gir.ir import ClampAttrs, ConvAttrs, Graph, Op, RescaleParams, Tensor, conv2d_output_shape
 from cnnc.gir.printer import to_json
 from cnnc.gir.verify import verify
 
@@ -153,6 +153,44 @@ def test_verify_rejects_out_of_range_const_value():
     g2 = g.replace(tensors=tensors)
     with pytest.raises(VerifyError, match="out of range"):
         verify(g2)
+
+
+def _conv_graph(*, in_h: int, in_w: int, k: int, stride: tuple[int, int], pad: tuple[int, int, int, int]) -> Graph:
+    """A conv2d-only graph (8x8-ish, single in/out channel) with fully
+    configurable spatial shape/kernel/stride/pad, for the stride-
+    divisibility verifier tests below. `conv2d_output_shape` is used
+    directly so the declared output tensor always matches, letting the
+    stride-divisibility check (or lack thereof) be the only thing that can
+    fail."""
+    conv_attrs = ConvAttrs(pad=pad, stride=stride, dilation=(1, 1), in_zp=0, w_zp=0, acc_dtype="i32")
+    x_shape = (1, in_h, in_w, 1)
+    w_shape = (1, k, k, 1)
+    out_shape = conv2d_output_shape(x_shape, w_shape, conv_attrs)
+    tensors = {
+        "arg0": Tensor(id="arg0", shape=x_shape, dtype="i8"),
+        "w": Tensor(id="w", shape=w_shape, dtype="i8", values=tuple([1] * (k * k))),
+        "b": Tensor(id="b", shape=(1,), dtype="i32", values=(0,)),
+        "4": Tensor(id="4", shape=out_shape, dtype="i32"),
+    }
+    ops = (
+        Op(id="%w", kind="const", inputs=(), outputs=("w",), attrs=None),
+        Op(id="%b", kind="const", inputs=(), outputs=("b",), attrs=None),
+        Op(id="%4", kind="conv2d", inputs=("arg0", "w", "b"), outputs=("4",), attrs=conv_attrs),
+    )
+    return Graph(name="main", tensors=tensors, ops=ops, inputs=("arg0",), outputs=("4",))
+
+
+def test_verify_rejects_stride_not_dividing_padded_extent():
+    # 8x8, k=3, stride=2, pad=(0,0,0,0): (8-1+0-2) % 2 == 1 != 0.
+    g = _conv_graph(in_h=8, in_w=8, k=3, stride=(2, 2), pad=(0, 0, 0, 0))
+    with pytest.raises(VerifyError, match="stride_h"):
+        verify(g)
+
+
+def test_verify_passes_stride_dividing_padded_extent():
+    # 8x8, k=3, stride=2, pad=(1,0,1,0): (8-1+1-2) % 2 == 0 for both dims.
+    g = _conv_graph(in_h=8, in_w=8, k=3, stride=(2, 2), pad=(1, 0, 1, 0))
+    verify(g)  # no exception
 
 
 # --------------------------------------------------------------------------

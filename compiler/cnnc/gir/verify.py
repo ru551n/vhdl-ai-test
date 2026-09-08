@@ -124,6 +124,30 @@ def _verify_conv_shapes(op_id: str, x: Tensor, w: Tensor, b: Tensor, out: Tensor
         _fail(op_id, f"conv stride {attrs.stride} must be >= 1")
     if any(d < 1 for d in attrs.dilation):
         _fail(op_id, f"conv dilation {attrs.dilation} must be >= 1")
+    # TOSA/IREE additionally require the stride to evenly divide the
+    # padded input extent minus the dilated kernel span, i.e. the
+    # `conv2d_output_shape` division below must be exact; a non-exact
+    # division is silently floored into a smaller-than-expected output
+    # that IREE's conv lowering rejects at codegen time, so catch it here.
+    kh, kw = w.shape[1], w.shape[2]
+    in_h, in_w = x.shape[1], x.shape[2]
+    pad_t, pad_b, pad_l, pad_r = attrs.pad
+    stride_h, stride_w = attrs.stride
+    dil_h, dil_w = attrs.dilation
+    rem_h = (in_h - 1 + pad_t + pad_b - dil_h * (kh - 1)) % stride_h
+    if rem_h != 0:
+        _fail(
+            op_id,
+            f"conv stride_h {stride_h} does not evenly divide padded H extent "
+            f"(in_h={in_h}, pad=({pad_t},{pad_b}), k={kh}, dilation={dil_h}): remainder {rem_h}",
+        )
+    rem_w = (in_w - 1 + pad_l + pad_r - dil_w * (kw - 1)) % stride_w
+    if rem_w != 0:
+        _fail(
+            op_id,
+            f"conv stride_w {stride_w} does not evenly divide padded W extent "
+            f"(in_w={in_w}, pad=({pad_l},{pad_r}), k={kw}, dilation={dil_w}): remainder {rem_w}",
+        )
     if attrs.acc_dtype != "i32":
         _fail(op_id, f"conv acc_dtype {attrs.acc_dtype!r} must be i32")
     expected = conv2d_output_shape(x.shape, w.shape, attrs)

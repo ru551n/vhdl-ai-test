@@ -218,8 +218,14 @@ def test_5x5_kernel_rejected(target):
 
 
 def test_stride_300_exceeds_field_width_rejected(target):
+    # `verify()` (compiler/cnnc/gir/verify.py) requires the stride to
+    # evenly divide the padded input extent minus the dilated kernel span;
+    # with the default 8x8/k3/pad1111 shape, stride 300 leaves a remainder
+    # and is rejected there before reaching to_hir. Use a shape where the
+    # division is exact (in=303, k=3, pad=0: (303-1-2) % 300 == 0) so this
+    # test still reaches the intended CapabilityError about field width.
     with pytest.raises(CapabilityError) as exc_info:
-        _to_hir(target, stride=(300, 300))
+        _to_hir(target, stride=(300, 300), in_h=303, in_w=303, pad=(0, 0, 0, 0))
     assert "stride" in exc_info.value.constraint
 
 
@@ -229,7 +235,9 @@ def test_stride_3_passes_capability_checks(target):
     # only bounded by the general `max stride_h/stride_w` constraint
     # (255), not rejected outright like the M6 plan's original static
     # JSON example assumed.
-    module = _to_hir(target, stride=(3, 3), pad=(0, 0, 0, 0))
+    # in=9, k=3, pad=0: (9-1-2) % 3 == 0, so `verify()`'s stride-divisibility
+    # check (compiler/cnnc/gir/verify.py) is satisfied too.
+    module = _to_hir(target, stride=(3, 3), pad=(0, 0, 0, 0), in_h=9, in_w=9)
     assert module.ops[0].params["stride_h"] == 3
 
 
