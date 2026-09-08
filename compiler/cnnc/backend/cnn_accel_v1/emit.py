@@ -206,18 +206,34 @@ def _build_conv_descriptor(
 ) -> Descriptor:
     _reject_unknown_params(op, isa_version)
 
-    if len(op.reads) != 3:
+    params = op.params
+    per_channel = bool(params.get("per_channel_en"))
+    # ISA v1.2 (M12): a per-channel `conv_layer` reads a 4th buffer, the
+    # SCALE_TABLE const, which becomes W14 `scale_addr`.
+    n_reads = 4 if per_channel else 3
+    if len(op.reads) != n_reads:
+        what = "input, weight, bias, scale table" if per_channel else "input, weight, bias"
         raise CompilerError(
-            f"conv_layer op must read exactly 3 buffers (input, weight, bias), got {len(op.reads)}",
+            f"conv_layer op must read exactly {n_reads} buffers ({what}), got {len(op.reads)}",
             op_id=op.id, stage=_STAGE,
         )
     if len(op.writes) != 1:
         raise CompilerError(
             f"conv_layer op must write exactly 1 buffer, got {len(op.writes)}", op_id=op.id, stage=_STAGE,
         )
-    in_buf, w_buf, b_buf = (module.buffer(bid) for bid in op.reads)
+    in_buf, w_buf, b_buf = (module.buffer(bid) for bid in op.reads[:3])
+    scale_buf = module.buffer(op.reads[3]) if per_channel else None
     out_buf = module.buffer(op.writes[0])
-    for label, buf in (("in", in_buf), ("weight", w_buf), ("bias", b_buf), ("out", out_buf)):
+    addressed = [("in", in_buf), ("weight", w_buf), ("bias", b_buf), ("out", out_buf)]
+    if scale_buf is not None:
+        if scale_buf.layout != "SCALE_TABLE" or scale_buf.role != "const":
+            raise CompilerError(
+                f"per-channel conv_layer's 4th read {scale_buf.id!r} must be a const SCALE_TABLE buffer, "
+                f"got role {scale_buf.role!r} layout {scale_buf.layout!r}",
+                op_id=op.id, stage=_STAGE,
+            )
+        addressed.append(("scale table", scale_buf))
+    for label, buf in addressed:
         if buf.addr is None:
             raise CompilerError(f"buffer {buf.id!r} ({label}) has no addr", op_id=op.id, stage=_STAGE)
 
@@ -225,7 +241,6 @@ def _build_conv_descriptor(
     if opcode is None:
         raise CapabilityError("target ISA has no CONV2D opcode", op_id=op.id, stage=_STAGE)
 
-    params = op.params
     for key in _CORE_FIELD_PARAMS:
         if key not in params:
             raise CompilerError(f"conv_layer op missing required param {key!r}", op_id=op.id, stage=_STAGE)
@@ -259,6 +274,7 @@ def _build_conv_descriptor(
         requant_scale=params["requant_scale"],
         requant_shift=params["requant_shift"],
         next_instr_addr=program_addr + (index + 1) * target.isa.instr_word_bytes,
+        scale_addr=scale_buf.addr if scale_buf is not None else 0,
         **{key: params.get(key, 0) for key in _W13_FIELD_PARAMS},
     )
 

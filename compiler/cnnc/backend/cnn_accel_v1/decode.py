@@ -124,6 +124,11 @@ def print_program(descriptors: tuple[Descriptor, ...], target: "Target", *, prog
                 f"output_offset={desc.output_offset}",
                 f"clamp={desc.clamp_min}/{desc.clamp_max}",
             ]
+        if "PER_CHANNEL_EN" in flags:
+            # ISA v1.2 (H2/M12) W14: only meaningful (and only dereferenced
+            # by the HW) while PER_CHANNEL_EN is set; per-tensor layers keep
+            # the pre-M12 line format.
+            parts.append(f"scale_addr=0x{desc.scale_addr:08x}")
         parts.append(f"next=0x{desc.next_instr_addr:08x}")
         lines.append(" ".join(parts))
         addr += word

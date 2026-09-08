@@ -22,6 +22,7 @@ from cnnc.hir.verify import verify_hir
 from cnnc.lower.layout import (
     activation_bytes,
     pack_bias_tiled,
+    pack_scale_table,
     pack_weights_tiled,
 )
 from cnnc.target.constraints import check
@@ -51,12 +52,19 @@ _STAGE = "to_hir"
 _W13_ISA_VERSION = "1.1"
 _INT8_RANGE = (-128, 127)
 # ISA v1.2 (HW milestone H2) added PER_CHANNEL_EN/`scale_addr`: a per-
-# output-channel (multiplier, shift) table in DDR. Emitting that table as a
-# constant buffer and pointing `scale_addr` at it is compiler milestone M12
-# (after M11, doc/tosa_compiler_plan.md); until then a
-# per-channel rescale the target CAN take is rejected here, at the fused op,
-# rather than silently lowered with only channel 0's pair.
-_H2_PER_CHANNEL_LOWERING_IMPLEMENTED = False
+# output-channel (multiplier, shift) table in DDR (doc/tosa_compiler_plan.md
+# §5 extension 2, M12). A `fused_conv` whose rescale is `per_channel` lowers
+# to a `conv_layer` that additionally reads one `Buffer(role=const,
+# layout=SCALE_TABLE)` -- `pack_scale_table`'s `[OT][pe_rows]` image of
+# `(multiplier, shift - implicit_shift)`, the same byte image
+# `cnn_accel_model.pack_scale_table_for_hw` defines -- and carries
+# `per_channel_en=True`; the backend points W14 `scale_addr` at that buffer.
+# The descriptor's scalar `requant_scale`/`requant_shift` are ignored by
+# the HW while the flag is set and are emitted as 0. Only a unit whose
+# `epilogue.rescale.per_channel` is true (discovered from `PER_CHANNEL_EN`
+# in `cnn_accel_constants.FLAGS`, i.e. ISA >= 1.2) gets here; older ISAs
+# raise `CapabilityError` in `_check_capabilities`.
+_SCALE_TABLE_ISA_VERSION = "1.2"
 
 _ENV_FIELDS = (
     "in_width",
@@ -242,9 +250,15 @@ def _check_capabilities(op: Op, x: Tensor, w: Tensor, b: Tensor, y: Tensor, unit
             "per-channel rescale not supported by target",
             op_id=op.id, stage=_STAGE, unit=unit.name, constraint="rescale.per_channel",
         )
-    if rescale.per_channel and not _H2_PER_CHANNEL_LOWERING_IMPLEMENTED:
+    if rescale.per_channel and not _isa_at_least(unit.isa_version, _SCALE_TABLE_ISA_VERSION):
         raise CapabilityError(
-            "per-channel rescale: scale table (PER_CHANNEL_EN/scale_addr) lowering not implemented yet (M12)",
+            f"per-channel rescale needs the ISA v{_SCALE_TABLE_ISA_VERSION} scale table "
+            f"(PER_CHANNEL_EN/scale_addr); unit is ISA v{unit.isa_version}",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="rescale.per_channel",
+        )
+    if rescale.per_channel and len(rescale.multiplier) != oc:
+        raise CapabilityError(
+            f"per-channel rescale has {len(rescale.multiplier)} multipliers for {oc} output channels",
             op_id=op.id, stage=_STAGE, unit=unit.name, constraint="rescale.per_channel",
         )
 
@@ -278,9 +292,28 @@ def _accumulator_note(op: Op, kh: int, kw: int, in_channels: int, bias_values: t
     return None
 
 
+def _scale_table_buffer(op: Op, y_id: str, rescale, caps: RescaleCaps, unit: Unit, *, space_name: str, align: int) -> Buffer:
+    """The ISA v1.2 per-channel `(multiplier, shift)` table as a const HIR
+    buffer, `%<y>.scale`, padded to whole `internal_tiling.cout` tiles."""
+    shifts = tuple(int(s) - caps.implicit_shift for s in rescale.shift)
+    data = pack_scale_table(tuple(int(m) for m in rescale.multiplier), shifts, unit.internal_tiling.cout)
+    return Buffer(
+        id=f"%{y_id}.scale",
+        space=space_name,
+        size_bytes=len(data),
+        align=align,
+        role="const",
+        layout="SCALE_TABLE",
+        shape=(len(rescale.multiplier), 2),
+        dtype="i32",
+        data=data,
+        gir_tensor=None,
+    )
+
+
 def _lower_fused_conv(
     op: Op, graph: Graph, unit: Unit, *, space_name: str, align: int, activation_layout: str, plane_channels: int
-) -> tuple[HirOp, Buffer, str | None]:
+) -> tuple[HirOp, Buffer, Buffer | None, str | None]:
     x_id, w_id, b_id = op.inputs
     y_id = op.outputs[0]
     x, w, b, y = graph.tensor(x_id), graph.tensor(w_id), graph.tensor(b_id), graph.tensor(y_id)
@@ -324,8 +357,20 @@ def _lower_fused_conv(
     params.update(_clamp_params(op, attrs, unit))
     params.update(_output_offset_params(op, attrs, unit))
     params["pad_en"] = any(p > 0 for p in (pad_t, pad_b, pad_l, pad_r))
-    params["requant_scale"] = int(rescale.multiplier[0])
-    params["requant_shift"] = int(rescale.shift[0]) - caps.implicit_shift
+    reads = [f"%{x_id}", f"%{w_id}", f"%{b_id}"]
+    scale_buf: Buffer | None = None
+    if rescale.per_channel:
+        # The scalar W-fields are dead while PER_CHANNEL_EN is set; the
+        # table (4th read, -> W14 `scale_addr` in the backend) carries the
+        # per-channel pairs.
+        params["requant_scale"] = 0
+        params["requant_shift"] = 0
+        params["per_channel_en"] = True
+        scale_buf = _scale_table_buffer(op, y_id, rescale, caps, unit, space_name=space_name, align=align)
+        reads.append(scale_buf.id)
+    else:
+        params["requant_scale"] = int(rescale.multiplier[0])
+        params["requant_shift"] = int(rescale.shift[0]) - caps.implicit_shift
 
     note = _accumulator_note(op, kh, kw, x.shape[3], b.values or ())
 
@@ -334,7 +379,7 @@ def _lower_fused_conv(
         unit=unit.name,
         kind="conv_layer",
         params=params,
-        reads=(f"%{x_id}", f"%{w_id}", f"%{b_id}"),
+        reads=tuple(reads),
         writes=(f"%{y_id}",),
         deps=(),
         gir_op=op.id,
@@ -351,7 +396,7 @@ def _lower_fused_conv(
         dtype=y.dtype,
         gir_tensor=y_id,
     )
-    return hir_op, y_buf, note
+    return hir_op, y_buf, scale_buf, note
 
 
 def to_hir(graph: Graph, target: Target) -> HirModule:
@@ -408,13 +453,15 @@ def to_hir(graph: Graph, target: Target) -> HirModule:
     notes: list[str] = []
     writer_of: dict[str, str] = {}
     for idx, op in enumerate(fused_ops):
-        hir_op, y_buf, note = _lower_fused_conv(
+        hir_op, y_buf, scale_buf, note = _lower_fused_conv(
             op, graph, conv_unit, space_name=space_name, align=space.align, activation_layout=activation_layout,
             plane_channels=plane_channels,
         )
         op_id = f"#{idx}"
         hir_op = hir_op.replace(id=op_id, deps=tuple(sorted({writer_of[bid] for bid in hir_op.reads if bid in writer_of})))
         ops.append(hir_op)
+        if scale_buf is not None:
+            buffers[scale_buf.id] = scale_buf
         buffers[y_buf.id] = y_buf
         writer_of[y_buf.id] = op_id
         if note is not None:

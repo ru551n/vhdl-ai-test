@@ -16,6 +16,13 @@ independently; `tests/test_layout.py` pins the two against each other.
   `out_channels`/`in_channels` are written as 0, never omitted.
 - Bias: `[OT][pe_rows]` int32 little-endian, zero-padded like the weights'
   output-channel tiles.
+- Scale table (ISA v1.2 / H2, doc/tosa_compiler_plan.md §5 extension 2):
+  `[OT][pe_rows]` entries of `SCALE_TABLE_ENTRY_BYTES` (8) bytes each,
+  `multiplier int32 LE | shift uint8 | 3 zero bytes`, padded with all-zero
+  entries to whole `pe_rows` tiles exactly like the bias (the weight buffer
+  fills its `scale_buffer` lanes in the same tile-load phase as the bias).
+  `shift` here is the *descriptor* shift (TOSA shift minus the target's
+  `implicit_shift`), the same semantics as W-field `requant_shift`.
 """
 
 from __future__ import annotations
@@ -92,3 +99,32 @@ def pack_bias_tiled(values: tuple[int, ...], pe_rows: int) -> bytes:
     oc = len(values)
     padded = list(values) + [0] * (_ceil_div(oc, pe_rows) * pe_rows - oc)
     return struct.pack(f"<{len(padded)}i", *padded)
+
+
+SCALE_TABLE_ENTRY_BYTES = 8
+_SCALE_TABLE_ENTRY_PAD = SCALE_TABLE_ENTRY_BYTES - 4 - 1  # int32 multiplier + uint8 shift
+
+
+def packed_scale_table_bytes(out_channels: int, pe_rows: int) -> int:
+    return _ceil_div(out_channels, pe_rows) * pe_rows * SCALE_TABLE_ENTRY_BYTES
+
+
+def pack_scale_table(multipliers: tuple[int, ...], shifts: tuple[int, ...], pe_rows: int) -> bytes:
+    """Per-output-channel `(multiplier, shift)` -> the `[OT][pe_rows]` scale
+    table image of `cnn_accel_model.pack_scale_table_for_hw` (see module
+    doc). `shifts` are descriptor shifts (already minus `implicit_shift`),
+    each in `0..255`; multipliers are signed int32."""
+    if len(multipliers) != len(shifts):
+        raise ValueError(f"scale table multiplier count {len(multipliers)} != shift count {len(shifts)}")
+    oc = len(multipliers)
+    n_padded = _ceil_div(oc, pe_rows) * pe_rows
+    out = bytearray()
+    for i in range(n_padded):
+        m, s = (int(multipliers[i]), int(shifts[i])) if i < oc else (0, 0)
+        if not -(2**31) <= m <= 2**31 - 1:
+            raise ValueError(f"scale table entry {i} multiplier {m} outside int32")
+        if not 0 <= s <= 0xFF:
+            raise ValueError(f"scale table entry {i} shift {s} outside uint8")
+        out += struct.pack("<iB", m, s)
+        out += bytes(_SCALE_TABLE_ENTRY_PAD)
+    return bytes(out)
