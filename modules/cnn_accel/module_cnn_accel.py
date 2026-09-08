@@ -1762,6 +1762,52 @@ class Module(BaseModule):
         self._setup_cnn_accel_pe_array(library)
         self._setup_cnn_accel_pe_array_from_vectors(library)
         self._setup_cnn_accel_conv_core(library)
+        self._setup_cnn_accel_top(library)
+
+    def _setup_cnn_accel_top(self, library) -> None:
+        """The rev-2 top-level integration testbench (arch doc section 11).
+
+        `tb_cnn_accel_top` is the project's ONE top-level testbench and it
+        is completely generic: it loads a DDR image from CSV, starts the
+        DUT through the CSR, waits for DONE/ERROR, then exports the CSR
+        counters plus a byte region of the DDR model back to CSV. Every
+        decision about what to run, and all numerical verification, lives
+        in `accel_v2/cases.py` + `accel_v2/tbcase.py`, so one VUnit config
+        per case is the whole registration -- adding a test never touches
+        VHDL.
+
+        `pre_config` writes that case's `mem_image.csv` into VUnit's own
+        per-config `output_path`; `post_check` reads `result.csv` (the
+        bytes the DUT itself wrote over AXI) and `counters.csv` back out
+        of it. Nothing is checked into the repository.
+        """
+        # Imported here rather than at module scope: `accel_v2` is only
+        # needed to register these configs, and `module_cnn_accel.py` is
+        # also loaded by `build_fpga.py` (the synthesis env), where
+        # dragging in the whole model/planner/reference stack buys nothing.
+        from accel_v2 import cases  # noqa: PLC0415
+
+        tb = library.test_bench("tb_cnn_accel_top")
+
+        for case in cases.all_cases():
+            # VUnit's own `add_config` rather than tsfpga's
+            # `add_vunit_config` helper: the helper always appends every
+            # generic to the config name, and these configs carry ten of
+            # them, which would bury the one identifier that matters (the
+            # case name) in a 200-character test name. The case name is
+            # already the reproducible handle -- `cases.py` maps it to its
+            # seed and geometry -- so the generics add nothing here.
+            #
+            # `case.pre_config`/`case.post_check` are bound methods of that
+            # one case object, so each config carries its own state; a
+            # closure over the loop variable would instead run every hook
+            # against the last case built.
+            tb.add_config(
+                name=case.name,
+                generics=case.generics(),
+                pre_config=case.pre_config,
+                post_check=case.post_check,
+            )
 
     def _setup_cnn_accel_bias_requant(self, library) -> None:
         tb = library.test_bench("tb_cnn_accel_bias_requant")
