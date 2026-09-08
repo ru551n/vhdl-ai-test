@@ -33,3 +33,4 @@ regs_sim/
 # checked in; this only guards manual `python generate_vectors.py` runs that
 # happen to target the module tree.
 modules/cnn_accel/test/vectors*/
+vunit_out*/

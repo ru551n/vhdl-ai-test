@@ -80,10 +80,14 @@ ERR_TIMEOUT = 0x9
 # [1:0]=space_src0 [3:2]=space_src1 [5:4]=space_dst [7:6]=space_wgt.
 # ---------------------------------------------------------------------------
 
-# W0 byte 3 is the one remaining W0 reserved byte (must be 0); it has no
-# entry in `isa_field_offsets()` precisely because it is a reserved gap,
-# so it is the only offset here that is stated rather than derived.
-_OFF_RESERVED_W0 = 3
+# The two `reserved, must be 0` gaps. Neither has an entry in
+# `isa_field_offsets()` -- that function returns only named fields -- so
+# these are derived from `isa_reserved_ranges()` instead of being stated,
+# which keeps them correct if the layout table changes.
+_RESERVED_RANGES = _const.isa_reserved_ranges()
+_OFF_RESERVED_W0 = _RESERVED_RANGES[0][0]
+_OFF_RESERVED_W10 = _RESERVED_RANGES[1][0]
+_LEN_RESERVED_W10 = _RESERVED_RANGES[1][1] - _RESERVED_RANGES[1][0] + 1
 
 # Derived, never hand-typed: walking `cnn_accel_constants.ISA_LAYOUT` is
 # what guarantees this encoder and the RTL's generated `cnn_accel_isa_pkg`
@@ -153,6 +157,14 @@ class DescV2:
     clamp_max: int = 0
     scale_addr: int = 0
     xfer_bytes: int = 0
+    # The `reserved, must be 0` gaps (W0 byte 3, W10 bytes 41-43). A
+    # well-formed program always leaves these zero, and they are exposed
+    # here for exactly one purpose: letting the error-case tests emit a
+    # deliberately malformed program to prove the hardware raises
+    # ERR_BAD_RESERVED instead of executing it. Do not use them to smuggle
+    # data -- `cnn_accel_cmd_proc` rejects any descriptor with either set.
+    reserved_w0: int = 0
+    reserved_w10: int = 0
 
     @property
     def relu_en(self) -> bool:
@@ -201,7 +213,7 @@ def encode_desc(d: DescV2) -> bytes:
         | ((d.space_dst & _SPACE_MASK) << _SPACE_DST_SHIFT)
         | ((d.space_wgt & _SPACE_MASK) << _SPACE_WGT_SHIFT)
     )
-    buf[_OFF_RESERVED_W0] = 0
+    buf[_OFF_RESERVED_W0] = d.reserved_w0 & 0xFF
     struct.pack_into("<I", buf, _OFF_IN_ADDR, d.in_addr & 0xFFFFFFFF)
     struct.pack_into("<I", buf, _OFF_OUT_ADDR, d.out_addr & 0xFFFFFFFF)
     struct.pack_into("<I", buf, _OFF_WEIGHT_ADDR, d.weight_addr & 0xFFFFFFFF)
@@ -220,6 +232,9 @@ def encode_desc(d: DescV2) -> bytes:
     buf[_OFF_PAD_RIGHT] = d.pad_right & 0xFF
     struct.pack_into("<i", buf, _OFF_REQUANT_SCALE, d.requant_scale)
     buf[_OFF_REQUANT_SHIFT] = d.requant_shift & 0xFF
+    buf[_OFF_RESERVED_W10 : _OFF_RESERVED_W10 + _LEN_RESERVED_W10] = (
+        d.reserved_w10 & ((1 << (8 * _LEN_RESERVED_W10)) - 1)
+    ).to_bytes(_LEN_RESERVED_W10, "little")
     buf[_OFF_POOL_KERNEL_H] = d.pool_kernel_h & 0xFF
     buf[_OFF_POOL_KERNEL_W] = d.pool_kernel_w & 0xFF
     buf[_OFF_POOL_STRIDE_H] = d.pool_stride_h & 0xFF
@@ -264,6 +279,11 @@ def decode_desc(data: bytes) -> DescV2:
         pad_right=data[_OFF_PAD_RIGHT],
         requant_scale=struct.unpack_from("<i", data, _OFF_REQUANT_SCALE)[0],
         requant_shift=data[_OFF_REQUANT_SHIFT],
+        reserved_w0=data[_OFF_RESERVED_W0],
+        reserved_w10=int.from_bytes(
+            data[_OFF_RESERVED_W10 : _OFF_RESERVED_W10 + _LEN_RESERVED_W10],
+            "little",
+        ),
         pool_kernel_h=data[_OFF_POOL_KERNEL_H],
         pool_kernel_w=data[_OFF_POOL_KERNEL_W],
         pool_stride_h=data[_OFF_POOL_STRIDE_H],

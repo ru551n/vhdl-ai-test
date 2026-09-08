@@ -1,0 +1,1145 @@
+library ieee;
+use ieee.std_logic_1164.all;
+use ieee.numeric_std.all;
+
+library cnn_accel;
+use cnn_accel.cnn_accel_pkg.all;
+use cnn_accel.cnn_accel_v2_pkg.all;
+use cnn_accel.cnn_accel_regs_pkg.all;
+
+library axi;
+use axi.axi_pkg.all;
+
+library axi_lite;
+use axi_lite.axi_lite_pkg.all;
+
+library axi_stream;
+use axi_stream.axi_stream_pkg.all;
+
+-- Structural integration of the rev-2 programmable tensor accelerator, per
+-- modules/cnn_accel/doc/cnn_accel_top_v2_arch.md section 2. This entity owns
+-- no command, opcode or neural-network semantics of its own: everything that
+-- decides *what* to do lives in 'cnn_accel_cmd_proc', everything that decides
+-- *how* a tensor is computed lives in the engines. What is left here is
+-- wiring, the two clock-domain-free adapters that the reused blocks need
+-- (section "Pool engine" below), and the generic algebra that turns the
+-- array/scratchpad geometry into the per-block generics.
+--
+-- Externally the accelerator is a single AXI4 master towards DDR plus a
+-- single AXI4-Lite slave for the host:
+--
+--   host  --AXI4-Lite-->  cnn_accel_csr  --start/desc-->  cnn_accel_cmd_proc
+--   cmd_proc  --engines/scratchpad-->  conv_core | pool | elementwise
+--   cmd_proc  --DMA requests-->  3x axi_read_dma + 1x ofmap_dma
+--   those 4 DMA masters  --cnn_accel_axi_mux-->  m_axi (DDR)
+--
+-- Reset: 'reset' is the cold, host-visible reset. 'reset_internal' additionally
+-- folds in the CSR's 'soft_reset_pulse' and is what every datapath block sees,
+-- so a soft reset aborts an in-flight command everywhere at once while leaving
+-- the CSR (and therefore the error/status a host is about to read) intact. This
+-- is the 'reset_internal' referred to by the reused blocks' port comments.
+entity cnn_accel_top is
+  generic (
+    ----------------------------------------------------------------------
+    -- Systolic-array geometry. 'g_pe_rows' output channels are produced in
+    -- parallel (one output plane per OT pass, spec section 5.4) and
+    -- 'g_pe_cols' input channels are consumed in parallel.
+    ----------------------------------------------------------------------
+    g_pe_rows : positive := cnn_accel_constant_pe_rows;
+    g_pe_cols : positive := cnn_accel_constant_pe_cols;
+    -- Input channels per activation-plane word. 'cnn_accel_conv_core' wants
+    -- this equal to 'g_pe_cols', 'cnn_accel_cmd_proc' wants it equal to the
+    -- generated activation-plane channel count; both are asserted below.
+    g_tile_channels : positive := cnn_accel_constant_tile_channels;
+    ----------------------------------------------------------------------
+    -- Local tensor scratchpad geometry. 'g_tensor_bytes' -- the value the
+    -- ISA's LOCAL_TENSOR range check and the CSR's capability register are
+    -- expressed in -- is *derived* from these two, so the scratchpad and
+    -- the address-space bound can never disagree.
+    ----------------------------------------------------------------------
+    g_num_banks : positive := 2;
+    g_bank_words : positive := 1024;
+    ----------------------------------------------------------------------
+    -- Datapath bounds.
+    ----------------------------------------------------------------------
+    g_max_kernel_size : positive := cnn_accel_constant_max_kernel_size;
+    g_max_row_tile_words : positive := cnn_accel_constant_max_row_tile_words;
+    g_accum_width : positive := cnn_accel_constant_accum_width;
+    g_weight_buffer_depth : positive := cnn_accel_constant_weight_buffer_depth;
+    g_bias_buffer_depth : positive := cnn_accel_constant_bias_buffer_depth;
+    g_max_requant_shift : natural := 31;
+    ----------------------------------------------------------------------
+    -- External AXI4 geometry.
+    ----------------------------------------------------------------------
+    g_axi_addr_width : positive := 32;
+    g_axi_data_width : positive := cnn_accel_constant_max_axi_data_width;
+    -- Only used to size the DMA masters' internal ID plumbing. The read
+    -- masters are serialized by 'cnn_accel_axi_mux' rather than distinguished
+    -- by ID, so this value is a don't-care for correctness.
+    g_axi_id_width : natural := 4;
+    ----------------------------------------------------------------------
+    -- Validation / liveness bounds, forwarded to 'cnn_accel_cmd_proc'.
+    ----------------------------------------------------------------------
+    g_ddr_limit : positive := 16#0020_0000#;
+    g_watchdog_cycles : positive := 1_000_000
+  );
+  port (
+    clk : in std_ulogic;
+    -- Cold, synchronous active-high reset. See the reset note above.
+    reset : in std_ulogic := '0';
+    --# {{}}
+    -- Host control/status: the generated register file, section 6.
+    s_axi_lite_m2s : in axi_lite_m2s_t;
+    s_axi_lite_s2m : out axi_lite_s2m_t := axi_lite_s2m_init;
+    --# {{}}
+    -- The accelerator's one and only DDR port: instruction fetch, tensor
+    -- load, weight fill and store/spill, arbitrated by 'cnn_accel_axi_mux'.
+    m_axi_m2s : out axi_m2s_t := axi_m2s_init;
+    m_axi_s2m : in axi_s2m_t;
+    --# {{}}
+    -- Level interrupt, asserted while the CSR holds an unacknowledged
+    -- done/error.
+    irq : out std_ulogic := '0'
+  );
+end entity cnn_accel_top;
+
+architecture a of cnn_accel_top is
+
+  ------------------------------------------------------------------------
+  -- Derived geometry.
+  ------------------------------------------------------------------------
+
+  constant c_word_bytes : positive := g_axi_data_width / 8;
+
+  -- The LOCAL_TENSOR address space is exactly the scratchpad, so the bound
+  -- used by validation (ERR_LOCAL_RANGE) and reported to the host is derived
+  -- rather than declared -- spec section 3.
+  constant c_tensor_bytes : positive := g_num_banks * g_bank_words * c_word_bytes;
+
+  -- Maximum number of pooling taps in one window. Fixed by 'g_max_kernel_size'
+  -- alone: a pooling window is spatial only, the channel dimension is handled
+  -- by the parallel lanes below.
+  constant c_max_taps : positive := g_max_kernel_size * g_max_kernel_size;
+
+  -- Read masters on the DDR port, in 'cnn_accel_axi_mux' input order.
+  constant c_rd_instr : natural := 0;
+  constant c_rd_load : natural := 1;
+  constant c_rd_wgt : natural := 2;
+  constant c_num_read_inputs : positive := 3;
+
+  ------------------------------------------------------------------------
+  -- Reset distribution.
+  ------------------------------------------------------------------------
+
+  signal reset_internal : std_ulogic := '0';
+  signal soft_reset_pulse : std_ulogic := '0';
+
+  ------------------------------------------------------------------------
+  -- CSR <-> cmd_proc.
+  ------------------------------------------------------------------------
+
+  signal program_base_addr : std_ulogic_vector(g_axi_addr_width - 1 downto 0);
+  signal start : std_ulogic := '0';
+  signal seq_done : std_ulogic := '0';
+  signal seq_error : std_ulogic := '0';
+  signal err_code : std_ulogic_vector(3 downto 0) := (others => '0');
+  signal err_pc : std_ulogic_vector(31 downto 0) := (others => '0');
+  signal counters : csr_counters_t := csr_counters_init;
+
+  ------------------------------------------------------------------------
+  -- External AXI fan-in.
+  ------------------------------------------------------------------------
+
+  signal read_m2s_vec : axi_read_m2s_vec_t(0 to c_num_read_inputs - 1) :=
+    (others => axi_read_m2s_init);
+  signal read_s2m_vec : axi_read_s2m_vec_t(0 to c_num_read_inputs - 1);
+  signal write_m2s_vec : axi_write_m2s_vec_t(0 to 0) := (others => axi_write_m2s_init);
+  signal write_s2m_vec : axi_write_s2m_vec_t(0 to 0);
+
+  signal axi_rd_bytes : unsigned(7 downto 0) := (others => '0');
+  signal axi_wr_bytes : unsigned(7 downto 0) := (others => '0');
+
+  -- Per-DMA halves of the vectors above. Kept as named signals (rather than
+  -- port-mapping straight onto '<vec>(i).ar' etc.) so that every driver of a
+  -- vector element is one concurrent aggregate assignment, which is what makes
+  -- the fan-in readable in a netlist viewer.
+  signal instr_ar_m2s, load_ar_m2s, wgt_ar_m2s : axi_m2s_a_t := axi_m2s_a_init;
+  signal instr_ar_s2m, load_ar_s2m, wgt_ar_s2m : axi_s2m_a_t;
+  signal instr_r_m2s, load_r_m2s, wgt_r_m2s : axi_m2s_r_t := axi_m2s_r_init;
+  signal instr_r_s2m, load_r_s2m, wgt_r_s2m : axi_s2m_r_t;
+
+  signal store_aw_m2s : axi_m2s_a_t := axi_m2s_a_init;
+  signal store_aw_s2m : axi_s2m_a_t;
+  signal store_w_m2s : axi_m2s_w_t := axi_m2s_w_init;
+  signal store_w_s2m : axi_s2m_w_t;
+  signal store_b_m2s : axi_m2s_b_t := axi_m2s_b_init;
+  signal store_b_s2m : axi_s2m_b_t;
+
+  ------------------------------------------------------------------------
+  -- Instruction fetch.
+  ------------------------------------------------------------------------
+
+  signal fetch_start : std_ulogic := '0';
+  signal fetch_addr : unsigned(31 downto 0) := (others => '0');
+  signal fetch_desc : desc_v2_t := desc_v2_init;
+  signal fetch_pc : unsigned(31 downto 0) := (others => '0');
+  signal fetch_desc_valid : std_ulogic := '0';
+  signal fetch_desc_ready : std_ulogic := '0';
+  signal fetch_error : std_ulogic := '0';
+  signal fetch_error_code : err_code_t := c_err_none;
+
+  signal instr_req_m2s : dma_req_m2s_t;
+  signal instr_req_s2m : dma_req_s2m_t;
+  signal instr_dma_done : std_ulogic := '0';
+  signal instr_resp_error : std_ulogic := '0';
+  signal instr_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal instr_stream_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+
+  ------------------------------------------------------------------------
+  -- DDR-side operand DMAs.
+  ------------------------------------------------------------------------
+
+  signal load_req_m2s : dma_req_m2s_t;
+  signal load_req_s2m : dma_req_s2m_t;
+  signal load_dma_done : std_ulogic := '0';
+  signal load_resp_error : std_ulogic := '0';
+  signal load_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal load_stream_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+
+  signal wgt_req_m2s : dma_req_m2s_t;
+  signal wgt_req_s2m : dma_req_s2m_t;
+  signal wgt_dma_done : std_ulogic := '0';
+  signal wgt_resp_error : std_ulogic := '0';
+  signal wgt_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal wgt_stream_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+
+  signal store_req_m2s : dma_req_m2s_t;
+  signal store_req_s2m : dma_req_s2m_t;
+  signal store_dma_done : std_ulogic := '0';
+  signal store_resp_error : std_ulogic := '0';
+  signal store_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal store_stream_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+
+  ------------------------------------------------------------------------
+  -- Local tensor scratchpad ports.
+  ------------------------------------------------------------------------
+
+  signal tm_w0_req_m2s, tm_w1_req_m2s : dma_req_m2s_t;
+  signal tm_w0_req_s2m, tm_w1_req_s2m : dma_req_s2m_t;
+  signal tm_w0_m2s, tm_w1_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal tm_w0_s2m, tm_w1_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+  signal tm_w0_done, tm_w1_done : std_ulogic := '0';
+
+  signal tm_r0_req_m2s, tm_r1_req_m2s : dma_req_m2s_t;
+  signal tm_r0_req_s2m, tm_r1_req_s2m : dma_req_s2m_t;
+  signal tm_r0_m2s, tm_r1_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal tm_r0_s2m, tm_r1_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+  signal tm_r0_done, tm_r1_done : std_ulogic := '0';
+
+  ------------------------------------------------------------------------
+  -- Convolution engine.
+  ------------------------------------------------------------------------
+
+  signal conv_cfg_kernel_h, conv_cfg_kernel_w : std_ulogic_vector(7 downto 0);
+  signal conv_cfg_stride_h, conv_cfg_stride_w : std_ulogic_vector(7 downto 0);
+  signal conv_cfg_pad_top, conv_cfg_pad_bottom : std_ulogic_vector(7 downto 0);
+  signal conv_cfg_pad_left, conv_cfg_pad_right : std_ulogic_vector(7 downto 0);
+  signal conv_cfg_in_width, conv_cfg_in_height : std_ulogic_vector(15 downto 0);
+  signal conv_cfg_in_channels : std_ulogic_vector(15 downto 0);
+  signal conv_cfg_bias_en, conv_cfg_requant_en, conv_cfg_relu_en : std_ulogic;
+  signal conv_cfg_requant_scale : std_ulogic_vector(31 downto 0);
+  signal conv_cfg_requant_shift : std_ulogic_vector(7 downto 0);
+  signal conv_cfg_output_offset : std_ulogic_vector(15 downto 0);
+  signal conv_cfg_clamp_en : std_ulogic;
+  signal conv_cfg_clamp_min, conv_cfg_clamp_max : std_ulogic_vector(7 downto 0);
+  signal conv_cfg_per_channel_en : std_ulogic;
+
+  signal conv_start : std_ulogic := '0';
+  signal conv_done : std_ulogic := '0';
+  signal conv_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal conv_stream_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+  signal conv_fill_start, conv_fill_is_bias, conv_fill_is_scale : std_ulogic := '0';
+  signal conv_weight_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal conv_weight_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+  signal conv_out_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal conv_out_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+
+  ------------------------------------------------------------------------
+  -- Pool engine (see the "Pool engine" section in the body).
+  ------------------------------------------------------------------------
+
+  signal pool_cfg_kernel_h, pool_cfg_kernel_w : std_ulogic_vector(7 downto 0);
+  signal pool_cfg_stride_h, pool_cfg_stride_w : std_ulogic_vector(7 downto 0);
+  signal pool_cfg_in_width, pool_cfg_in_height : std_ulogic_vector(15 downto 0);
+  signal pool_cfg_opcode : std_ulogic_vector(7 downto 0);
+  signal pool_cfg_requant_scale : std_ulogic_vector(31 downto 0);
+  signal pool_cfg_requant_shift : std_ulogic_vector(7 downto 0);
+
+  signal pool_start : std_ulogic := '0';
+  signal pool_done : std_ulogic := '0';
+  signal pool_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal pool_stream_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+  signal pool_out_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal pool_out_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+
+  signal pool_window_m2s :
+    window_m2s_t(data(0 to window_data_length(g_max_kernel_size, g_tile_channels) - 1));
+  signal pool_window_s2m : window_s2m_t;
+
+  -- One flat, pool-shaped ('data(8*i+7 downto 8*i)' = tap i) window per
+  -- channel lane, sliced out of the single 'window_gen' beat.
+  signal pool_lane_window_m2s : axi_stream_m2s_vec_t(0 to g_tile_channels - 1) :=
+    (others => axi_stream_m2s_init);
+  signal pool_lane_window_s2m : axi_stream_s2m_vec_t(0 to g_tile_channels - 1);
+  signal pool_lane_max_m2s : axi_stream_m2s_vec_t(0 to g_tile_channels - 1);
+  signal pool_lane_avgsum_m2s : axi_stream_m2s_vec_t(0 to g_tile_channels - 1);
+  signal pool_max_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+  signal pool_avgsum_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+
+  signal pool_max_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal pool_avg_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal pool_avg_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+  signal pool_is_avg : std_ulogic := '0';
+
+  signal pool_accum_m2s :
+    accum_m2s_t(data(0 to g_tile_channels - 1)(g_accum_width - 1 downto 0));
+  signal pool_accum_s2m : accum_s2m_t;
+
+  ------------------------------------------------------------------------
+  -- Elementwise engine.
+  ------------------------------------------------------------------------
+
+  signal ew_start : std_ulogic := '0';
+  signal ew_opcode : std_ulogic_vector(7 downto 0);
+  signal ew_src0_addr, ew_src1_addr, ew_dst_addr, ew_lut_addr : unsigned(31 downto 0);
+  signal ew_xfer_bytes : unsigned(31 downto 0);
+  signal ew_in_width, ew_in_height, ew_in_channels : unsigned(15 downto 0);
+  signal ew_requant_scale : signed(31 downto 0);
+  signal ew_requant_shift : unsigned(7 downto 0);
+  signal ew_done : std_ulogic := '0';
+  signal ew_error : std_ulogic := '0';
+  signal ew_error_code : err_code_t := c_err_none;
+
+  signal ew_src0_req_m2s, ew_src1_req_m2s : dma_req_m2s_t;
+  signal ew_src0_req_s2m, ew_src1_req_s2m : dma_req_s2m_t;
+  signal ew_dst_req_m2s, ew_lut_req_m2s : dma_req_m2s_t;
+  signal ew_dst_req_s2m, ew_lut_req_s2m : dma_req_s2m_t;
+  signal ew_src0_stream_m2s, ew_src1_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal ew_src0_stream_s2m, ew_src1_stream_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+  signal ew_dst_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal ew_dst_stream_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+  signal ew_lut_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal ew_lut_stream_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+
+begin
+
+  ------------------------------------------------------------------------
+  -- Geometry contracts. These are the places where a top-level generic
+  -- override could silently produce a design that computes the wrong thing
+  -- rather than one that fails to build, so each is checked here even though
+  -- some of the sub-blocks repeat the check.
+  ------------------------------------------------------------------------
+
+  assert g_tile_channels = cnn_accel_constant_activation_plane_channels
+    report "cnn_accel_top: g_tile_channels (" & positive'image(g_tile_channels) &
+      ") must equal the generated activation-plane channel count (" &
+      integer'image(cnn_accel_constant_activation_plane_channels) &
+      "): one scratchpad/DDR activation word is exactly one input-channel tile"
+    severity failure;
+
+  assert g_pe_rows = cnn_accel_constant_activation_plane_channels
+    report "cnn_accel_top: g_pe_rows (" & positive'image(g_pe_rows) &
+      ") must equal the generated activation-plane channel count (" &
+      integer'image(cnn_accel_constant_activation_plane_channels) &
+      "): one OT pass writes exactly one output activation plane"
+    severity failure;
+
+  assert g_tile_channels * c_max_taps * 8 <= axi_stream_data_sz
+    report "cnn_accel_top: the pool lane window (" &
+      integer'image(c_max_taps * 8) & " bits) must fit axi_stream_data_sz"
+    severity failure;
+
+  assert g_axi_data_width = 8 * g_tile_channels
+    report "cnn_accel_top: g_axi_data_width (" & positive'image(g_axi_data_width) &
+      ") must be 8 * g_tile_channels -- one bus word is one activation tile"
+    severity failure;
+
+  ------------------------------------------------------------------------
+  -- Reset. 'soft_reset_pulse' is a single-cycle CSR write side effect; ORing
+  -- it into the datapath reset is exactly the "abort at any point" semantics
+  -- the spec asks for, and it costs nothing because every block already has a
+  -- synchronous reset input.
+  ------------------------------------------------------------------------
+
+  reset_internal <= reset or soft_reset_pulse;
+
+  ------------------------------------------------------------------------
+  -- Host control/status.
+  ------------------------------------------------------------------------
+
+  csr_inst : entity cnn_accel.cnn_accel_csr
+    generic map (
+      g_pe_rows => g_pe_rows,
+      g_pe_cols => g_pe_cols,
+      g_tile_channels => g_tile_channels,
+      g_max_kernel_size => g_max_kernel_size,
+      g_tensor_bytes => c_tensor_bytes,
+      g_axi_addr_width => g_axi_addr_width
+    )
+    port map (
+      clk => clk,
+      -- Deliberately the cold reset: a soft reset must abort the datapath
+      -- without destroying the status the host is about to read back.
+      reset => reset,
+
+      s_axi_lite_m2s => s_axi_lite_m2s,
+      s_axi_lite_s2m => s_axi_lite_s2m,
+
+      program_base_addr => program_base_addr,
+      start => start,
+      soft_reset_pulse => soft_reset_pulse,
+
+      seq_done => seq_done,
+      seq_error => seq_error,
+      err_code => err_code,
+      err_pc => err_pc,
+
+      counters => counters,
+
+      irq => irq
+    );
+
+  ------------------------------------------------------------------------
+  -- Command processor: the only block with an opinion about the ISA.
+  ------------------------------------------------------------------------
+
+  cmd_proc_inst : entity cnn_accel.cnn_accel_cmd_proc
+    generic map (
+      g_pe_rows => g_pe_rows,
+      g_pe_cols => g_pe_cols,
+      g_tile_channels => g_tile_channels,
+      g_max_kernel_size => g_max_kernel_size,
+      g_max_row_tile_words => g_max_row_tile_words,
+      g_tensor_bytes => c_tensor_bytes,
+      g_ddr_limit => g_ddr_limit,
+      g_watchdog_cycles => g_watchdog_cycles
+    )
+    port map (
+      clk => clk,
+      reset => reset,
+
+      start => start,
+      program_base_addr => program_base_addr,
+      soft_reset_pulse => soft_reset_pulse,
+      seq_done => seq_done,
+      seq_error => seq_error,
+      err_code => err_code,
+      err_pc => err_pc,
+      counters => counters,
+
+      axi_rd_bytes => axi_rd_bytes,
+      axi_wr_bytes => axi_wr_bytes,
+
+      fetch_start => fetch_start,
+      fetch_addr => fetch_addr,
+      fetch_desc => fetch_desc,
+      fetch_pc => fetch_pc,
+      fetch_desc_valid => fetch_desc_valid,
+      fetch_desc_ready => fetch_desc_ready,
+      fetch_error => fetch_error,
+      fetch_error_code => fetch_error_code,
+
+      load_req_m2s => load_req_m2s,
+      load_req_s2m => load_req_s2m,
+      load_dma_done => load_dma_done,
+      load_resp_error => load_resp_error,
+      s_load_stream_m2s => load_stream_m2s,
+      s_load_stream_s2m => load_stream_s2m,
+
+      wgt_req_m2s => wgt_req_m2s,
+      wgt_req_s2m => wgt_req_s2m,
+      wgt_dma_done => wgt_dma_done,
+      wgt_resp_error => wgt_resp_error,
+      s_wgt_stream_m2s => wgt_stream_m2s,
+      s_wgt_stream_s2m => wgt_stream_s2m,
+
+      store_req_m2s => store_req_m2s,
+      store_req_s2m => store_req_s2m,
+      store_dma_done => store_dma_done,
+      store_resp_error => store_resp_error,
+      m_store_stream_m2s => store_stream_m2s,
+      m_store_stream_s2m => store_stream_s2m,
+
+      tm_w0_req_m2s => tm_w0_req_m2s,
+      tm_w0_req_s2m => tm_w0_req_s2m,
+      m_tm_w0_m2s => tm_w0_m2s,
+      m_tm_w0_s2m => tm_w0_s2m,
+      tm_w0_done => tm_w0_done,
+
+      tm_w1_req_m2s => tm_w1_req_m2s,
+      tm_w1_req_s2m => tm_w1_req_s2m,
+      m_tm_w1_m2s => tm_w1_m2s,
+      m_tm_w1_s2m => tm_w1_s2m,
+      tm_w1_done => tm_w1_done,
+
+      tm_r0_req_m2s => tm_r0_req_m2s,
+      tm_r0_req_s2m => tm_r0_req_s2m,
+      s_tm_r0_m2s => tm_r0_m2s,
+      s_tm_r0_s2m => tm_r0_s2m,
+      tm_r0_done => tm_r0_done,
+
+      tm_r1_req_m2s => tm_r1_req_m2s,
+      tm_r1_req_s2m => tm_r1_req_s2m,
+      s_tm_r1_m2s => tm_r1_m2s,
+      s_tm_r1_s2m => tm_r1_s2m,
+      tm_r1_done => tm_r1_done,
+
+      conv_cfg_kernel_h => conv_cfg_kernel_h,
+      conv_cfg_kernel_w => conv_cfg_kernel_w,
+      conv_cfg_stride_h => conv_cfg_stride_h,
+      conv_cfg_stride_w => conv_cfg_stride_w,
+      conv_cfg_pad_top => conv_cfg_pad_top,
+      conv_cfg_pad_bottom => conv_cfg_pad_bottom,
+      conv_cfg_pad_left => conv_cfg_pad_left,
+      conv_cfg_pad_right => conv_cfg_pad_right,
+      conv_cfg_in_width => conv_cfg_in_width,
+      conv_cfg_in_height => conv_cfg_in_height,
+      conv_cfg_in_channels => conv_cfg_in_channels,
+      conv_cfg_bias_en => conv_cfg_bias_en,
+      conv_cfg_requant_en => conv_cfg_requant_en,
+      conv_cfg_relu_en => conv_cfg_relu_en,
+      conv_cfg_requant_scale => conv_cfg_requant_scale,
+      conv_cfg_requant_shift => conv_cfg_requant_shift,
+      conv_cfg_output_offset => conv_cfg_output_offset,
+      conv_cfg_clamp_en => conv_cfg_clamp_en,
+      conv_cfg_clamp_min => conv_cfg_clamp_min,
+      conv_cfg_clamp_max => conv_cfg_clamp_max,
+      conv_cfg_per_channel_en => conv_cfg_per_channel_en,
+      conv_start => conv_start,
+      conv_done => conv_done,
+      m_conv_stream_m2s => conv_stream_m2s,
+      m_conv_stream_s2m => conv_stream_s2m,
+      conv_fill_start => conv_fill_start,
+      conv_fill_is_bias => conv_fill_is_bias,
+      conv_fill_is_scale => conv_fill_is_scale,
+      m_conv_weight_m2s => conv_weight_m2s,
+      m_conv_weight_s2m => conv_weight_s2m,
+      s_conv_out_m2s => conv_out_m2s,
+      s_conv_out_s2m => conv_out_s2m,
+
+      pool_cfg_kernel_h => pool_cfg_kernel_h,
+      pool_cfg_kernel_w => pool_cfg_kernel_w,
+      pool_cfg_stride_h => pool_cfg_stride_h,
+      pool_cfg_stride_w => pool_cfg_stride_w,
+      pool_cfg_in_width => pool_cfg_in_width,
+      pool_cfg_in_height => pool_cfg_in_height,
+      pool_cfg_opcode => pool_cfg_opcode,
+      pool_cfg_requant_scale => pool_cfg_requant_scale,
+      pool_cfg_requant_shift => pool_cfg_requant_shift,
+      pool_start => pool_start,
+      pool_done => pool_done,
+      m_pool_stream_m2s => pool_stream_m2s,
+      m_pool_stream_s2m => pool_stream_s2m,
+      s_pool_out_m2s => pool_out_m2s,
+      s_pool_out_s2m => pool_out_s2m,
+
+      ew_start => ew_start,
+      ew_opcode => ew_opcode,
+      ew_src0_addr => ew_src0_addr,
+      ew_src1_addr => ew_src1_addr,
+      ew_dst_addr => ew_dst_addr,
+      ew_lut_addr => ew_lut_addr,
+      ew_xfer_bytes => ew_xfer_bytes,
+      ew_in_width => ew_in_width,
+      ew_in_height => ew_in_height,
+      ew_in_channels => ew_in_channels,
+      ew_requant_scale => ew_requant_scale,
+      ew_requant_shift => ew_requant_shift,
+      ew_done => ew_done,
+      ew_error => ew_error,
+      ew_error_code => ew_error_code,
+
+      ew_src0_req_m2s => ew_src0_req_m2s,
+      ew_src0_req_s2m => ew_src0_req_s2m,
+      m_ew_src0_stream_m2s => ew_src0_stream_m2s,
+      m_ew_src0_stream_s2m => ew_src0_stream_s2m,
+      ew_src1_req_m2s => ew_src1_req_m2s,
+      ew_src1_req_s2m => ew_src1_req_s2m,
+      m_ew_src1_stream_m2s => ew_src1_stream_m2s,
+      m_ew_src1_stream_s2m => ew_src1_stream_s2m,
+      ew_dst_req_m2s => ew_dst_req_m2s,
+      ew_dst_req_s2m => ew_dst_req_s2m,
+      s_ew_dst_stream_m2s => ew_dst_stream_m2s,
+      s_ew_dst_stream_s2m => ew_dst_stream_s2m,
+      ew_lut_req_m2s => ew_lut_req_m2s,
+      ew_lut_req_s2m => ew_lut_req_s2m,
+      m_ew_lut_stream_m2s => ew_lut_stream_m2s,
+      m_ew_lut_stream_s2m => ew_lut_stream_s2m
+    );
+
+  ------------------------------------------------------------------------
+  -- Instruction fetch: 64-byte descriptor assembler on its own DDR read
+  -- master, so an instruction fetch never has to wait behind a tensor load.
+  -- 'g_timeout_cycles' is tied to the same watchdog bound as 'cmd_proc' so
+  -- that a DDR that never responds surfaces as ERR_TIMEOUT from whichever of
+  -- the two notices first.
+  ------------------------------------------------------------------------
+
+  cmd_fetch_inst : entity cnn_accel.cnn_accel_cmd_fetch
+    generic map (
+      g_axi_data_width => g_axi_data_width,
+      g_timeout_cycles => g_watchdog_cycles
+    )
+    port map (
+      clk => clk,
+      reset => reset_internal,
+
+      start => fetch_start,
+      addr => fetch_addr,
+
+      instr_req_m2s => instr_req_m2s,
+      instr_req_s2m => instr_req_s2m,
+
+      s_instr_stream_m2s => instr_stream_m2s,
+      s_instr_stream_s2m => instr_stream_s2m,
+
+      instr_dma_done => instr_dma_done,
+      instr_resp_error => instr_resp_error,
+
+      desc => fetch_desc,
+      pc => fetch_pc,
+      desc_valid => fetch_desc_valid,
+      desc_ready => fetch_desc_ready,
+
+      error => fetch_error,
+      error_code => fetch_error_code
+    );
+
+  ------------------------------------------------------------------------
+  -- DDR read masters. Three instances of the same block, differing only in
+  -- who owns the request port: instruction fetch, tensor/activation load, and
+  -- the weight/bias/scale/side operand.
+  ------------------------------------------------------------------------
+
+  instr_read_dma_inst : entity cnn_accel.cnn_accel_axi_read_dma
+    generic map (
+      g_axi_addr_width => g_axi_addr_width,
+      g_axi_data_width => g_axi_data_width,
+      g_axi_id_width => g_axi_id_width
+    )
+    port map (
+      clk => clk,
+      reset => reset_internal,
+
+      req_m2s => instr_req_m2s,
+      req_s2m => instr_req_s2m,
+      dma_done => instr_dma_done,
+      resp_error => instr_resp_error,
+
+      m_axi_ar_m2s => instr_ar_m2s,
+      m_axi_ar_s2m => instr_ar_s2m,
+      m_axi_r_m2s => instr_r_m2s,
+      m_axi_r_s2m => instr_r_s2m,
+
+      m_stream_m2s => instr_stream_m2s,
+      m_stream_s2m => instr_stream_s2m
+    );
+
+  load_read_dma_inst : entity cnn_accel.cnn_accel_axi_read_dma
+    generic map (
+      g_axi_addr_width => g_axi_addr_width,
+      g_axi_data_width => g_axi_data_width,
+      g_axi_id_width => g_axi_id_width
+    )
+    port map (
+      clk => clk,
+      reset => reset_internal,
+
+      req_m2s => load_req_m2s,
+      req_s2m => load_req_s2m,
+      dma_done => load_dma_done,
+      resp_error => load_resp_error,
+
+      m_axi_ar_m2s => load_ar_m2s,
+      m_axi_ar_s2m => load_ar_s2m,
+      m_axi_r_m2s => load_r_m2s,
+      m_axi_r_s2m => load_r_s2m,
+
+      m_stream_m2s => load_stream_m2s,
+      m_stream_s2m => load_stream_s2m
+    );
+
+  wgt_read_dma_inst : entity cnn_accel.cnn_accel_axi_read_dma
+    generic map (
+      g_axi_addr_width => g_axi_addr_width,
+      g_axi_data_width => g_axi_data_width,
+      g_axi_id_width => g_axi_id_width
+    )
+    port map (
+      clk => clk,
+      reset => reset_internal,
+
+      req_m2s => wgt_req_m2s,
+      req_s2m => wgt_req_s2m,
+      dma_done => wgt_dma_done,
+      resp_error => wgt_resp_error,
+
+      m_axi_ar_m2s => wgt_ar_m2s,
+      m_axi_ar_s2m => wgt_ar_s2m,
+      m_axi_r_m2s => wgt_r_m2s,
+      m_axi_r_s2m => wgt_r_s2m,
+
+      m_stream_m2s => wgt_stream_m2s,
+      m_stream_s2m => wgt_stream_s2m
+    );
+
+  ------------------------------------------------------------------------
+  -- The one DDR write master: STORE and spill.
+  ------------------------------------------------------------------------
+
+  ofmap_dma_inst : entity cnn_accel.cnn_accel_ofmap_dma
+    generic map (
+      g_axi_addr_width => g_axi_addr_width,
+      g_axi_data_width => g_axi_data_width
+    )
+    port map (
+      clk => clk,
+      reset => reset_internal,
+
+      req_m2s => store_req_m2s,
+      req_s2m => store_req_s2m,
+      dma_done => store_dma_done,
+      resp_error => store_resp_error,
+
+      s_stream_m2s => store_stream_m2s,
+      s_stream_s2m => store_stream_s2m,
+
+      m_axi_aw_m2s => store_aw_m2s,
+      m_axi_aw_s2m => store_aw_s2m,
+      m_axi_w_m2s => store_w_m2s,
+      m_axi_w_s2m => store_w_s2m,
+      m_axi_b_m2s => store_b_m2s,
+      m_axi_b_s2m => store_b_s2m
+    );
+
+  ------------------------------------------------------------------------
+  -- DDR port arbitration and traffic measurement. The byte increments feed
+  -- 'cmd_proc's DDR_RD_BYTES/DDR_WR_BYTES counters, which is why they are
+  -- taken here -- at the single point every DDR beat must pass through --
+  -- rather than estimated from descriptor lengths.
+  ------------------------------------------------------------------------
+
+  read_m2s_vec(c_rd_instr) <= (ar => instr_ar_m2s, r => instr_r_m2s);
+  read_m2s_vec(c_rd_load) <= (ar => load_ar_m2s, r => load_r_m2s);
+  read_m2s_vec(c_rd_wgt) <= (ar => wgt_ar_m2s, r => wgt_r_m2s);
+
+  instr_ar_s2m <= read_s2m_vec(c_rd_instr).ar;
+  instr_r_s2m <= read_s2m_vec(c_rd_instr).r;
+  load_ar_s2m <= read_s2m_vec(c_rd_load).ar;
+  load_r_s2m <= read_s2m_vec(c_rd_load).r;
+  wgt_ar_s2m <= read_s2m_vec(c_rd_wgt).ar;
+  wgt_r_s2m <= read_s2m_vec(c_rd_wgt).r;
+
+  write_m2s_vec(0) <= (aw => store_aw_m2s, w => store_w_m2s, b => store_b_m2s);
+
+  store_aw_s2m <= write_s2m_vec(0).aw;
+  store_w_s2m <= write_s2m_vec(0).w;
+  store_b_s2m <= write_s2m_vec(0).b;
+
+  axi_mux_inst : entity cnn_accel.cnn_accel_axi_mux
+    generic map (
+      g_axi_data_width => g_axi_data_width,
+      g_num_read_inputs => c_num_read_inputs,
+      g_num_write_inputs => 1
+    )
+    port map (
+      clk => clk,
+
+      input_read_m2s => read_m2s_vec,
+      input_read_s2m => read_s2m_vec,
+
+      input_write_m2s => write_m2s_vec,
+      input_write_s2m => write_s2m_vec,
+
+      m_axi_m2s => m_axi_m2s,
+      m_axi_s2m => m_axi_s2m,
+
+      rd_bytes => axi_rd_bytes,
+      wr_bytes => axi_wr_bytes
+    );
+
+  ------------------------------------------------------------------------
+  -- Local tensor scratchpad. Two write and two read channels, matching the
+  -- worst-case simultaneous demand of one command: an engine reading its
+  -- source and its side operand while writing its destination, plus the
+  -- separate pure-move write port.
+  ------------------------------------------------------------------------
+
+  tensor_mem_inst : entity cnn_accel.cnn_accel_tensor_mem
+    generic map (
+      g_num_banks => g_num_banks,
+      g_bank_words => g_bank_words,
+      g_data_width => g_axi_data_width
+    )
+    port map (
+      clk => clk,
+      reset => reset_internal,
+
+      w0_req_m2s => tm_w0_req_m2s,
+      w0_req_s2m => tm_w0_req_s2m,
+      s_w0_m2s => tm_w0_m2s,
+      s_w0_s2m => tm_w0_s2m,
+      w0_done => tm_w0_done,
+
+      w1_req_m2s => tm_w1_req_m2s,
+      w1_req_s2m => tm_w1_req_s2m,
+      s_w1_m2s => tm_w1_m2s,
+      s_w1_s2m => tm_w1_s2m,
+      w1_done => tm_w1_done,
+
+      r0_req_m2s => tm_r0_req_m2s,
+      r0_req_s2m => tm_r0_req_s2m,
+      m_r0_m2s => tm_r0_m2s,
+      m_r0_s2m => tm_r0_s2m,
+      r0_done => tm_r0_done,
+
+      r1_req_m2s => tm_r1_req_m2s,
+      r1_req_s2m => tm_r1_req_s2m,
+      m_r1_m2s => tm_r1_m2s,
+      m_r1_s2m => tm_r1_s2m,
+      r1_done => tm_r1_done
+    );
+
+  ------------------------------------------------------------------------
+  -- Convolution engine (CONV2D / FC). Self-contained: it brings its own
+  -- window_gen, pe_array, weight_buffer and the fused bias/requant/clamp
+  -- epilogue, so the fusion rule of spec section 5.3 is satisfied
+  -- structurally -- there is no wire here on which an int32 tensor could be
+  -- materialized.
+  ------------------------------------------------------------------------
+
+  conv_core_inst : entity cnn_accel.cnn_accel_conv_core
+    generic map (
+      g_pe_rows => g_pe_rows,
+      g_pe_cols => g_pe_cols,
+      g_accum_width => g_accum_width,
+      g_max_kernel_size => g_max_kernel_size,
+      g_tile_channels => g_tile_channels,
+      g_max_row_tile_words => g_max_row_tile_words,
+      g_weight_buffer_depth => g_weight_buffer_depth,
+      g_bias_buffer_depth => g_bias_buffer_depth,
+      g_max_requant_shift => g_max_requant_shift
+    )
+    port map (
+      clk => clk,
+      reset => reset_internal,
+
+      cfg_kernel_h => conv_cfg_kernel_h,
+      cfg_kernel_w => conv_cfg_kernel_w,
+      cfg_stride_h => conv_cfg_stride_h,
+      cfg_stride_w => conv_cfg_stride_w,
+      cfg_pad_top => conv_cfg_pad_top,
+      cfg_pad_bottom => conv_cfg_pad_bottom,
+      cfg_pad_left => conv_cfg_pad_left,
+      cfg_pad_right => conv_cfg_pad_right,
+      cfg_in_width => conv_cfg_in_width,
+      cfg_in_height => conv_cfg_in_height,
+      cfg_in_channels => conv_cfg_in_channels,
+
+      cfg_bias_en => conv_cfg_bias_en,
+      cfg_requant_en => conv_cfg_requant_en,
+      cfg_relu_en => conv_cfg_relu_en,
+      cfg_requant_scale => conv_cfg_requant_scale,
+      cfg_requant_shift => conv_cfg_requant_shift,
+      cfg_output_offset => conv_cfg_output_offset,
+      cfg_clamp_en => conv_cfg_clamp_en,
+      cfg_clamp_min => conv_cfg_clamp_min,
+      cfg_clamp_max => conv_cfg_clamp_max,
+      cfg_per_channel_en => conv_cfg_per_channel_en,
+
+      start => conv_start,
+      done => conv_done,
+
+      s_stream_m2s => conv_stream_m2s,
+      s_stream_s2m => conv_stream_s2m,
+
+      fill_start => conv_fill_start,
+      fill_is_bias => conv_fill_is_bias,
+      fill_is_scale => conv_fill_is_scale,
+      s_weight_m2s => conv_weight_m2s,
+      s_weight_s2m => conv_weight_s2m,
+
+      m_out_m2s => conv_out_m2s,
+      m_out_s2m => conv_out_s2m
+    );
+
+  ------------------------------------------------------------------------
+  -- Pool engine (POOL_MAX / POOL_AVG).
+  --
+  -- The architecture document names the pieces -- "window_gen + pool
+  -- (+ bias_requant)" -- but rev 1's 'cnn_accel_layer_ctrl', which was to own
+  -- the glue between them, was never built, so the assembly is defined here.
+  -- Two interface facts drive the shape:
+  --
+  --  * 'cnn_accel_pool' reduces ONE channel's window per beat: its
+  --    's_window_m2s.data' holds tap 'i' at bits '8i+7 downto 8i' and it emits
+  --    one int8 ('m_max') or one int32 ('m_avgsum').
+  --  * 'cnn_accel_window_gen' emits 'data(i * g_tile_channels + c)' = tap 'i'
+  --    of channel 'c' -- a whole activation tile per beat.
+  --
+  -- So one 'window_gen' feeds 'g_tile_channels' pool lanes in lockstep, each
+  -- lane getting a static stride-'g_tile_channels' slice of the window. The
+  -- lanes are identical combinational-plus-one-register reducers driven by the
+  -- same 'valid'/'ready', so they never diverge; the shared handshake is the
+  -- AND of the lanes' readys.
+  --
+  -- That width is not an arbitrary choice: it is what makes the two outputs
+  -- land on the interfaces the reused blocks already have. The MAX lanes pack
+  -- straight into one activation word, and the AVG lanes form exactly the
+  -- 'g_pe_rows'-lane 'accum_m2s_t' that 'cnn_accel_bias_requant' consumes, so
+  -- the pool-area divide is the same requantizer the conv epilogue uses, with
+  -- bias and per-channel scaling switched off.
+  --
+  -- Channel tiling is handled upstream: 'cmd_proc' runs pooling as one pass
+  -- per activation plane, so within a pass 'in_channels' is always exactly one
+  -- tile and the window_gen's tile count is 1. That is why 'cfg_in_channels'
+  -- is a constant here and why the output planes come out in
+  -- '[tile][y][x]' order without any output-side reordering.
+  ------------------------------------------------------------------------
+
+  pool_window_gen_inst : entity cnn_accel.cnn_accel_window_gen
+    generic map (
+      g_max_kernel_size => g_max_kernel_size,
+      g_max_row_tile_words => g_max_row_tile_words,
+      g_tile_channels => g_tile_channels
+    )
+    port map (
+      clk => clk,
+      reset => reset_internal,
+
+      cfg_kernel_h => pool_cfg_kernel_h,
+      cfg_kernel_w => pool_cfg_kernel_w,
+      cfg_stride_h => pool_cfg_stride_h,
+      cfg_stride_w => pool_cfg_stride_w,
+      -- Pooling has no padding in this ISA revision: the descriptor has no
+      -- pooling pad fields and the golden model rejects 'pad_en' on a pooling
+      -- instruction outright, so zero here is the specified behaviour and not
+      -- a simplification.
+      cfg_pad_top => (others => '0'),
+      cfg_pad_bottom => (others => '0'),
+      cfg_pad_left => (others => '0'),
+      cfg_pad_right => (others => '0'),
+      cfg_in_width => pool_cfg_in_width,
+      cfg_in_height => pool_cfg_in_height,
+      cfg_in_channels => std_ulogic_vector(to_unsigned(g_tile_channels, 16)),
+
+      start => pool_start,
+      -- The engine's completion is taken from the far end of the pipeline
+      -- (below), not from the feeder, so that the last window is known to have
+      -- been reduced and accepted.
+      done => open,
+
+      s_stream_m2s => pool_stream_m2s,
+      s_stream_s2m => pool_stream_s2m,
+
+      m_window_m2s => pool_window_m2s,
+      m_window_s2m => pool_window_s2m
+    );
+
+  -- Static de-interleave of one window beat into 'g_tile_channels' flat,
+  -- pool-shaped lane windows. Every index is an elaboration-time constant, so
+  -- this is pure wiring, not a multiplexer.
+  pool_lane_slice : process(all)
+  begin
+    for lane in 0 to g_tile_channels - 1 loop
+      pool_lane_window_m2s(lane) <= axi_stream_m2s_init;
+      pool_lane_window_m2s(lane).valid <= pool_window_m2s.valid;
+      pool_lane_window_m2s(lane).last <= pool_window_m2s.last;
+      pool_lane_window_m2s(lane).data <= (others => '0');
+      for tap in 0 to c_max_taps - 1 loop
+        pool_lane_window_m2s(lane).data(8 * tap + 7 downto 8 * tap) <=
+          pool_window_m2s.data(tap * g_tile_channels + lane);
+      end loop;
+    end loop;
+  end process;
+
+  -- The lanes are structurally identical and see identical inputs, so their
+  -- readys are identical too; ANDing them is a zero-cost statement of that
+  -- invariant rather than real arbitration.
+  pool_lane_ready : process(all)
+    variable v_ready : std_ulogic;
+  begin
+    v_ready := '1';
+    for lane in 0 to g_tile_channels - 1 loop
+      v_ready := v_ready and pool_lane_window_s2m(lane).ready;
+    end loop;
+    pool_window_s2m.ready <= v_ready;
+  end process;
+
+  pool_lane_gen : for lane in 0 to g_tile_channels - 1 generate
+
+    pool_inst : entity cnn_accel.cnn_accel_pool
+      generic map (
+        g_max_kernel_size => g_max_kernel_size,
+        g_accum_width => g_accum_width
+      )
+      port map (
+        clk => clk,
+        reset => reset_internal,
+
+        cfg_opcode => pool_cfg_opcode,
+        cfg_pool_kernel_h => pool_cfg_kernel_h,
+        cfg_pool_kernel_w => pool_cfg_kernel_w,
+
+        s_window_m2s => pool_lane_window_m2s(lane),
+        s_window_s2m => pool_lane_window_s2m(lane),
+
+        m_max_m2s => pool_lane_max_m2s(lane),
+        m_max_s2m => pool_max_s2m,
+
+        m_avgsum_m2s => pool_lane_avgsum_m2s(lane),
+        m_avgsum_s2m => pool_avgsum_s2m
+      );
+
+  end generate;
+
+  -- POOL_MAX: the lanes' int8 results are already the final output; pack one
+  -- activation word and bypass the requantizer entirely, per the pool
+  -- requirement document.
+  pool_max_pack : process(all)
+  begin
+    pool_max_m2s <= axi_stream_m2s_init;
+    pool_max_m2s.valid <= pool_lane_max_m2s(0).valid;
+    pool_max_m2s.last <= pool_lane_max_m2s(0).last;
+    pool_max_m2s.data <= (others => '0');
+    for lane in 0 to g_tile_channels - 1 loop
+      pool_max_m2s.data(8 * lane + 7 downto 8 * lane) <=
+        pool_lane_max_m2s(lane).data(7 downto 0);
+    end loop;
+  end process;
+
+  -- POOL_AVG: the lanes' int32 sums are one 'accum_m2s_t' beat, which is
+  -- literally the conv epilogue's input type.
+  pool_avgsum_pack : process(all)
+  begin
+    pool_accum_m2s.valid <= pool_lane_avgsum_m2s(0).valid;
+    pool_accum_m2s.last <= pool_lane_avgsum_m2s(0).last;
+    for lane in 0 to g_tile_channels - 1 loop
+      pool_accum_m2s.data(lane) <=
+        signed(pool_lane_avgsum_m2s(lane).data(g_accum_width - 1 downto 0));
+    end loop;
+  end process;
+
+  pool_avgsum_s2m.ready <= pool_accum_s2m.ready;
+
+  pool_requant_inst : entity cnn_accel.cnn_accel_bias_requant
+    generic map (
+      g_accum_width => g_accum_width,
+      g_pe_rows => g_tile_channels,
+      -- No bias table is read on this path, so the address port degenerates to
+      -- its minimum legal width.
+      g_bias_addr_width => 1,
+      g_max_requant_shift => g_max_requant_shift
+    )
+    port map (
+      clk => clk,
+      reset => reset_internal,
+
+      -- Division by the pool area is the whole job here: no bias, no ReLU, no
+      -- output offset, no clamp and no per-channel table -- 'cmd_proc' has
+      -- already turned the area into the scale/shift pair.
+      cfg_bias_en => '0',
+      cfg_requant_en => '1',
+      cfg_relu_en => '0',
+      cfg_requant_scale => pool_cfg_requant_scale,
+      cfg_requant_shift => pool_cfg_requant_shift,
+      cfg_output_offset => (others => '0'),
+      cfg_clamp_en => '0',
+      cfg_clamp_min => (others => '0'),
+      cfg_clamp_max => (others => '0'),
+      cfg_per_channel_en => '0',
+
+      bias_rd_addr => open,
+      bias_rd_data => (others => '0'),
+      scale_rd_data => (others => '0'),
+
+      s_accum_m2s => pool_accum_m2s,
+      s_accum_s2m => pool_accum_s2m,
+
+      m_out_m2s => pool_avg_m2s,
+      m_out_s2m => pool_avg_s2m
+    );
+
+  -- Final POOL_MAX / POOL_AVG output select. 'cnn_accel_pool' already makes
+  -- the two paths structurally mutually exclusive (one shared output register,
+  -- tagged), so this is a select, not an arbiter.
+  pool_is_avg <= '1' when pool_cfg_opcode = c_opcode_pool_avg else '0';
+
+  pool_out_m2s <= pool_avg_m2s when pool_is_avg = '1' else pool_max_m2s;
+  pool_avg_s2m.ready <= pool_out_s2m.ready and pool_is_avg;
+  pool_max_s2m.ready <= pool_out_s2m.ready and not pool_is_avg;
+
+  -- Same completion rule as 'cnn_accel_conv_core': the pass is over when the
+  -- engine's last beat has been accepted by its sink.
+  pool_done <= pool_out_m2s.valid and pool_out_m2s.last and pool_out_s2m.ready;
+
+  ------------------------------------------------------------------------
+  -- Elementwise engine (ADD / UPSAMPLE / COPY / ACT). Unlike the other two it
+  -- is its own address generator: it issues the DMA requests and 'cmd_proc'
+  -- only resolves their space tags onto real ports, which is why the request
+  -- records flow from this block towards 'cmd_proc'.
+  ------------------------------------------------------------------------
+
+  elementwise_inst : entity cnn_accel.cnn_accel_elementwise
+    generic map (
+      g_axi_data_width => g_axi_data_width,
+      -- 'g_max_requant_shift' and 'g_max_xfer_bytes' keep their block-level
+      -- defaults: the first is the elementwise datapath's own documented
+      -- bound (narrower than the conv epilogue's) and the second is an
+      -- internal counter bound, not an address-space bound -- the address
+      -- space is policed by 'cmd_proc's 'g_ddr_limit'/'g_tensor_bytes'.
+      g_max_xfer_bytes => g_ddr_limit
+    )
+    port map (
+      clk => clk,
+      reset => reset_internal,
+
+      start => ew_start,
+      opcode => ew_opcode,
+      src0_addr => ew_src0_addr,
+      src1_addr => ew_src1_addr,
+      dst_addr => ew_dst_addr,
+      lut_addr => ew_lut_addr,
+      xfer_bytes => ew_xfer_bytes,
+      in_width => ew_in_width,
+      in_height => ew_in_height,
+      in_channels => ew_in_channels,
+      requant_scale => ew_requant_scale,
+      requant_shift => ew_requant_shift,
+
+      done => ew_done,
+      error => ew_error,
+      error_code => ew_error_code,
+
+      src0_req_m2s => ew_src0_req_m2s,
+      src0_req_s2m => ew_src0_req_s2m,
+      s_src0_stream_m2s => ew_src0_stream_m2s,
+      s_src0_stream_s2m => ew_src0_stream_s2m,
+
+      src1_req_m2s => ew_src1_req_m2s,
+      src1_req_s2m => ew_src1_req_s2m,
+      s_src1_stream_m2s => ew_src1_stream_m2s,
+      s_src1_stream_s2m => ew_src1_stream_s2m,
+
+      dst_req_m2s => ew_dst_req_m2s,
+      dst_req_s2m => ew_dst_req_s2m,
+      m_dst_stream_m2s => ew_dst_stream_m2s,
+      m_dst_stream_s2m => ew_dst_stream_s2m,
+
+      lut_req_m2s => ew_lut_req_m2s,
+      lut_req_s2m => ew_lut_req_s2m,
+      s_lut_stream_m2s => ew_lut_stream_m2s,
+      s_lut_stream_s2m => ew_lut_stream_s2m
+    );
+
+end architecture a;

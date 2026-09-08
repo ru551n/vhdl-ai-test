@@ -111,7 +111,13 @@ package cnn_accel_v2_pkg is
   -- Decoded ISA v2.0 descriptor. Every field of 'cnn_accel_pkg.layer_desc_t'
   -- is reproduced verbatim (same name, same type) plus the v2.0 additions:
   -- the four operand space tags and 'xfer_bytes' (which doubles as
-  -- 'src1_addr' for ADD, same bits -- spec section 5.1, W15).
+  -- 'src1_addr' for ADD, same bits -- spec section 5.1, W15), plus the two
+  -- 'reserved, must be 0' gaps. The reserved gaps are carried as real
+  -- record fields for one reason: section 9 requires 'ERR_BAD_RESERVED',
+  -- and a validator that cannot see the bits it is supposed to police
+  -- would silently pass every malformed program. Keeping them here rather
+  -- than exposing a raw instruction word from 'cnn_accel_cmd_fetch' keeps
+  -- 'decode_desc_v2' the single place that knows the word layout.
   ------------------------------------------------------------------------
 
   type desc_v2_t is record
@@ -150,6 +156,9 @@ package cnn_accel_v2_pkg is
     space_dst       : space_t;
     space_wgt       : space_t;
     xfer_bytes      : unsigned(31 downto 0);
+    -- W0 byte 3 and W10 bytes 41-43: must be zero (section 5.1).
+    reserved_w0     : std_ulogic_vector(7 downto 0);
+    reserved_w10    : std_ulogic_vector(23 downto 0);
   end record;
 
   -- All-zero descriptor (opcode HALT, space DDR everywhere), useful as a
@@ -239,7 +248,9 @@ package body cnn_accel_v2_pkg is
       space_src1      => (others => '0'),
       space_dst       => (others => '0'),
       space_wgt       => (others => '0'),
-      xfer_bytes      => (others => '0')
+      xfer_bytes      => (others => '0'),
+      reserved_w0     => (others => '0'),
+      reserved_w10    => (others => '0')
     );
   begin
     return result;
@@ -307,6 +318,14 @@ package body cnn_accel_v2_pkg is
     result.scale_addr      := unsigned(field(c_off_scale_addr, 32));
 
     result.xfer_bytes      := unsigned(field(c_off_xfer_bytes, 32));
+
+    -- The two reserved gaps. Their positions are derived, not stated: W0
+    -- byte 3 is the byte after the 'spaces' tag byte, and the W10 gap is
+    -- the three bytes after 'requant_shift'. If a future ISA revision
+    -- turns either gap into a real field, the generator stops emitting it
+    -- as a gap and these two lines are what must be revisited.
+    result.reserved_w0     := field(c_off_spaces + 1, 8);
+    result.reserved_w10    := field(c_off_requant_shift + 1, 24);
 
     return result;
   end function;
