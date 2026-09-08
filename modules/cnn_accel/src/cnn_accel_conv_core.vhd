@@ -164,6 +164,12 @@ entity cnn_accel_conv_core is
     cfg_relu_en : in std_ulogic;
     cfg_requant_scale : in std_ulogic_vector(31 downto 0);
     cfg_requant_shift : in std_ulogic_vector(7 downto 0);
+    -- ISA v1.1 (H1) epilogue fields (instruction word W13 + FLAG_CLAMP_EN);
+    -- all-zero reproduces the v1.0 epilogue exactly.
+    cfg_output_offset : in std_ulogic_vector(15 downto 0) := (others => '0');
+    cfg_clamp_en : in std_ulogic := '0';
+    cfg_clamp_min : in std_ulogic_vector(7 downto 0) := (others => '0');
+    cfg_clamp_max : in std_ulogic_vector(7 downto 0) := (others => '0');
     --# {{}}
     -- Pulse: latches the 'cfg_*' ports above and resets cnn_accel_
     -- window_gen's row/column counters and line-buffer pointers for a new
@@ -354,7 +360,8 @@ begin
 
   ------------------------------------------------------------------------
   -- cnn_accel_bias_requant: per-pixel int32 accumulators -> bias/requant/
-  -- ReLU/saturate -> requantized int8 output stream.
+  -- offset/clamp (ReLU+saturate in v1.0 terms) -> requantized int8 output
+  -- stream.
   ------------------------------------------------------------------------
 
   bias_requant_inst : entity cnn_accel.cnn_accel_bias_requant
@@ -373,6 +380,10 @@ begin
       cfg_relu_en => cfg_relu_en,
       cfg_requant_scale => cfg_requant_scale,
       cfg_requant_shift => cfg_requant_shift,
+      cfg_output_offset => cfg_output_offset,
+      cfg_clamp_en => cfg_clamp_en,
+      cfg_clamp_min => cfg_clamp_min,
+      cfg_clamp_max => cfg_clamp_max,
 
       bias_rd_addr => bias_rd_addr,
       bias_rd_data => bias_rd_data,

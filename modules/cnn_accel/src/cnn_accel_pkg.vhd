@@ -53,6 +53,11 @@ package cnn_accel_pkg is
     pool_stride_h   : unsigned(7 downto 0);
     pool_stride_w   : unsigned(7 downto 0);
     next_instr_addr : unsigned(31 downto 0);
+    -- ISA v1.1 (H1), instruction word W13: epilogue output offset and the
+    -- FLAG_CLAMP_EN clamp bounds. All zero in a v1.0 program.
+    output_offset   : signed(15 downto 0);
+    clamp_min       : signed(7 downto 0);
+    clamp_max       : signed(7 downto 0);
   end record;
 
   -- Handshake wrapper records, per shared/InterfaceRecords.md.

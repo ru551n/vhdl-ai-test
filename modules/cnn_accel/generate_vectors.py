@@ -27,6 +27,7 @@ from typing import NamedTuple
 import cnn_accel_constants
 from cnn_accel_model import (
     FLAG_BIAS_EN,
+    FLAG_CLAMP_EN,
     FLAG_PAD_EN,
     FLAG_RELU_EN,
     FLAG_REQUANT_EN,
@@ -73,12 +74,15 @@ def hw_packing(vectors_dir: Path, *, pe_rows: int = cnn_accel_constants.PE_ROWS)
     )
 
 
-def _flags(*, relu_en: bool, bias_en: bool, requant_en: bool, pad_en: bool) -> int:
+def _flags(
+    *, relu_en: bool, bias_en: bool, requant_en: bool, pad_en: bool, clamp_en: bool = False
+) -> int:
     return (
         (int(relu_en) << FLAG_RELU_EN)
         | (int(bias_en) << FLAG_BIAS_EN)
         | (int(requant_en) << FLAG_REQUANT_EN)
         | (int(pad_en) << FLAG_PAD_EN)
+        | (int(clamp_en) << FLAG_CLAMP_EN)
     )
 
 
@@ -124,6 +128,12 @@ def _build_case(
     requant_shift: int,
     input_override: list[int] | None = None,
     weight_override: list[int] | None = None,
+    # ISA v1.1 (H1) epilogue fields; the defaults are the v1.0 encoding, so
+    # every pre-H1 case's desc.txt gains only three `... 0` records.
+    output_offset: int = 0,
+    clamp_en: bool = False,
+    clamp_min: int = 0,
+    clamp_max: int = 0,
 ) -> None:
     # `pad` is the symmetric (all 4 sides equal) shorthand used by the
     # original 5 cases; pad_top/bottom/left/right let a case override
@@ -153,7 +163,9 @@ def _build_case(
 
     desc = LayerDesc(
         opcode=OPCODE_DWCONV2D if depthwise else OPCODE_CONV2D,
-        flags=_flags(relu_en=relu_en, bias_en=bias_en, requant_en=requant_en, pad_en=pad_en),
+        flags=_flags(
+            relu_en=relu_en, bias_en=bias_en, requant_en=requant_en, pad_en=pad_en, clamp_en=clamp_en
+        ),
         in_width=in_w,
         in_height=in_h,
         in_channels=in_c,
@@ -168,6 +180,9 @@ def _build_case(
         pad_right=pad_right,
         requant_scale=requant_scale,
         requant_shift=requant_shift,
+        output_offset=output_offset,
+        clamp_min=clamp_min,
+        clamp_max=clamp_max,
     )
 
     expected = (
@@ -571,6 +586,27 @@ def generate_conv_core_cases(hw: HwPacking) -> list[str]:
         kernel=3, stride=1, pad=1,
         bias_en=True, relu_en=False, requant_en=True,
         requant_scale=-(1 << 13), requant_shift=1,
+    )
+
+    # conv3x3_offset_clamp (ISA v1.1, H1): the one conv_core case that
+    # exercises the W13 epilogue fields end to end -- a non-zero
+    # output_offset added after the rounded shift, and FLAG_CLAMP_EN with
+    # a general [clamp_min, clamp_max] range replacing the legacy
+    # ReLU/int8 saturate (relu_en stays '0' so the clamp alone sets the
+    # lower bound). Shape family of conv3x3_negative_requant_scale.
+    # The offset/clamp values are chosen so that both bounds are actually
+    # hit by this seed's random data (bias range +-1000 at scale 2**-2
+    # spreads the pre-clamp values well past both bounds).
+    _build_case(
+        "conv3x3_offset_clamp",
+        hw=hw,
+        seed=14014,
+        depthwise=False,
+        in_w=5, in_h=5, in_c=4, out_c=5,
+        kernel=3, stride=1, pad=1,
+        bias_en=True, relu_en=False, requant_en=True,
+        requant_scale=1 << 13, requant_shift=6,
+        output_offset=-7, clamp_en=True, clamp_min=-100, clamp_max=90,
     )
 
     # fc_in6_out4: FC layer in its required degenerate spatial form

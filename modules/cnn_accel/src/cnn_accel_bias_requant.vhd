@@ -26,13 +26,34 @@ use cnn_accel.cnn_accel_pkg.all;
 --            -- cfg_requant_shift are folded into one shift amount, per the
 --            -- requirement's documented option, so no double-rounding
 --            -- error versus two separate rounding steps.
---   relu   = max(scaled, 0) when cfg_relu_en, applied BEFORE the int8 clamp
---   result = saturate_signed(relu, 8)
--- When cfg_requant_en='0': bias/relu are still applied to 'total', then
--- 'total' is saturated to int8 directly (no scaling) -- debug/bypass path.
--- Saturates rather than wraps so both paths share one overflow semantic
--- (architectural decision D2), matching cnn_accel_model.py's golden
--- reference.
+--   biased = scaled + cfg_output_offset   -- ISA v1.1 (H1), exact, unbounded
+--   result = clamp(biased, lo, hi)
+--            where (lo, hi) = (cfg_clamp_min, cfg_clamp_max) when cfg_clamp_en
+--                  else (0 when cfg_relu_en else -128, 127)   -- v1.0 legacy
+-- With cfg_output_offset=0 and cfg_clamp_en='0' this is bit-identical to
+-- the v1.0 epilogue "ReLU (max(scaled, 0)) BEFORE the int8 saturate":
+-- max(x, 0) then saturate_signed(., 8) == clamp(x, 0, 127). cfg_clamp_en
+-- makes cfg_relu_en irrelevant (a program wanting a ReLU with a general
+-- clamp encodes it as clamp_min = 0). If cfg_clamp_min > cfg_clamp_max
+-- (rejected by the ISA encoder, so never seen in a compiled program) the
+-- result is min(max(biased, lo), hi) = hi, the same order the golden
+-- model's bias_requantize_relu uses.
+-- When cfg_requant_en='0': bias and offset are still applied to 'total',
+-- then the same clamp is applied directly (no scaling) -- debug/bypass
+-- path. Saturates rather than wraps so both paths share one overflow
+-- semantic (architectural decision D2), matching cnn_accel_model.py's
+-- golden reference.
+--
+-- Implementation note on the offset (kept out of the requirement text):
+-- the offset is folded into the rounding incrementer, i.e. stage 6 adds
+-- 'offset + round_up' (a 17-bit value pre-added at stage 5) to the shifted
+-- quotient instead of adding the 1-bit 'round_up' alone. Mathematically
+-- identical to "round, then add offset" -- both are exact on the full-width
+-- quotient -- and it keeps the pipeline at 7 stages. The bypass path
+-- saturates 'total' to 17 bits before adding the 16-bit offset, which is
+-- also exact with respect to the final int8 clamp: any 'total' outside
+-- 17-bit range lands outside int8 after adding any 16-bit offset, so the
+-- clamp result is unchanged.
 --
 -- Timing: the datapath is a 7-stage pipeline (still one output beat per
 -- accepted input beat, but 7 cycles of latency) and the per-beat 'cfg_*'
@@ -76,6 +97,12 @@ entity cnn_accel_bias_requant is
     cfg_relu_en : in std_ulogic;
     cfg_requant_scale : in std_ulogic_vector(31 downto 0);
     cfg_requant_shift : in std_ulogic_vector(7 downto 0);
+    -- ISA v1.1 (H1) epilogue fields, instruction word W13. Signed int16 /
+    -- int8 / int8; all-zero (and cfg_clamp_en='0') reproduces v1.0.
+    cfg_output_offset : in std_ulogic_vector(15 downto 0) := (others => '0');
+    cfg_clamp_en : in std_ulogic := '0';
+    cfg_clamp_min : in std_ulogic_vector(7 downto 0) := (others => '0');
+    cfg_clamp_max : in std_ulogic_vector(7 downto 0) := (others => '0');
 
     bias_rd_addr : out std_ulogic_vector(g_bias_addr_width - 1 downto 0);
     bias_rd_data : in std_ulogic_vector(g_accum_width * g_pe_rows - 1 downto 0);
@@ -128,9 +155,12 @@ architecture a of cnn_accel_bias_requant is
   --   3  product = total * scale     (DSP48E1 MREG stage)
   --      and, in parallel, the whole bypass path's 8-bit result
   --   4  product pipeline register   (DSP48E1 PREG stage)
-  --   5  rounded shift: quotient (barrel shift) + round-up decision
-  --   6  quotient + round_up (the c_product_width incrementer)
-  --   7  ReLU, saturate, pack -> output register
+  --   5  rounded shift: quotient (barrel shift) + round-up decision,
+  --      and offset + round_up (17-bit add, in parallel with the shifter)
+  --   6  quotient + (offset + round_up) (the c_product_width adder; a
+  --      full adder with a 17-bit sign-extended operand costs the same
+  --      carry chain as the incrementer it replaces)
+  --   7  saturate to int8, clamp to [lo, hi], pack -> output register
   --
   -- Stages 6 and 7 are split rather than fused. Fused, this module was
   -- conv_core's critical path at 6.215 ns / 21 levels / 17 CARRY4
@@ -172,8 +202,22 @@ architecture a of cnn_accel_bias_requant is
   type product_lanes_t is array (0 to g_pe_rows - 1) of signed(c_product_width - 1 downto 0);
   type byte_lanes_t is array (0 to g_pe_rows - 1) of signed(7 downto 0);
 
+  -- Bypass path intermediate: 'total' saturated to 17 bits, then the
+  -- 16-bit offset added at 18 bits (see the entity-level implementation
+  -- note for why 17 bits is exact).
+  constant c_bypass_sat_width : positive := 17;
+  constant c_bypass_sum_width : positive := c_bypass_sat_width + 1;
+  -- offset (16-bit signed) + round_up (0/1) fits 17 bits signed.
+  constant c_offs_round_width : positive := 17;
+
+  type bypass_sat_lanes_t is array (0 to g_pe_rows - 1) of signed(c_bypass_sat_width - 1 downto 0);
+  type bypass_sum_lanes_t is array (0 to g_pe_rows - 1) of signed(c_bypass_sum_width - 1 downto 0);
+  type offs_round_lanes_t is array (0 to g_pe_rows - 1) of signed(c_offs_round_width - 1 downto 0);
+
   type shift_pipe_t is array (1 to 4) of shift_t;
   type scale_pipe_t is array (1 to 2) of signed(31 downto 0);
+  type offset_pipe_t is array (1 to 4) of signed(15 downto 0);
+  type bound_pipe_t is array (1 to 6) of signed(7 downto 0);
 
   ------------------------------------------------------------------------
   -- Shared (per-beat, all lanes) control signal decoding.
@@ -182,6 +226,9 @@ architecture a of cnn_accel_bias_requant is
   signal shift_amt_raw : natural range 0 to 255;
   signal shift_amt_clamped : natural range 0 to g_max_requant_shift;
   signal combined_shift : shift_t;
+  -- The clamp bounds resolved from cfg_clamp_en/cfg_relu_en/cfg_clamp_*.
+  signal clamp_lo : signed(7 downto 0);
+  signal clamp_hi : signed(7 downto 0);
 
   ------------------------------------------------------------------------
   -- Pipeline control.
@@ -202,14 +249,17 @@ architecture a of cnn_accel_bias_requant is
   ------------------------------------------------------------------------
 
   signal bias_en_1 : std_ulogic := '0';
-  -- Consumed at stage 3 (bypass ReLU) and stage 7 (requant ReLU).
-  signal relu_en_p : std_ulogic_vector(1 to 6) := (others => '0');
   -- Consumed at stage 7 (final path mux).
   signal requant_en_p : std_ulogic_vector(1 to 6) := (others => '0');
   -- Consumed at stage 3 (the multiply).
   signal scale_p : scale_pipe_t := (others => (others => '0'));
   -- Consumed at stage 5 (the rounded shift).
   signal shift_p : shift_pipe_t := (others => 15);
+  -- Consumed at stage 4 (bypass offset add) and stage 5 (offset + round_up).
+  signal offset_p : offset_pipe_t := (others => (others => '0'));
+  -- Consumed at stage 7 (the clamp).
+  signal lo_p : bound_pipe_t := (others => (others => '0'));
+  signal hi_p : bound_pipe_t := (others => (others => '0'));
 
   ------------------------------------------------------------------------
   -- Per-lane datapath registers.
@@ -221,10 +271,10 @@ architecture a of cnn_accel_bias_requant is
   signal prod_3 : product_lanes_t := (others => (others => '0'));
   signal prod_4 : product_lanes_t := (others => (others => '0'));
   signal quot_5 : product_lanes_t := (others => (others => '0'));
-  signal round_up_5 : std_ulogic_vector(0 to g_pe_rows - 1) := (others => '0');
+  signal offs_round_5 : offs_round_lanes_t := (others => (others => '0'));
   signal scaled_6 : product_lanes_t := (others => (others => '0'));
-  signal bypass_3 : byte_lanes_t := (others => (others => '0'));
-  signal bypass_4 : byte_lanes_t := (others => (others => '0'));
+  signal bypass_3 : bypass_sat_lanes_t := (others => (others => '0'));
+  signal bypass_4 : bypass_sum_lanes_t := (others => (others => '0'));
   signal bypass_5 : byte_lanes_t := (others => (others => '0'));
   signal bypass_6 : byte_lanes_t := (others => (others => '0'));
 
@@ -234,9 +284,12 @@ architecture a of cnn_accel_bias_requant is
   ------------------------------------------------------------------------
 
   signal total_next : sum_lanes_t;
-  signal bypass_next : byte_lanes_t;
+  signal bypass_sat_next : bypass_sat_lanes_t;
+  signal bypass_sum_next : bypass_sum_lanes_t;
+  signal bypass_sat8_next : byte_lanes_t;
   signal quot_next : product_lanes_t;
   signal round_up_next : std_ulogic_vector(0 to g_pe_rows - 1);
+  signal offs_round_next : offs_round_lanes_t;
   signal scaled_next : product_lanes_t;
   signal final_lane : byte_lanes_t;
 
@@ -268,6 +321,13 @@ begin
   shift_amt_clamped <= shift_amt_raw when shift_amt_raw <= g_max_requant_shift else g_max_requant_shift;
   combined_shift <= 15 + shift_amt_clamped;
 
+  -- Clamp bounds: general clamp (ISA v1.1 CLAMP_EN) or the v1.0 legacy
+  -- pair, where ReLU is just a lower bound of 0 (see entity comment).
+  clamp_lo <= signed(cfg_clamp_min) when cfg_clamp_en = '1' else
+              to_signed(0, 8) when cfg_relu_en = '1' else
+              to_signed(-128, 8);
+  clamp_hi <= signed(cfg_clamp_max) when cfg_clamp_en = '1' else to_signed(127, 8);
+
   ------------------------------------------------------------------------
   -- v1 bias addressing: single bias row (row 0) for the whole layer --
   -- see entity-level comment.
@@ -289,11 +349,10 @@ begin
 
   lane_gen : for l in 0 to g_pe_rows - 1 generate
 
-    -- Stage 3's bypass path.
-    signal relu_clamped_total_l : signed(c_sum_width - 1 downto 0);
-    -- Stage 7's requant path.
-    signal relu_scaled_l : signed(c_product_width - 1 downto 0);
+    -- Stage 7: requant path saturated to int8, then the path mux and the
+    -- general clamp.
     signal sat_result_l : signed(7 downto 0);
+    signal pre_clamp_l : signed(7 downto 0);
 
   begin
 
@@ -305,32 +364,51 @@ begin
                      resize(accum_1(l), c_sum_width);
 
     --------------------------------------------------------------------
-    -- Into stage 3: the bypass path (cfg_requant_en='0'), computed in
-    -- parallel with the multiply so only 8 bits per lane need carrying
-    -- down the rest of the pipeline instead of the full 'total'. Bias
-    -- and ReLU are still applied to 'total', then it is saturated to
-    -- int8 -- the same overflow semantic (saturate, not wrap) as the
-    -- requant path, per architectural decision D2, matching
-    -- cnn_accel_model.py's golden reference. Reuses
-    -- 'math.saturate_signed' directly, same primitive as the requant
-    -- path below, rather than hand-rolling a second saturation.
+    -- Into stages 3..5: the bypass path (cfg_requant_en='0'), computed in
+    -- parallel with the multiply so only a narrow value per lane needs
+    -- carrying down the rest of the pipeline instead of the full 'total'.
+    -- Bias and the output offset are still applied to 'total', then it
+    -- is saturated to int8 -- the same overflow semantic (saturate, not
+    -- wrap) as the requant path, per architectural decision D2, matching
+    -- cnn_accel_model.py's golden reference. The clamp (which subsumes
+    -- the v1.0 ReLU) is shared with the requant path at stage 7.
+    --   stage 3: total saturated to 17 bits (exact w.r.t. the final
+    --            clamp, see the entity-level implementation note)
+    --   stage 4: + offset, at 18 bits
+    --   stage 5: saturated to int8
+    -- Reuses 'math.saturate_signed' directly, same primitive as the
+    -- requant path below, rather than hand-rolling saturations.
     --------------------------------------------------------------------
 
-    relu_clamped_total_l <= (others => '0') when (relu_en_p(2) = '1' and total_2(l)(total_2(l)'high) = '1') else
-                            total_2(l);
+    bypass_saturate_wide_inst : entity math.saturate_signed
+      generic map (
+        input_width => c_sum_width,
+        result_width => c_bypass_sat_width,
+        enable_output_register => false
+      )
+      port map (
+        clk => clk,
+        input_valid => '1',
+        input_value => total_2(l),
+        result_valid => open,
+        result_value => bypass_sat_next(l),
+        result_is_saturated => open
+      );
+
+    bypass_sum_next(l) <= resize(bypass_3(l), c_bypass_sum_width) + resize(offset_p(3), c_bypass_sum_width);
 
     bypass_saturate_signed_inst : entity math.saturate_signed
       generic map (
-        input_width => c_sum_width,
+        input_width => c_bypass_sum_width,
         result_width => 8,
         enable_output_register => false
       )
       port map (
         clk => clk,
         input_valid => '1',
-        input_value => relu_clamped_total_l,
+        input_value => bypass_4(l),
         result_valid => open,
-        result_value => bypass_next(l),
+        result_value => bypass_sat8_next(l),
         result_is_saturated => open
       );
 
@@ -376,20 +454,27 @@ begin
       round_up_next(l) <= product_u(shift_amt - 1);
     end process;
 
+    -- The output offset folded into the rounding term (entity-level
+    -- implementation note): offset + round_up, 17 bits.
+    offs_round_next(l) <= resize(offset_p(4), c_offs_round_width) + 1 when round_up_next(l) = '1' else
+                          resize(offset_p(4), c_offs_round_width);
+
     --------------------------------------------------------------------
-    -- Into stage 6: finish the rounding.
+    -- Into stage 6: finish the rounding and add the offset in one adder.
     --------------------------------------------------------------------
 
-    scaled_next(l) <= quot_5(l) + 1 when round_up_5(l) = '1' else quot_5(l);
+    scaled_next(l) <= quot_5(l) + resize(offs_round_5(l), c_product_width);
 
     --------------------------------------------------------------------
-    -- Into stage 7: apply ReLU BEFORE the int8 clamp, saturate (genuine
-    -- reuse of 'math.saturate_signed'), then select the requant or the
-    -- bypass result.
+    -- Into stage 7: saturate to int8 (genuine reuse of
+    -- 'math.saturate_signed'), select the requant or the bypass result,
+    -- then clamp to [lo, hi]. clamp(saturate8(x), lo, hi) == clamp(x, lo,
+    -- hi) for int8 bounds: anything saturated was already beyond the
+    -- bound on that side. The 'lo > hi' term makes the result equal to
+    -- min(max(x, lo), hi) also for that (encoder-rejected) case, so the
+    -- RTL and the golden model agree everywhere, without chaining the
+    -- two comparisons.
     --------------------------------------------------------------------
-
-    relu_scaled_l <= (others => '0') when (relu_en_p(6) = '1' and scaled_6(l)(c_product_width - 1) = '1') else
-                     scaled_6(l);
 
     saturate_signed_inst : entity math.saturate_signed
       generic map (
@@ -400,13 +485,17 @@ begin
       port map (
         clk => clk,
         input_valid => '1',
-        input_value => relu_scaled_l,
+        input_value => scaled_6(l),
         result_valid => open,
         result_value => sat_result_l,
         result_is_saturated => open
       );
 
-    final_lane(l) <= sat_result_l when requant_en_p(6) = '1' else bypass_6(l);
+    pre_clamp_l <= sat_result_l when requant_en_p(6) = '1' else bypass_6(l);
+
+    final_lane(l) <= hi_p(6) when (pre_clamp_l > hi_p(6) or lo_p(6) > hi_p(6)) else
+                     lo_p(6) when pre_clamp_l < lo_p(6) else
+                     pre_clamp_l;
 
     next_out_data_full(8 * (l + 1) - 1 downto 8 * l) <= std_ulogic_vector(final_lane(l));
 
@@ -436,59 +525,72 @@ begin
           bias_1(l) <= signed(bias_rd_data(g_accum_width * (l + 1) - 1 downto g_accum_width * l));
         end loop;
         bias_en_1 <= cfg_bias_en;
-        relu_en_p(1) <= cfg_relu_en;
         requant_en_p(1) <= cfg_requant_en;
         scale_p(1) <= signed(cfg_requant_scale);
         shift_p(1) <= combined_shift;
+        offset_p(1) <= signed(cfg_output_offset);
+        lo_p(1) <= clamp_lo;
+        hi_p(1) <= clamp_hi;
 
         -- Stage 2: bias add.
         valid_q(2) <= valid_q(1);
         last_q(2) <= last_q(1);
         total_2 <= total_next;
-        relu_en_p(2) <= relu_en_p(1);
         requant_en_p(2) <= requant_en_p(1);
         scale_p(2) <= scale_p(1);
         shift_p(2) <= shift_p(1);
+        offset_p(2) <= offset_p(1);
+        lo_p(2) <= lo_p(1);
+        hi_p(2) <= hi_p(1);
 
-        -- Stage 3: the requant multiply, plus the finished bypass result.
+        -- Stage 3: the requant multiply, plus the bypass path's 17-bit
+        -- saturated total.
         valid_q(3) <= valid_q(2);
         last_q(3) <= last_q(2);
         for l in 0 to g_pe_rows - 1 loop
           prod_3(l) <= total_2(l) * scale_p(2);
         end loop;
-        bypass_3 <= bypass_next;
-        relu_en_p(3) <= relu_en_p(2);
+        bypass_3 <= bypass_sat_next;
         requant_en_p(3) <= requant_en_p(2);
         shift_p(3) <= shift_p(2);
+        offset_p(3) <= offset_p(2);
+        lo_p(3) <= lo_p(2);
+        hi_p(3) <= hi_p(2);
 
         -- Stage 4: product pipeline register. Deliberately a bare
         -- register move: it lets Vivado retime it into the DSP48E1
-        -- cascade's own PREG instead of spending fabric on it.
+        -- cascade's own PREG instead of spending fabric on it. The
+        -- bypass path adds its offset here.
         valid_q(4) <= valid_q(3);
         last_q(4) <= last_q(3);
         prod_4 <= prod_3;
-        bypass_4 <= bypass_3;
-        relu_en_p(4) <= relu_en_p(3);
+        bypass_4 <= bypass_sum_next;
         requant_en_p(4) <= requant_en_p(3);
         shift_p(4) <= shift_p(3);
+        offset_p(4) <= offset_p(3);
+        lo_p(4) <= lo_p(3);
+        hi_p(4) <= hi_p(3);
 
-        -- Stage 5: quotient and round-up decision.
+        -- Stage 5: quotient and (offset + round_up); the bypass path's
+        -- int8 saturate.
         valid_q(5) <= valid_q(4);
         last_q(5) <= last_q(4);
         quot_5 <= quot_next;
-        round_up_5 <= round_up_next;
-        bypass_5 <= bypass_4;
-        relu_en_p(5) <= relu_en_p(4);
+        offs_round_5 <= offs_round_next;
+        bypass_5 <= bypass_sat8_next;
         requant_en_p(5) <= requant_en_p(4);
+        lo_p(5) <= lo_p(4);
+        hi_p(5) <= hi_p(4);
 
-        -- Stage 6: the rounding incrementer, on its own so that its
+        -- Stage 6: the rounding/offset adder, on its own so that its
         -- carry chain does not share a cycle with the saturate cone.
         valid_q(6) <= valid_q(5);
         last_q(6) <= last_q(5);
         scaled_6 <= scaled_next;
         bypass_6 <= bypass_5;
-        relu_en_p(6) <= relu_en_p(5);
         requant_en_p(6) <= requant_en_p(5);
+        lo_p(6) <= lo_p(5);
+        hi_p(6) <= hi_p(5);
 
         -- Stage 7: the output register.
         valid_q(7) <= valid_q(6);

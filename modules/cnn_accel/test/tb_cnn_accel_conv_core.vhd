@@ -167,6 +167,12 @@ architecture tb of tb_cnn_accel_conv_core is
   signal cfg_relu_en : std_ulogic := '0';
   signal cfg_requant_scale : std_ulogic_vector(31 downto 0) := (others => '0');
   signal cfg_requant_shift : std_ulogic_vector(7 downto 0) := (others => '0');
+  -- ISA v1.1 (H1) epilogue fields, from desc.txt's output_offset/
+  -- clamp_min/clamp_max records and FLAG_CLAMP_EN (flags bit 4).
+  signal cfg_output_offset : std_ulogic_vector(15 downto 0) := (others => '0');
+  signal cfg_clamp_en : std_ulogic := '0';
+  signal cfg_clamp_min : std_ulogic_vector(7 downto 0) := (others => '0');
+  signal cfg_clamp_max : std_ulogic_vector(7 downto 0) := (others => '0');
 
   signal start : std_ulogic := '0';
   signal done : std_ulogic;
@@ -304,6 +310,10 @@ begin
       cfg_relu_en => cfg_relu_en,
       cfg_requant_scale => cfg_requant_scale,
       cfg_requant_shift => cfg_requant_shift,
+      cfg_output_offset => cfg_output_offset,
+      cfg_clamp_en => cfg_clamp_en,
+      cfg_clamp_min => cfg_clamp_min,
+      cfg_clamp_max => cfg_clamp_max,
 
       start => start,
       done => done,
@@ -404,6 +414,9 @@ begin
       variable v_pad_right : integer := get_desc_field(case_dir, "pad_right");
       variable v_requant_scale : integer := get_desc_field(case_dir, "requant_scale");
       variable v_requant_shift : integer := get_desc_field(case_dir, "requant_shift");
+      variable v_output_offset : integer := get_desc_field(case_dir, "output_offset");
+      variable v_clamp_min : integer := get_desc_field(case_dir, "clamp_min");
+      variable v_clamp_max : integer := get_desc_field(case_dir, "clamp_max");
       variable v_pe_rows : integer := get_desc_field(case_dir, "pe_rows");
       variable v_tile_channels : integer := get_desc_field(case_dir, "tile_channels");
 
@@ -514,6 +527,10 @@ begin
       cfg_relu_en <= to_sl(flags mod 2 = 1);
       cfg_requant_scale <= std_ulogic_vector(to_signed(v_requant_scale, 32));
       cfg_requant_shift <= std_ulogic_vector(to_unsigned(v_requant_shift, 8));
+      cfg_clamp_en <= to_sl((flags / 16) mod 2 = 1);
+      cfg_output_offset <= std_ulogic_vector(to_signed(v_output_offset, 16));
+      cfg_clamp_min <= std_ulogic_vector(to_signed(v_clamp_min, 8));
+      cfg_clamp_max <= std_ulogic_vector(to_signed(v_clamp_max, 8));
 
       wait until rising_edge(clk);
       start <= '1';

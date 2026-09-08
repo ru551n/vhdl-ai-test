@@ -75,6 +75,11 @@ architecture tb of tb_cnn_accel_bias_requant is
   signal cfg_relu_en : std_ulogic := '0';
   signal cfg_requant_scale : std_ulogic_vector(31 downto 0) := (others => '0');
   signal cfg_requant_shift : std_ulogic_vector(7 downto 0) := (others => '0');
+  -- ISA v1.1 (H1) epilogue fields.
+  signal cfg_output_offset : std_ulogic_vector(15 downto 0) := (others => '0');
+  signal cfg_clamp_en : std_ulogic := '0';
+  signal cfg_clamp_min : std_ulogic_vector(7 downto 0) := (others => '0');
+  signal cfg_clamp_max : std_ulogic_vector(7 downto 0) := (others => '0');
 
   signal bias_rd_addr : std_ulogic_vector(c_bias_addr_width - 1 downto 0);
   signal bias_rd_data : std_ulogic_vector(c_accum_width * c_pe_rows - 1 downto 0) := (others => '0');
@@ -193,14 +198,36 @@ architecture tb of tb_cnn_accel_bias_requant is
     return resize(clamped, result_width);
   end function;
 
+  -- min(max(value, lo), hi) on an arbitrarily wide signed value with int8
+  -- bounds -- the golden model's final `min(max(scaled, lo), hi)`. Written
+  -- as two chained comparisons on the full-width value (not via an int8
+  -- saturate first) so that it is independent of the RTL's
+  -- saturate-then-clamp implementation.
+  function ref_clamp(value : signed; lo : integer; hi : integer) return signed is
+    -- 'value' may be wider than integer: compare at its own width, never
+    -- convert it.
+    variable v : signed(value'length - 1 downto 0) := value;
+  begin
+    if v < to_signed(lo, v'length) then
+      v := to_signed(lo, v'length);
+    end if;
+    if v > to_signed(hi, v'length) then
+      v := to_signed(hi, v'length);
+    end if;
+    return resize(v, 8);
+  end function;
+
   -- Per-lane reference function for cnn_accel_bias_requant. See
   -- cnn_accel_model.py's bias_requantize_relu docstring: int32 accumulator
   -- -> (+ bias) -> (x requant_scale, Q15) -> (>> requant_shift, rounded)
-  -- -> saturate to int8 -> (optional ReLU clamp at 0, before the int8
-  -- saturate). requant_en='0' bypasses scaling: bias/ReLU still applied,
-  -- then the result is SATURATED to int8 (same overflow semantic as the
-  -- requant_en='1' path -- architectural decision D2, single overflow
-  -- semantic across both paths, matching the golden model's fix #1).
+  -- -> (+ output_offset, exact/unbounded) -> clamp(lo, hi), where
+  -- (lo, hi) = (clamp_min, clamp_max) when clamp_en='1' and otherwise the
+  -- v1.0 legacy (0 when relu_en else -128, 127), i.e. "ReLU before the
+  -- int8 saturate". requant_en='0' bypasses scaling: bias/offset/clamp
+  -- still applied to the unscaled total, SATURATED (clamped) to int8 (same
+  -- overflow semantic as the requant_en='1' path -- architectural decision
+  -- D2, single overflow semantic across both paths, matching the golden
+  -- model's fix #1). ISA v1.1 (H1) fields default to the v1.0 behaviour.
   function ref_bias_requantize_relu(
     accum : signed;
     bias : signed;
@@ -208,15 +235,33 @@ architecture tb of tb_cnn_accel_bias_requant is
     requant_en : std_ulogic;
     relu_en : std_ulogic;
     requant_scale : signed(31 downto 0);
-    requant_shift : natural
+    requant_shift : natural;
+    output_offset : integer := 0;
+    clamp_en : std_ulogic := '0';
+    clamp_min : integer := -128;
+    clamp_max : integer := 127
   ) return signed is
     constant sum_width : positive := accum'length + 1;
     constant product_width : positive := sum_width + requant_scale'length;
+    -- One extra bit on both paths so the offset add cannot overflow.
     variable total : signed(sum_width - 1 downto 0);
     variable product : signed(product_width - 1 downto 0);
-    variable scaled : signed(product_width - 1 downto 0);
-    variable bypass_total : signed(sum_width - 1 downto 0);
+    variable scaled : signed(product_width downto 0);
+    variable bypass_total : signed(sum_width downto 0);
+    variable lo, hi : integer;
   begin
+    if clamp_en = '1' then
+      lo := clamp_min;
+      hi := clamp_max;
+    else
+      if relu_en = '1' then
+        lo := 0;
+      else
+        lo := -128;
+      end if;
+      hi := 127;
+    end if;
+
     if bias_en = '1' then
       total := resize(accum, sum_width) + resize(bias, sum_width);
     else
@@ -225,21 +270,12 @@ architecture tb of tb_cnn_accel_bias_requant is
 
     if requant_en = '1' then
       product := total * requant_scale;
-      scaled := ref_round_shift_right(product, 15 + requant_shift);
-
-      if relu_en = '1' and scaled(scaled'high) = '1' then
-        scaled := (others => '0');
-      end if;
-
-      return ref_saturate_signed(scaled, 8);
+      scaled := resize(ref_round_shift_right(product, 15 + requant_shift), scaled'length)
+                + to_signed(output_offset, scaled'length);
+      return ref_clamp(scaled, lo, hi);
     else
-      bypass_total := total;
-
-      if relu_en = '1' and bypass_total(bypass_total'high) = '1' then
-        bypass_total := (others => '0');
-      end if;
-
-      return ref_saturate_signed(bypass_total, 8);
+      bypass_total := resize(total, bypass_total'length) + to_signed(output_offset, bypass_total'length);
+      return ref_clamp(bypass_total, lo, hi);
     end if;
   end function;
 
@@ -323,6 +359,10 @@ begin
       cfg_relu_en => cfg_relu_en,
       cfg_requant_scale => cfg_requant_scale,
       cfg_requant_shift => cfg_requant_shift,
+      cfg_output_offset => cfg_output_offset,
+      cfg_clamp_en => cfg_clamp_en,
+      cfg_clamp_min => cfg_clamp_min,
+      cfg_clamp_max => cfg_clamp_max,
 
       bias_rd_addr => bias_rd_addr,
       bias_rd_data => bias_rd_data,
@@ -372,6 +412,16 @@ begin
   main : process
     variable rnd : RandomPType;
 
+    -- ISA v1.1 (H1) epilogue fields for the next beats. Process-level
+    -- state rather than extra 'send_beat' arguments so the v1.0 tests
+    -- below keep their call sites (and prove the defaults are v1.0).
+    -- Driven onto the 'cfg_*' ports and fed to the reference function by
+    -- 'send_beat'.
+    variable h1_offset : integer := 0;
+    variable h1_clamp_en : std_ulogic := '0';
+    variable h1_clamp_min : integer := -128;
+    variable h1_clamp_max : integer := 127;
+
     procedure do_reset is
     begin
       reset <= '1';
@@ -407,6 +457,10 @@ begin
       cfg_relu_en <= relu_en;
       cfg_requant_scale <= std_ulogic_vector(scale);
       cfg_requant_shift <= std_ulogic_vector(to_unsigned(shift, 8));
+      cfg_output_offset <= std_ulogic_vector(to_signed(h1_offset, 16));
+      cfg_clamp_en <= h1_clamp_en;
+      cfg_clamp_min <= std_ulogic_vector(to_signed(h1_clamp_min, 8));
+      cfg_clamp_max <= std_ulogic_vector(to_signed(h1_clamp_max, 8));
 
       s_accum_m2s.data <= to_accum_array(accum_vals);
       bias_rd_data <= pack_lanes_bias(bias_vals);
@@ -428,7 +482,8 @@ begin
           to_signed(accum_vals(i), c_accum_width),
           to_signed(bias_vals(i), c_accum_width),
           bias_en, requant_en, relu_en,
-          scale, shift
+          scale, shift,
+          h1_offset, h1_clamp_en, h1_clamp_min, h1_clamp_max
         );
       end loop;
 
@@ -606,6 +661,170 @@ begin
       -- clamped to 0 (passes through as -50, unaffected by relu_en='0').
       send_directed(-50, 0, '0', '0', '0', c_scale_one, 0);
       drain_and_check(200);
+
+    elsif run("test_output_offset_after_shift") then
+      -- ISA v1.1 (H1): 'output_offset' is added AFTER the rounded shift,
+      -- exactly (not scaled), then clamped. scale=0.5, shift=0: accum=100
+      -- -> scaled=50; offset=+10 -> 60, offset=-60 -> -10 (no ReLU).
+      h1_offset := 10;
+      send_directed(100, 0, '0', '1', '0', c_scale_half, 0);
+      h1_offset := -60;
+      send_directed(100, 0, '0', '1', '0', c_scale_half, 0);
+      -- Offset applied to an exact-tie rounding result: accum=1 -> 0.5
+      -- rounds half-up to 1, plus 5 -> 6 (a pre-shift offset would have
+      -- given a different value).
+      h1_offset := 5;
+      send_directed(1, 0, '0', '1', '0', c_scale_half, 0);
+      -- Offset past int8 in both directions must saturate, not wrap:
+      -- 120 + 100 -> 127, -120 - 100 -> -128, and the extremes of the
+      -- int16 offset range.
+      h1_offset := 100;
+      send_directed(120, 0, '0', '1', '0', c_scale_one, 0);
+      h1_offset := -100;
+      send_directed(-120, 0, '0', '1', '0', c_scale_one, 0);
+      h1_offset := 32767;
+      send_directed(-200, 0, '0', '1', '0', c_scale_one, 0);
+      h1_offset := -32768;
+      send_directed(200, 0, '0', '1', '0', c_scale_one, 0);
+      -- A huge scaled value plus a huge negative offset must still
+      -- saturate high (the offset is added on the unbounded value, not on
+      -- an int8-saturated one -- but the result is the same, and this
+      -- pins it): 2**19 * 1.0 + (-32768) >> 127.
+      h1_offset := -32768;
+      send_directed(2 ** 19 - 1, 0, '0', '1', '0', c_scale_one, 0);
+      -- Offset then legacy ReLU: -50 + 30 = -20 -> ReLU -> 0; -50 + 70 =
+      -- 20 -> stays 20 (ReLU acts on the offset value).
+      h1_offset := 30;
+      send_directed(-50, 0, '0', '1', '1', c_scale_one, 0);
+      h1_offset := 70;
+      send_directed(-50, 0, '0', '1', '1', c_scale_one, 0);
+      -- Bypass path (requant_en='0') gets the same offset treatment,
+      -- including saturation from far outside int8 range.
+      h1_offset := 10;
+      send_directed(100, 0, '0', '0', '0', c_scale_one, 0);
+      h1_offset := -32768;
+      send_directed(2 ** 19 - 1, 0, '0', '0', '0', c_scale_one, 0);
+      h1_offset := 32767;
+      send_directed(-(2 ** 19), 0, '0', '0', '0', c_scale_one, 0);
+      -- Randomized offsets across the full int16 range, both paths.
+      for beat in 0 to 59 loop
+        random_accum_arr(accum_vals);
+        random_accum_arr(bias_vals);
+        scale := rnd.RandSigned(32);
+        shift := rnd.RandInt(0, c_max_requant_shift);
+        h1_offset := rnd.RandInt(-32768, 32767);
+        send_beat(
+          accum_vals, bias_vals,
+          to_sl(rnd.RandInt(0, 1) = 1), to_sl(rnd.RandInt(0, 1) = 1), to_sl(rnd.RandInt(0, 1) = 1),
+          scale, shift, '0'
+        );
+      end loop;
+      h1_offset := 0;
+      drain_and_check(400);
+
+    elsif run("test_general_clamp") then
+      -- ISA v1.1 (H1): CLAMP_EN replaces the legacy ReLU/int8 saturate
+      -- with clamp(scaled + offset, clamp_min, clamp_max). scale=1.0,
+      -- shift=0 so scaled = accum.
+      h1_clamp_en := '1';
+      h1_clamp_min := -20;
+      h1_clamp_max := 100;
+      send_directed(-50, 0, '0', '1', '0', c_scale_one, 0);   -- -> -20
+      send_directed(-20, 0, '0', '1', '0', c_scale_one, 0);   -- -> -20 (exact bound)
+      send_directed(0, 0, '0', '1', '0', c_scale_one, 0);     -- -> 0
+      send_directed(100, 0, '0', '1', '0', c_scale_one, 0);   -- -> 100 (exact bound)
+      send_directed(101, 0, '0', '1', '0', c_scale_one, 0);   -- -> 100
+      send_directed(1000, 0, '0', '1', '0', c_scale_one, 0);  -- -> 100
+      send_directed(-1000, 0, '0', '1', '0', c_scale_one, 0); -- -> -20
+      -- With CLAMP_EN the ReLU flag is irrelevant: relu_en='1' must NOT
+      -- raise the lower bound above clamp_min.
+      send_directed(-50, 0, '0', '1', '1', c_scale_one, 0);   -- -> -20, not 0
+      -- Offset and clamp together: (-50) + 40 = -10 -> in range -> -10;
+      -- (-50) + 200 = 150 -> clamp_max 100.
+      h1_offset := 40;
+      send_directed(-50, 0, '0', '1', '0', c_scale_one, 0);
+      h1_offset := 200;
+      send_directed(-50, 0, '0', '1', '0', c_scale_one, 0);
+      h1_offset := 0;
+      -- The full int8 range as clamp bounds must equal plain saturation.
+      h1_clamp_min := -128;
+      h1_clamp_max := 127;
+      send_directed(1000, 0, '0', '1', '0', c_scale_one, 0);  -- -> 127
+      send_directed(-1000, 0, '0', '1', '0', c_scale_one, 0); -- -> -128
+      -- Degenerate clamp_min = clamp_max pins every value.
+      h1_clamp_min := 7;
+      h1_clamp_max := 7;
+      send_directed(-1000, 0, '0', '1', '0', c_scale_one, 0); -- -> 7
+      send_directed(1000, 0, '0', '1', '0', c_scale_one, 0);  -- -> 7
+      -- Bypass path honours the same clamp.
+      h1_clamp_min := -3;
+      h1_clamp_max := 3;
+      send_directed(50, 0, '0', '0', '0', c_scale_one, 0);    -- -> 3
+      send_directed(-50, 0, '0', '0', '0', c_scale_one, 0);   -- -> -3
+      send_directed(1, 0, '0', '0', '0', c_scale_one, 0);     -- -> 1
+      -- Randomized: random (min <= max) bounds, random offset, both
+      -- paths, all legacy flags.
+      for beat in 0 to 79 loop
+        random_accum_arr(accum_vals);
+        random_accum_arr(bias_vals);
+        scale := rnd.RandSigned(32);
+        shift := rnd.RandInt(0, c_max_requant_shift);
+        h1_clamp_min := rnd.RandInt(-128, 127);
+        h1_clamp_max := rnd.RandInt(h1_clamp_min, 127);
+        h1_offset := rnd.RandInt(-32768, 32767);
+        send_beat(
+          accum_vals, bias_vals,
+          to_sl(rnd.RandInt(0, 1) = 1), to_sl(rnd.RandInt(0, 1) = 1), to_sl(rnd.RandInt(0, 1) = 1),
+          scale, shift, '0'
+        );
+      end loop;
+      -- Encoder-rejected clamp_min > clamp_max: RTL and golden model both
+      -- return min(max(x, lo), hi) = hi. Pinned so they cannot drift apart.
+      h1_offset := 0;
+      h1_clamp_min := 50;
+      h1_clamp_max := -50;
+      send_directed(0, 0, '0', '1', '0', c_scale_one, 0);     -- -> -50
+      send_directed(100, 0, '0', '1', '0', c_scale_one, 0);   -- -> -50
+      send_directed(-100, 0, '0', '1', '0', c_scale_one, 0);  -- -> -50
+      h1_clamp_en := '0';
+      h1_clamp_min := -128;
+      h1_clamp_max := 127;
+      drain_and_check(500);
+
+    elsif run("test_clamp_en_zero_is_legacy") then
+      -- ISA v1.1 (H1) backwards compatibility: with cfg_clamp_en='0' and
+      -- cfg_output_offset=0, the clamp bounds are ignored and the result
+      -- is the v1.0 ReLU-before-saturate epilogue for every flag combo.
+      -- Garbage in clamp_min/clamp_max (including min > max) must have
+      -- no effect.
+      for combo in 0 to 7 loop
+        for beat in 0 to 14 loop
+          random_accum_arr(accum_vals);
+          random_accum_arr(bias_vals);
+          scale := rnd.RandSigned(32);
+          shift := rnd.RandInt(0, c_max_requant_shift);
+          h1_clamp_min := rnd.RandInt(-128, 127);
+          h1_clamp_max := rnd.RandInt(-128, 127);
+          send_beat(
+            accum_vals, bias_vals,
+            to_sl((combo mod 2) = 1),
+            to_sl(((combo / 2) mod 2) = 1),
+            to_sl(((combo / 4) mod 2) = 1),
+            scale, shift, '0'
+          );
+        end loop;
+      end loop;
+      -- Directed v1.0 boundary cases with non-default clamp bounds
+      -- present but disabled.
+      h1_clamp_min := 10;
+      h1_clamp_max := 20;
+      send_directed(-1000, 0, '0', '1', '1', c_scale_one, 0); -- ReLU -> 0, not 10
+      send_directed(1000, 0, '0', '1', '0', c_scale_one, 0);  -- saturate -> 127, not 20
+      send_directed(-1000, 0, '0', '1', '0', c_scale_one, 0); -- saturate -> -128
+      send_directed(-1000, 0, '0', '0', '1', c_scale_one, 0); -- bypass ReLU -> 0
+      h1_clamp_min := -128;
+      h1_clamp_max := 127;
+      drain_and_check(500);
 
     elsif run("test_full_throughput") then
       -- Zero stall on both links (generic-driven, per
