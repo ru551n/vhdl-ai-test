@@ -74,7 +74,8 @@ use cnn_accel.cnn_accel_pkg.all;
 --     same "flow-through, no bubble" idiom on both ends of one link,
 --     designed to compose directly (proposal section 7: "unchanged from the
 --     pre-tiling proposal").
---   * weight_rd_addr/weight_rd_data and bias_rd_addr/bias_rd_data are plain
+--   * weight_rd_addr/weight_rd_data and bias_rd_addr/bias_rd_data/
+--     scale_rd_data (ISA v1.2) are plain
 --     synchronous read ports (no handshake at all, 1 cycle registered
 --     latency, always-ready -- cnn_accel_weight_buffer's own contract),
 --     wired straight across.
@@ -170,6 +171,11 @@ entity cnn_accel_conv_core is
     cfg_clamp_en : in std_ulogic := '0';
     cfg_clamp_min : in std_ulogic_vector(7 downto 0) := (others => '0');
     cfg_clamp_max : in std_ulogic_vector(7 downto 0) := (others => '0');
+    -- ISA v1.2 (H2) FLAG_PER_CHANNEL_EN: cnn_accel_bias_requant takes each
+    -- lane's (multiplier, shift) from cnn_accel_weight_buffer's scale
+    -- region (filled through 's_weight' with 'fill_is_scale') instead of
+    -- 'cfg_requant_scale'/'cfg_requant_shift'. '0' is the pre-H2 datapath.
+    cfg_per_channel_en : in std_ulogic := '0';
     --# {{}}
     -- Pulse: latches the 'cfg_*' ports above and resets cnn_accel_
     -- window_gen's row/column counters and line-buffer pointers for a new
@@ -200,6 +206,10 @@ entity cnn_accel_conv_core is
     -- weights/biases; no fill sequencer is built here.
     fill_start : in std_ulogic := '0';
     fill_is_bias : in std_ulogic;
+    -- ISA v1.2 (H2): routes fill beats to the per-channel scale region
+    -- (one 8-byte table entry, 'data(39 downto 0)', per beat) -- see
+    -- cnn_accel_weight_buffer's own port comment.
+    fill_is_scale : in std_ulogic := '0';
     s_weight_m2s : in axi_stream_m2s_t;
     s_weight_s2m : out axi_stream_s2m_t;
     --# {{}}
@@ -233,6 +243,7 @@ architecture a of cnn_accel_conv_core is
   signal weight_rd_data : std_ulogic_vector(8 * c_weight_lanes - 1 downto 0);
   signal bias_rd_addr : std_ulogic_vector(c_bias_addr_width - 1 downto 0);
   signal bias_rd_data : std_ulogic_vector(g_accum_width * g_pe_rows - 1 downto 0);
+  signal scale_rd_data : std_ulogic_vector(c_scale_entry_width * g_pe_rows - 1 downto 0);
 
   signal accum_m2s : accum_m2s_t(data(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0));
   signal accum_s2m : accum_s2m_t;
@@ -350,12 +361,14 @@ begin
 
       fill_start => fill_start,
       fill_is_bias => fill_is_bias,
+      fill_is_scale => fill_is_scale,
 
       weight_rd_addr => weight_rd_addr,
       weight_rd_data => weight_rd_data,
 
       bias_rd_addr => bias_rd_addr,
-      bias_rd_data => bias_rd_data
+      bias_rd_data => bias_rd_data,
+      scale_rd_data => scale_rd_data
     );
 
   ------------------------------------------------------------------------
@@ -384,9 +397,11 @@ begin
       cfg_clamp_en => cfg_clamp_en,
       cfg_clamp_min => cfg_clamp_min,
       cfg_clamp_max => cfg_clamp_max,
+      cfg_per_channel_en => cfg_per_channel_en,
 
       bias_rd_addr => bias_rd_addr,
       bias_rd_data => bias_rd_data,
+      scale_rd_data => scale_rd_data,
 
       s_accum_m2s => accum_m2s,
       s_accum_s2m => accum_s2m,

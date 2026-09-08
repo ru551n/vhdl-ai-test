@@ -14,6 +14,10 @@ use ieee.numeric_std.all;
 -- editing cnn_accel_constants.py.
 library cnn_accel;
 use cnn_accel.cnn_accel_isa_pkg.all;
+-- Generated hdl-registers constants (cnn_accel_constant_*); referenced by
+-- selected name below. The use clause makes the compile-order dependency
+-- visible to VUnit's dependency scanner.
+use cnn_accel.cnn_accel_regs_pkg;
 
 -- Shared record types for modules/cnn_accel/ that hdl-registers cannot
 -- generate (mixed unsigned/signed record fields, handshake wrapper
@@ -58,6 +62,11 @@ package cnn_accel_pkg is
     output_offset   : signed(15 downto 0);
     clamp_min       : signed(7 downto 0);
     clamp_max       : signed(7 downto 0);
+    -- ISA v1.2 (H2), instruction word W14: DDR byte address of the
+    -- per-channel requant table (c_scale_table_entry_bytes per output
+    -- channel), consumed only while FLAG_PER_CHANNEL_EN is set. Zero in a
+    -- v1.0/v1.1 program.
+    scale_addr      : unsigned(31 downto 0);
   end record;
 
   -- Handshake wrapper records, per shared/InterfaceRecords.md.
@@ -181,6 +190,25 @@ package cnn_accel_pkg is
   -- inside RTL -- that is what the array is for.
   function to_slv(data : tap_array_t) return std_ulogic_vector;
   function to_tap_array(data : std_ulogic_vector) return tap_array_t;
+
+  ------------------------------------------------------------------------
+  -- ISA v1.2 (H2) per-channel requant table entry, as kept on chip in
+  -- cnn_accel_weight_buffer's scale region and read by
+  -- cnn_accel_bias_requant's 'scale_rd_data' port. One lane 'l' of a
+  -- 'g_pe_rows'-lane row occupies bits
+  -- 'c_scale_entry_width*(l+1)-1 downto c_scale_entry_width*l' and is,
+  -- LSB first, the int32 multiplier then the uint8 shift -- exactly the
+  -- first 40 bits of the 8-byte little-endian DDR entry (multiplier i32
+  -- LE, shift u8, 3 zero bytes; cnn_accel_constants.SCALE_TABLE_*), so a
+  -- 64-bit DMA beat carrying one entry is a scale fill beat with no
+  -- reshuffling: 'data(39 downto 0)'. The width comes from the generated
+  -- constant so it cannot drift from cnn_accel_model.pack_scale_table_for_hw.
+  ------------------------------------------------------------------------
+
+  constant c_scale_entry_mult_width : positive := 32;
+  constant c_scale_entry_shift_width : positive := 8;
+  constant c_scale_entry_width : positive :=
+    cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_scale_buffer_entry_bits;
 
 end package cnn_accel_pkg;
 

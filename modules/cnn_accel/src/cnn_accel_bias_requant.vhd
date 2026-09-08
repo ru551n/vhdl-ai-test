@@ -16,8 +16,10 @@ use cnn_accel.cnn_accel_pkg.all;
 --
 -- Per lane (one per output-channel PE row, 'g_pe_rows' lanes total), per
 -- accepted 's_accum' beat:
+--   (scale, shift) = lane l's entry of 'scale_rd_data' when cfg_per_channel_en
+--                    else (cfg_requant_scale, cfg_requant_shift)   -- ISA v1.2 (H2)
 --   total  = accum + (bias when cfg_bias_en else 0)
---   scaled = round_half_up(total * cfg_requant_scale, shift = 15 + cfg_requant_shift)
+--   scaled = round_half_up(total * scale, shift = 15 + shift)
 --            -- = floor((product + 2**(shift-1)) / 2**shift): ties round
 --            -- towards +infinity, matching TOSA's `apply_scale_32`
 --            -- (SINGLE_ROUND) so the TOSA->cnn_accel compiler can emit
@@ -43,6 +45,20 @@ use cnn_accel.cnn_accel_pkg.all;
 -- path. Saturates rather than wraps so both paths share one overflow
 -- semantic (architectural decision D2), matching cnn_accel_model.py's
 -- golden reference.
+--
+-- Per-channel requantization (ISA v1.2, H2, doc/tosa_compiler_plan.md
+-- section 5 extension 2): with cfg_per_channel_en='1' every lane takes
+-- its own (multiplier, shift) from 'scale_rd_data' -- the row of
+-- cnn_accel_weight_buffer's scale region addressed by this module's own
+-- 'bias_rd_addr', so it is tiled and timed exactly like 'bias_rd_data'
+-- (lane layout: cnn_accel_pkg's 'c_scale_entry_width' comment). With
+-- cfg_per_channel_en='0' the descriptor's cfg_requant_scale/
+-- cfg_requant_shift are broadcast to every lane, which is the pre-H2
+-- datapath bit for bit; 'scale_rd_data' is then ignored entirely (may be
+-- stale or unconnected). The per-lane selection happens at stage 1 with
+-- the beat capture, so the pipeline depth, throughput and handshake are
+-- unchanged from v1.1 -- only the stage-3 multiplier operand and the
+-- stage-5 shift amount became per-lane instead of shared.
 --
 -- Implementation note on the offset (kept out of the requirement text):
 -- the offset is folded into the rounding incrementer, i.e. stage 6 adds
@@ -103,9 +119,17 @@ entity cnn_accel_bias_requant is
     cfg_clamp_en : in std_ulogic := '0';
     cfg_clamp_min : in std_ulogic_vector(7 downto 0) := (others => '0');
     cfg_clamp_max : in std_ulogic_vector(7 downto 0) := (others => '0');
+    -- ISA v1.2 (H2) FLAG_PER_CHANNEL_EN: '1' selects lane-wise
+    -- (multiplier, shift) from 'scale_rd_data' instead of the two cfg_*
+    -- ports above. Sampled per beat like every other cfg_* port.
+    cfg_per_channel_en : in std_ulogic := '0';
 
     bias_rd_addr : out std_ulogic_vector(g_bias_addr_width - 1 downto 0);
     bias_rd_data : in std_ulogic_vector(g_accum_width * g_pe_rows - 1 downto 0);
+    -- Per-channel requant table row for the same 'bias_rd_addr' (cnn_accel_
+    -- weight_buffer's 'scale_rd_data'), 'c_scale_entry_width' bits per
+    -- lane; only read while cfg_per_channel_en='1'.
+    scale_rd_data : in std_ulogic_vector(c_scale_entry_width * g_pe_rows - 1 downto 0) := (others => '0');
 
     -- One int32-ish (g_accum_width-bit) partial sum per PE row, from
     -- cnn_accel_pe_array's 'm_accum_m2s'. An array of lanes (D15), not a
@@ -214,18 +238,24 @@ architecture a of cnn_accel_bias_requant is
   type bypass_sum_lanes_t is array (0 to g_pe_rows - 1) of signed(c_bypass_sum_width - 1 downto 0);
   type offs_round_lanes_t is array (0 to g_pe_rows - 1) of signed(c_offs_round_width - 1 downto 0);
 
-  type shift_pipe_t is array (1 to 4) of shift_t;
-  type scale_pipe_t is array (1 to 2) of signed(31 downto 0);
+  -- Scale and shift are per lane since ISA v1.2 (per-channel
+  -- requantization); the remaining config is shared by all lanes.
+  type shift_lanes_t is array (0 to g_pe_rows - 1) of shift_t;
+  type scale_lanes_t is array (0 to g_pe_rows - 1) of signed(c_scale_entry_mult_width - 1 downto 0);
+  type shift_pipe_t is array (1 to 4) of shift_lanes_t;
+  type scale_pipe_t is array (1 to 2) of scale_lanes_t;
   type offset_pipe_t is array (1 to 4) of signed(15 downto 0);
   type bound_pipe_t is array (1 to 6) of signed(7 downto 0);
 
   ------------------------------------------------------------------------
-  -- Shared (per-beat, all lanes) control signal decoding.
+  -- Per-beat control signal decoding: the per-lane (scale, shift) select
+  -- (ISA v1.2) and the shared clamp bounds.
   ------------------------------------------------------------------------
 
-  signal shift_amt_raw : natural range 0 to 255;
-  signal shift_amt_clamped : natural range 0 to g_max_requant_shift;
-  signal combined_shift : shift_t;
+  -- Lane-wise multiplier / combined shift, after the per-channel select
+  -- and the g_max_requant_shift clamp.
+  signal lane_scale : scale_lanes_t;
+  signal combined_shift : shift_lanes_t;
   -- The clamp bounds resolved from cfg_clamp_en/cfg_relu_en/cfg_clamp_*.
   signal clamp_lo : signed(7 downto 0);
   signal clamp_hi : signed(7 downto 0);
@@ -252,9 +282,9 @@ architecture a of cnn_accel_bias_requant is
   -- Consumed at stage 7 (final path mux).
   signal requant_en_p : std_ulogic_vector(1 to 6) := (others => '0');
   -- Consumed at stage 3 (the multiply).
-  signal scale_p : scale_pipe_t := (others => (others => '0'));
+  signal scale_p : scale_pipe_t := (others => (others => (others => '0')));
   -- Consumed at stage 5 (the rounded shift).
-  signal shift_p : shift_pipe_t := (others => 15);
+  signal shift_p : shift_pipe_t := (others => (others => 15));
   -- Consumed at stage 4 (bypass offset add) and stage 5 (offset + round_up).
   signal offset_p : offset_pipe_t := (others => (others => '0'));
   -- Consumed at stage 7 (the clamp).
@@ -311,15 +341,41 @@ begin
     report "cnn_accel_bias_requant: g_max_requant_shift too large for g_accum_width"
     severity failure;
 
+  assert c_scale_entry_width = c_scale_entry_mult_width + c_scale_entry_shift_width
+    report "cnn_accel_bias_requant: c_scale_entry_width does not match multiplier + shift widths"
+    severity failure;
+
+  assert c_scale_entry_mult_width = cfg_requant_scale'length
+    report "cnn_accel_bias_requant: per-channel multiplier width must equal cfg_requant_scale's"
+    severity failure;
+
   ------------------------------------------------------------------------
-  -- Shared (per-beat, all lanes) control signal decoding. Combinational
-  -- off the 'cfg_*' ports; the result is captured at stage 1 with the
-  -- beat it belongs to.
+  -- Per-beat control signal decoding. Combinational off the 'cfg_*'/
+  -- 'scale_rd_data' ports; the result is captured at stage 1 with the beat
+  -- it belongs to. Per lane (ISA v1.2): the multiplier and the raw 8-bit
+  -- shift come from the lane's table entry when cfg_per_channel_en, else
+  -- from the shared cfg_* ports; the g_max_requant_shift clamp and the
+  -- '+15' Q15 fold are then applied to whichever was selected, so both
+  -- modes see exactly the same shift arithmetic.
   ------------------------------------------------------------------------
 
-  shift_amt_raw <= to_integer(unsigned(cfg_requant_shift));
-  shift_amt_clamped <= shift_amt_raw when shift_amt_raw <= g_max_requant_shift else g_max_requant_shift;
-  combined_shift <= 15 + shift_amt_clamped;
+  lane_cfg_gen : for l in 0 to g_pe_rows - 1 generate
+    constant c_lane_lo : natural := c_scale_entry_width * l;
+    signal shift_raw_l : std_ulogic_vector(7 downto 0);
+    signal shift_amt_raw_l : natural range 0 to 255;
+    signal shift_amt_clamped_l : natural range 0 to g_max_requant_shift;
+  begin
+    lane_scale(l) <=
+      signed(scale_rd_data(c_lane_lo + c_scale_entry_mult_width - 1 downto c_lane_lo))
+      when cfg_per_channel_en = '1' else signed(cfg_requant_scale);
+    shift_raw_l <=
+      scale_rd_data(c_lane_lo + c_scale_entry_width - 1 downto c_lane_lo + c_scale_entry_mult_width)
+      when cfg_per_channel_en = '1' else cfg_requant_shift;
+
+    shift_amt_raw_l <= to_integer(unsigned(shift_raw_l));
+    shift_amt_clamped_l <= shift_amt_raw_l when shift_amt_raw_l <= g_max_requant_shift else g_max_requant_shift;
+    combined_shift(l) <= 15 + shift_amt_clamped_l;
+  end generate lane_cfg_gen;
 
   -- Clamp bounds: general clamp (ISA v1.1 CLAMP_EN) or the v1.0 legacy
   -- pair, where ReLU is just a lower bound of 0 (see entity comment).
@@ -447,7 +503,7 @@ begin
       variable product_u : unsigned(c_product_width - 1 downto 0);
       variable shift_amt : shift_t;
     begin
-      shift_amt := shift_p(4);
+      shift_amt := shift_p(4)(l);
       product_u := unsigned(prod_4(l));
 
       quot_next(l) <= shift_right(prod_4(l), shift_amt);
@@ -526,7 +582,7 @@ begin
         end loop;
         bias_en_1 <= cfg_bias_en;
         requant_en_p(1) <= cfg_requant_en;
-        scale_p(1) <= signed(cfg_requant_scale);
+        scale_p(1) <= lane_scale;
         shift_p(1) <= combined_shift;
         offset_p(1) <= signed(cfg_output_offset);
         lo_p(1) <= clamp_lo;
@@ -548,7 +604,7 @@ begin
         valid_q(3) <= valid_q(2);
         last_q(3) <= last_q(2);
         for l in 0 to g_pe_rows - 1 loop
-          prod_3(l) <= total_2(l) * scale_p(2);
+          prod_3(l) <= total_2(l) * scale_p(2)(l);
         end loop;
         bypass_3 <= bypass_sat_next;
         requant_en_p(3) <= requant_en_p(2);

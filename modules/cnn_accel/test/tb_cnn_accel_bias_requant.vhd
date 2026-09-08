@@ -80,9 +80,12 @@ architecture tb of tb_cnn_accel_bias_requant is
   signal cfg_clamp_en : std_ulogic := '0';
   signal cfg_clamp_min : std_ulogic_vector(7 downto 0) := (others => '0');
   signal cfg_clamp_max : std_ulogic_vector(7 downto 0) := (others => '0');
+  -- ISA v1.2 (H2) per-channel requantization.
+  signal cfg_per_channel_en : std_ulogic := '0';
 
   signal bias_rd_addr : std_ulogic_vector(c_bias_addr_width - 1 downto 0);
   signal bias_rd_data : std_ulogic_vector(c_accum_width * c_pe_rows - 1 downto 0) := (others => '0');
+  signal scale_rd_data : std_ulogic_vector(c_scale_entry_width * c_pe_rows - 1 downto 0) := (others => '0');
 
   signal s_accum_m2s : accum_m2s_t(data(0 to c_pe_rows - 1)(c_accum_width - 1 downto 0)) :=
     (valid => '0', last => '0', data => (others => (others => '0')));
@@ -110,6 +113,9 @@ architecture tb of tb_cnn_accel_bias_requant is
   type accum_arr_t is array (0 to c_pe_rows - 1) of
     integer range -(2 ** (c_accum_width - 1)) to (2 ** (c_accum_width - 1) - 1);
   type result_arr_t is array (0 to c_pe_rows - 1) of signed(7 downto 0);
+  -- Per-lane (multiplier, shift) for the ISA v1.2 per-channel table row.
+  type scale_arr_t is array (0 to c_pe_rows - 1) of signed(31 downto 0);
+  type shift_arr_t is array (0 to c_pe_rows - 1) of natural range 0 to 255;
 
   function to_sl(cond : boolean) return std_ulogic is
   begin
@@ -312,6 +318,22 @@ architecture tb of tb_cnn_accel_bias_requant is
     return result;
   end function;
 
+  -- 'scale_rd_data' lane layout per cnn_accel_pkg's c_scale_entry_width
+  -- comment: multiplier in the low 32 bits of each 40-bit lane, the raw
+  -- 8-bit shift above it -- i.e. bytes 0..4 of the 8-byte DDR table entry
+  -- (cnn_accel_model.pack_scale_table_for_hw).
+  function pack_lanes_scale(scales : scale_arr_t; shifts : shift_arr_t) return std_ulogic_vector is
+    variable result : std_ulogic_vector(c_scale_entry_width * c_pe_rows - 1 downto 0);
+    variable lo : natural;
+  begin
+    for i in 0 to c_pe_rows - 1 loop
+      lo := c_scale_entry_width * i;
+      result(lo + 31 downto lo) := std_ulogic_vector(scales(i));
+      result(lo + 39 downto lo + 32) := std_ulogic_vector(to_unsigned(shifts(i), 8));
+    end loop;
+    return result;
+  end function;
+
   function pack_lanes_result(values : result_arr_t) return std_ulogic_vector is
     variable result : std_ulogic_vector(axi_stream_data_sz - 1 downto 0) := (others => '0');
   begin
@@ -363,9 +385,11 @@ begin
       cfg_clamp_en => cfg_clamp_en,
       cfg_clamp_min => cfg_clamp_min,
       cfg_clamp_max => cfg_clamp_max,
+      cfg_per_channel_en => cfg_per_channel_en,
 
       bias_rd_addr => bias_rd_addr,
       bias_rd_data => bias_rd_data,
+      scale_rd_data => scale_rd_data,
 
       s_accum_m2s => s_accum_m2s,
       s_accum_s2m => s_accum_s2m,
@@ -421,6 +445,13 @@ begin
     variable h1_clamp_en : std_ulogic := '0';
     variable h1_clamp_min : integer := -128;
     variable h1_clamp_max : integer := 127;
+    -- ISA v1.2 (H2) per-channel table row for the next beats, same idiom:
+    -- with h2_per_channel_en='0' (the default every pre-H2 test runs
+    -- with) the row is driven onto 'scale_rd_data' but must be ignored by
+    -- the DUT, and the reference uses send_beat's scalar scale/shift.
+    variable h2_per_channel_en : std_ulogic := '0';
+    variable h2_lane_scale : scale_arr_t := (others => (others => '0'));
+    variable h2_lane_shift : shift_arr_t := (others => 0);
 
     procedure do_reset is
     begin
@@ -461,9 +492,11 @@ begin
       cfg_clamp_en <= h1_clamp_en;
       cfg_clamp_min <= std_ulogic_vector(to_signed(h1_clamp_min, 8));
       cfg_clamp_max <= std_ulogic_vector(to_signed(h1_clamp_max, 8));
+      cfg_per_channel_en <= h2_per_channel_en;
 
       s_accum_m2s.data <= to_accum_array(accum_vals);
       bias_rd_data <= pack_lanes_bias(bias_vals);
+      scale_rd_data <= pack_lanes_scale(h2_lane_scale, h2_lane_shift);
       s_accum_m2s.last <= beat_last;
 
       if rnd.RandInt(0, 99) < stall_pct_in then
@@ -478,13 +511,25 @@ begin
       s_accum_m2s.valid <= '0';
 
       for i in 0 to c_pe_rows - 1 loop
-        results(i) := ref_bias_requantize_relu(
-          to_signed(accum_vals(i), c_accum_width),
-          to_signed(bias_vals(i), c_accum_width),
-          bias_en, requant_en, relu_en,
-          scale, shift,
-          h1_offset, h1_clamp_en, h1_clamp_min, h1_clamp_max
-        );
+        if h2_per_channel_en = '1' then
+          -- Lane i requantised with ITS OWN table entry (the model's
+          -- lane_requant_params); the scalar scale/shift are ignored.
+          results(i) := ref_bias_requantize_relu(
+            to_signed(accum_vals(i), c_accum_width),
+            to_signed(bias_vals(i), c_accum_width),
+            bias_en, requant_en, relu_en,
+            h2_lane_scale(i), h2_lane_shift(i),
+            h1_offset, h1_clamp_en, h1_clamp_min, h1_clamp_max
+          );
+        else
+          results(i) := ref_bias_requantize_relu(
+            to_signed(accum_vals(i), c_accum_width),
+            to_signed(bias_vals(i), c_accum_width),
+            bias_en, requant_en, relu_en,
+            scale, shift,
+            h1_offset, h1_clamp_en, h1_clamp_min, h1_clamp_max
+          );
+        end if;
       end loop;
 
       push(expected_q, pack_lanes_result(results));
@@ -824,6 +869,92 @@ begin
       send_directed(-1000, 0, '0', '0', '1', c_scale_one, 0); -- bypass ReLU -> 0
       h1_clamp_min := -128;
       h1_clamp_max := 127;
+      drain_and_check(500);
+
+    elsif run("test_per_channel_lanes") then
+      -- ISA v1.2 (H2): with cfg_per_channel_en='1' every lane must use
+      -- its own (multiplier, shift) from 'scale_rd_data' and ignore
+      -- cfg_requant_scale/cfg_requant_shift entirely. Directed first: the
+      -- same accumulator on every lane, lane-distinct multipliers 1.0,
+      -- 0.5, 1.0>>1, -1.0 -> outputs x, x/2, x/2, -x (a lane mix-up or a
+      -- broadcast of the scalar cfg would be visible immediately).
+      h2_per_channel_en := '1';
+      for i in 0 to c_pe_rows - 1 loop
+        case i mod 4 is
+          when 0 => h2_lane_scale(i) := c_scale_one;  h2_lane_shift(i) := 0;
+          when 1 => h2_lane_scale(i) := c_scale_half; h2_lane_shift(i) := 0;
+          when 2 => h2_lane_scale(i) := c_scale_one;  h2_lane_shift(i) := 1;
+          when others => h2_lane_scale(i) := -c_scale_one; h2_lane_shift(i) := 0;
+        end case;
+      end loop;
+      -- Scalar cfg deliberately garbage (must be ignored).
+      send_directed(100, 0, '0', '1', '0', to_signed(12345, 32), 7);
+      send_directed(-50, 0, '0', '1', '0', to_signed(-7, 32), 31);
+      send_directed(7, 3, '1', '1', '0', to_signed(0, 32), 0);
+      -- Randomised per-lane tables, all flag combinations, H1 fields
+      -- mixed in: requant_en='0' must still bypass regardless of the table.
+      for combo in 0 to 7 loop
+        for beat in 0 to 19 loop
+          random_accum_arr(accum_vals);
+          random_accum_arr(bias_vals);
+          for i in 0 to c_pe_rows - 1 loop
+            h2_lane_scale(i) := rnd.RandSigned(32);
+            h2_lane_shift(i) := rnd.RandInt(0, c_max_requant_shift);
+          end loop;
+          h1_offset := rnd.RandInt(-300, 300);
+          h1_clamp_en := to_sl(rnd.RandInt(0, 1) = 1);
+          h1_clamp_min := rnd.RandInt(-128, 0);
+          h1_clamp_max := rnd.RandInt(0, 127);
+          send_beat(
+            accum_vals, bias_vals,
+            to_sl((combo mod 2) = 1),
+            to_sl(((combo / 2) mod 2) = 1),
+            to_sl(((combo / 4) mod 2) = 1),
+            rnd.RandSigned(32), rnd.RandInt(0, 255), to_sl(beat = 19)
+          );
+        end loop;
+      end loop;
+      h1_offset := 0;
+      h1_clamp_en := '0';
+      h1_clamp_min := -128;
+      h1_clamp_max := 127;
+      h2_per_channel_en := '0';
+      drain_and_check(1000);
+
+    elsif run("test_per_channel_en_zero_is_legacy") then
+      -- ISA v1.2 (H2) backwards compatibility: with cfg_per_channel_en='0'
+      -- a fully populated (garbage) table row on 'scale_rd_data' must have
+      -- no effect -- every lane uses the scalar cfg_requant_scale/shift,
+      -- exactly the pre-H2 datapath, for every flag combination.
+      h2_per_channel_en := '0';
+      for combo in 0 to 7 loop
+        for beat in 0 to 14 loop
+          random_accum_arr(accum_vals);
+          random_accum_arr(bias_vals);
+          for i in 0 to c_pe_rows - 1 loop
+            h2_lane_scale(i) := rnd.RandSigned(32);
+            h2_lane_shift(i) := rnd.RandInt(0, 255);
+          end loop;
+          scale := rnd.RandSigned(32);
+          shift := rnd.RandInt(0, c_max_requant_shift);
+          send_beat(
+            accum_vals, bias_vals,
+            to_sl((combo mod 2) = 1),
+            to_sl(((combo / 2) mod 2) = 1),
+            to_sl(((combo / 4) mod 2) = 1),
+            scale, shift, '0'
+          );
+        end loop;
+      end loop;
+      -- Directed: table says -1.0 / shift 5 on every lane, scalar says
+      -- 1.0 / 0 -> result must be +100, not -3.
+      for i in 0 to c_pe_rows - 1 loop
+        h2_lane_scale(i) := -c_scale_one;
+        h2_lane_shift(i) := 5;
+      end loop;
+      send_directed(100, 0, '0', '1', '0', c_scale_one, 0);
+      h2_lane_scale := (others => (others => '0'));
+      h2_lane_shift := (others => 0);
       drain_and_check(500);
 
     elsif run("test_full_throughput") then

@@ -29,6 +29,7 @@ from cnn_accel_model import (
     FLAG_BIAS_EN,
     FLAG_CLAMP_EN,
     FLAG_PAD_EN,
+    FLAG_PER_CHANNEL_EN,
     FLAG_RELU_EN,
     FLAG_REQUANT_EN,
     OPCODE_CONV2D,
@@ -41,9 +42,11 @@ from cnn_accel_model import (
     conv2d,
     dwconv2d,
     fc,
+    pack_scale_table_for_hw,
     pack_weights_for_hw,
     pool_avg,
     pool_max,
+    unpack_scale_table_from_hw,
 )
 
 class HwPacking(NamedTuple):
@@ -75,7 +78,13 @@ def hw_packing(vectors_dir: Path, *, pe_rows: int = cnn_accel_constants.PE_ROWS)
 
 
 def _flags(
-    *, relu_en: bool, bias_en: bool, requant_en: bool, pad_en: bool, clamp_en: bool = False
+    *,
+    relu_en: bool,
+    bias_en: bool,
+    requant_en: bool,
+    pad_en: bool,
+    clamp_en: bool = False,
+    per_channel_en: bool = False,
 ) -> int:
     return (
         (int(relu_en) << FLAG_RELU_EN)
@@ -83,11 +92,30 @@ def _flags(
         | (int(requant_en) << FLAG_REQUANT_EN)
         | (int(pad_en) << FLAG_PAD_EN)
         | (int(clamp_en) << FLAG_CLAMP_EN)
+        | (int(per_channel_en) << FLAG_PER_CHANNEL_EN)
     )
 
 
 def _write_int_lines(path: Path, values: list[int]) -> None:
     path.write_text("".join(f"{v}\n" for v in values))
+
+
+def _write_scale_table_packed(
+    path: Path, scale_table: list[tuple[int, int]], desc: LayerDesc, pe_rows: int
+) -> None:
+    """`scale_table_packed.txt` (ISA v1.2, H2; doc/cnn_accel_test_vectors.md):
+    the per-channel requant table in `pack_scale_table_for_hw`'s PADDED
+    `OT*pe_rows`-entry order, two `_write_int_lines`-style records per
+    entry -- `multiplier` (signed int32) then `shift` (0..255) -- so
+    tb_cnn_accel_conv_core.vhd streams it one entry per `fill_is_scale`
+    beat with its existing one-int-per-line reader and no repacking. It is
+    derived from the byte image (not from `scale_table` directly) so the
+    file can only ever disagree with the DDR contents if the pack/unpack
+    pair does."""
+    image = pack_scale_table_for_hw(scale_table, desc, pe_rows)
+    n_entries = len(image) // cnn_accel_constants.SCALE_TABLE_ENTRY_BYTES
+    entries = unpack_scale_table_from_hw(image, n_entries)
+    _write_int_lines(path, [v for multiplier, shift in entries for v in (multiplier, shift)])
 
 
 def _write_desc(path: Path, desc: LayerDesc, *, extra: dict[str, int] | None = None) -> None:
@@ -134,6 +162,11 @@ def _build_case(
     clamp_en: bool = False,
     clamp_min: int = 0,
     clamp_max: int = 0,
+    # ISA v1.2 (H2) per-channel requant: `scale_table[oc] = (multiplier,
+    # shift)` sets FLAG_PER_CHANNEL_EN and emits `scale_table_packed.txt`;
+    # None is the v1.0/v1.1 encoding (every pre-H2 case's desc.txt gains
+    # only a `scale_addr 0` record, no other file changes).
+    scale_table: list[tuple[int, int]] | None = None,
 ) -> None:
     # `pad` is the symmetric (all 4 sides equal) shorthand used by the
     # original 5 cases; pad_top/bottom/left/right let a case override
@@ -164,7 +197,12 @@ def _build_case(
     desc = LayerDesc(
         opcode=OPCODE_DWCONV2D if depthwise else OPCODE_CONV2D,
         flags=_flags(
-            relu_en=relu_en, bias_en=bias_en, requant_en=requant_en, pad_en=pad_en, clamp_en=clamp_en
+            relu_en=relu_en,
+            bias_en=bias_en,
+            requant_en=requant_en,
+            pad_en=pad_en,
+            clamp_en=clamp_en,
+            per_channel_en=scale_table is not None,
         ),
         in_width=in_w,
         in_height=in_h,
@@ -186,9 +224,9 @@ def _build_case(
     )
 
     expected = (
-        dwconv2d(input_values, weights, bias, desc)
+        dwconv2d(input_values, weights, bias, desc, scale_table)
         if depthwise
-        else conv2d(input_values, weights, bias, desc)
+        else conv2d(input_values, weights, bias, desc, scale_table)
     )
 
     case_dir = hw.vectors_dir / name
@@ -211,6 +249,10 @@ def _build_case(
             extra={"tile_channels": hw.tile_channels, "pe_rows": hw.pe_rows},
         )
         _write_int_lines(case_dir / "weights_packed.txt", packed_weights)
+        if scale_table is not None:
+            _write_scale_table_packed(
+                case_dir / "scale_table_packed.txt", scale_table, desc, hw.pe_rows
+            )
     _write_int_lines(case_dir / "input.txt", input_values)
     _write_int_lines(case_dir / "weights.txt", weights)
     _write_int_lines(case_dir / "bias.txt", bias)
@@ -607,6 +649,40 @@ def generate_conv_core_cases(hw: HwPacking) -> list[str]:
         bias_en=True, relu_en=False, requant_en=True,
         requant_scale=1 << 13, requant_shift=6,
         output_offset=-7, clamp_en=True, clamp_min=-100, clamp_max=90,
+    )
+
+    # conv3x3_per_channel (ISA v1.2, H2): the one conv_core case that
+    # exercises FLAG_PER_CHANNEL_EN end to end -- the (multiplier, shift)
+    # pair comes from scale_table_packed.txt (streamed into cnn_accel_
+    # weight_buffer's scale region in the tile-load phase) instead of the
+    # descriptor's requant_scale/requant_shift, which are deliberately set
+    # to values that would give a WRONG answer if any lane fell back to
+    # them (scale 1<<14 with shift 0 vs. per-lane scales around 1<<13 with
+    # shifts 5..10). Every lane gets a distinct pair, one of them negative,
+    # so a lane-index or multiplier/shift byte-order slip shows up as a
+    # mismatch; the shifts are chosen so most lanes stay inside int8 (the
+    # arithmetic is actually compared, not just the saturation rails) while
+    # lane 4's smaller shift does hit them. Shape family of
+    # conv3x3_offset_clamp; the output offset is kept so the v1.1 epilogue
+    # is also active with a per-lane shift.
+    _build_case(
+        "conv3x3_per_channel",
+        hw=hw,
+        seed=15015,
+        depthwise=False,
+        in_w=5, in_h=5, in_c=4, out_c=6,
+        kernel=3, stride=1, pad=1,
+        bias_en=True, relu_en=False, requant_en=True,
+        requant_scale=1 << 14, requant_shift=0,
+        output_offset=3,
+        scale_table=[
+            (1 << 13, 8),
+            (3 << 11, 8),
+            (-(1 << 13), 9),
+            (5 << 10, 7),
+            (1 << 12, 5),
+            (7 << 10, 10),
+        ],
     )
 
     # fc_in6_out4: FC layer in its required degenerate spatial form

@@ -75,6 +75,10 @@ use cnn_accel.cnn_accel_isa_pkg.all;
 -- streaming (D11 -- no packed-bias vector file exists for these cases, so
 -- this is the one place this testbench does its own trivial,
 -- shape-only, zero-padding, not conv math).
+-- ISA v1.2 (H2): a case with FLAG_PER_CHANNEL_EN additionally streams
+-- 'scale_table_packed.txt' (already padded to 'g_pe_rows' entries, two
+-- records per entry) one entry per 'fill_is_scale' beat right after the
+-- bias -- the same tile-load phase, into the weight_buffer's scale region.
 --
 -- Fill sessions: every case pulses 'fill_start' once before streaming its
 -- own weight/bias set (see run_case), which is what makes
@@ -173,6 +177,10 @@ architecture tb of tb_cnn_accel_conv_core is
   signal cfg_clamp_en : std_ulogic := '0';
   signal cfg_clamp_min : std_ulogic_vector(7 downto 0) := (others => '0');
   signal cfg_clamp_max : std_ulogic_vector(7 downto 0) := (others => '0');
+  -- ISA v1.2 (H2) FLAG_PER_CHANNEL_EN (flags bit 5): the per-lane
+  -- (multiplier, shift) table is streamed from 'scale_table_packed.txt'
+  -- into cnn_accel_weight_buffer's scale region with 'fill_is_scale'.
+  signal cfg_per_channel_en : std_ulogic := '0';
 
   signal start : std_ulogic := '0';
   signal done : std_ulogic;
@@ -182,6 +190,7 @@ architecture tb of tb_cnn_accel_conv_core is
 
   signal fill_start : std_ulogic := '0';
   signal fill_is_bias : std_ulogic := '0';
+  signal fill_is_scale : std_ulogic := '0';
   signal s_weight_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
   signal s_weight_s2m : axi_stream_s2m_t;
 
@@ -314,6 +323,7 @@ begin
       cfg_clamp_en => cfg_clamp_en,
       cfg_clamp_min => cfg_clamp_min,
       cfg_clamp_max => cfg_clamp_max,
+      cfg_per_channel_en => cfg_per_channel_en,
 
       start => start,
       done => done,
@@ -323,6 +333,7 @@ begin
 
       fill_start => fill_start,
       fill_is_bias => fill_is_bias,
+      fill_is_scale => fill_is_scale,
       s_weight_m2s => s_weight_m2s,
       s_weight_s2m => s_weight_s2m,
 
@@ -429,8 +440,16 @@ begin
       variable v_n_weight_vals : positive :=
         v_n_tiles * v_kernel_h * v_kernel_w * c_weight_lanes;
 
+      -- flags bit 5 = FLAG_PER_CHANNEL_EN (ISA v1.2, H2).
+      variable v_per_channel_en : boolean := (flags / 32) mod 2 = 1;
+
       variable weights_flat : flat_int_arr_t(0 to v_n_weight_vals - 1);
       variable bias_flat : flat_int_arr_t(0 to v_out_channels - 1);
+      -- 'scale_table_packed.txt' (doc/cnn_accel_test_vectors.md): two
+      -- records (multiplier, shift) per PADDED entry, 'c_pe_rows' entries
+      -- for the single output-channel tile run_case supports. Only read
+      -- when 'v_per_channel_en'.
+      variable scale_flat : flat_int_arr_t(0 to 2 * c_pe_rows - 1);
       variable input_flat : flat_int_arr_t(0 to v_in_width * v_in_height * v_in_channels - 1);
       variable expected_flat : flat_int_arr_t(0 to v_num_pixels * v_out_channels - 1);
 
@@ -470,6 +489,9 @@ begin
       read_int_file(case_dir & "/bias.txt", bias_flat);
       read_int_file(case_dir & "/input.txt", input_flat);
       read_int_file(case_dir & "/expected.txt", expected_flat);
+      if v_per_channel_en then
+        read_int_file(case_dir & "/scale_table_packed.txt", scale_flat);
+      end if;
 
       -- Start a new fill session (write pointers reset to 0) before
       -- streaming any fill beat -- see this file's header comment. One
@@ -509,6 +531,28 @@ begin
         wait until rising_edge(clk) and s_weight_s2m.ready = '1';
       end loop;
       s_weight_m2s.valid <= '0';
+      fill_is_bias <= '0';
+
+      -- Fill the per-channel scale table (ISA v1.2, H2) in the same
+      -- tile-load phase, one 'c_scale_entry_width'-bit entry per beat with
+      -- 'fill_is_scale'='1': multiplier in bits [31:0], shift in [39:32],
+      -- exactly cnn_accel_model.pack_scale_table_for_hw's 8-byte entry
+      -- with the three reserved bytes dropped. The file is already padded
+      -- to 'c_pe_rows' entries, so no zero-padding happens here.
+      if v_per_channel_en then
+        fill_is_scale <= '1';
+        for i in 0 to c_pe_rows - 1 loop
+          s_weight_m2s.data(c_scale_entry_mult_width - 1 downto 0) <=
+            std_ulogic_vector(to_signed(scale_flat(2 * i), c_scale_entry_mult_width));
+          s_weight_m2s.data(c_scale_entry_width - 1 downto c_scale_entry_mult_width) <=
+            std_ulogic_vector(to_unsigned(scale_flat(2 * i + 1), c_scale_entry_shift_width));
+          s_weight_m2s.data(axi_stream_data_sz - 1 downto c_scale_entry_width) <= (others => '0');
+          s_weight_m2s.valid <= '1';
+          wait until rising_edge(clk) and s_weight_s2m.ready = '1';
+        end loop;
+        s_weight_m2s.valid <= '0';
+        fill_is_scale <= '0';
+      end if;
 
       -- Configure and pulse 'start'.
       cfg_kernel_h <= std_ulogic_vector(to_unsigned(v_kernel_h, 8));
@@ -531,6 +575,7 @@ begin
       cfg_output_offset <= std_ulogic_vector(to_signed(v_output_offset, 16));
       cfg_clamp_min <= std_ulogic_vector(to_signed(v_clamp_min, 8));
       cfg_clamp_max <= std_ulogic_vector(to_signed(v_clamp_max, 8));
+      cfg_per_channel_en <= to_sl(v_per_channel_en);
 
       wait until rising_edge(clk);
       start <= '1';
