@@ -56,12 +56,14 @@ from cnn_accel_model import (
     OFF_POOL_STRIDE_W,
     OFF_REQUANT_SCALE,
     OFF_REQUANT_SHIFT,
+    OFF_SCALE_ADDR,
     OFF_STRIDE_H,
     OFF_STRIDE_W,
     OFF_WEIGHT_ADDR,
     FLAG_BIAS_EN,
     FLAG_CLAMP_EN,
     FLAG_PAD_EN,
+    FLAG_PER_CHANNEL_EN,
     FLAG_RELU_EN,
     FLAG_REQUANT_EN,
     activation_bytes,
@@ -75,9 +77,12 @@ from cnn_accel_model import (
     encode_program,
     fc,
     pack_activation_planes,
+    lane_requant_params,
     pack_bias_for_hw,
+    pack_scale_table_for_hw,
     pack_weights_for_hw,
     packed_bias_count,
+    packed_scale_table_bytes,
     packed_weight_count,
     pool_avg,
     pool_max,
@@ -86,6 +91,7 @@ from cnn_accel_model import (
     run_program,
     saturate_signed,
     unpack_activation_planes,
+    unpack_scale_table_from_hw,
     unpack_weights_from_hw,
 )
 
@@ -461,6 +467,78 @@ def test_layer_desc_clamp_en_property_and_conv2d_uses_w13() -> None:
     assert conv2d([-128, -1, 0, 127], [1], [0], desc) == [0, 0, 0, 0]
 
 
+# ---------------------------------------------------------------------------
+# ISA v1.2 (H2): per-channel requantization.
+# ---------------------------------------------------------------------------
+
+
+def test_lane_requant_params_per_channel_en_zero_is_broadcast() -> None:
+    """With PER_CHANNEL_EN clear the lane vector is the descriptor's
+    (requant_scale, requant_shift) broadcast to every channel and any
+    table is ignored -- the RTL's legacy `cfg_requant_*` path."""
+    desc = LayerDesc(opcode=OPCODE_CONV2D, flags=1 << FLAG_REQUANT_EN, out_channels=3,
+                     requant_scale=1234, requant_shift=5)
+    assert not desc.per_channel_en
+    assert lane_requant_params(desc, None) == [(1234, 5)] * 3
+    assert lane_requant_params(desc, [(1, 1)] * 3) == [(1234, 5)] * 3
+
+
+def test_lane_requant_params_per_channel_en_uses_table_and_requires_it() -> None:
+    desc = LayerDesc(opcode=OPCODE_CONV2D, flags=(1 << FLAG_REQUANT_EN) | (1 << FLAG_PER_CHANNEL_EN),
+                     out_channels=3, requant_scale=1234, requant_shift=5)
+    assert desc.per_channel_en
+    table = [(10, 1), (20, 2), (30, 3), (40, 4)]  # padded entries beyond out_c are dropped
+    assert lane_requant_params(desc, table) == table[:3]
+    with pytest.raises(ValueError):
+        lane_requant_params(desc, None)
+    with pytest.raises(ValueError):
+        lane_requant_params(desc, table[:2])
+
+
+def test_conv2d_per_channel_lanes_apply_distinct_scale_and_shift() -> None:
+    """A 1x1 conv, 4 output channels each with weight 1 on a single input
+    channel: lane `oc` must be requantised with ITS OWN (multiplier,
+    shift), i.e. `bias_requantize_relu(x, ..., scale[oc], shift[oc])`."""
+    desc = LayerDesc(
+        opcode=OPCODE_CONV2D,
+        flags=(1 << FLAG_REQUANT_EN) | (1 << FLAG_PER_CHANNEL_EN),
+        in_width=3, in_height=1, in_channels=1, out_channels=4,
+        requant_scale=1 << 15, requant_shift=0,  # must be ignored
+    )
+    table = [(1 << 15, 0), (1 << 14, 0), (1 << 15, 1), (-(1 << 15), 0)]
+    xs = [100, -50, 7]
+    out = conv2d(xs, [1, 1, 1, 1], [0, 0, 0, 0], desc, table)
+    expected = []
+    for x in xs:
+        for mult, shift in table:
+            expected.append(
+                bias_requantize_relu(x, 0, bias_en=False, requant_en=True, relu_en=False,
+                                     requant_scale=mult, requant_shift=shift)
+            )
+    assert out == expected
+    # Sanity on the actual numbers: x, x/2, x/2, -x.
+    assert out[:4] == [100, 50, 50, -100]
+
+
+def test_conv2d_per_channel_en_zero_is_legacy_bit_identical() -> None:
+    """Same random layer, once with the flag clear (table present but
+    ignored) and once via the old call signature: byte-identical."""
+    rng = random.Random(0x4A2)
+    in_w, in_h, in_c, out_c, k = 4, 3, 3, 5, 3
+    desc = LayerDesc(
+        opcode=OPCODE_CONV2D,
+        flags=(1 << FLAG_REQUANT_EN) | (1 << FLAG_BIAS_EN) | (1 << FLAG_RELU_EN) | (1 << FLAG_PAD_EN),
+        in_width=in_w, in_height=in_h, in_channels=in_c, out_channels=out_c,
+        kernel_h=k, kernel_w=k, pad_top=1, pad_bottom=1, pad_left=1, pad_right=1,
+        requant_scale=rng.randint(1, 2**31 - 1), requant_shift=rng.randint(0, 12),
+    )
+    xs = [rng.randint(-128, 127) for _ in range(in_w * in_h * in_c)]
+    ws = [rng.randint(-128, 127) for _ in range(out_c * k * k * in_c)]
+    bs = [rng.randint(-5000, 5000) for _ in range(out_c)]
+    stale_table = [(rng.randint(-(2**31), 2**31 - 1), rng.randint(0, 255)) for _ in range(out_c)]
+    assert conv2d(xs, ws, bs, desc, stale_table) == conv2d(xs, ws, bs, desc)
+
+
 def test_instruction_offsets_match_vhdl_pkg_literals() -> None:
     expected = {
         "OFF_OPCODE": 0,
@@ -491,6 +569,7 @@ def test_instruction_offsets_match_vhdl_pkg_literals() -> None:
         "OFF_OUTPUT_OFFSET": 52,
         "OFF_CLAMP_MIN": 54,
         "OFF_CLAMP_MAX": 55,
+        "OFF_SCALE_ADDR": 56,
     }
     actual = {
         "OFF_OPCODE": OFF_OPCODE,
@@ -521,10 +600,14 @@ def test_instruction_offsets_match_vhdl_pkg_literals() -> None:
         "OFF_OUTPUT_OFFSET": OFF_OUTPUT_OFFSET,
         "OFF_CLAMP_MIN": OFF_CLAMP_MIN,
         "OFF_CLAMP_MAX": OFF_CLAMP_MAX,
+        "OFF_SCALE_ADDR": OFF_SCALE_ADDR,
     }
     assert actual == expected
     assert INSTR_WORD_BYTES == 64
     assert FLAG_CLAMP_EN == 4
+    assert FLAG_PER_CHANNEL_EN == 5
+    assert cnn_accel_constants.SCALE_TABLE_ENTRY_BYTES == 8
+    assert cnn_accel_constants.SCALE_BUFFER_ENTRY_BITS == 40
 
 
 def test_isa_layout_self_consistent() -> None:
@@ -533,10 +616,10 @@ def test_isa_layout_self_consistent() -> None:
     above, which cross-checks the model's *exported* `OFF_*` names against
     independently hand-typed literals): no two fields overlap, no field
     (named or reserved) crosses the 64-byte word boundary, and the
-    documented reserved gaps (W0 bytes 2-3, W10 bytes 41-43, W14-W15
-    bytes 56-63 -- doc/cnn_accel_arch.md's ISA table; W13 became the ISA
-    v1.1 output_offset/clamp_min/clamp_max fields in H1) land exactly where
-    specified. This is the guarantee that replaces the old hand-maintained
+    documented reserved gaps (W0 bytes 2-3, W10 bytes 41-43, W15 bytes
+    60-63 -- doc/cnn_accel_arch.md's ISA table; W13 became the ISA v1.1
+    output_offset/clamp_min/clamp_max fields in H1, W14 the ISA v1.2
+    scale_addr in H2) land exactly where specified. This is the guarantee that replaces the old hand-maintained
     "cnn_accel_model.py's encoder must agree with these byte-for-byte"
     comment with something a test actually enforces."""
     occupied = bytearray(cnn_accel_constants.INSTR_WORD_BYTES)
@@ -558,7 +641,7 @@ def test_isa_layout_self_consistent() -> None:
     assert offset == cnn_accel_constants.INSTR_WORD_BYTES
     assert all(occupied), "instruction word has unaccounted-for byte(s)"
 
-    assert cnn_accel_constants.isa_reserved_ranges() == [(2, 3), (41, 43), (56, 63)]
+    assert cnn_accel_constants.isa_reserved_ranges() == [(2, 3), (41, 43), (60, 63)]
 
     # Every non-reserved field name is unique and does not collide with the
     # `RESERVED` sentinel.
@@ -596,6 +679,7 @@ def test_encode_decode_round_trip() -> None:
         output_offset=-129,
         clamp_min=-100,
         clamp_max=100,
+        scale_addr=0xDEADBEE8,
     )
     encoded = encode_instruction(desc)
     assert len(encoded) == INSTR_WORD_BYTES
@@ -604,8 +688,19 @@ def test_encode_decode_round_trip() -> None:
     assert encoded[52:54] == (-129).to_bytes(2, "little", signed=True)
     assert encoded[54] == (-100) & 0xFF
     assert encoded[55] == 100
-    # Reserved W14-W15 untouched.
+    # W14 scale_addr (ISA v1.2), little-endian unsigned.
+    assert encoded[56:60] == (0xDEADBEE8).to_bytes(4, "little")
+    # Reserved W15 untouched.
+    assert encoded[60:64] == bytes(4)
+
+
+def test_encode_v11_style_desc_leaves_w14_zero() -> None:
+    """A descriptor that never mentions `scale_addr` must encode W14 as 0
+    -- the reserved-must-be-0 guarantee that makes every pre-H2 program
+    byte-identical under the v1.2 encoder."""
+    encoded = encode_instruction(LayerDesc(opcode=OPCODE_CONV2D, flags=1 << FLAG_REQUANT_EN))
     assert encoded[56:64] == bytes(8)
+    assert not decode_instruction(encoded).per_channel_en
 
 
 def test_encode_decode_round_trip_randomized() -> None:
@@ -640,6 +735,7 @@ def test_encode_decode_round_trip_randomized() -> None:
             output_offset=rng.randint(-(2**15), 2**15 - 1),
             clamp_min=(clamp_pair := sorted((rng.randint(-128, 127), rng.randint(-128, 127))))[0],
             clamp_max=clamp_pair[1],
+            scale_addr=rng.randint(0, 0xFFFFFFFF),
         )
         assert decode_instruction(encode_instruction(desc)) == desc
 
@@ -1489,6 +1585,49 @@ def _bias_chunk(bias: list[int], desc: LayerDesc) -> bytes:
     return struct.pack(f"<{len(packed)}i", *packed)
 
 
+def test_run_layer_per_channel_reads_scale_table_from_ddr() -> None:
+    """ISA v1.2 end to end: `run_layer` with PER_CHANNEL_EN must read
+    `pack_scale_table_for_hw`'s image at `scale_addr` and match `conv2d`
+    given the logical table; with the flag clear the same memory image
+    (table still present) must match the legacy `conv2d` exactly."""
+    rng = random.Random(0xC5A1)
+    in_w, in_h, in_c, out_c, k = 4, 4, 3, 12, 3  # 12 -> 2 output tiles at PE_ROWS=8, padded
+    xs = [rng.randint(-128, 127) for _ in range(in_w * in_h * in_c)]
+    ws = [rng.randint(-128, 127) for _ in range(out_c * k * k * in_c)]
+    bs = [rng.randint(-1000, 1000) for _ in range(out_c)]
+    table = [(rng.randint(1 << 10, 1 << 20), rng.randint(0, 6)) for _ in range(out_c)]
+
+    in_addr, weight_addr, bias_addr, scale_addr, out_addr = 0x1000, 0x2000, 0x3000, 0x3800, 0x4000
+    desc = LayerDesc(
+        opcode=OPCODE_CONV2D,
+        flags=(1 << FLAG_REQUANT_EN) | (1 << FLAG_BIAS_EN) | (1 << FLAG_PAD_EN) | (1 << FLAG_PER_CHANNEL_EN),
+        in_addr=in_addr, out_addr=out_addr, weight_addr=weight_addr, bias_addr=bias_addr,
+        scale_addr=scale_addr,
+        in_width=in_w, in_height=in_h, in_channels=in_c, out_channels=out_c,
+        kernel_h=k, kernel_w=k, pad_top=1, pad_bottom=1, pad_left=1, pad_right=1,
+        requant_scale=1 << 15, requant_shift=3,
+    )
+    table_image = pack_scale_table_for_hw(table, desc, cnn_accel_constants.PE_ROWS)
+    assert len(table_image) == packed_scale_table_bytes(desc, cnn_accel_constants.PE_ROWS) == 16 * 8
+    chunks = {
+        in_addr: _activation_chunk(xs, in_w, in_h, in_c),
+        weight_addr: _weight_chunk(ws, desc),
+        bias_addr: _bias_chunk(bs, desc),
+        scale_addr: table_image,
+    }
+
+    mem = build_memory_image(chunks, size=0x5000)
+    run_layer(mem, desc)
+    assert _read_activation(mem, out_addr, in_w, in_h, out_c) == conv2d(xs, ws, bs, desc, table)
+
+    # Flag clear, same image: legacy result, scale_addr never dereferenced.
+    legacy = LayerDesc(**{**desc.__dict__, "flags": desc.flags & ~(1 << FLAG_PER_CHANNEL_EN)})
+    mem = build_memory_image(chunks, size=0x5000)
+    run_layer(mem, legacy)
+    assert _read_activation(mem, out_addr, in_w, in_h, out_c) == conv2d(xs, ws, bs, legacy)
+    assert conv2d(xs, ws, bs, legacy) != conv2d(xs, ws, bs, desc, table)  # the test has teeth
+
+
 def test_run_layer_conv2d_end_to_end_via_memory_image() -> None:
     rng = random.Random(42001)
     in_w, in_h, in_c, out_c, k = 4, 4, 2, 3, 3
@@ -1949,6 +2088,53 @@ def test_pack_bias_for_hw_matches_and_pads_zero() -> None:
                 expected = bias[oc] if oc < out_c else 0
                 assert packed[idx] == expected
                 idx += 1
+
+
+def test_pack_scale_table_for_hw_format_padding_and_round_trip() -> None:
+    """ISA v1.2 table image: 8 bytes per entry (`<i` multiplier, `B`
+    shift, 3 zero bytes), padded to whole `pe_rows` tiles with the same
+    `oc = ot*pe_rows + r` tiling as the bias image, and
+    `unpack_scale_table_from_hw` inverts it."""
+    rng = random.Random(0x5CA1)
+    for out_c, pe_rows in itertools.product(_PACK_OUT_CHANNELS_SWEEP, _PACK_PE_ROWS_SWEEP):
+        desc = _desc(out_channels=out_c)
+        table = [(rng.randint(-(2**31), 2**31 - 1), rng.randint(0, 255)) for _ in range(out_c)]
+        packed = pack_scale_table_for_hw(table, desc, pe_rows)
+
+        n_out_tiles = -(-out_c // pe_rows)
+        assert len(packed) == n_out_tiles * pe_rows * 8 == packed_scale_table_bytes(desc, pe_rows)
+        assert len(packed) == packed_bias_count(desc, pe_rows) * cnn_accel_constants.SCALE_TABLE_ENTRY_BYTES
+
+        for i in range(n_out_tiles * pe_rows):
+            entry = packed[8 * i : 8 * i + 8]
+            mult, shift = table[i] if i < out_c else (0, 0)
+            assert entry[0:4] == struct.pack("<i", mult)
+            assert entry[4] == shift
+            assert entry[5:8] == bytes(3)
+
+        assert unpack_scale_table_from_hw(packed, out_c) == table
+        assert unpack_scale_table_from_hw(packed, n_out_tiles * pe_rows) == table + [(0, 0)] * (
+            n_out_tiles * pe_rows - out_c
+        )
+
+
+def test_pack_scale_table_for_hw_rejects_bad_input() -> None:
+    desc = _desc(out_channels=2)
+    with pytest.raises(ValueError):
+        pack_scale_table_for_hw([(1, 0)], desc, 8)  # too short
+    with pytest.raises(ValueError):
+        pack_scale_table_for_hw([(2**31, 0), (1, 0)], desc, 8)  # multiplier not int32
+    with pytest.raises(ValueError):
+        pack_scale_table_for_hw([(1, 256), (1, 0)], desc, 8)  # shift not uint8
+    with pytest.raises(ValueError):
+        pack_scale_table_for_hw([(1, 0), (1, 0)], desc, 0)
+    good = pack_scale_table_for_hw([(1, 0), (1, 0)], desc, 8)
+    with pytest.raises(ValueError):
+        unpack_scale_table_from_hw(good[:8], 2)  # too short
+    bad = bytearray(good)
+    bad[5] = 1  # reserved byte must be zero
+    with pytest.raises(ValueError):
+        unpack_scale_table_from_hw(bytes(bad), 2)
 
 
 # ---------------------------------------------------------------------------

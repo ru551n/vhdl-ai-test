@@ -449,6 +449,22 @@ class Module(BaseModule):
             value=cnn_accel_constants.ACCUM_WIDTH,
             description="PE array / bias_requant accumulator width, bits.",
         )
+        regs.add_constant(
+            name="scale_table_entry_bytes",
+            value=cnn_accel_constants.SCALE_TABLE_ENTRY_BYTES,
+            description=(
+                "ISA v1.2 per-channel requant table: bytes per output channel in DDR "
+                "(int32 multiplier, uint8 shift, 3 zero bytes)."
+            ),
+        )
+        regs.add_constant(
+            name="scale_buffer_entry_bits",
+            value=cnn_accel_constants.SCALE_BUFFER_ENTRY_BITS,
+            description=(
+                "Bits of each per-channel table entry kept in cnn_accel_weight_buffer's "
+                "scale_buffer (multiplier + shift; the zero bytes are dropped)."
+            ),
+        )
 
         self._registers = regs
 

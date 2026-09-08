@@ -61,6 +61,13 @@ layout; they convert to/from LOGICAL at the `memory[]` boundary via
   `pack_bias_for_hw`'s `OT*PE_ROWS`-int32 image (`OT =
   ceil(out_channels/PE_ROWS)`, padded lanes zero); `run_layer` uses the
   first `out_channels` of it.
+- Per-channel requant table (ISA v1.2, H2, `PER_CHANNEL_EN`), DDR layout
+  at `scale_addr`: exactly `pack_scale_table_for_hw`'s image -- one
+  8-byte `SCALE_TABLE_ENTRY_BYTES` entry (`multiplier int32 LE | shift
+  uint8 | 3 zero bytes`) per output channel, padded to `OT*PE_ROWS`
+  entries with the same tiling as the bias image; `run_layer` uses the
+  first `out_channels` of it and ignores `scale_addr` entirely while the
+  flag is clear.
 """
 
 from __future__ import annotations
@@ -74,6 +81,9 @@ from cnn_accel_constants import (
     INSTR_WORD_BYTES,
     OPCODES,
     PE_ROWS,
+    SCALE_TABLE_ENTRY_BYTES,
+    SCALE_TABLE_MULTIPLIER_BYTES,
+    SCALE_TABLE_SHIFT_BYTES,
     TILE_CHANNELS,
     isa_field_offsets,
 )
@@ -141,6 +151,9 @@ class LayerDesc:
     output_offset: int = 0
     clamp_min: int = 0
     clamp_max: int = 0
+    # ISA v1.2 (H2), W14: byte address of the per-channel requant table
+    # (`pack_scale_table_for_hw`), read only while `per_channel_en`.
+    scale_addr: int = 0
 
     @property
     def relu_en(self) -> bool:
@@ -149,6 +162,10 @@ class LayerDesc:
     @property
     def clamp_en(self) -> bool:
         return bool((self.flags >> FLAG_CLAMP_EN) & 1)
+
+    @property
+    def per_channel_en(self) -> bool:
+        return bool((self.flags >> FLAG_PER_CHANNEL_EN) & 1)
 
     @property
     def bias_en(self) -> bool:
@@ -211,6 +228,7 @@ def encode_instruction(desc: LayerDesc) -> bytes:
     struct.pack_into("<h", buf, OFF_OUTPUT_OFFSET, desc.output_offset)
     struct.pack_into("<b", buf, OFF_CLAMP_MIN, desc.clamp_min)
     struct.pack_into("<b", buf, OFF_CLAMP_MAX, desc.clamp_max)
+    struct.pack_into("<I", buf, OFF_SCALE_ADDR, desc.scale_addr & 0xFFFFFFFF)
     return bytes(buf)
 
 
@@ -249,6 +267,7 @@ def decode_instruction(data: bytes) -> LayerDesc:
         output_offset=struct.unpack_from("<h", data, OFF_OUTPUT_OFFSET)[0],
         clamp_min=struct.unpack_from("<b", data, OFF_CLAMP_MIN)[0],
         clamp_max=struct.unpack_from("<b", data, OFF_CLAMP_MAX)[0],
+        scale_addr=struct.unpack_from("<I", data, OFF_SCALE_ADDR)[0],
     )
 
 
@@ -429,6 +448,33 @@ def _at(
     return values[(row * width + col) * channels + channel]
 
 
+def lane_requant_params(
+    desc: LayerDesc, scale_table: list[tuple[int, int]] | None
+) -> list[tuple[int, int]]:
+    """Resolve the per-output-channel `(requant_scale, requant_shift)`
+    pairs `_conv2d_generic` hands to `bias_requantize_relu` (ISA v1.2,
+    H2): with `desc.per_channel_en` the first `out_channels` entries of
+    `scale_table` (the decoded DDR table, see `pack_scale_table_for_hw`),
+    otherwise the descriptor's `requant_scale`/`requant_shift` broadcast
+    to every channel -- exactly what `cnn_accel_bias_requant` sees on
+    its `lane_scale`/`lane_shift` vectors in each mode, so
+    `PER_CHANNEL_EN=0` is bit-identical to the pre-H2 epilogue by
+    construction (the broadcast IS the old single-`cfg_requant_*` path).
+
+    `scale_table` is ignored while the flag is clear (a host may leave a
+    stale table in DDR); with the flag set it must hold at least
+    `out_channels` entries."""
+    out_c = desc.out_channels
+    if not desc.per_channel_en:
+        return [(desc.requant_scale, desc.requant_shift)] * out_c
+    if scale_table is None or len(scale_table) < out_c:
+        raise ValueError(
+            f"PER_CHANNEL_EN set but scale_table has "
+            f"{0 if scale_table is None else len(scale_table)} entries, need {out_c}"
+        )
+    return [(int(m), int(s)) for m, s in scale_table[:out_c]]
+
+
 def _conv2d_generic(
     input_values: list[int],
     weights: list[int],
@@ -436,13 +482,17 @@ def _conv2d_generic(
     desc: LayerDesc,
     *,
     depthwise: bool,
+    scale_table: list[tuple[int, int]] | None = None,
 ) -> list[int]:
     """Shared implementation for `conv2d`/`dwconv2d`/`fc`: int8 x int8 MAC
     over the padded, strided window, then `bias_requantize_relu` per
     output element. `weights` layout: OHWI for `depthwise=False`,
-    `(channels, kernel_h, kernel_w)` for `depthwise=True`."""
+    `(channels, kernel_h, kernel_w)` for `depthwise=True`. `scale_table`
+    is the decoded per-channel `(multiplier, shift)` table, consulted
+    only while `desc.per_channel_en` (see `lane_requant_params`)."""
     in_w, in_h, in_c = desc.in_width, desc.in_height, desc.in_channels
     out_c = desc.out_channels
+    lane_params = lane_requant_params(desc, scale_table)
     k_h, k_w = desc.kernel_h, desc.kernel_w
     s_h, s_w = desc.stride_h, desc.stride_w
     pad_top = desc.pad_top if desc.pad_en else 0
@@ -498,6 +548,7 @@ def _conv2d_generic(
                     acc, opcode=desc.opcode, out_channel=oc, out_row=out_row, out_col=out_col
                 )
                 bias_value = bias[oc] if desc.bias_en else 0
+                lane_scale, lane_shift = lane_params[oc]
                 output.append(
                     bias_requantize_relu(
                         acc,
@@ -505,8 +556,8 @@ def _conv2d_generic(
                         bias_en=desc.bias_en,
                         requant_en=desc.requant_en,
                         relu_en=desc.relu_en,
-                        requant_scale=desc.requant_scale,
-                        requant_shift=desc.requant_shift,
+                        requant_scale=lane_scale,
+                        requant_shift=lane_shift,
                         output_offset=desc.output_offset,
                         clamp_en=desc.clamp_en,
                         clamp_min=desc.clamp_min,
@@ -516,28 +567,48 @@ def _conv2d_generic(
     return output
 
 
-def conv2d(input_values: list[int], weights: list[int], bias: list[int], desc: LayerDesc) -> list[int]:
+def conv2d(
+    input_values: list[int],
+    weights: list[int],
+    bias: list[int],
+    desc: LayerDesc,
+    scale_table: list[tuple[int, int]] | None = None,
+) -> list[int]:
     """`OPCODE_CONV2D` reference: full cross-channel convolution.
     Weights: OHWI, `out_channels * kernel_h * kernel_w * in_channels` int8s.
+    `scale_table`: per-channel `(multiplier, shift)`, used only while
+    `desc.per_channel_en` (ISA v1.2).
     """
-    return _conv2d_generic(input_values, weights, bias, desc, depthwise=False)
+    return _conv2d_generic(input_values, weights, bias, desc, depthwise=False, scale_table=scale_table)
 
 
-def dwconv2d(input_values: list[int], weights: list[int], bias: list[int], desc: LayerDesc) -> list[int]:
+def dwconv2d(
+    input_values: list[int],
+    weights: list[int],
+    bias: list[int],
+    desc: LayerDesc,
+    scale_table: list[tuple[int, int]] | None = None,
+) -> list[int]:
     """`OPCODE_DWCONV2D` reference: one filter per channel, no
     cross-channel accumulation (`out_channels` must equal `in_channels`).
     Weights: `channels * kernel_h * kernel_w` int8s."""
     if desc.out_channels != desc.in_channels:
         raise ValueError("dwconv2d requires out_channels == in_channels")
-    return _conv2d_generic(input_values, weights, bias, desc, depthwise=True)
+    return _conv2d_generic(input_values, weights, bias, desc, depthwise=True, scale_table=scale_table)
 
 
-def fc(input_values: list[int], weights: list[int], bias: list[int], desc: LayerDesc) -> list[int]:
+def fc(
+    input_values: list[int],
+    weights: list[int],
+    bias: list[int],
+    desc: LayerDesc,
+    scale_table: list[tuple[int, int]] | None = None,
+) -> list[int]:
     """`OPCODE_FC` reference: degenerate 1x1-spatial `CONV2D`
     (`in_width=in_height=kernel_h=kernel_w=1`), per
     `doc/cnn_accel_arch.md`'s ISA section."""
     fc_desc = LayerDesc(**{**desc.__dict__, "in_width": 1, "in_height": 1, "kernel_h": 1, "kernel_w": 1})
-    return conv2d(input_values, weights, bias, fc_desc)
+    return conv2d(input_values, weights, bias, fc_desc, scale_table)
 
 
 def activation_plane_count(channels: int) -> int:
@@ -805,6 +876,74 @@ def packed_bias_count(desc: LayerDesc, pe_rows: int) -> int:
     return n_out_tiles * pe_rows
 
 
+def pack_scale_table_for_hw(
+    scale_table: list[tuple[int, int]], desc: LayerDesc, pe_rows: int
+) -> bytes:
+    """ISA v1.2 (H2) per-channel requant table byte image, the exact DDR
+    contents at `LayerDesc.scale_addr` (doc/tosa_compiler_plan.md section
+    5, extension 2): one `SCALE_TABLE_ENTRY_BYTES` (8) entry per output
+    channel, `multiplier int32 LE | shift uint8 | 3 zero bytes`, zero-
+    padded to whole `pe_rows` tiles with the SAME `oc = ot*pe_rows + r`
+    tiling as `pack_bias_for_hw` -- `cnn_accel_weight_buffer` fills its
+    `scale_buffer` lane `r` from entry `ot*pe_rows + r` in the same tile-
+    load phase as `bias_buffer`, so the padded lanes must exist.
+
+    `scale_table[oc] = (multiplier, shift)` with `multiplier` a signed Q15
+    int32 and `shift` in `0..255`, the same semantics as the descriptor's
+    `requant_scale`/`requant_shift`. Padded entries are all-zero
+    (multiplier 0 -> lane output is `clamp(output_offset)`, which those
+    lanes' MAC results never reach the ofmap anyway, see D11).
+
+    Total length is always exactly `OT * pe_rows * SCALE_TABLE_ENTRY_BYTES`,
+    `OT = ceil(out_channels / pe_rows)`; `unpack_scale_table_from_hw` is
+    the inverse.
+    """
+    if pe_rows <= 0:
+        raise ValueError(f"pe_rows must be positive, got pe_rows={pe_rows}")
+    out_c = desc.out_channels
+    if len(scale_table) < out_c:
+        raise ValueError(f"scale_table has {len(scale_table)} entries, need {out_c}")
+    n_out_tiles = -(-out_c // pe_rows)  # ceil(out_c / pe_rows)
+    packed = bytearray()
+    for ot in range(n_out_tiles):
+        for r in range(pe_rows):
+            oc = ot * pe_rows + r
+            multiplier, shift = scale_table[oc] if oc < out_c else (0, 0)
+            if not -(2**31) <= multiplier <= 2**31 - 1:
+                raise ValueError(f"scale_table[{oc}] multiplier={multiplier} outside int32")
+            if not 0 <= shift <= 0xFF:
+                raise ValueError(f"scale_table[{oc}] shift={shift} outside uint8")
+            packed += struct.pack("<iB", multiplier, shift)
+            packed += bytes(SCALE_TABLE_ENTRY_BYTES - SCALE_TABLE_MULTIPLIER_BYTES - SCALE_TABLE_SHIFT_BYTES)
+    return bytes(packed)
+
+
+def packed_scale_table_bytes(desc: LayerDesc, pe_rows: int) -> int:
+    """Byte length of `pack_scale_table_for_hw`'s output, computable before
+    packing: `OT * pe_rows * SCALE_TABLE_ENTRY_BYTES`."""
+    return packed_bias_count(desc, pe_rows) * SCALE_TABLE_ENTRY_BYTES
+
+
+def unpack_scale_table_from_hw(packed: bytes, entries: int) -> list[tuple[int, int]]:
+    """Inverse of `pack_scale_table_for_hw` for the first `entries` entries
+    (the padding entries are simply not requested): `[(multiplier, shift),
+    ...]`. Rejects a nonzero pad byte -- the RTL drops those bytes
+    silently, so a host bug there would otherwise go unnoticed."""
+    if len(packed) < entries * SCALE_TABLE_ENTRY_BYTES:
+        raise ValueError(
+            f"scale table image has {len(packed)} bytes, need "
+            f"{entries * SCALE_TABLE_ENTRY_BYTES} for {entries} entries"
+        )
+    table: list[tuple[int, int]] = []
+    for i in range(entries):
+        entry = packed[i * SCALE_TABLE_ENTRY_BYTES : (i + 1) * SCALE_TABLE_ENTRY_BYTES]
+        multiplier, shift = struct.unpack_from("<iB", entry, 0)
+        if any(entry[SCALE_TABLE_MULTIPLIER_BYTES + SCALE_TABLE_SHIFT_BYTES :]):
+            raise ValueError(f"scale table entry {i} has nonzero reserved bytes: {entry.hex()}")
+        table.append((multiplier, shift))
+    return table
+
+
 def _pool_windows(input_values: list[int], desc: LayerDesc) -> list[list[int]]:
     """Per-channel pooling windows in output-raster order, one list of
     `pool_kernel_h * pool_kernel_w` int8 taps per (output position,
@@ -942,6 +1081,9 @@ def run_layer(memory: bytearray, desc: LayerDesc) -> None:
       planes.
     - `CONV2D`/`FC` bias: exactly `pack_bias_for_hw`'s byte image
       (`packed_bias_count`), first `out_channels` int32s used.
+    - per-channel requant table (`PER_CHANNEL_EN` only): exactly
+      `pack_scale_table_for_hw`'s byte image at `scale_addr`
+      (`packed_scale_table_bytes`), first `out_channels` entries used.
     """
     in_w, in_h, in_c = desc.in_width, desc.in_height, desc.in_channels
 
@@ -987,12 +1129,22 @@ def run_layer(memory: bytearray, desc: LayerDesc) -> None:
             packed_bias_values = struct.unpack(f"<{bias_count}i", bytes(bias_bytes))
             bias = list(packed_bias_values[:out_c])
 
+        # ISA v1.2 (H2): the per-channel table is exactly
+        # `pack_scale_table_for_hw`'s byte image at scale_addr; only the
+        # first out_channels entries are used. Not touched while
+        # PER_CHANNEL_EN is clear (scale_addr is then ignored, so a v1.0/
+        # v1.1 program's reserved-zero W14 is never dereferenced).
+        scale_table: list[tuple[int, int]] | None = None
+        if desc.per_channel_en:
+            table_bytes = memory[desc.scale_addr : desc.scale_addr + packed_scale_table_bytes(desc, PE_ROWS)]
+            scale_table = unpack_scale_table_from_hw(bytes(table_bytes), out_c)
+
         if desc.opcode == OPCODE_CONV2D:
-            output = conv2d(input_values, weights, bias, desc)
+            output = conv2d(input_values, weights, bias, desc, scale_table)
         elif desc.opcode == OPCODE_DWCONV2D:
-            output = dwconv2d(input_values, weights, bias, desc)
+            output = dwconv2d(input_values, weights, bias, desc, scale_table)
         else:
-            output = fc(input_values, weights, bias, desc)
+            output = fc(input_values, weights, bias, desc, scale_table)
         out_w, out_h = _conv_output_dims(desc)
 
     elif desc.opcode in (OPCODE_POOL_MAX, OPCODE_POOL_AVG):

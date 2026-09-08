@@ -99,6 +99,29 @@ WEIGHT_BUFFER_DEPTH = 288
 BIAS_BUFFER_DEPTH = 8
 ACCUM_WIDTH = 32
 
+# ISA v1.2 (doc/tosa_compiler_plan.md section 5, extension 2 / HW milestone
+# H2): per-channel requantization table in DDR at `scale_addr`, one entry
+# per output channel (zero-padded to whole PE_ROWS tiles exactly like the
+# bias image, see cnn_accel_model.pack_scale_table_for_hw):
+#
+#   byte 0..3  multiplier, int32 little-endian (same Q15 semantics as
+#              requant_scale)
+#   byte 4     shift, uint8 (same semantics as requant_shift)
+#   byte 5..7  zero, must be 0
+#
+# 8 bytes = one 64-bit AXI beat per channel, so the table streams through
+# the same weight/bias DMA path as the bias image with no repacking. The
+# accelerator keeps SCALE_BUFFER_ENTRY_BITS (32 + 8 = 40) of each entry in
+# `cnn_accel_weight_buffer`'s `scale_buffer` (PE_ROWS entries, parallel to
+# `bias_buffer`); the 3 zero bytes are dropped on load.
+SCALE_TABLE_ENTRY_BYTES = 8
+SCALE_TABLE_MULTIPLIER_BYTES = 4
+SCALE_TABLE_SHIFT_BYTES = 1
+SCALE_BUFFER_ENTRY_BITS = 8 * (SCALE_TABLE_MULTIPLIER_BYTES + SCALE_TABLE_SHIFT_BYTES)
+
+assert SCALE_TABLE_MULTIPLIER_BYTES + SCALE_TABLE_SHIFT_BYTES <= SCALE_TABLE_ENTRY_BYTES
+assert SCALE_TABLE_ENTRY_BYTES == 8, "one 64-bit AXI beat per channel is the ratified table format"
+
 # ---------------------------------------------------------------------------
 # Frame budget (flow_status.md S5): the target backbone, the clock/fps
 # targets, and the section-6 cycle model from
@@ -200,6 +223,12 @@ FLAGS: dict[str, int] = {
     # instead of the RELU_EN-derived [0 or -128, 127] range. RELU_EN is
     # ignored while CLAMP_EN is set.
     "CLAMP_EN": 4,
+    # ISA v1.2 (doc/tosa_compiler_plan.md section 5, extension 2 / HW
+    # milestone H2): when set, every output channel's (multiplier, shift)
+    # comes from the DDR table at `scale_addr` (SCALE_TABLE_ENTRY_BYTES per
+    # channel) instead of the descriptor's requant_scale/requant_shift,
+    # which are then ignored. Only meaningful with REQUANT_EN.
+    "PER_CHANNEL_EN": 5,
 }
 
 # ---------------------------------------------------------------------------
@@ -259,7 +288,11 @@ ISA_LAYOUT: tuple[IsaField, ...] = (
     IsaField("output_offset", 2, signed=True),
     IsaField("clamp_min", 1, signed=True),
     IsaField("clamp_max", 1, signed=True),
-    IsaField(RESERVED, 8),  # W14-W15 bytes 56-63
+    # W14 (ISA v1.2, H2): byte address of the per-channel requantization
+    # table (PER_CHANNEL_EN). Must be 0 in a v1.0/v1.1 program (reserved-
+    # must-be-0), and is ignored while PER_CHANNEL_EN is clear.
+    IsaField("scale_addr", 4),
+    IsaField(RESERVED, 4),  # W15 bytes 60-63
 )
 
 
