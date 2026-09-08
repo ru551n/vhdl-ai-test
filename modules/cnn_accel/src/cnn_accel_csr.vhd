@@ -61,6 +61,12 @@ entity cnn_accel_csr is
     -- next START, i.e. a running program must not have its base address
     -- changed under it.
     program_base_addr : out std_ulogic_vector(g_axi_addr_width - 1 downto 0) := (others => '0');
+    -- Pulses exactly one cycle AFTER the accepted CTRL.START write, so that
+    -- 'program_base_addr' above (registered, captured on that same write)
+    -- is already stable when the consumer samples it. Handing 'start' out
+    -- in the write cycle itself would make the consumer latch the previous
+    -- base address -- 0 on the very first run, which fetches an all-zero
+    -- descriptor at address 0 and decodes as an immediate HALT.
     start : out std_ulogic := '0';
     soft_reset_pulse : out std_ulogic := '0';
 
@@ -100,11 +106,12 @@ architecture a of cnn_accel_csr is
   signal program_base_addr_q : unsigned(g_axi_addr_width - 1 downto 0) := (others => '0');
 
   signal start_i : std_ulogic;
+  signal start_q : std_ulogic := '0';
   signal soft_reset_pulse_i : std_ulogic;
 
 begin
 
-  start <= start_i;
+  start <= start_q;
   soft_reset_pulse <= soft_reset_pulse_i;
   program_base_addr <= std_ulogic_vector(program_base_addr_q);
 
@@ -189,6 +196,21 @@ begin
       elsif start_i = '1' then
         program_base_addr_q <=
           unsigned(regs_down.program_base_addr.addr(g_axi_addr_width - 1 downto 0));
+      end if;
+    end if;
+  end process;
+
+  -- The configuration snapshot above is a register, so it is only stable
+  -- one cycle after the START write. 'start_q' delays the outgoing pulse by
+  -- exactly that cycle; 'busy_q' is set in the same cycle as 'start_i', so
+  -- the delay cannot let a second START through in between.
+  start_delay : process(clk)
+  begin
+    if rising_edge(clk) then
+      if reset = '1' then
+        start_q <= '0';
+      else
+        start_q <= start_i;
       end if;
     end if;
   end process;
