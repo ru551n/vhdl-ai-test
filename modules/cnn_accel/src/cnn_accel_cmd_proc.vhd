@@ -210,6 +210,13 @@ entity cnn_accel_cmd_proc is
     conv_cfg_pad_bottom : out std_ulogic_vector(7 downto 0) := (others => '0');
     conv_cfg_pad_left : out std_ulogic_vector(7 downto 0) := (others => '0');
     conv_cfg_pad_right : out std_ulogic_vector(7 downto 0) := (others => '0');
+    -- ISA v2.1 'pad_value' for convolution: the int8 value a padded tap
+    -- takes -- the input tensor's quantization zero-point, not 0. Driven
+    -- straight from the descriptor and NOT gated on FLAG_PAD_EN, exactly
+    -- like 'pool_cfg_pad_value' below: with the flag clear the four pad
+    -- counts above are already zero, so no tap is ever padded and the
+    -- fill value cannot be observed.
+    conv_cfg_pad_value : out std_ulogic_vector(7 downto 0) := (others => '0');
     conv_cfg_in_width : out std_ulogic_vector(15 downto 0) := (others => '0');
     conv_cfg_in_height : out std_ulogic_vector(15 downto 0) := (others => '0');
     conv_cfg_in_channels : out std_ulogic_vector(15 downto 0) := (others => '0');
@@ -1910,6 +1917,9 @@ begin
       conv_cfg_pad_right <= std_ulogic_vector(desc_q.pad_right);
     end if;
   end process;
+
+  -- Ungated, see the port comment.
+  conv_cfg_pad_value <= std_ulogic_vector(desc_q.pad_value);
 
   -- Fusion (section 5.3): the epilogue is configuration on the compute
   -- engine, never a second command, so the int32 accumulator tensor is

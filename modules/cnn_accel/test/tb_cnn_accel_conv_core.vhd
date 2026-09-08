@@ -162,6 +162,9 @@ architecture tb of tb_cnn_accel_conv_core is
   signal cfg_pad_bottom : std_ulogic_vector(7 downto 0) := (others => '0');
   signal cfg_pad_left : std_ulogic_vector(7 downto 0) := (others => '0');
   signal cfg_pad_right : std_ulogic_vector(7 downto 0) := (others => '0');
+  -- ISA v2.1: the signed int8 value padded taps take (the input tensor's
+  -- quantization zero-point), read from each case's desc.txt.
+  signal cfg_pad_value : std_ulogic_vector(7 downto 0) := (others => '0');
   signal cfg_in_width : std_ulogic_vector(15 downto 0) := (others => '0');
   signal cfg_in_height : std_ulogic_vector(15 downto 0) := (others => '0');
   signal cfg_in_channels : std_ulogic_vector(15 downto 0) := (others => '0');
@@ -310,6 +313,7 @@ begin
       cfg_pad_bottom => cfg_pad_bottom,
       cfg_pad_left => cfg_pad_left,
       cfg_pad_right => cfg_pad_right,
+      cfg_pad_value => cfg_pad_value,
       cfg_in_width => cfg_in_width,
       cfg_in_height => cfg_in_height,
       cfg_in_channels => cfg_in_channels,
@@ -423,6 +427,7 @@ begin
       variable v_pad_bottom : integer := get_desc_field(case_dir, "pad_bottom");
       variable v_pad_left : integer := get_desc_field(case_dir, "pad_left");
       variable v_pad_right : integer := get_desc_field(case_dir, "pad_right");
+      variable v_pad_value : integer := get_desc_field(case_dir, "pad_value");
       variable v_requant_scale : integer := get_desc_field(case_dir, "requant_scale");
       variable v_requant_shift : integer := get_desc_field(case_dir, "requant_shift");
       variable v_output_offset : integer := get_desc_field(case_dir, "output_offset");
@@ -563,6 +568,8 @@ begin
       cfg_pad_bottom <= std_ulogic_vector(to_unsigned(v_pad_bottom, 8));
       cfg_pad_left <= std_ulogic_vector(to_unsigned(v_pad_left, 8));
       cfg_pad_right <= std_ulogic_vector(to_unsigned(v_pad_right, 8));
+      -- Signed, unlike the four pad counts above.
+      cfg_pad_value <= std_ulogic_vector(to_signed(v_pad_value, 8));
       cfg_in_width <= std_ulogic_vector(to_unsigned(v_in_width, 16));
       cfg_in_height <= std_ulogic_vector(to_unsigned(v_in_height, 16));
       cfg_in_channels <= std_ulogic_vector(to_unsigned(v_in_channels, 16));
@@ -684,6 +691,14 @@ begin
       run_case(vectors_root & "/conv3x3_negative_requant_scale");
       run_case(vectors_root & "/fc_in6_out4");
       run_case(vectors_root & "/conv3x3_c20_o6_multitile");
+      -- ISA v2.1 'pad_value' on the CONV path: a padded tap takes the
+      -- input tensor's quantization zero-point, not 0. Both cases use
+      -- all-negative input against positive weights so the difference
+      -- survives requantization instead of being clipped away -- see
+      -- generate_vectors.py's own comment, and note that a case which
+      -- does NOT do that passes against a 'cfg_pad_value' tied to zero.
+      run_case(vectors_root & "/conv3x3_pad_zero_point");
+      run_case(vectors_root & "/conv3x3_pad_value_asymmetric");
       -- The one case that drives EVERY lane of a 16-row array (out_channels
       -- = 16, the target backbone's layer 1). It only exists in the scaled
       -- vector root -- at g_pe_rows=8 it would be two output-channel

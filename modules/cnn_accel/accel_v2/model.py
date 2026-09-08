@@ -259,6 +259,14 @@ class Conv2dOp(Op):
     requant_shift: int
     output_offset: int = 0
     per_channel_scale: list[tuple[int, int]] | None = None
+    #: ISA v2.1 `pad_value`: the int8 value a padded tap takes -- the
+    #: input tensor's quantization zero-point, NOT 0. Declared here rather
+    #: than next to `padding` only because every field between them lacks
+    #: a default and a dataclass cannot put a defaulted field first.
+    #: Padding a quantized tensor with 0 adds `sum(w) * (0 - zp)` to every
+    #: border accumulator; with YOLOv8n's 3x3/pad-1 convolutions that is
+    #: every border output of every layer. 0 keeps pre-v2.1 behaviour.
+    pad_value: int = 0
     #: ISA v2.0 `WEIGHT_REUSE` (R6): when set, this op's weight/bias/
     #: scale buffers are already resident from `reused_weight_op` and
     #: must not be refetched -- `planner.py` charges it zero weight
@@ -470,6 +478,7 @@ class Model:
         kernel: tuple[int, int] = (3, 3),
         stride: tuple[int, int] = (1, 1),
         padding: tuple[int, int, int, int] = (0, 0, 0, 0),
+        pad_value: int = 0,
         bias: bool = True,
         activation: Activation = Activation.RELU,
         clamp: tuple[int, int] | None = None,
@@ -482,6 +491,13 @@ class Model:
         name: str | None = None,
     ) -> Tensor:
         """`CONV2D`. `padding` is `(top, bottom, left, right)`.
+
+        `pad_value` is the int8 value padded taps take (ISA v2.1) -- the
+        input tensor's quantization zero-point in a real network, not 0.
+        `QuantParams` models symmetric quantization and has no zero-point
+        field, so it is passed explicitly, exactly as `pool_max`/
+        `pool_avg` take it; the default of 0 keeps every existing program
+        bit-identical.
 
         If `requant_scale`/`requant_shift` are both omitted they are
         derived from `x.quant.scale * weight_scale / output_scale` via
@@ -501,6 +517,8 @@ class Model:
         out_w = (x.width + pl + pr - kw) // sw + 1
         if out_h <= 0 or out_w <= 0:
             raise ValueError(f"conv2d: non-positive output dims out_h={out_h} out_w={out_w}")
+        if not -128 <= pad_value <= 127:
+            raise ValueError(f"conv2d: pad_value must be int8, got {pad_value}")
 
         if weight_reuse_from is not None:
             reused = weight_reuse_from.producer
@@ -549,6 +567,7 @@ class Model:
             requant_scale=requant_scale,
             requant_shift=requant_shift,
             per_channel_scale=per_channel_scale,
+            pad_value=pad_value,
             weight_reuse=reused is not None,
             reused_weight_op=reused,
         )

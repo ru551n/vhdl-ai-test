@@ -160,7 +160,8 @@ class DescV2:
     # ISA v2.1, W10 byte 41: signed int8 value a padded tap takes (the
     # input tensor's quantization zero-point). 0 -- the value every v2.0
     # program left in this then-reserved byte -- means "pad with zero",
-    # i.e. exactly v2.0 behaviour. Only the POOL_* path consumes it.
+    # i.e. exactly v2.0 behaviour. Consumed by every opcode that pads a
+    # window: POOL_MAX/POOL_AVG and CONV2D/DWCONV2D/FC alike.
     pad_value: int = 0
     # The `reserved, must be 0` gaps (W0 byte 3, W10 bytes 42-43). A
     # well-formed program always leaves these zero, and they are exposed

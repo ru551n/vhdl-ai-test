@@ -111,13 +111,28 @@ class Descriptor:
     # writes the table (same v1.0/v1.1 reserved-zero rule as W13 above).
     scale_addr: int = 0
     # ISA v2.1, W10 byte 41: the int8 value padded taps take (the input
-    # tensor's zero-point). This backend targets the v1.x ISA, where that
-    # byte is reserved-must-be-0, so the field exists here only to keep
-    # `Descriptor` field-for-field identical to `cnn_accel_model.LayerDesc`
-    # (see this class' docstring, and `vectors.py`, which walks
-    # `LayerDesc`'s fields to write `desc.txt`). `encode_descriptor` drops
-    # it silently while it is 0 and refuses to emit it otherwise, exactly
-    # as it does for the other version-gated fields above.
+    # tensor's zero-point). Kept field-for-field identical to
+    # `cnn_accel_model.LayerDesc` (see this class' docstring, and
+    # `vectors.py`, which walks `LayerDesc`'s fields to write `desc.txt`).
+    #
+    # ALWAYS 0 today, and correctly so -- not because the hardware cannot
+    # do better. Both `POOL_*` and, since the convolution half landed,
+    # `CONV2D`/`DWCONV2D`/`FC` fill their padded taps with this field, and
+    # `target.discover` already surfaces byte 41 as a real signed ISA
+    # field, so `encode_descriptor` would encode a non-zero value
+    # correctly. What is missing is upstream: `lower/to_hir.py` REJECTS
+    # `conv.in_zp != 0` outright ("zero points not supported: padding is
+    # literal 0 in HW", constraint `conv.zero_point`), so every conv this
+    # backend ever sees has a zero input zero-point, for which 0 is the
+    # right pad value.
+    #
+    # Lifting that rejection is `doc/tosa_compiler_plan.md`'s extension 5
+    # and is NOT just "set this field": TOSA pads with `input_zp` and then
+    # subtracts it, so an exact lowering must ALSO fold
+    # `bias'[o] = bias[o] - input_zp * sum(w[o])` into the packed bias,
+    # and `target/discover.py`'s isa_version ladder (which stops at "1.2"
+    # and never looks at `pad_value`) has to learn the field exists.
+    # Setting `pad_value` without the bias fold would be silently wrong.
     pad_value: int = 0
 
 

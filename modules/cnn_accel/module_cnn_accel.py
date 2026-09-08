@@ -1838,6 +1838,26 @@ class Module(BaseModule):
                     # window_gen's own comment above. This is still the
                     # only timing number in this file that is worth
                     # trusting, and it is comfortably above 150 MHz.
+                    #
+                    # Re-measured 2026-09 after conv started honouring the
+                    # ISA v2.1 `pad_value` (this entity's `cfg_pad_value`
+                    # is now a real input instead of a tie-off): **14487
+                    # LUTs, 8735 FFs, 27 RAMB36 + 2 RAMB18, 36 DSP,
+                    # 170.33 MHz**, against 14196/8727/27/2/36 at the same
+                    # 170.33 MHz before it. That is +291 LUTs and +8 FFs
+                    # and nothing else, and both halves are exactly what
+                    # the change predicts: the 8 FFs are the `pad_value_q`
+                    # register that latches the field at `start`, and the
+                    # LUTs are the per-window clear of the tap-assembly
+                    # register, which used to be a constant-0 synchronous
+                    # reset on `g_max_kernel_size**2 * g_tile_channels`
+                    # (72) byte lanes and is now a fill from a runtime
+                    # value. Memory, DSP and Fmax are all bit-for-bit
+                    # unchanged -- the fill sits on the per-window restart
+                    # path, not on the per-cycle read or capture path, and
+                    # `window_gen`'s own netlist build is byte-identical
+                    # (its RTL was not touched at all: it already had the
+                    # port).
                     checkers=[
                         TotalLuts(LessThan(16300)),
                         Ffs(LessThan(9500)),
@@ -2085,26 +2105,32 @@ class Module(BaseModule):
         from accel_v2 import (  # noqa: PLC0415
             cases,
             cases_concat_split,
+            cases_conv_pad,
             cases_pool_pad,
             cases_yolo,
         )
 
         tb = library.test_bench("tb_cnn_accel_top")
 
-        # Four catalogues, one registration loop. `cases_pool_pad.py`
+        # Five catalogues, one registration loop. `cases_pool_pad.py`
         # holds the ISA v2.1 pooling cases (padding, the zero-point pad
-        # value, the 5x5 SPPF kernel); `cases_concat_split.py` holds the
+        # value, the 5x5 SPPF kernel); `cases_conv_pad.py` holds the
+        # convolution half of that same `pad_value` field (a padded conv
+        # fills with the tensor's zero-point, not 0 -- see that file's
+        # docstring for why the data has to be clamped for the difference
+        # to be observable at all); `cases_concat_split.py` holds the
         # channel CONCAT/SPLIT cases (which add no opcode at all -- they
         # are buffer aliasing, see that file's docstring); `cases_yolo.py`
         # tests by *topology* rather than by feature -- Bottleneck, C2f,
         # SPPF, backbone stage, FPN/PAN merge, the three-scale head
         # boundary and a small end-to-end YOLOv8n-shaped network. All
         # follow exactly the same contract as `cases.py` and are separate
-        # files only so the four can be edited independently. Case names
+        # files only so the five can be edited independently. Case names
         # are unique across all of them.
         for case in (
             cases.all_cases()
             + cases_pool_pad.all_cases()
+            + cases_conv_pad.all_cases()
             + cases_concat_split.all_cases()
             + cases_yolo.all_cases()
         ):

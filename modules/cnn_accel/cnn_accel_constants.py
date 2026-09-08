@@ -382,10 +382,19 @@ ISA_LAYOUT: tuple[IsaField, ...] = (
     # (0 - zero_point) * scale. For MAX pooling that is fatal -- YOLOv8n's
     # activations have zero_point = -128, so a 0 tap is larger than nearly
     # every real value in the window and silently wins the max on every
-    # border output. Consumed by the POOL path; CONV2D deliberately keeps
-    # its hard-wired 0 for now (cnn_accel_top.vhd wires the conv
-    # window_gen's cfg_pad_value to zero), so this field changes no
-    # existing behaviour.
+    # border output. For CONVOLUTION it is a bias, not a corruption, but
+    # not a small one: every padded tap contributes 'w * (0 - zero_point)'
+    # instead of nothing, i.e. roughly 'sum(w) * zero_point * scale' added
+    # to every border output, and YOLOv8n convolves 3x3 with padding 1
+    # throughout, so every layer has an affected border.
+    #
+    # The field is therefore per-descriptor and OPCODE-AGNOSTIC: any
+    # opcode that pads a window (CONV2D/DWCONV2D/FC via
+    # 'cnn_accel_conv_core', POOL_MAX/POOL_AVG via 'cnn_accel_pool') fills
+    # its padded taps with it, through the one shared
+    # 'cnn_accel_window_gen.cfg_pad_value' port. Pooling reached that
+    # point first (4915955) and convolution followed; no encoding
+    # changed in between, so the version stays 0x0201.
     IsaField("pad_value", 1, signed=True),
     IsaField(RESERVED, 2),  # W10 bytes 42-43
     IsaField("pool_kernel_h", 1),

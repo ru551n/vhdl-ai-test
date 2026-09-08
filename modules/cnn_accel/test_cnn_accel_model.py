@@ -1243,10 +1243,15 @@ def _naive_conv_generic(
     pad_top, pad_bottom, pad_left, pad_right,
     bias_en, requant_en, relu_en, requant_scale, requant_shift,
     depthwise: bool,
+    # ISA v2.1: what a padded tap is. Built here by materializing the
+    # whole padded frame filled with `pad_value`, which is a different
+    # formulation from `cnn_accel_model._at`'s bounds-check-and-substitute
+    # -- deliberately, so the two cannot share a mistake.
+    pad_value: int = 0,
 ) -> list[int]:
     padded_h = in_h + pad_top + pad_bottom
     padded_w = in_w + pad_left + pad_right
-    padded = [[[0] * in_c for _ in range(padded_w)] for _ in range(padded_h)]
+    padded = [[[pad_value] * in_c for _ in range(padded_w)] for _ in range(padded_h)]
     for r in range(in_h):
         for c in range(in_w):
             for ch in range(in_c):
@@ -1288,7 +1293,16 @@ def _naive_conv_generic(
     return result
 
 
-def _random_layer_case(rng: random.Random, *, depthwise: bool, asymmetric_pad: bool = False):
+def _random_layer_case(
+    rng: random.Random,
+    *,
+    depthwise: bool,
+    asymmetric_pad: bool = False,
+    # ISA v2.1 `pad_value`. Taken as an argument rather than drawn from
+    # `rng`, so that adding it does not perturb the random stream (and
+    # therefore the case mix) of the pre-existing callers above.
+    pad_value: int = 0,
+):
     kernel = rng.choice([1, 3])
     stride = rng.choice([1, 2])
     if asymmetric_pad and kernel > 1:
@@ -1340,6 +1354,7 @@ def _random_layer_case(rng: random.Random, *, depthwise: bool, asymmetric_pad: b
         in_width=in_w, in_height=in_h, in_channels=in_c, out_channels=out_c,
         kernel_h=kernel, kernel_w=kernel, stride_h=stride, stride_w=stride,
         pad_top=pad_top, pad_bottom=pad_bottom, pad_left=pad_left, pad_right=pad_right,
+        pad_value=pad_value,
         requant_scale=requant_scale, requant_shift=requant_shift,
     )
     naive_kwargs = dict(
@@ -1348,6 +1363,7 @@ def _random_layer_case(rng: random.Random, *, depthwise: bool, asymmetric_pad: b
         pad_top=pad_top, pad_bottom=pad_bottom, pad_left=pad_left, pad_right=pad_right,
         bias_en=bias_en, requant_en=requant_en, relu_en=relu_en,
         requant_scale=requant_scale, requant_shift=requant_shift,
+        pad_value=pad_value,
     )
     return desc, inp, weights, bias, naive_kwargs
 
@@ -1384,6 +1400,211 @@ def test_dwconv2d_matches_naive_reference_randomized() -> None:
         assert model_out == naive_out, (desc, naive_kwargs)
         checked += 1
     assert checked >= 200
+
+
+# ---------------------------------------------------------------------------
+# ISA v2.1 `pad_value` for CONVOLUTION. Pooling got the field first
+# (4915955); convolution has the same bug for a different reason -- a
+# padded tap of 0 in a tensor whose zero-point is `zp` is not "nothing",
+# it is the real value `(0 - zp) * scale`, so every padded tap adds
+# `w * (0 - zp)` to the accumulator, i.e. roughly `sum(w) * zp * scale`
+# of bias on every border output. It is checked here against
+# `_naive_conv_generic`, which builds the padded frame explicitly rather
+# than substituting on a bounds check, and by a directed test that pins
+# WHICH output positions may move and by exactly how much.
+# ---------------------------------------------------------------------------
+
+
+def test_conv2d_pad_value_matches_naive_reference_randomized() -> None:
+    """The randomized conv cross-check, re-run at every interesting int8
+    pad value. `pad_value=0` is the pre-v2.1 behaviour and must reproduce
+    it exactly; -128 is the YOLOv8n activation zero-point."""
+    for pad_value in (-128, -37, 0, 37, 127):
+        rng = random.Random(20260908 + pad_value)
+        checked = 0
+        attempts = 0
+        while checked < 60 and attempts < 5000:
+            attempts += 1
+            case = _random_layer_case(
+                rng, depthwise=False, asymmetric_pad=True, pad_value=pad_value
+            )
+            if case is None:
+                continue
+            desc, inp, weights, bias, naive_kwargs = case
+            model_out = conv2d(inp, weights, bias, desc)
+            naive_out = _naive_conv_generic(inp, weights, bias, depthwise=False, **naive_kwargs)
+            assert model_out == naive_out, (pad_value, desc, naive_kwargs)
+            checked += 1
+        assert checked >= 60
+
+
+def test_dwconv2d_pad_value_matches_naive_reference_randomized() -> None:
+    """`DWCONV2D` shares `_conv2d_generic`'s window, so it must share the
+    pad value too -- checked separately because the depthwise branch
+    indexes `_at` on its own line."""
+    for pad_value in (-128, 0, 91):
+        rng = random.Random(20260909 + pad_value)
+        checked = 0
+        attempts = 0
+        while checked < 60 and attempts < 5000:
+            attempts += 1
+            case = _random_layer_case(
+                rng, depthwise=True, asymmetric_pad=True, pad_value=pad_value
+            )
+            if case is None:
+                continue
+            desc, inp, weights, bias, naive_kwargs = case
+            model_out = dwconv2d(inp, weights, bias, desc)
+            naive_out = _naive_conv_generic(inp, weights, bias, depthwise=True, **naive_kwargs)
+            assert model_out == naive_out, (pad_value, desc, naive_kwargs)
+            checked += 1
+        assert checked >= 60
+
+
+def _padded_tap_count(row: int, col: int, height: int, width: int) -> int:
+    """Number of the 9 taps of a 3x3 / stride-1 / pad-1 window centred on
+    output `(row, col)` that fall outside a `height x width` frame.
+    Written as plain geometry (count the out-of-range neighbours), with no
+    reference to any convolution code."""
+    return sum(
+        1
+        for dr in (-1, 0, 1)
+        for dc in (-1, 0, 1)
+        if not (0 <= row + dr < height and 0 <= col + dc < width)
+    )
+
+
+def test_conv2d_pad_value_moves_exactly_the_border_outputs() -> None:
+    """Directed geometry check: with an all-ones 3x3 kernel over a 3x3
+    'same'-padded frame, changing `pad_value` from 0 to `v` must change
+    output `(r, c)` by exactly `v * (number of padded taps at (r, c))` --
+    zero for interior positions, 3 on an edge, 5 in a corner.
+
+    This pins WHERE the effect lands, not just that the numbers differ:
+    a bug that padded the wrong rows, or padded interior windows, would
+    still make the outputs differ but would fail here.
+    """
+    in_h = in_w = 5
+    in_c = out_c = 1
+    rng = random.Random(4242)
+    # Small magnitudes so nothing saturates at int8 and the deltas below
+    # are exact rather than clipped.
+    values = [rng.randint(-5, 5) for _ in range(in_h * in_w * in_c)]
+    weights = [1] * (out_c * 3 * 3 * in_c)
+
+    def desc_for(pad_value: int) -> LayerDesc:
+        return LayerDesc(
+            opcode=OPCODE_CONV2D,
+            flags=(1 << FLAG_PAD_EN),
+            in_width=in_w, in_height=in_h, in_channels=in_c, out_channels=out_c,
+            kernel_h=3, kernel_w=3, stride_h=1, stride_w=1,
+            pad_top=1, pad_bottom=1, pad_left=1, pad_right=1,
+            pad_value=pad_value,
+        )
+
+    baseline = conv2d(values, weights, [0], desc_for(0))
+    assert len(baseline) == in_h * in_w
+
+    for pad_value in (-3, 2):
+        got = conv2d(values, weights, [0], desc_for(pad_value))
+        for row in range(in_h):
+            for col in range(in_w):
+                idx = row * in_w + col
+                expected_delta = pad_value * _padded_tap_count(row, col, in_h, in_w)
+                assert got[idx] - baseline[idx] == expected_delta, (
+                    f"pad_value={pad_value} at ({row}, {col}): "
+                    f"got {got[idx]}, baseline {baseline[idx]}, "
+                    f"expected delta {expected_delta}"
+                )
+        # Interior positions are untouched, border positions are not.
+        assert got[2 * in_w + 2] == baseline[2 * in_w + 2]
+        assert got[0] != baseline[0]
+
+
+def test_conv2d_pad_value_defaults_to_zero_fill() -> None:
+    """`pad_value` defaults to 0, so a pre-v2.1 descriptor convolves
+    bit-identically to before; and with `FLAG_PAD_EN` clear the field is
+    unobservable because nothing is padded at all."""
+    rng = random.Random(777)
+    values = [rng.randint(-128, 127) for _ in range(4 * 4 * 2)]
+    weights = [rng.randint(-128, 127) for _ in range(3 * 3 * 3 * 2)]
+
+    common = dict(
+        opcode=OPCODE_CONV2D,
+        in_width=4, in_height=4, in_channels=2, out_channels=3,
+        kernel_h=3, kernel_w=3, stride_h=1, stride_w=1,
+        pad_top=1, pad_bottom=1, pad_left=1, pad_right=1,
+    )
+    default = LayerDesc(flags=(1 << FLAG_PAD_EN), **common)
+    explicit_zero = LayerDesc(flags=(1 << FLAG_PAD_EN), pad_value=0, **common)
+    assert conv2d(values, weights, [0] * 3, default) == conv2d(
+        values, weights, [0] * 3, explicit_zero
+    )
+
+    # PAD_EN clear: the pad counts are ignored, so the pad value is too.
+    unpadded_default = LayerDesc(**common)
+    unpadded_zp = LayerDesc(pad_value=-128, **common)
+    assert conv2d(values, weights, [0] * 3, unpadded_default) == conv2d(
+        values, weights, [0] * 3, unpadded_zp
+    )
+
+
+def test_conv2d_zero_pad_biases_every_border_output() -> None:
+    """The reason this exists at all, stated as a test: for a tensor whose
+    zero-point is -128, zero-padding adds a large constant to every border
+    output while zero-point padding adds nothing.
+
+    Uses a positive-weight kernel so the injected bias has a definite
+    sign, and a plain power-of-two requant (divide by 16) so the
+    accumulator lands inside int8 instead of saturating -- a saturated
+    output would hide the very difference under test.
+    """
+    in_h = in_w = 6
+    zero_point = -128
+    # A quantized tensor whose real values all sit near its zero-point --
+    # exactly the "clamp into a range where 0 is not a plausible value"
+    # situation the hardware cases below reproduce.
+    rng = random.Random(31337)
+    values = [rng.randint(-128, -100) for _ in range(in_h * in_w)]
+    weights = [1] * 9
+
+    def desc_for(pad_value: int) -> LayerDesc:
+        return LayerDesc(
+            opcode=OPCODE_CONV2D,
+            flags=(1 << FLAG_PAD_EN) | (1 << FLAG_REQUANT_EN),
+            in_width=in_w, in_height=in_h, in_channels=1, out_channels=1,
+            kernel_h=3, kernel_w=3, stride_h=1, stride_w=1,
+            pad_top=1, pad_bottom=1, pad_left=1, pad_right=1,
+            pad_value=pad_value,
+            requant_scale=1 << 15, requant_shift=4,
+        )
+
+    with_zp = conv2d(values, weights, [0], desc_for(zero_point))
+    with_zero = conv2d(values, weights, [0], desc_for(0))
+
+    # Every border output differs; no interior output does.
+    for row in range(in_h):
+        for col in range(in_w):
+            idx = row * in_w + col
+            on_border = row in (0, in_h - 1) or col in (0, in_w - 1)
+            assert (with_zp[idx] != with_zero[idx]) == on_border, (row, col)
+
+    # And the difference is the injected bias, in the direction predicted
+    # by `sum(w) * (0 - zero_point)` -- upward, here.
+    assert all(z >= p for z, p in zip(with_zero, with_zp))
+
+
+def test_conv2d_pad_value_rejects_out_of_int8_range() -> None:
+    desc = LayerDesc(
+        opcode=OPCODE_CONV2D,
+        flags=(1 << FLAG_PAD_EN),
+        in_width=3, in_height=3, in_channels=1, out_channels=1,
+        kernel_h=3, kernel_w=3, stride_h=1, stride_w=1,
+        pad_top=1, pad_bottom=1, pad_left=1, pad_right=1,
+        pad_value=200,
+    )
+    with pytest.raises(ValueError):
+        conv2d([0] * 9, [1] * 9, [0], desc)
 
 
 # ---------------------------------------------------------------------------

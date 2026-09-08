@@ -149,6 +149,10 @@ def _build_case(
     pad_bottom: int | None = None,
     pad_left: int | None = None,
     pad_right: int | None = None,
+    # ISA v2.1 W10 byte 41: the signed int8 value a padded tap takes --
+    # the input tensor's quantization zero-point, not 0. The default of 0
+    # is the pre-v2.1 zero-padding, so every case above is unchanged.
+    pad_value: int = 0,
     bias_en: bool,
     relu_en: bool,
     requant_en: bool,
@@ -216,6 +220,7 @@ def _build_case(
         pad_bottom=pad_bottom,
         pad_left=pad_left,
         pad_right=pad_right,
+        pad_value=pad_value,
         requant_scale=requant_scale,
         requant_shift=requant_shift,
         output_offset=output_offset,
@@ -714,6 +719,73 @@ def generate_conv_core_cases(hw: HwPacking) -> list[str]:
         kernel=3, stride=1, pad=1,
         bias_en=True, relu_en=True, requant_en=True,
         requant_scale=1 << 13, requant_shift=1,
+    )
+
+    # ---------------------------------------------------------------
+    # ISA v2.1 `pad_value` for CONVOLUTION. Padding a quantized int8
+    # tensor with a literal 0 is wrong whenever its zero-point is not 0:
+    # every padded tap contributes `w * (0 - zero_point)` instead of
+    # nothing. These are the conv_core-level cases that pin the fix -- the
+    # golden model and the composed RTL must agree bit for bit, and they
+    # can only agree if `cnn_accel_conv_core` actually forwards
+    # `cfg_pad_value` to its window generator instead of tying it off.
+    #
+    # THE TRAP (learned by the pool work, 4915955): with ordinary random
+    # int8 data a wrong pad value very often produces the same int8 output
+    # anyway -- saturation and requantization swallow the difference, and
+    # the case then passes against broken hardware. Both cases below use
+    # all-NEGATIVE input near the zero-point and all-POSITIVE weights, so
+    # the injected bias has a definite sign and a magnitude of
+    # `zero_point * sum(w)` per padded tap, and a gentle requant that
+    # keeps the result off the int8 rails where it stays visible. Each was
+    # confirmed to FAIL with `cfg_pad_value` tied back to zero.
+    # ---------------------------------------------------------------
+
+    # conv3x3_pad_zero_point: 3x3 / stride 1 / pad 1 -- YOLOv8n's shape
+    # throughout -- with pad_value = -128, the int8 zero-point of a real
+    # quantized activation tensor.
+    in_w = in_h = 6
+    in_c = 4
+    out_c = 4
+    zp_rng = random.Random(16016)
+    _build_case(
+        "conv3x3_pad_zero_point",
+        hw=hw,
+        seed=16016,
+        depthwise=False,
+        in_w=in_w, in_h=in_h, in_c=in_c, out_c=out_c,
+        kernel=3, stride=1, pad=1, pad_value=-128,
+        bias_en=False, relu_en=False, requant_en=True,
+        # 1/512: a 3x3x4 window of values near -128 against small positive
+        # weights accumulates to roughly -36000 without padding, so this
+        # brings it to about -70 -- inside int8, where the pad
+        # contribution is visible rather than saturated away.
+        requant_scale=1 << 15, requant_shift=9,
+        input_override=[
+            zp_rng.randint(-128, -100) for _ in range(in_w * in_h * in_c)
+        ],
+        weight_override=[
+            zp_rng.randint(1, 8) for _ in range(out_c * 3 * 3 * in_c)
+        ],
+    )
+
+    # conv3x3_pad_value_asymmetric: a positive pad value with all four pad
+    # counts different, so a fill that leaked into the wrong tap index (or
+    # only into the left/top ones) shows up.
+    asym_rng = random.Random(17017)
+    _build_case(
+        "conv3x3_pad_value_asymmetric",
+        hw=hw,
+        seed=17017,
+        depthwise=False,
+        in_w=6, in_h=5, in_c=3, out_c=4,
+        kernel=3, stride=1,
+        pad_top=1, pad_bottom=0, pad_left=0, pad_right=1,
+        pad_value=100,
+        bias_en=False, relu_en=False, requant_en=True,
+        requant_scale=1 << 15, requant_shift=8,
+        input_override=[asym_rng.randint(-128, -100) for _ in range(6 * 5 * 3)],
+        weight_override=[asym_rng.randint(1, 8) for _ in range(4 * 3 * 3 * 3)],
     )
 
     # conv3x3_c8_o16: the one case that exercises EVERY lane of a

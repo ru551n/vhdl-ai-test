@@ -252,6 +252,8 @@ architecture a of cnn_accel_top is
   signal conv_cfg_stride_h, conv_cfg_stride_w : std_ulogic_vector(7 downto 0);
   signal conv_cfg_pad_top, conv_cfg_pad_bottom : std_ulogic_vector(7 downto 0);
   signal conv_cfg_pad_left, conv_cfg_pad_right : std_ulogic_vector(7 downto 0);
+  -- ISA v2.1 'pad_value' for convolution -- see the conv_core port map.
+  signal conv_cfg_pad_value : std_ulogic_vector(7 downto 0);
   signal conv_cfg_in_width, conv_cfg_in_height : std_ulogic_vector(15 downto 0);
   signal conv_cfg_in_channels : std_ulogic_vector(15 downto 0);
   signal conv_cfg_bias_en, conv_cfg_requant_en, conv_cfg_relu_en : std_ulogic;
@@ -532,6 +534,7 @@ begin
       conv_cfg_pad_bottom => conv_cfg_pad_bottom,
       conv_cfg_pad_left => conv_cfg_pad_left,
       conv_cfg_pad_right => conv_cfg_pad_right,
+      conv_cfg_pad_value => conv_cfg_pad_value,
       conv_cfg_in_width => conv_cfg_in_width,
       conv_cfg_in_height => conv_cfg_in_height,
       conv_cfg_in_channels => conv_cfg_in_channels,
@@ -877,6 +880,14 @@ begin
       cfg_pad_bottom => conv_cfg_pad_bottom,
       cfg_pad_left => conv_cfg_pad_left,
       cfg_pad_right => conv_cfg_pad_right,
+      -- ISA v2.1: convolution pads with the descriptor's 'pad_value', not
+      -- with a literal 0. For an int8 tensor with a nonzero zero-point the
+      -- two differ by a constant on every padded tap, and a 3x3/pad-1
+      -- convolution (YOLOv8n's shape throughout) pads every border output
+      -- of every layer, so this is an accuracy bug and not a rounding
+      -- artefact. 'cmd_proc' passes the field straight through; a
+      -- descriptor that leaves it 0 zero-pads exactly as before.
+      cfg_pad_value => conv_cfg_pad_value,
       cfg_in_width => conv_cfg_in_width,
       cfg_in_height => conv_cfg_in_height,
       cfg_in_channels => conv_cfg_in_channels,

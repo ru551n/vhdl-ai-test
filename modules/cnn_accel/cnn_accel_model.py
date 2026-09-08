@@ -157,8 +157,11 @@ class LayerDesc:
     # ISA v2.1, W10 byte 41: the int8 value a padded tap takes, i.e. the
     # input tensor's quantization zero-point. 0 (the reserved-must-be-0
     # value every earlier revision wrote) reproduces the old zero-padding
-    # exactly. Consumed by `_pool_windows`; `_conv_windows` deliberately
-    # still pads with 0 -- see `_pool_windows`' docstring.
+    # exactly. Applies to EVERY padded window: `_pool_windows` (where it
+    # landed first) and `_conv2d_generic` alike -- padding a quantized
+    # tensor with a literal 0 injects `(0 - zero_point) * scale` at every
+    # border tap, which for convolution is a constant `sum(w) * zp` bias
+    # on every border output rather than a rounding artefact.
     pad_value: int = 0
 
     @property
@@ -452,8 +455,9 @@ def _at(
     """HWC-indexed read from a flat activation buffer, returning `outside`
     (default 0) outside `[0, width) x [0, height)` -- the padding
     convention. Callers pass already-shifted `row`/`col` so this only needs
-    to bounds-check. `outside` is the ISA v2.1 `pad_value`; convolution
-    leaves it at its 0 default (see `_pool_windows`)."""
+    to bounds-check. `outside` is the ISA v2.1 `pad_value`, passed by
+    both `_conv2d_generic` and `_pool_windows`; its 0 default is the
+    pre-v2.1 zero-padding."""
     if row < 0 or row >= height or col < 0 or col >= width:
         return outside
     return values[(row * width + col) * channels + channel]
@@ -510,9 +514,17 @@ def _conv2d_generic(
     pad_left = desc.pad_left if desc.pad_en else 0
     pad_bottom = desc.pad_bottom if desc.pad_en else 0
     pad_right = desc.pad_right if desc.pad_en else 0
+    # ISA v2.1 `pad_value`: what a padded tap actually is. Not gated on
+    # `pad_en` -- with the flag clear the four counts above are already 0,
+    # so no tap is ever outside the frame and the fill value is
+    # unobservable, which is exactly how `cnn_accel_cmd_proc.vhd` drives
+    # `conv_cfg_pad_value`.
+    pad_value = desc.pad_value
 
     if s_h == 0 or s_w == 0:
         raise ValueError(f"conv: stride_h/stride_w must be nonzero, got ({s_h}, {s_w})")
+    if not -128 <= pad_value <= 127:
+        raise ValueError(f"conv: pad_value must be int8, got {pad_value}")
 
     padded_h = in_h + pad_top + pad_bottom
     padded_w = in_w + pad_left + pad_right
@@ -535,7 +547,14 @@ def _conv2d_generic(
                     for kr in range(k_h):
                         for kc in range(k_w):
                             tap = _at(
-                                input_values, base_row + kr, base_col + kc, oc, in_w, in_h, in_c
+                                input_values,
+                                base_row + kr,
+                                base_col + kc,
+                                oc,
+                                in_w,
+                                in_h,
+                                in_c,
+                                outside=pad_value,
                             )
                             w = weights[(oc * k_h + kr) * k_w + kc]
                             acc += tap * w
@@ -551,6 +570,7 @@ def _conv2d_generic(
                                     in_w,
                                     in_h,
                                     in_c,
+                                    outside=pad_value,
                                 )
                                 w = weights[((oc * k_h + kr) * k_w + kc) * in_c + ic]
                                 acc += tap * w
@@ -980,10 +1000,9 @@ def _pool_windows(input_values: list[int], desc: LayerDesc) -> list[list[int]]:
     wins every border max. `pad_value` defaults to 0, so a program that
     never sets it behaves exactly as before.
 
-    `_conv_windows` deliberately still pads with a hard 0 (and so does the
-    RTL's conv `cnn_accel_window_gen` instance, whose `cfg_pad_value` is
-    tied off): convolution has the same theoretical issue, but changing it
-    would change every existing conv result, and is out of scope here."""
+    `_conv2d_generic` honours the same field, for the same reason (it
+    followed one commit later); both paths reach the same
+    `cnn_accel_window_gen` `cfg_pad_value` port in the RTL."""
     in_w, in_h, channels = desc.in_width, desc.in_height, desc.in_channels
     k_h, k_w = desc.pool_kernel_h, desc.pool_kernel_w
     s_h, s_w = desc.pool_stride_h, desc.pool_stride_w

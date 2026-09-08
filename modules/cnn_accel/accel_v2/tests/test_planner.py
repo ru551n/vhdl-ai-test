@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from accel_v2 import cases, cases_concat_split, cases_pool_pad, cases_yolo, isa
+from accel_v2 import cases, cases_concat_split, cases_conv_pad, cases_pool_pad, cases_yolo, isa
 from accel_v2.model import Activation, Model
 from accel_v2.planner import ComputeStep, MoveStep, PlannedProgram, Planner
 
@@ -203,6 +203,7 @@ def test_every_catalogue_case_places_every_buffer_inside_one_bank() -> None:
     catalogue = (
         cases.all_cases()
         + cases_pool_pad.all_cases()
+        + cases_conv_pad.all_cases()
         + cases_concat_split.all_cases()
         + cases_yolo.all_cases()
     )

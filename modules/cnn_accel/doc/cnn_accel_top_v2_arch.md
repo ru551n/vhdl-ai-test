@@ -264,12 +264,22 @@ at every border output position. The host sets `pad_value` to the input
 tensor's zero-point; 0 (the pre-v2.1 value of that byte) reproduces the
 old zero-fill exactly.
 
-Scope note: `CONV2D` has the same theoretical issue and is deliberately
-**unchanged** in v2.1. Its `cnn_accel_window_gen` instance has the
-`cfg_pad_value` port like every other, but `cnn_accel_conv_core` ties it
-to zero, so conv still zero-pads. Making conv honour the field is a
-behaviour change to every existing convolution and belongs in its own
-change, with its own re-verification.
+`pad_value` is **opcode-agnostic**: every opcode that pads a window fills
+its padded taps with it. Pooling reached that point first, in the change
+that introduced the field; `CONV2D`/`DWCONV2D`/`FC` followed immediately
+afterwards, with no encoding change of any kind in between — the field
+was already per-descriptor and already signed int8, so the ISA version
+stays `0x0201`. For convolution the same zero fill is a systematic
+**bias** rather than a corrupted maximum: every padded tap contributes
+`w * (0 - zero_point)` instead of nothing, i.e. about
+`sum(w) * zero_point * scale` added to every border output. YOLOv8n
+convolves 3x3 with padding 1 in essentially every layer, so that error
+lands on the border of every feature map in the network.
+
+Both engines take the value from their own descriptor, over their own
+wire: `cnn_accel_cmd_proc` drives `conv_cfg_pad_value` and
+`pool_cfg_pad_value` separately, and one program may set different values
+on a convolution and on a pool that consumes its output.
 
 ### 5.1 Word layout
 
@@ -292,7 +302,7 @@ change, with its own re-verification.
 | W8 | [7:0] x4 | `pad_top`, `pad_bottom`, `pad_left`, `pad_right` | |
 | W9 | [31:0] | `requant_scale` | signed Q15 |
 | W10 | [7:0] | `requant_shift` | |
-| W10 | [15:8] | `pad_value` | **v2.1**, signed int8: the value padded taps take (the input tensor's zero-point). Consumed by `POOL_MAX`/`POOL_AVG`; ignored by `CONV2D`, which always pads with 0. Reserved-must-be-0 before v2.1, so 0 = the old zero-fill |
+| W10 | [15:8] | `pad_value` | **v2.1**, signed int8: the value padded taps take (the input tensor's zero-point). Consumed by every opcode that pads a window — `POOL_MAX`/`POOL_AVG` and `CONV2D`/`DWCONV2D`/`FC` alike. Reserved-must-be-0 before v2.1, so 0 = the old zero-fill |
 | W10 | [31:16] | reserved | must be 0 (`ERR_BAD_RESERVED`) |
 | W11 | [7:0] x4 | `pool_kernel_h/w`, `pool_stride_h/w` | |
 | W12 | [31:0] | `next_instr_addr` | DDR byte address; always DDR space |

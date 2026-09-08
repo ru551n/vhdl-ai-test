@@ -37,7 +37,7 @@ differ between the two uses, only the consumer.
 | `clk`, `reset` | in | `std_ulogic` | `reset` = `reset_internal` |
 | `cfg_kernel_h`/`w`, `cfg_stride_h`/`w` | in | `std_ulogic_vector(7 downto 0)` | latched at `start` |
 | `cfg_pad_top`/`bottom`/`left`/`right` | in | `std_ulogic_vector(7 downto 0)` | latched at `start`; taps outside `[0, in_width) x [0, in_height)` are filled with `cfg_pad_value` |
-| `cfg_pad_value` | in | `std_ulogic_vector(7 downto 0)` | **ISA v2.1**; latched at `start`. The signed int8 value a padded tap takes -- the input tensor's quantization zero-point, not necessarily 0. Defaults to 0 (the pre-v2.1 zero-fill). `cnn_accel_top` drives it from the descriptor on the POOL instance and ties it to 0 on the CONV instance; see `doc/cnn_accel_top_v2_arch.md` §5 for why zero-padding a zero-point-shifted tensor is wrong for max pooling |
+| `cfg_pad_value` | in | `std_ulogic_vector(7 downto 0)` | **ISA v2.1**; latched at `start`. The signed int8 value a padded tap takes -- the input tensor's quantization zero-point, not necessarily 0. Defaults to 0 (the pre-v2.1 zero-fill). `cnn_accel_top` drives it from the descriptor on BOTH the POOL and the CONV instance, from two separate `cnn_accel_cmd_proc` outputs; see `doc/cnn_accel_top_v2_arch.md` §5 for why zero-padding a zero-point-shifted tensor is wrong — a corrupted maximum for pooling, a per-border-output bias for convolution |
 | `cfg_in_width`/`height`/`channels` | in | `std_ulogic_vector(15 downto 0)` | latched at `start` |
 | `start` | in | `std_ulogic` | pulse, from `cnn_accel_layer_ctrl` |
 | `done` | out | `std_ulogic` | pulse, last tile beat of the last window of the frame emitted |

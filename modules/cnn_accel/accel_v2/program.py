@@ -201,6 +201,7 @@ def _compute_desc(
             pad_bottom=pad_bottom,
             pad_left=pad_left,
             pad_right=pad_right,
+            pad_value=op.pad_value,
             requant_scale=op.requant_scale,
             requant_shift=op.requant_shift,
             output_offset=op.output_offset,

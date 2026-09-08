@@ -612,6 +612,57 @@ begin
       random_frame(5, 5);
       run_frame(5, 5, 3, 3, 2, 2, 1, 1, 1, 1, 20, 20, 2000, c_tile_channels, -128);
 
+    elsif run("test_pad_value_conv_geometry") then
+      -- The convolution half of 'cfg_pad_value'. This entity is shared by
+      -- the conv and the pool datapaths and does not know which it is
+      -- serving, but the two drive it with quite different shapes, and
+      -- until now every non-zero pad value exercised here was a pooling
+      -- one (square kernel, the shapes 'cnn_accel_pool' asks for). These
+      -- are the shapes 'cnn_accel_conv_core' asks for, now that its
+      -- 'cfg_pad_value' is the descriptor's field instead of a tie-off:
+      -- 1x1 and non-square kernels, strided windows, and the multi-tile
+      -- channel walk a real convolution does.
+
+      -- 3x3 / stride 1 / pad 1 with a zero-point fill: YOLOv8n's shape in
+      -- essentially every layer, and the one the whole change exists for.
+      random_frame(6, 6);
+      run_frame(6, 6, 3, 3, 1, 1, 1, 1, 1, 1, 30, 30, 3000, c_tile_channels, -128);
+
+      -- 1x1 kernel with padding: EVERY window is either entirely real or
+      -- entirely pad, so a fill that landed one tap out of place cannot
+      -- hide behind a neighbouring real tap.
+      random_frame(4, 4);
+      run_frame(4, 4, 1, 1, 1, 1, 1, 1, 1, 1, 30, 30, 3000, c_tile_channels, -128);
+
+      -- Non-square kernels, both ways round. 'kr * kernel_w' is the tap
+      -- index arithmetic the fill has to agree with, and it is the same
+      -- for kh and kw only while the kernel is square.
+      random_frame(5, 5);
+      run_frame(5, 5, 3, 1, 1, 1, 1, 1, 0, 0, 30, 30, 3000, c_tile_channels, -128);
+
+      random_frame(5, 5);
+      run_frame(5, 5, 1, 3, 1, 1, 0, 0, 1, 1, 30, 30, 3000, c_tile_channels, 127);
+
+      -- Asymmetric padding with a positive fill, over every pad
+      -- combination: the four counts are independent ISA fields sharing
+      -- one fill value.
+      for p in c_pads'range loop
+        random_frame(5, 5);
+        run_frame(
+          5, 5, 3, 3, 1, 1,
+          c_pads(p).top, c_pads(p).bottom, c_pads(p).left, c_pads(p).right,
+          20, 20, 3000, c_tile_channels, 100
+        );
+      end loop;
+
+      -- Strided, padded and channel-tiled at once (T = 3 tiles, the last
+      -- one partial): the shape a real convolution over a wide input
+      -- actually streams. The D11 unused-lane fill of the final partial
+      -- tile stays 0 -- those are channels that do not exist, not spatial
+      -- padding -- while the spatial pad taps take -128.
+      random_frame(5, 5);
+      run_frame(5, 5, 3, 3, 2, 2, 1, 1, 1, 1, 40, 40, 4000, 20, -128);
+
     elsif run("test_backpressure") then
       random_frame(6, 6);
       run_frame(6, 6, 2, 2, 1, 1, 0, 0, 0, 0, 40, 40, 3000);

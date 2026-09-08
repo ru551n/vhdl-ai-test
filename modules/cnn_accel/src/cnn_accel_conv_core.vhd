@@ -153,6 +153,16 @@ entity cnn_accel_conv_core is
     cfg_pad_bottom : in std_ulogic_vector(7 downto 0);
     cfg_pad_left : in std_ulogic_vector(7 downto 0);
     cfg_pad_right : in std_ulogic_vector(7 downto 0);
+    -- ISA v2.1 'pad_value': the signed int8 value every PADDED tap of the
+    -- window takes. For a quantized int8 tensor whose zero-point is not
+    -- 0, that value is the ZERO-POINT and not 0 -- a padded tap of 0 is
+    -- not "nothing", it is the real value '(0 - zero_point) * scale', so
+    -- every padded tap contributes 'w * (0 - zero_point)' of pure bias to
+    -- the accumulator. YOLOv8n convolves 3x3 with padding 1 throughout,
+    -- so that error lands on every border output of every layer.
+    -- Defaults to 0, which is the pre-v2.1 zero-padding exactly, so a
+    -- descriptor that never sets the field is bit-identical to before.
+    cfg_pad_value : in std_ulogic_vector(7 downto 0) := (others => '0');
     cfg_in_width : in std_ulogic_vector(15 downto 0);
     cfg_in_height : in std_ulogic_vector(15 downto 0);
     cfg_in_channels : in std_ulogic_vector(15 downto 0);
@@ -291,15 +301,13 @@ begin
       cfg_pad_bottom => cfg_pad_bottom,
       cfg_pad_left => cfg_pad_left,
       cfg_pad_right => cfg_pad_right,
-      -- Convolution zero-pads, deliberately and explicitly. ISA v2.1's
-      -- 'pad_value' (fill padded taps with the tensor's quantization
-      -- zero-point instead of 0) applies to the POOL path only: the same
-      -- issue exists in principle for conv, but honouring the field here
-      -- would change the result of every existing convolution, so it is
-      -- its own change with its own re-verification. Tied off rather than
-      -- left to the port's default so this is a decision in the source,
-      -- not an omission.
-      cfg_pad_value => (others => '0'),
+      -- ISA v2.1 'pad_value', now honoured by CONV2D too (it reached the
+      -- POOL path first, in 4915955, where a zero-filled tap wins every
+      -- border max). It was tied to zero here on purpose while that
+      -- change was in flight; it is the descriptor's field now, and a
+      -- descriptor that leaves it at its 0 default still zero-pads
+      -- exactly as before.
+      cfg_pad_value => cfg_pad_value,
       cfg_in_width => cfg_in_width,
       cfg_in_height => cfg_in_height,
       cfg_in_channels => cfg_in_channels,
