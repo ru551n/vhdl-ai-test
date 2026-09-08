@@ -116,8 +116,15 @@ def print_program(descriptors: tuple[Descriptor, ...], target: "Target", *, prog
             f"pad={desc.pad_top}/{desc.pad_bottom}/{desc.pad_left}/{desc.pad_right}",
             f"requant_scale={desc.requant_scale}",
             f"requant_shift={desc.requant_shift}",
-            f"next=0x{desc.next_instr_addr:08x}",
         ]
+        if "output_offset" in target.isa.fields:
+            # ISA v1.1 (H1/M11) W13 epilogue fields; a v1.0 target has no
+            # such fields, so its dump keeps the v1.0 line format.
+            parts += [
+                f"output_offset={desc.output_offset}",
+                f"clamp={desc.clamp_min}/{desc.clamp_max}",
+            ]
+        parts.append(f"next=0x{desc.next_instr_addr:08x}")
         lines.append(" ".join(parts))
         addr += word
     return "\n".join(lines)

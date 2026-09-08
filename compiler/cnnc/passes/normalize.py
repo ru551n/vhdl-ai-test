@@ -2,13 +2,16 @@
 remove identity clamps and drop dead ops. Semantics-preserving: `interp`
 gives byte-identical results before and after.
 
-Identity clamp removal is target-aware (M11 preview): a clamp whose
-`[min, max]` exactly covers its dtype's full range is a no-op and, on a
-target whose every unit accepts an unrestricted clamp (`epilogue.clamp_ranges
-== "any"`), keeping it costs nothing and stays traceable, so it is *kept*.
-Otherwise (including `ctx.target is None`, i.e. no capability information)
-it is removed. With the current `cnn_accel` target (`clamp_ranges =
-[[-128,127],[0,127]]`, not `"any"`) identity clamps are always removed.
+Identity clamp removal is target-aware (M11): a clamp whose `[min, max]`
+exactly covers its dtype's full range is a no-op and, on a target whose
+every unit accepts an unrestricted clamp (`epilogue.clamp_ranges ==
+"any"`), keeping it costs nothing and stays traceable (FusePass folds it
+and `to_hir` lowers it as `CLAMP_EN,[-128,127]`, which is what a fused
+conv with no clamp gets anyway), so it is *kept*. Otherwise (including
+`ctx.target is None`, i.e. no capability information) it is removed. The
+real `cnn_accel` target has been `clamp_ranges: "any"` since ISA v1.1
+(H1), so it keeps identity clamps; the synthetic ISA v1.0 target in
+`tests/conftest.py` (`[[-128,127],[0,127]]`) removes them.
 
 One aliasing edge case is deliberately conservative: if the clamp's input
 is itself a graph input *and* its output is a graph output, removing the

@@ -1,2 +1,2 @@
-[0] @0x00000000 CONV2D flags={RELU_EN,BIAS_EN,REQUANT_EN,PAD_EN} in_addr=0x00000300 out_addr=0x00000500 weight_addr=0x00000080 bias_addr=0x000002c0 in=8x8x4 out_channels=8 kernel=3x3 stride=1x1 pad=1/1/1/1 requant_scale=1073741824 requant_shift=23 next=0x00000040
+[0] @0x00000000 CONV2D flags={BIAS_EN,REQUANT_EN,PAD_EN,CLAMP_EN} in_addr=0x00000300 out_addr=0x00000500 weight_addr=0x00000080 bias_addr=0x000002c0 in=8x8x4 out_channels=8 kernel=3x3 stride=1x1 pad=1/1/1/1 requant_scale=1073741824 requant_shift=23 output_offset=0 clamp=0/127 next=0x00000040
 [1] @0x00000040 HALT

@@ -52,6 +52,13 @@ _CORE_FIELD_PARAMS = (
     "requant_scale", "requant_shift",
 )
 
+# ISA v1.1 (H1) W13 epilogue params (doc/tosa_compiler_plan.md §5 ext. 1,
+# M11): optional in `HirOp.params` -- `lower.to_hir` sets them only for
+# `isa_version >= 1.1` units -- and copied verbatim like the core fields.
+# On a v1.0 target they have no ISA field, so `encode_descriptor` rejects
+# any nonzero value (a v1.0 `to_hir` never produces one).
+_W13_FIELD_PARAMS = ("output_offset", "clamp_min", "clamp_max")
+
 _LAYOUT_NOTE = (
     '"ddr_layouts": "activations are S6 channel-tiled planes (memory.activation_plane_channels); '
     'weights/bias are the D10/D11 tile-major images of cnn_accel_model.pack_weights_for_hw/'
@@ -91,10 +98,11 @@ class Descriptor:
     pool_stride_h: int = 1
     pool_stride_w: int = 1
     next_instr_addr: int = 0
-    # ISA v1.1 (HW milestone H1) epilogue fields, W13. Always 0 until the
-    # M11 lowering writes them; on an `isa_version 1.0` target they have no
-    # ISA field and `encode_descriptor` accepts them only as 0 (= the
-    # reserved bytes they occupy there).
+    # ISA v1.1 (HW milestone H1) epilogue fields, W13, written by the M11
+    # lowering for `isa_version >= 1.1` units (with `CLAMP_EN` in `flags`).
+    # On an `isa_version 1.0` target they have no ISA field and
+    # `encode_descriptor` accepts them only as 0 (= the reserved bytes they
+    # occupy there).
     output_offset: int = 0
     clamp_min: int = 0
     clamp_max: int = 0
@@ -164,7 +172,7 @@ def _assemble_flags(op: HirOp, target: "Target") -> int:
 
 
 def _reject_unknown_params(op: HirOp, isa_version: str) -> None:
-    handled = set(_CORE_FIELD_PARAMS) | set(_FLAG_PARAM_TO_FLAG_NAME)
+    handled = set(_CORE_FIELD_PARAMS) | set(_W13_FIELD_PARAMS) | set(_FLAG_PARAM_TO_FLAG_NAME)
     for key in op.params:
         if key not in handled:
             raise CapabilityError(
@@ -217,6 +225,13 @@ def _build_conv_descriptor(
     for key in _CORE_FIELD_PARAMS:
         if key not in params:
             raise CompilerError(f"conv_layer op missing required param {key!r}", op_id=op.id, stage=_STAGE)
+    if params.get("clamp_en") and params.get("clamp_min", 0) > params.get("clamp_max", 0):
+        # Same rule as `cnn_accel_model.encode_instruction`: an empty clamp
+        # range has no defined HW result; fail here, naming the op.
+        raise CompilerError(
+            f"clamp_min {params['clamp_min']} > clamp_max {params['clamp_max']} (empty clamp range)",
+            op_id=op.id, stage=_STAGE,
+        )
 
     return Descriptor(
         opcode=opcode,
@@ -240,6 +255,7 @@ def _build_conv_descriptor(
         requant_scale=params["requant_scale"],
         requant_shift=params["requant_shift"],
         next_instr_addr=program_addr + (index + 1) * target.isa.instr_word_bytes,
+        **{key: params.get(key, 0) for key in _W13_FIELD_PARAMS},
     )
 
 

@@ -30,11 +30,26 @@ from cnnc.target.contract import RescaleCaps, Target, Unit
 _STAGE = "to_hir"
 
 # ISA v1.1 (HW milestone H1) added `output_offset` and CLAMP_EN/`clamp_min`/
-# `clamp_max`; lowering TOSA `out_zp` and general clamps onto them is
-# compiler milestone M11 (doc/tosa_compiler_plan.md). Until M11 flips this,
-# both are rejected with a CapabilityError naming the op, rather than being
-# silently dropped (out_zp) or failing later in the emitter (clamp).
-_H1_FIELDS_LOWERING_IMPLEMENTED = False
+# `clamp_max` (doc/tosa_compiler_plan.md §5 extension 1); M11 lowers TOSA
+# `rescale.out_zp` and any `clamp` onto them. Epilogue encoding rule:
+#
+#   isa_version >= 1.1: `output_offset = out_zp`, `clamp_en = 1`,
+#       `[clamp_min, clamp_max]` = the fused clamp's bounds if present,
+#       else `[-128, 127]` (the int8 saturate TOSA rescale does anyway),
+#       `relu_en = 0`. So the MVP fixture's ReLU is `CLAMP_EN,[0,127]` --
+#       bit-identical in behaviour to the v1.0 `RELU_EN` encoding
+#       (`cnn_accel_model.bias_requantize_relu`), differing only in the
+#       flags byte and W13.
+#   isa_version 1.0 (legacy): `relu_en = 1` for clamp `[0,127]`, `0` for
+#       `[-128,127]`/none; any other clamp and any `out_zp != 0` is a
+#       CapabilityError (no field to carry it).
+#
+# TOSA `rescale` computes `clamp_i8(s + out_zp)` and a following `clamp`
+# narrows within int8, so HW `clamp(s + output_offset, lo, hi)` with
+# `[lo, hi]` inside `[-128, 127]` is the exact composition (gir.interp is
+# the reference for the TOSA side; see tests/test_fixtures_m11.py).
+_W13_ISA_VERSION = "1.1"
+_INT8_RANGE = (-128, 127)
 
 _ENV_FIELDS = (
     "in_width",
@@ -96,33 +111,61 @@ def _rounding_gate(target: Target) -> Unit:
     return conv_unit
 
 
-def _check_clamp(op: Op, attrs: FusedConvAttrs, unit: Unit) -> dict:
+def _uses_w13_epilogue(unit: Unit) -> bool:
+    """True iff `unit` is programmed with the ISA v1.1 epilogue encoding
+    (`output_offset` + `CLAMP_EN`/`clamp_min`/`clamp_max`, see module
+    comment); False selects the legacy `RELU_EN` encoding."""
+    return _isa_at_least(unit.isa_version, _W13_ISA_VERSION)
+
+
+def _clamp_params(op: Op, attrs: FusedConvAttrs, unit: Unit) -> dict:
+    """The epilogue clamp/ReLU part of a `conv_layer`'s params (module
+    comment for the rule). Also enforces `epilogue.clamp_ranges`: a fused
+    clamp outside the advertised ranges is a lowering bug (FusePass only
+    folds admissible clamps) or a hand-built graph, and is rejected."""
     clamp = attrs.clamp
-    if clamp is None:
-        return {"relu_en": False}
-    bounds = (clamp.min, clamp.max)
+    bounds = _INT8_RANGE if clamp is None else (clamp.min, clamp.max)
+    lo, hi = bounds
+    if not (_INT8_RANGE[0] <= lo <= hi <= _INT8_RANGE[1]):
+        raise CapabilityError(
+            f"clamp {bounds} is not a non-empty sub-range of int8 {_INT8_RANGE}",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="clamp",
+        )
+    clamp_ranges = unit.epilogue.clamp_ranges
+    if clamp_ranges != "any" and clamp is not None and bounds not in clamp_ranges:
+        raise CapabilityError(
+            f"clamp {bounds} not in epilogue.clamp_ranges {clamp_ranges}",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="clamp",
+        )
+
+    if _uses_w13_epilogue(unit):
+        return {"relu_en": False, "clamp_en": True, "clamp_min": lo, "clamp_max": hi}
+
+    # Legacy ISA v1.0 encoding: only ReLU and plain int8 saturate exist.
     if bounds == (0, 127):
         return {"relu_en": True}
-    if bounds == (-128, 127):
+    if bounds == _INT8_RANGE:
         return {"relu_en": False}
-    clamp_ranges = unit.epilogue.clamp_ranges
-    if clamp_ranges != "any" or not _isa_at_least(unit.isa_version, "1.1"):
+    raise CapabilityError(
+        f"general clamp {bounds} requires isa_version >= {_W13_ISA_VERSION} (CLAMP_EN/clamp_min/clamp_max); "
+        f"unit {unit.name!r} is isa_version {unit.isa_version}",
+        op_id=op.id, stage=_STAGE, unit=unit.name, constraint="clamp",
+    )
+
+
+def _output_offset_params(op: Op, attrs: FusedConvAttrs, unit: Unit) -> dict:
+    """`output_offset` (= TOSA `rescale.out_zp`) for ISA >= 1.1; on a v1.0
+    unit only `out_zp == 0` is representable."""
+    out_zp = attrs.rescale.out_zp
+    if _uses_w13_epilogue(unit):
+        return {"output_offset": int(out_zp)}
+    if out_zp != 0:
         raise CapabilityError(
-            f"general clamp {bounds} requires isa_version >= 1.1",
-            op_id=op.id,
-            stage=_STAGE,
-            unit=unit.name,
-            constraint="clamp",
+            f"rescale out_zp {out_zp} != 0 requires isa_version >= {_W13_ISA_VERSION} (output_offset); "
+            f"unit {unit.name!r} is isa_version {unit.isa_version}",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="rescale.out_zp",
         )
-    if not _H1_FIELDS_LOWERING_IMPLEMENTED:
-        raise CapabilityError(
-            f"general clamp {bounds}: clamp_en/clamp_min/clamp_max lowering not implemented yet (M11)",
-            op_id=op.id,
-            stage=_STAGE,
-            unit=unit.name,
-            constraint="clamp",
-        )
-    return {"relu_en": False, "clamp_en": True, "clamp_min": clamp.min, "clamp_max": clamp.max}
+    return {}
 
 
 def _check_capabilities(op: Op, x: Tensor, w: Tensor, b: Tensor, y: Tensor, unit: Unit) -> None:
@@ -181,12 +224,9 @@ def _check_capabilities(op: Op, x: Tensor, w: Tensor, b: Tensor, y: Tensor, unit
             f"rescale out_zp {rescale.out_zp} != 0 not supported by target",
             op_id=op.id, stage=_STAGE, unit=unit.name, constraint="rescale.out_zp",
         )
-    if rescale.out_zp != 0 and not _H1_FIELDS_LOWERING_IMPLEMENTED:
-        # The target has `output_offset` (ISA v1.1) but this lowering does
-        # not emit it yet: reject loudly rather than silently drop out_zp
-        # from the descriptor (a numerically wrong program).
+    if not (_INT8_RANGE[0] <= rescale.out_zp <= _INT8_RANGE[1]):
         raise CapabilityError(
-            f"rescale out_zp {rescale.out_zp} != 0: output_offset lowering not implemented yet (M11)",
+            f"rescale out_zp {rescale.out_zp} outside int8 {_INT8_RANGE}",
             op_id=op.id, stage=_STAGE, unit=unit.name, constraint="rescale.out_zp",
         )
 
@@ -269,7 +309,8 @@ def _lower_fused_conv(
 
     params["bias_en"] = True
     params["requant_en"] = True
-    params.update(_check_clamp(op, attrs, unit))
+    params.update(_clamp_params(op, attrs, unit))
+    params.update(_output_offset_params(op, attrs, unit))
     params["pad_en"] = any(p > 0 for p in (pad_t, pad_b, pad_l, pad_r))
     params["requant_scale"] = int(rescale.multiplier[0])
     params["requant_shift"] = int(rescale.shift[0]) - caps.implicit_shift

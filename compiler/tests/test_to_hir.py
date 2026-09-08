@@ -16,6 +16,7 @@ from cnnc.hir.printer import print_hir
 from cnnc.lower.to_hir import layer_env, select_unit, to_hir
 from cnnc.passes import PassContext, default_pipeline, run_pipeline
 from cnnc.target.constraints import check
+from cnnc.target.contract import Target
 
 GOLDEN_PATH = Path(__file__).parent / "golden" / "conv_rescale_clamp.hir.txt"
 
@@ -135,7 +136,13 @@ def test_fixture_params(target):
     params = module.ops[0].params
     assert params["requant_shift"] == 23  # 38 - 15
     assert params["requant_scale"] == 1073741824
-    assert params["relu_en"] is True
+    # ISA v1.1 (M11) epilogue encoding: the fixture's ReLU clamp [0,127] is
+    # CLAMP_EN,[0,127] with relu_en=0 (behaviourally identical to the v1.0
+    # RELU_EN encoding, see test_fixtures_m11.py); out_zp=0 -> output_offset=0.
+    assert params["relu_en"] is False
+    assert params["clamp_en"] is True
+    assert (params["clamp_min"], params["clamp_max"]) == (0, 127)
+    assert params["output_offset"] == 0
     assert params["pad_en"] is True
     assert params["bias_en"] is True
     assert params["requant_en"] is True
@@ -270,16 +277,35 @@ def test_out_zp_stays_unfused_and_rejected_on_isa_v10_target(target):
     assert "%4" in str(exc_info.value)
 
 
-def test_out_zp_fused_but_rejected_until_m11(target):
-    # Real ISA v1.1 target (H1): the out_zp rescale IS fused, and `to_hir`
-    # must still reject it -- loudly, at the fused op -- until M11 lowers
-    # it onto `output_offset`. Silently dropping out_zp would compile a
-    # numerically wrong program.
-    with pytest.raises(CapabilityError) as exc_info:
-        _to_hir(target, rescale_out_zp=5)
-    assert exc_info.value.constraint == "rescale.out_zp"
-    assert "M11" in str(exc_info.value)
-    assert "%10" in str(exc_info.value)
+def test_out_zp_lowers_to_output_offset_on_isa_v11_target(target):
+    # Real ISA v1.1 target (H1/M11): the out_zp rescale is fused and lowered
+    # onto `output_offset`; the ReLU clamp rides on CLAMP_EN,[0,127].
+    module = _to_hir(target, rescale_out_zp=5)
+    params = module.ops[0].params
+    assert params["output_offset"] == 5
+    assert params["clamp_en"] is True and params["relu_en"] is False
+    assert (params["clamp_min"], params["clamp_max"]) == (0, 127)
+
+
+def test_legacy_relu_encoding_on_isa_v10_target(target):
+    # ISA v1.0 keeps the RELU_EN encoding and never emits W13 params.
+    from conftest import v10_target
+
+    module = _to_hir(v10_target(target))
+    params = module.ops[0].params
+    assert params["relu_en"] is True
+    assert not any(key in params for key in ("clamp_en", "clamp_min", "clamp_max", "output_offset"))
+
+    module = _to_hir(v10_target(target), clamp=(-128, 127))
+    assert module.ops[0].params["relu_en"] is False
+
+
+def test_no_clamp_lowers_to_int8_range_on_isa_v11_target(target):
+    # Rule: clamp bounds = following clamp if present else [-128,127].
+    module = _to_hir(target, clamp=None)
+    params = module.ops[0].params
+    assert params["clamp_en"] is True and params["relu_en"] is False
+    assert (params["clamp_min"], params["clamp_max"]) == (-128, 127)
 
 
 def test_unfused_clamp_5_100_rejected_on_isa_v10_target(target):
@@ -290,14 +316,42 @@ def test_unfused_clamp_5_100_rejected_on_isa_v10_target(target):
     assert "%10" in str(exc_info.value)
 
 
-def test_fused_clamp_5_100_rejected_until_m11(target):
+def test_fused_clamp_5_100_lowers_to_clamp_fields_on_isa_v11_target(target):
     # Real ISA v1.1 target: the general clamp is fused (clamp_ranges "any")
-    # but CLAMP_EN/clamp_min/clamp_max lowering is M11.
+    # and lowered onto CLAMP_EN/clamp_min/clamp_max (M11).
+    module = _to_hir(target, clamp=(5, 100))
+    params = module.ops[0].params
+    assert params["clamp_en"] is True and params["relu_en"] is False
+    assert (params["clamp_min"], params["clamp_max"]) == (5, 100)
+    assert params["output_offset"] == 0
+
+
+def test_direct_general_clamp_rejected_on_isa_v10_target(target):
+    # Bypass FusePass: a hand-built fused_conv with a general clamp on a
+    # v1.0 unit has no field to carry it -> CapabilityError at the fused op.
+    from conftest import v10_target
+
+    rescale = RescaleParams(
+        multiplier=(1073741824,), shift=(38,), per_channel=False, in_zp=0, out_zp=0,
+        rounding="SINGLE_ROUND", scale32=True, input_unsigned=False, output_unsigned=False,
+    )
+    graph = _direct_fused_graph(rescale, clamp=ClampAttrs(min=5, max=100))
+    verify_gir(graph)
     with pytest.raises(CapabilityError) as exc_info:
-        _to_hir(target, clamp=(5, 100))
+        to_hir(graph, v10_target(target))
     assert exc_info.value.constraint == "clamp"
-    assert "M11" in str(exc_info.value)
-    assert "%10" in str(exc_info.value)
+    assert exc_info.value.op_id == "%10"
+    assert "clamp_ranges" in str(exc_info.value)
+
+    # Inconsistent target (advertises "any" clamp but is still ISA v1.0):
+    # the isa_version gate, not clamp_ranges, rejects it.
+    data = v10_target(target).to_dict()
+    for unit in data["units"]:
+        unit["epilogue"]["clamp_ranges"] = "any"
+    with pytest.raises(CapabilityError) as exc_info:
+        to_hir(graph, Target.from_dict(data))
+    assert exc_info.value.constraint == "clamp"
+    assert "isa_version >= 1.1" in str(exc_info.value)
 
 
 # --------------------------------------------------------------------------
@@ -309,9 +363,8 @@ def test_fused_clamp_5_100_rejected_until_m11(target):
 # --------------------------------------------------------------------------
 
 
-def _direct_fused_graph(rescale: RescaleParams) -> Graph:
+def _direct_fused_graph(rescale: RescaleParams, clamp: ClampAttrs | None = ClampAttrs(min=0, max=127)) -> Graph:
     conv = ConvAttrs(pad=(1, 1, 1, 1), stride=(1, 1), dilation=(1, 1), in_zp=0, w_zp=0, acc_dtype="i32")
-    clamp = ClampAttrs(min=0, max=127)
     attrs = FusedConvAttrs(conv=conv, rescale=rescale, clamp=clamp)
     tensors = {
         "arg0": Tensor(id="arg0", shape=(1, 8, 8, 4), dtype="i8"),
@@ -340,7 +393,11 @@ def test_to_hir_rejects_per_channel_directly(target):
     assert exc_info.value.op_id == "%10"
 
 
-def test_to_hir_rejects_out_zp_directly(target):
+def test_to_hir_rejects_out_zp_directly_on_isa_v10_target(target):
+    # M11 acceptance: `isa_version 1.0` target + `out_zp != 0` -> CapabilityError
+    # (here at the fused op, bypassing FusePass's own `output_zp` filter).
+    from conftest import v10_target
+
     rescale = RescaleParams(
         multiplier=(1073741824,), shift=(38,), per_channel=False, in_zp=0, out_zp=5,
         rounding="SINGLE_ROUND", scale32=True, input_unsigned=False, output_unsigned=False,
@@ -348,9 +405,20 @@ def test_to_hir_rejects_out_zp_directly(target):
     graph = _direct_fused_graph(rescale)
     verify_gir(graph)
     with pytest.raises(CapabilityError) as exc_info:
-        to_hir(graph, target)
+        to_hir(graph, v10_target(target))
     assert exc_info.value.constraint == "rescale.out_zp"
     assert exc_info.value.op_id == "%10"
+
+
+def test_to_hir_rejects_out_zp_outside_int8_directly(target):
+    rescale = RescaleParams(
+        multiplier=(1073741824,), shift=(38,), per_channel=False, in_zp=0, out_zp=200,
+        rounding="SINGLE_ROUND", scale32=True, input_unsigned=False, output_unsigned=False,
+    )
+    graph = _direct_fused_graph(rescale)
+    with pytest.raises(CapabilityError) as exc_info:
+        to_hir(graph, target)
+    assert exc_info.value.constraint == "rescale.out_zp"
 
 
 # --------------------------------------------------------------------------

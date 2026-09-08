@@ -113,8 +113,12 @@ def test_descriptor_params_match_hir(target, tmp_path):
     assert (conv_desc.stride_h, conv_desc.stride_w) == (1, 1)
     assert (conv_desc.pad_top, conv_desc.pad_bottom, conv_desc.pad_left, conv_desc.pad_right) == (1, 1, 1, 1)
 
+    # ISA v1.1 (M11) epilogue encoding of the fixture's ReLU: CLAMP_EN with
+    # [0,127] in W13, RELU_EN clear (see test_fixtures_m11.py for the proof
+    # that this is behaviourally identical to the v1.0 RELU_EN encoding).
     set_flags = {name for name, bit in target.isa.flags.items() if (conv_desc.flags >> bit) & 1}
-    assert set_flags == {"RELU_EN", "BIAS_EN", "REQUANT_EN", "PAD_EN"}
+    assert set_flags == {"CLAMP_EN", "BIAS_EN", "REQUANT_EN", "PAD_EN"}
+    assert (conv_desc.output_offset, conv_desc.clamp_min, conv_desc.clamp_max) == (0, 0, 127)
 
 
 def test_program_bytes_end_with_halt(target, tmp_path):
