@@ -16,7 +16,23 @@ that analysis is entirely this module's job. `Planner.plan` walks a
   to immediately free the buffer again wastes both a local slot and an
   instruction for no bandwidth benefit -- see `_resolve_input`'s
   docstring for the exact rule and why it differs from the always-reload
-  rule for values that were *previously* spilled.
+  rule for values that were *previously* spilled;
+* `DDR` for its whole lifetime -- no local buffer at any point --
+  when it *cannot* be placed on chip at all: bigger than one
+  `cnn_accel_tensor_mem` bank, or unable to fit even with every
+  evictable buffer evicted. This is the fallback that stops the
+  planner falling over on a real network. It is always available and
+  always correct because section 3 defines ONE activation layout,
+  used byte-identically in DDR and `LOCAL_TENSOR`, and operand space
+  is a per-operand tag on each instruction: a buffer's slice offsets,
+  plane order and alignment do not change with the space it sits in.
+  It matters most for the `C2f` concat family, which is written by
+  several scattered producers, stays live until the block's closing
+  convolution, and is therefore deliberately never an eviction
+  victim -- so it has no spill lowering, and without this it had no
+  lowering at all. What it costs is bandwidth, reported separately in
+  `DdrTraffic.ddr_resident_read_bytes`/`ddr_resident_write_bytes` and
+  listed buffer by buffer in `PlannedProgram.ddr_placements`.
 
 Channel `concat`/`split` (`model.Model.concat`/`split`) add a second job:
 **buffer aliasing**. Those two operations produce no instruction at all --
@@ -104,6 +120,15 @@ class DdrTraffic:
     reload_count: int = 0
     local_read_bytes: int = 0
     local_write_bytes: int = 0
+    #: Subtotals of `read_bytes`/`write_bytes` (not additional to them)
+    #: attributable to buffers the planner had to place in DDR because
+    #: they could not be placed in the scratchpad at all -- see
+    #: `Planner.plan`'s `place_in_ddr`. Zero for every program that fits
+    #: locally, so a test can assert "this program paid nothing for
+    #: overflow" as directly as it can assert "this one paid exactly
+    #: N bytes".
+    ddr_resident_read_bytes: int = 0
+    ddr_resident_write_bytes: int = 0
 
 
 @dataclass
@@ -162,6 +187,16 @@ class PlannedProgram:
     #: same plan, so a placement bug is self-consistently wrong on both
     #: sides and invisible to a value-only comparison.
     local_placements: list[tuple[str, int, int]] = field(default_factory=list)
+    #: Every buffer this plan could NOT place in the scratchpad and
+    #: therefore left resident in DDR, in order, as `(alias-root tensor
+    #: name, DDR byte address, byte size)`. Empty for a program that
+    #: fits entirely locally -- which is every program that planned
+    #: before this fallback existed, so a non-empty list is exactly the
+    #: set of buffers whose placement changed. Recorded (like
+    #: `local_placements`) so a test can assert the *placement* directly
+    #: rather than inferring it from values, which the DUT and
+    #: `reference.py` would agree on even if it were wrong.
+    ddr_placements: list[tuple[str, int, int]] = field(default_factory=list)
 
 
 class _LocalAllocator:
@@ -247,6 +282,14 @@ class _LocalAllocator:
             return aligned_start
         return None
 
+    def clone(self) -> "_LocalAllocator":
+        """A throwaway copy, for asking "could this size EVER be placed
+        here?" without touching the real free list -- see
+        `Planner.plan`'s `can_ever_fit`."""
+        other = _LocalAllocator(self.capacity, self.bank_bytes)
+        other._free = list(self._free)
+        return other
+
     def free(self, addr: int, size: int) -> None:
         entries = sorted(self._free + [(addr, size)])
         merged: list[tuple[int, int]] = []
@@ -289,6 +332,7 @@ class Planner:
     def plan(self, model: Model) -> PlannedProgram:
         alloc = _LocalAllocator(self.tensor_mem_bytes, self.bank_bytes)
         local_placements: list[tuple[str, int, int]] = []
+        ddr_placements: list[tuple[str, int, int]] = []
         traffic = DdrTraffic()
         steps: list[Step] = []
         tensor_ddr_addr: dict[str, int] = {}
@@ -313,6 +357,13 @@ class Planner:
         #: (evicted, not yet reloaded). Absent for a root that has never
         #: been spilled.
         spilled: dict[str, int] = {}
+        #: root name -> its permanent DDR address, for a buffer that
+        #: could not be placed in the scratchpad AT ALL (see
+        #: `place_in_ddr`). Sticky: once a buffer lives in DDR every
+        #: producer of every family member writes straight into it and
+        #: every consumer reads straight out of it, so it is never
+        #: reloaded, never spilled and never half-resident.
+        ddr_resident: dict[str, int] = {}
         #: root name -> not-yet-executed consumer edges over the whole
         #: family, and not-yet-run producers of family members. A buffer
         #: is freed only when BOTH reach zero: a concat buffer is written
@@ -402,29 +453,103 @@ class Planner:
             tensor_ddr_addr[best_name] = ddr_addr
             return True
 
-        def alloc_local(root_name: str, size: int, exclude: set[str]) -> int:
+        def can_ever_fit(size: int, exclude: set[str]) -> bool:
+            """Would `size` bytes fit locally if every buffer `evict_one`
+            is *allowed* to evict were evicted?
+
+            Asked BEFORE the first eviction, and answered on a throwaway
+            copy of the free list, because the eviction loop is not
+            transactional: `evict_one` appends a real `STORE` step and
+            charges real traffic, so discovering only afterwards that the
+            buffer still does not fit would leave a trail of pointless
+            spills in the program (before this fallback existed that did
+            not matter -- the `ValueError` threw the whole plan away).
+
+            The eviction loop below evicts one victim at a time, so if
+            the all-victims-evicted state admits the allocation the loop
+            is guaranteed to terminate in success; if it does not, no
+            sequence of evictions can help and the caller places the
+            buffer in DDR instead, having moved nothing."""
+            probe = alloc.clone()
+            for name, addr in local_addr.items():
+                if name in exclude or pending_producers[name]:
+                    continue
+                probe.free(addr, nbytes(root_by_name[name]))
+            return probe.try_alloc(size) is not None
+
+        def alloc_local(root_name: str, size: int, exclude: set[str]) -> int | None:
+            """Place `root_name`'s `size`-byte buffer in the scratchpad,
+            spilling other buffers if that is what it takes, and return
+            its byte address -- or `None` when it cannot be placed
+            locally at all, which is the caller's cue to leave the buffer
+            in DDR (`place_in_ddr`).
+
+            The two ways a buffer is unplaceable are both permanent
+            properties of this moment, not transient pressure:
+
+            * it is larger than one `cnn_accel_tensor_mem` bank, so no
+              legal address exists for it at any occupancy (the hardware
+              serves every transfer from the single bank the address
+              decodes to and clamps anything past that bank's end);
+            * even with every evictable buffer evicted there is no
+              bank-confined hole big enough -- the free list is
+              fragmented and this planner has no defragmenter, or the
+              buffers that *cannot* be evicted (this op's own operands, a
+              half-written concat family) already own too much of the
+              scratchpad.
+
+            Neither is an error. `ValueError` is reserved for programs
+            that cannot be lowered *at all*; "does not fit on chip" has a
+            correct, if slower, lowering, and taking it is what makes the
+            planner degrade instead of falling over."""
             if size > self.bank_bytes:
-                raise ValueError(
-                    f"planner: '{root_name}' needs {size} bytes, which is more than "
-                    f"one {self.bank_bytes}-byte cnn_accel_tensor_mem bank "
-                    f"(g_bank_words={self.bank_bytes // 8}); a local buffer must fit "
-                    "in a single bank because the hardware serves each transfer from "
-                    "exactly one bank and clamps anything that would cross a bank "
-                    "boundary. Either enlarge g_bank_words, or keep this tensor in "
-                    "DDR -- it is never split across banks."
-                )
+                return None
             addr = alloc.try_alloc(size)
-            while addr is None:
-                if not evict_one(exclude):
-                    raise ValueError(
-                        f"planner: {size} bytes for '{root_name}' do not fit in the "
-                        f"{self.tensor_mem_bytes}-byte tensor memory "
-                        f"({self.tensor_mem_bytes // self.bank_bytes} x "
-                        f"{self.bank_bytes}-byte banks, and a buffer may not cross a "
-                        "bank boundary) even after evicting every evictable buffer"
-                    )
-                addr = alloc.try_alloc(size)
+            if addr is None:
+                if not can_ever_fit(size, exclude):
+                    return None
+                while addr is None:
+                    if not evict_one(exclude):  # pragma: no cover - can_ever_fit said yes
+                        raise ValueError(
+                            f"planner: {size} bytes for '{root_name}' do not fit in the "
+                            f"{self.tensor_mem_bytes}-byte tensor memory "
+                            f"({self.tensor_mem_bytes // self.bank_bytes} x "
+                            f"{self.bank_bytes}-byte banks, and a buffer may not cross a "
+                            "bank boundary) even after evicting every evictable buffer"
+                        )
+                    addr = alloc.try_alloc(size)
             local_placements.append((root_name, addr, size))
+            return addr
+
+        def place_in_ddr(root_name: str, size: int) -> int:
+            """Give `root_name`'s buffer a permanent DDR home and return
+            its address, allocating one on first call.
+
+            This is the whole fallback. It is correct because the
+            section-3 activation layout is byte-identical in DDR and in
+            `LOCAL_TENSOR`: a buffer's slice offsets, plane order and
+            alignment do not depend on which space it sits in, so every
+            address the alias arithmetic computes stays valid, and both
+            operand spaces are per-operand tags on the instruction
+            (`space_src0`/`space_src1`/`space_dst`) that the hardware
+            binds to a DMA instead of a scratchpad port. A concat family
+            in particular needs nothing else: its parts' producers write
+            their slices straight to DDR at `base + plane_offset *
+            H*W*T`, and its consumer reads the assembled tensor from
+            there. What it costs is bandwidth -- every write and every
+            read of this buffer is now real AXI traffic, counted in
+            `ddr_resident_write_bytes`/`ddr_resident_read_bytes`."""
+            addr = ddr_resident.get(root_name)
+            if addr is not None:
+                return addr
+            # A graph input (or a previously spilled buffer) already has
+            # a DDR home; reuse it rather than allocating a second copy.
+            addr = tensor_ddr_addr.get(root_name)
+            if addr is None:
+                addr = self.ddr_map.alloc(DdrMap.SPILL, size)
+                tensor_ddr_addr[root_name] = addr
+            ddr_resident[root_name] = addr
+            ddr_placements.append((root_name, addr, size))
             return addr
 
         def resolve_input(t: Tensor, exclude: set[str]) -> tuple[int, int]:
@@ -461,6 +586,15 @@ class Planner:
                 traffic.local_read_bytes += nbytes(t)
                 return isa.SPACE_LOCAL_TENSOR, local_addr[root.name] + offset
 
+            if root.name in ddr_resident:
+                # Never reloaded: a buffer only lives in DDR because it
+                # provably has no local home, so there is nowhere to
+                # reload it to, and a later producer of another slice of
+                # it would have to find it in DDR anyway.
+                traffic.read_bytes += nbytes(t)
+                traffic.ddr_resident_read_bytes += nbytes(t)
+                return isa.SPACE_DDR, ddr_resident[root.name] + offset
+
             if root.is_input and root.name not in tensor_ddr_addr:
                 tensor_ddr_addr[root.name] = self.ddr_map.alloc(DdrMap.INPUTS, nbytes(root))
             if root.name not in tensor_ddr_addr:
@@ -475,31 +609,38 @@ class Planner:
             if was_spilled or remaining_uses(root.name, op_index) > 1:
                 size = nbytes(root)
                 addr = alloc_local(root.name, size, exclude)
-                steps.append(
-                    MoveStep(
-                        tensor=root,
-                        src_space=isa.SPACE_DDR,
-                        src_addr=ddr_addr,
-                        dst_space=isa.SPACE_LOCAL_TENSOR,
-                        dst_addr=addr,
-                        nbytes=size,
-                        kind="reload" if was_spilled else "cold_load",
+                # `addr is None`: the buffer has no local home. Reading it
+                # straight out of DDR moves the same bytes as the reload
+                # would have, one instruction fewer, and is the only
+                # lowering left -- so take it instead of failing. The
+                # buffer stays in `spilled` (if it was), so a later use
+                # under less pressure gets its explicit reload back.
+                if addr is not None:
+                    steps.append(
+                        MoveStep(
+                            tensor=root,
+                            src_space=isa.SPACE_DDR,
+                            src_addr=ddr_addr,
+                            dst_space=isa.SPACE_LOCAL_TENSOR,
+                            dst_addr=addr,
+                            nbytes=size,
+                            kind="reload" if was_spilled else "cold_load",
+                        )
                     )
-                )
-                traffic.read_bytes += size
-                traffic.local_write_bytes += size
-                traffic.tensor_load_count += 1
-                if was_spilled:
-                    traffic.reload_count += 1
-                    del spilled[root.name]
-                local_addr[root.name] = addr
-                # The reload above is its own DDR<->local transaction;
-                # the compute op then reads the now-resident copy as a
-                # second, separate local-memory transaction (mirrors
-                # reference.py, which always counts a ComputeStep's
-                # operand fetch regardless of how the operand got local).
-                traffic.local_read_bytes += nbytes(t)
-                return isa.SPACE_LOCAL_TENSOR, addr + offset
+                    traffic.read_bytes += size
+                    traffic.local_write_bytes += size
+                    traffic.tensor_load_count += 1
+                    if was_spilled:
+                        traffic.reload_count += 1
+                        del spilled[root.name]
+                    local_addr[root.name] = addr
+                    # The reload above is its own DDR<->local transaction;
+                    # the compute op then reads the now-resident copy as a
+                    # second, separate local-memory transaction (mirrors
+                    # reference.py, which always counts a ComputeStep's
+                    # operand fetch regardless of how the operand got local).
+                    traffic.local_read_bytes += nbytes(t)
+                    return isa.SPACE_LOCAL_TENSOR, addr + offset
 
             traffic.read_bytes += nbytes(t)
             return isa.SPACE_DDR, ddr_addr + offset
@@ -546,13 +687,21 @@ class Planner:
                         f"'{out_root.name}', which is currently spilled to DDR -- a "
                         "half-written concat buffer must never be evicted (see evict_one)"
                     )
-                if out_root.name not in local_addr:
-                    local_addr[out_root.name] = alloc_local(
-                        out_root.name, nbytes(out_root), exclude_this_op
-                    )
-                out_addr = local_addr[out_root.name] + out_offset
-                output_space = isa.SPACE_LOCAL_TENSOR
-                traffic.local_write_bytes += nbytes(out_t)
+                if out_root.name not in local_addr and out_root.name not in ddr_resident:
+                    addr = alloc_local(out_root.name, nbytes(out_root), exclude_this_op)
+                    if addr is None:
+                        place_in_ddr(out_root.name, nbytes(out_root))
+                    else:
+                        local_addr[out_root.name] = addr
+                if out_root.name in ddr_resident:
+                    out_addr = ddr_resident[out_root.name] + out_offset
+                    output_space = isa.SPACE_DDR
+                    traffic.write_bytes += nbytes(out_t)
+                    traffic.ddr_resident_write_bytes += nbytes(out_t)
+                else:
+                    out_addr = local_addr[out_root.name] + out_offset
+                    output_space = isa.SPACE_LOCAL_TENSOR
+                    traffic.local_write_bytes += nbytes(out_t)
 
             steps.append(
                 ComputeStep(
@@ -598,6 +747,7 @@ class Planner:
             tensor_ddr_addr=tensor_ddr_addr,
             bank_bytes=self.bank_bytes,
             local_placements=local_placements,
+            ddr_placements=ddr_placements,
         )
 
 

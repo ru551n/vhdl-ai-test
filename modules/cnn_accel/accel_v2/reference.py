@@ -305,12 +305,26 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
         else:
             local[addr : addr + len(data)] = data
 
-    def count(space: int, nbytes: int, *, is_read: bool) -> None:
+    # Byte ranges of every buffer the planner could not place in the
+    # scratchpad and left in DDR (`PlannedProgram.ddr_placements`). Used
+    # only to split the DDR totals into "traffic this program would have
+    # had anyway" and "traffic the overflow fallback cost", so that
+    # `planned.traffic == result.traffic` still compares every field.
+    resident_ranges = [(addr, addr + size) for _, addr, size in planned.ddr_placements]
+
+    def is_resident(addr: int) -> bool:
+        return any(lo <= addr < hi for lo, hi in resident_ranges)
+
+    def count(space: int, addr: int, nbytes: int, *, is_read: bool) -> None:
         if space == isa.SPACE_DDR:
             if is_read:
                 traffic.read_bytes += nbytes
+                if is_resident(addr):
+                    traffic.ddr_resident_read_bytes += nbytes
             else:
                 traffic.write_bytes += nbytes
+                if is_resident(addr):
+                    traffic.ddr_resident_write_bytes += nbytes
         else:
             if is_read:
                 traffic.local_read_bytes += nbytes
@@ -327,8 +341,8 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
         if isinstance(step, MoveStep):
             raw = read_from(step.src_space, step.src_addr, step.nbytes)
             write_to(step.dst_space, step.dst_addr, raw)
-            count(step.src_space, step.nbytes, is_read=True)
-            count(step.dst_space, step.nbytes, is_read=False)
+            count(step.src_space, step.src_addr, step.nbytes, is_read=True)
+            count(step.dst_space, step.dst_addr, step.nbytes, is_read=False)
             if step.kind == "spill":
                 traffic.tensor_store_count += 1
                 traffic.spill_count += 1
@@ -344,9 +358,9 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
         if isinstance(op, CopyOp):
             nbytes = op.inputs[0].size_bytes
             raw = read_from(step.input_spaces[0], step.input_addrs[0], nbytes)
-            count(step.input_spaces[0], nbytes, is_read=True)
+            count(step.input_spaces[0], step.input_addrs[0], nbytes, is_read=True)
             write_to(step.output_space, step.output_addr, raw)
-            count(step.output_space, nbytes, is_read=False)
+            count(step.output_space, step.output_addr, nbytes, is_read=False)
             # Unpacked from the bytes actually copied, not from the
             # source tensor's `tensor_data` entry: a COPY's source may be
             # a `split` view or a `concat` slice, whose logical values are
@@ -360,7 +374,7 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
         for t, space, addr in zip(op.inputs, step.input_spaces, step.input_addrs):
             nbytes = t.size_bytes
             raw = read_from(space, addr, nbytes)
-            count(space, nbytes, is_read=True)
+            count(space, addr, nbytes, is_read=True)
             input_values.append(unpack(t, raw))
 
         if isinstance(op, Conv2dOp):
@@ -379,7 +393,7 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
 
         out_bytes = pack(op.output, values)
         write_to(step.output_space, step.output_addr, out_bytes)
-        count(step.output_space, len(out_bytes), is_read=False)
+        count(step.output_space, step.output_addr, len(out_bytes), is_read=False)
         tensor_data[op.output.name] = values
 
     traffic.read_bytes += (len(planned.steps) + 1) * isa.INSTR_WORD_BYTES

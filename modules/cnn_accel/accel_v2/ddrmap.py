@@ -68,19 +68,45 @@ class DdrMap:
         OUTPUTS: "OUTPUTS",
     }
 
-    def __init__(self) -> None:
+    def __init__(self, scale: int = 1) -> None:
+        """`scale` multiplies every region base and `LIMIT`, keeping the
+        section-6 layout's shape and ordering but making each region
+        `scale` times larger. It defaults to 1, i.e. the literal
+        section-6 map above, which is what every `tb_cnn_accel_top` case
+        uses -- the testbench's DDR memory model is sized from
+        `DdrMap.LIMIT`, so growing the map costs simulation memory and is
+        never done implicitly.
+
+        Its one purpose is the *planner-only* (unsimulated) direction:
+        a network at YOLOv8n's real channel counts has working buffers of
+        tens of kilobytes each, and once the planner is allowed to leave
+        an oversized buffer in DDR (`planner.Planner.plan`'s
+        `place_in_ddr`) the 256 KiB `SPILL` arena of the 2 MiB
+        simulation map becomes the next thing to run out -- a real
+        limit, but a limit of *this memory map*, not of the lowering
+        strategy. `scale` is how a test says "assume a real board's DDR"
+        without disturbing any simulated case.
+
+        Region *identifiers* stay the unscaled class constants
+        (`DdrMap.SPILL` and friends), so callers are unaffected; only the
+        addresses `alloc` returns move."""
+        if scale < 1:
+            raise ValueError(f"scale must be at least 1, got {scale}")
+        self.scale = scale
+        self.limit = self.LIMIT * scale
+        self._base: dict[int, int] = {region: region * scale for region in self._REGION_ORDER}
         self._next: dict[int, int] = {}
         self.reset()
 
     def reset(self) -> None:
         """Reset every region's bump cursor back to its base offset."""
-        self._next = {base: base for base in self._REGION_ORDER}
+        self._next = {region: self._base[region] for region in self._REGION_ORDER}
 
     def _region_limit(self, region: int) -> int:
         idx = self._REGION_ORDER.index(region)
         if idx + 1 < len(self._REGION_ORDER):
-            return self._REGION_ORDER[idx + 1]
-        return self.LIMIT
+            return self._base[self._REGION_ORDER[idx + 1]]
+        return self.limit
 
     def alloc(self, region: int, nbytes: int, align: int = 8) -> int:
         """Allocate `nbytes` (rounded up to `align`-aligned start) from

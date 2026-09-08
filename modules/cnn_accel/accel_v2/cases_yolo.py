@@ -45,28 +45,33 @@ than quietly approximated:
   count of every case for no extra coverage, so the catalogue uses the
   RELU epilogue by default and `case_silu_through_block` is the case
   that runs a genuine SiLU LUT in a realistic position.
-* **A `C2f` under scratchpad pressure cannot be expressed at all.** A
-  concat buffer with producers still ahead of it is deliberately never
-  an eviction victim (`planner.evict_one`), and the free list is never
-  defragmented, so a `C2f` whose 3-plane concat family cannot be placed
-  contiguously makes `Planner.plan` raise `ValueError` rather than
-  degrade into spill traffic. Measured on `case_c2f_n1`'s graph: it
-  plans with no spill at all from 3584 bytes of scratchpad upwards and
-  raises below that -- there is no size at which a `C2f` spills. So
-  there is no "`C2f` that had to spill" case here; there cannot be one.
-  `case_concat_family_spills` is the closest reachable thing: a concat
-  family that is *fully written* before the pressure arrives, which is
-  evictable and does spill.
-* **Bottleneck kernels.** `ultralytics`' `Bottleneck` is 3x3 then 3x3.
-  These cases use 1x1 then 3x3, which is the same dataflow (two chained
-  convolutions plus a residual add) with a mixed pair of kernel
-  geometries, so the shared weight-fetch path is exercised at both.
+* **A `C2f` under scratchpad pressure does not spill -- it moves to
+  DDR.** A concat buffer with producers still ahead of it is
+  deliberately never an eviction victim (`planner.evict_one`), and the
+  free list is never defragmented, so a `C2f` whose concat family cannot
+  be placed contiguously has no spill lowering at all. It used to be a
+  hard `ValueError`; it is now a DDR placement (`planner.Planner.plan`'s
+  `place_in_ddr`), which is always available because the section-3
+  activation layout is byte-identical in DDR and `LOCAL_TENSOR`.
+  `case_c2f_concat_in_ddr` is that case, and it is the shape that
+  matters for a real network: at YOLOv8n's actual channel counts a
+  `C2f` concat family is tens of kilobytes and cannot be on chip at all.
+  `case_concat_family_spills` remains the genuinely-spilling neighbour:
+  a concat family that is *fully written* before the pressure arrives,
+  which is evictable and does spill.
+* **Bottleneck kernels.** `ultralytics`' `Bottleneck` is 3x3 then 3x3
+  (`Conv(c1, c_, k[0], 1)`, `Conv(c_, c2, k[1], 1, g=g)` with the
+  default `k=(3, 3)`), and so is `_bottleneck` here. The 1x1 kernel is
+  still exercised everywhere the real network has one -- `C2f`'s own
+  `cv1`/`cv2`, `SPPF`'s -- so nothing was lost by making the Bottleneck
+  match.
 """
 
 from __future__ import annotations
 
 import math
 
+from accel_v2 import isa
 from accel_v2.model import (
     CopyOp,
     Model,
@@ -280,11 +285,11 @@ def _bottleneck(
 ) -> Tensor:
     """`ultralytics.nn.modules.block.Bottleneck`.
 
-    `cv1` then `cv2`, plus the residual add when `shortcut` is set. The
-    real module is 3x3 then 3x3; this is 1x1 then 3x3 (see the module
-    docstring).
+    `cv1` then `cv2`, plus the residual add when `shortcut` is set. Both
+    convolutions are 3x3 with `k//2` padding, exactly as `ultralytics`'
+    `Bottleneck` builds them.
     """
-    h = model.conv2d(x, channels, kernel=(1, 1), name=f"{prefix}_cv1")
+    h = model.conv2d(x, channels, kernel=(3, 3), padding=_PAD, name=f"{prefix}_cv1")
     h = model.conv2d(h, channels, kernel=(3, 3), padding=_PAD, name=f"{prefix}_cv2")
     if shortcut:
         h = model.add(h, x, name=f"{prefix}_add")
@@ -1227,6 +1232,118 @@ def case_two_c2f_blocks_back_to_back() -> TbCase:
     )
 
 
+def case_c2f_concat_in_ddr() -> TbCase:
+    """The case the catalogue could not express until the planner learned
+    to leave an unplaceable buffer in DDR: a `C2f` whose concat family
+    does not fit in the scratchpad.
+
+    The geometry is chosen so that exactly one thing is unplaceable and
+    nothing else changes. The scratchpad is 4 KiB -- ample for this graph
+    -- but it is four INDEPENDENT 1 KiB banks, and `cnn_accel_tensor_mem`
+    serves every transfer from the single bank the address decodes to.
+    The 24-channel concat buffer is 8*8*24 = 1536 bytes, larger than a
+    bank, so no legal local address for it exists at any occupancy. Every
+    other buffer (512 or 1024 bytes) still fits, so the block runs
+    exactly as `case_c2f_n1` does except that its concat family lives in
+    DDR: the two `COPY`s and the bottleneck's `ADD` write their slices
+    straight to DDR at the right plane offsets, and `cv2` reads the
+    assembled 24-channel tensor back from there.
+
+    That is not a contrived corner. It is what *every* real `C2f` looks
+    like: at YOLOv8n's channel counts the concat family is tens of
+    kilobytes and no plausible scratchpad holds it. This case runs that
+    lowering end to end at a size a simulator can afford.
+
+    What it asserts beyond the usual element-by-element comparison:
+
+    * the *placement* directly -- which buffers are local and which are
+      in DDR -- because the DUT and `reference.py` take their addresses
+      from the same plan and would agree on a wrong one;
+    * the concat slice geometry, exactly as the local `C2f` cases do,
+      which is the claim "DDR and LOCAL_TENSOR have the same layout"
+      cashed out as an assertion;
+    * `DDR_WR_BYTES` exactly -- now the concat family (1536 bytes) plus
+      the graph output (512) -- cross-checked against the testbench's own
+      passive AXI monitor, so "it went to DDR" is observed on the bus and
+      not merely predicted;
+    * no spill: an unplaceable buffer is recognized before the eviction
+      loop moves anything, so the fallback must not cost a single extra
+      `STORE` beyond the traffic of the buffer itself.
+    """
+
+    def build(model: Model) -> None:
+        x = model.input(_H, _W, _C, name="x")
+        stem = model.conv2d(x, _C, kernel=(3, 3), padding=_PAD, name="stem")
+        model.output(_c2f(model, stem, _C, n=1, prefix="c2f"))
+
+    def check(case: TbCase) -> None:
+        _require_no_spill(case)
+        _require_copy_count(case, 2)
+        _check_concat_geometry(case, "c2f_cat")
+
+        placed_in_ddr = {name for name, _, _ in case.planned.ddr_placements}
+        if placed_in_ddr != {"c2f_cat"}:
+            raise CheckFailure(
+                "expected exactly the concat family 'c2f_cat' to be left in DDR, got "
+                f"{sorted(placed_in_ddr) or 'nothing'} -- this case is only meaningful "
+                "while the concat buffer is the one buffer that does not fit\n"
+                f"{case._program_listing()}"
+            )
+        local = {name for name, _, _ in case.planned.local_placements}
+        if local != {"stem", "c2f_cv1", "c2f_m0_cv1", "c2f_m0_cv2"}:
+            raise CheckFailure(
+                "the rest of the block must still be resident; local buffers are "
+                f"{sorted(local)}\n{case._program_listing()}"
+            )
+
+        # Every instruction that touches the concat family must name DDR
+        # on the side that touches it, and stay inside the buffer.
+        cat_addr = case.planned.tensor_ddr_addr["c2f_cat"]
+        cat_size = _tensor(case, "c2f_cat").size_bytes
+        for index, step in enumerate(case.planned.steps):
+            if not isinstance(step, ComputeStep):
+                continue
+            if alias_root(step.op.output).name != "c2f_cat":
+                continue
+            if step.output_space != isa.SPACE_DDR:
+                raise CheckFailure(
+                    f"step {index} writes a slice of the DDR-resident concat buffer "
+                    f"but names space {step.output_space}\n{case._program_listing()}"
+                )
+            if not cat_addr <= step.output_addr < cat_addr + cat_size:
+                raise CheckFailure(
+                    f"step {index} writes outside the concat buffer "
+                    f"[0x{cat_addr:08x}, 0x{cat_addr + cat_size:08x})\n"
+                    f"{case._program_listing()}"
+                )
+
+        predicted = case.planned.traffic
+        if (predicted.ddr_resident_write_bytes, predicted.ddr_resident_read_bytes) != (
+            cat_size,
+            cat_size,
+        ):
+            raise CheckFailure(
+                "the DDR placement should cost exactly one write and one read of the "
+                f"{cat_size}-byte concat buffer, but the plan predicts "
+                f"wr={predicted.ddr_resident_write_bytes} "
+                f"rd={predicted.ddr_resident_read_bytes}"
+            )
+
+    return _with_extra_check(
+        build_case(
+            "c2f_concat_in_ddr",
+            build,
+            seed=421,
+            # 4 KiB of scratchpad, but as four independent 1 KiB banks --
+            # ample for every buffer except the 1536-byte concat family,
+            # which no single bank can hold.
+            num_banks=4,
+            bank_words=128,
+        ),
+        check,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Catalogue
 # ---------------------------------------------------------------------------
@@ -1255,6 +1372,7 @@ CASE_BUILDERS = (
     case_two_concats_share_operand,
     case_concat_family_spills,
     case_two_c2f_blocks_back_to_back,
+    case_c2f_concat_in_ddr,
 )
 
 

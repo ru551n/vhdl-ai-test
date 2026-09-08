@@ -101,28 +101,47 @@ def test_forced_small_memory_produces_explicit_spill_and_reload() -> None:
     assert "reload" in move_kinds
 
 
-def test_too_small_memory_raises() -> None:
-    """A single tensor that does not fit in the scratchpad at all (even
-    after evicting everything else) is a hard planner error, not a
-    silent truncation.
+def test_a_tensor_too_big_for_the_scratchpad_is_placed_in_ddr() -> None:
+    """A tensor that does not fit in the scratchpad at all is left
+    resident in DDR, not refused.
 
-    With a 64-byte scratchpad the failure is specifically "bigger than
-    one bank" (a 64-byte scratchpad is one 64-byte bank), which is the
-    stricter of the two hard errors: the hardware serves a transfer from
-    exactly one bank, so a buffer that exceeds a bank can never be placed
-    legally no matter how much of the scratchpad is free. See
-    `test_buffer_larger_than_one_bank_is_a_hard_error` for the case where
-    the scratchpad as a whole is ample and only the bank is not."""
-    with pytest.raises(ValueError, match="more than one 64-byte"):
-        Planner(tensor_mem_bytes=64).plan(_linear_chain())
+    With a 64-byte scratchpad every 256-byte buffer in the chain is
+    "bigger than one bank" (a 64-byte scratchpad is one 64-byte bank),
+    which is the *permanent* kind of unplaceable: the hardware serves a
+    transfer from exactly one bank, so no amount of free space would
+    ever admit it. The plan is still produced, every buffer named in
+    `ddr_placements`, and every one of them addressed as `SPACE_DDR` on
+    both sides of every instruction."""
+    m = _linear_chain()
+    planned = Planner(tensor_mem_bytes=64).plan(m)
+
+    assert planned.local_placements == []
+    assert [name for name, _, _ in planned.ddr_placements] == ["conv1", "conv2"]
+    # conv3 is the graph output: already DDR by the ordinary rule, so it
+    # is not an overflow placement.
+    for step in planned.steps:
+        assert isinstance(step, ComputeStep)
+        assert step.output_space == isa.SPACE_DDR
+        assert all(space == isa.SPACE_DDR for space in step.input_spaces)
+    # Nothing was spilled: an unplaceable buffer is recognized *before*
+    # the eviction loop moves anything (`Planner.plan`'s `can_ever_fit`).
+    assert planned.traffic.spill_count == 0
+    assert planned.traffic.tensor_store_count == 0
 
 
-def test_capacity_exhaustion_still_raises_do_not_fit() -> None:
-    """The other hard error: the buffer fits in a bank, but the whole
-    scratchpad is too small to hold it alongside everything that cannot
-    be evicted."""
-    with pytest.raises(ValueError, match="do not fit"):
-        Planner(tensor_mem_bytes=512, bank_bytes=512).plan(_fanout_chain())
+def test_capacity_exhaustion_degrades_to_ddr_placement() -> None:
+    """The other kind of unplaceable: the buffer fits in a bank, but the
+    scratchpad cannot hold it alongside what may not be evicted. Also a
+    DDR placement rather than a refusal -- and, again, no pointless
+    spills on the way there."""
+    planned = Planner(tensor_mem_bytes=512, bank_bytes=512).plan(_fanout_chain())
+    assert planned.ddr_placements, "expected at least one buffer pushed to DDR"
+    assert planned.traffic.ddr_resident_write_bytes > 0
+    assert planned.traffic.ddr_resident_read_bytes > 0
+    ddr_names = {name for name, _, _ in planned.ddr_placements}
+    for step in planned.steps:
+        if isinstance(step, ComputeStep) and step.op.output.name in ddr_names:
+            assert step.output_space == isa.SPACE_DDR
 
 
 def test_local_buffers_never_straddle_a_bank_boundary() -> None:
@@ -182,16 +201,18 @@ def test_skipped_bytes_below_a_bank_boundary_are_still_usable() -> None:
     )
 
 
-def test_buffer_larger_than_one_bank_is_a_hard_error() -> None:
-    """A buffer bigger than one bank cannot be placed legally at all, no
-    matter how much scratchpad is free -- the hardware has no multi-bank
-    transfer. That is a hard error with an actionable message, never a
-    split across banks."""
+def test_buffer_larger_than_one_bank_goes_to_ddr_never_across_banks() -> None:
+    """A buffer bigger than one bank cannot be placed legally at any
+    address -- the hardware has no multi-bank transfer -- so it is left
+    in DDR. Never split across banks, and never a refusal, even though
+    the scratchpad as a whole is ample."""
     m = _straddling_buffers_model()
-    with pytest.raises(ValueError, match="more than one 512-byte"):
-        # 8 KiB of scratchpad, ample -- but in 512-byte banks, and the
-        # tensors are 768 bytes.
-        Planner(tensor_mem_bytes=8192, bank_bytes=512).plan(m)
+    # 8 KiB of scratchpad, ample -- but in 512-byte banks, and the
+    # tensors are 768 bytes.
+    planned = Planner(tensor_mem_bytes=8192, bank_bytes=512).plan(m)
+    assert [name for name, _, _ in planned.ddr_placements] == ["h1", "a"]
+    assert planned.local_placements == []
+    _assert_every_buffer_lies_in_one_bank(planned)
 
 
 def test_every_catalogue_case_places_every_buffer_inside_one_bank() -> None:

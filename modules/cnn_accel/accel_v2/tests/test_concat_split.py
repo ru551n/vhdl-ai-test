@@ -619,9 +619,13 @@ def test_a_half_written_concat_buffer_is_never_spilled() -> None:
     `a`'s half would be silently lost -- there is no reload on a write
     path to bring it back.
 
-    Swept across a range of budgets: the planner must either produce a
-    program that is bit-identical to the roomy one, or refuse outright.
-    Never a spill of a buffer that still has a producer ahead of it.
+    Swept across a range of budgets: whatever the pressure, the planner
+    must never spill a buffer that still has a producer ahead of it, and
+    the answer must never change. Under pressure it puts the concat
+    buffer in DDR instead (`PlannedProgram.ddr_placements`), where the
+    same slice addresses still work because the activation layout is
+    identical in both spaces -- it used to refuse outright at the tight
+    end of this sweep.
     """
 
     def build() -> Model:
@@ -637,14 +641,11 @@ def test_a_half_written_concat_buffer_is_never_spilled() -> None:
 
     golden_values = _run(build())[1].tensor_data["z"]
 
-    refused = 0
+    degraded = 0
     for budget in (8192, 4096, 3072, 2560, 2048, 1792, 1536, 1024):
-        try:
-            planned = Planner(tensor_mem_bytes=budget).plan(build())
-        except ValueError as exc:
-            assert "do not fit" in str(exc)
-            refused += 1
-            continue
+        planned = Planner(tensor_mem_bytes=budget).plan(build())
+        if any(name == "y" for name, _, _ in planned.ddr_placements):
+            degraded += 1
         for step in planned.steps:
             if isinstance(step, MoveStep) and step.kind == "spill":
                 assert step.tensor.name != "y", (
@@ -654,4 +655,7 @@ def test_a_half_written_concat_buffer_is_never_spilled() -> None:
         result = run_reference(planned, MemoryImage())
         assert result.traffic == planned.traffic
         assert result.tensor_data["z"] == golden_values, f"budget {budget} changed the result"
-    assert refused, "budget sweep never reached the refusal case -- it proves nothing"
+    assert degraded, (
+        "budget sweep never got tight enough to push 'y' into DDR -- it proves "
+        "nothing about the half-written-concat rule under real pressure"
+    )
