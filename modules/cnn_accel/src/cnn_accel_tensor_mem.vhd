@@ -52,13 +52,17 @@ use math.math_pkg.is_power_of_two;
 -- Backpressure: a write channel's 's_w*_s2m.ready' is asserted only on
 -- the cycle it is actually granted the bank write port, so a beat is
 -- consumed if and only if it is written -- no drops, no duplicates. A
--- read channel only issues a bank read when it has no unconsumed beat
--- already waiting on its own output register (or that beat is being
--- accepted this very cycle), and the beat that comes back one cycle
--- later is captured into that channel's own private output register
--- (never read directly out of the shared per-bank read-data register),
--- so a slow consumer on one channel can never cause another channel's
--- in-flight read to be silently overwritten.
+-- read channel only issues a bank read when it can prove, for every
+-- possible consumer behaviour, that there will be a free slot in its own
+-- private two-deep landing/output pair by the time the returning beat
+-- must be stored (see the 'read_arbitrate' header comment for the
+-- accounting). The beat that comes back one cycle later is *always*
+-- moved out of the shared per-bank read-data register on that very
+-- cycle, into that channel's private registers, so a slow consumer on
+-- one channel can neither lose its own beats nor hold the shared bank
+-- register hostage against the other channel. Each channel sustains one
+-- beat per cycle when its consumer does not stall and it is not
+-- contending with the other channel for the same bank.
 entity cnn_accel_tensor_mem is
   generic (
     g_num_banks : positive := 2;
@@ -193,6 +197,17 @@ architecture a of cnn_accel_tensor_mem is
   signal r0_out_valid, r1_out_valid : std_ulogic := '0';
   signal r0_out_last, r1_out_last : std_ulogic := '0';
   signal r0_out_data, r1_out_data : data_word_t := (others => '0');
+
+  -- Per-channel landing ("skid") register: the second slot of each read
+  -- channel's private two-deep output buffer. It absorbs the beat that
+  -- lands while the output register still holds a beat the consumer has
+  -- not accepted, which is what lets a channel keep a read in flight
+  -- across a consumer stall instead of having to leave the pipeline
+  -- empty. Never bypassed: it is strictly the older-of-two slot, so beats
+  -- always leave in issue order.
+  signal r0_skid_valid, r1_skid_valid : std_ulogic := '0';
+  signal r0_skid_last, r1_skid_last : std_ulogic := '0';
+  signal r0_skid_data, r1_skid_data : data_word_t := (others => '0');
 
   -- Combinational read arbitration / issue gating.
   signal r0_can_issue, r1_can_issue : std_ulogic;
@@ -376,16 +391,61 @@ begin
   w1_done <= w1_done_q;
 
   ------------------------------------------------------------------------
-  -- Read-side round-robin arbitration. A channel may issue a bank read
-  -- only if it has beats left to issue and its own output register is
-  -- free (or being drained this very cycle), so it never has more than
-  -- one beat in flight.
+  -- Read-side round-robin arbitration and issue gating.
+  --
+  -- Pipeline timing, per channel: a read granted on cycle T addresses the
+  -- bank RAM on T, lands in the shared per-bank read register on T+1
+  -- (that cycle's 'rN_capture'), and is stored into the channel's own
+  -- registers at the end of T+1, i.e. it occupies a private slot from
+  -- T+2 onwards. The shared bank register is therefore only ever borrowed
+  -- for a single cycle: the owning channel takes the beat out of it
+  -- unconditionally on T+1, whatever its consumer is doing. That is the
+  -- property that rules out head-of-line blocking -- a stalled r0 can
+  -- never sit on bank B's read register and starve r1 of bank B, so the
+  -- ADD-with-both-operands-in-bank-0 case cannot deadlock.
+  --
+  -- For that unconditional take-out to be lossless, a read may only be
+  -- issued when there is *provably* somewhere for the returning beat to
+  -- land. With 'L' the number of beats the channel currently holds
+  -- (output register plus landing register, so 0..2), 'I' = 'rN_capture'
+  -- (a beat landing this cycle, i.e. a read granted last cycle) and 'A' =
+  -- 'rN_out_valid and ready' (a beat accepted this cycle) -- all three
+  -- known combinationally on the issue cycle T -- the channel holds
+  --
+  --   L(T+1) = L(T) + I(T) - A(T)
+  --
+  -- beats on T+1, and the beat we would issue on T is added at the end of
+  -- T+1. Since the consumer may stall arbitrarily on T+1 ('A(T+1)' is
+  -- unknowable on T), the issue rule must be 'L(T+1) <= 1', so that the
+  -- new beat still fits in the two available slots. Expanding the three
+  -- reachable values of L gives exactly the term below:
+  --
+  --   L=0                    : always safe (no beat held).
+  --   L=1 (output reg only)  : safe if the held beat is accepted now
+  --                            ('ready'), or if nothing is landing now.
+  --   L=2 (both slots)       : safe only if the head is accepted now.
+  --
+  -- Note that L=2 implies I=0: a beat only lands on T+1 if a read was
+  -- granted on T, which required L(T+1) <= 1. So the landing register can
+  -- never be overwritten, and a landing beat never has to overtake a beat
+  -- already parked in it (asserted in the read FSMs below).
+  --
+  -- This replaces an earlier, correct-but-throttling rule that simply
+  -- forbade issuing on any cycle where a beat was landing ('and not
+  -- rN_capture'). That guaranteed L <= 1 by never keeping more than one
+  -- beat in the channel at a time, at the cost of serializing
+  -- issue-then-capture into one beat every two cycles. The rule above
+  -- keeps a read in flight while the output register is occupied and so
+  -- sustains one beat per cycle; the pre-fix rule, which tested only the
+  -- output register and ignored the beat already in flight, allowed
+  -- L(T+1) = 2 with only one slot to put it in and silently dropped one
+  -- beat per consumer stall.
   ------------------------------------------------------------------------
 
   r0_can_issue <= r0_busy and to_sl(r0_beats_to_issue > 0) and
-    (not r0_out_valid or m_r0_s2m.ready);
+    (not r0_out_valid or m_r0_s2m.ready or (not r0_skid_valid and not r0_capture));
   r1_can_issue <= r1_busy and to_sl(r1_beats_to_issue > 0) and
-    (not r1_out_valid or m_r1_s2m.ready);
+    (not r1_out_valid or m_r1_s2m.ready or (not r1_skid_valid and not r1_capture));
 
   read_arbitrate : process(all)
   begin
@@ -455,13 +515,43 @@ begin
       if reset = '1' then
         r0_busy <= '0';
         r0_out_valid <= '0';
+        r0_skid_valid <= '0';
       else
+        -- Two-deep output buffer. The issue rule above guarantees a free
+        -- slot for every landing beat, and that a beat never lands while
+        -- the landing register is occupied, so 'capture' and "drain the
+        -- landing register" are mutually exclusive and no reordering is
+        -- possible.
+        assert not (r0_capture = '1' and r0_skid_valid = '1')
+          report "cnn_accel_tensor_mem: r0 beat landed with the landing register " &
+            "occupied -- read issue gating is broken"
+          severity failure;
+
         if r0_capture = '1' then
-          r0_out_valid <= '1';
-          r0_out_data <= bank_rd_data_q(r0_bank);
-          r0_out_last <= bank_rd_last_q(r0_bank);
+          if r0_out_valid = '0' or m_r0_s2m.ready = '1' then
+            -- Output register is empty, or is being drained this cycle:
+            -- the landing beat goes straight to the output.
+            r0_out_valid <= '1';
+            r0_out_data <= bank_rd_data_q(r0_bank);
+            r0_out_last <= bank_rd_last_q(r0_bank);
+          else
+            -- Consumer is stalled on an unaccepted beat: park the landing
+            -- beat behind it rather than leaving it in the shared bank
+            -- register (where it would block the other channel) or
+            -- overwriting the output register (where it would be lost).
+            r0_skid_valid <= '1';
+            r0_skid_data <= bank_rd_data_q(r0_bank);
+            r0_skid_last <= bank_rd_last_q(r0_bank);
+          end if;
         elsif r0_out_valid = '1' and m_r0_s2m.ready = '1' then
-          r0_out_valid <= '0';
+          if r0_skid_valid = '1' then
+            r0_out_valid <= '1';
+            r0_out_data <= r0_skid_data;
+            r0_out_last <= r0_skid_last;
+            r0_skid_valid <= '0';
+          else
+            r0_out_valid <= '0';
+          end if;
         end if;
 
         if r0_out_valid = '1' and r0_out_last = '1' and m_r0_s2m.ready = '1' then
@@ -513,13 +603,33 @@ begin
       if reset = '1' then
         r1_busy <= '0';
         r1_out_valid <= '0';
+        r1_skid_valid <= '0';
       else
+        -- Two-deep output buffer; see 'read_fsm_0' for the reasoning.
+        assert not (r1_capture = '1' and r1_skid_valid = '1')
+          report "cnn_accel_tensor_mem: r1 beat landed with the landing register " &
+            "occupied -- read issue gating is broken"
+          severity failure;
+
         if r1_capture = '1' then
-          r1_out_valid <= '1';
-          r1_out_data <= bank_rd_data_q(r1_bank);
-          r1_out_last <= bank_rd_last_q(r1_bank);
+          if r1_out_valid = '0' or m_r1_s2m.ready = '1' then
+            r1_out_valid <= '1';
+            r1_out_data <= bank_rd_data_q(r1_bank);
+            r1_out_last <= bank_rd_last_q(r1_bank);
+          else
+            r1_skid_valid <= '1';
+            r1_skid_data <= bank_rd_data_q(r1_bank);
+            r1_skid_last <= bank_rd_last_q(r1_bank);
+          end if;
         elsif r1_out_valid = '1' and m_r1_s2m.ready = '1' then
-          r1_out_valid <= '0';
+          if r1_skid_valid = '1' then
+            r1_out_valid <= '1';
+            r1_out_data <= r1_skid_data;
+            r1_out_last <= r1_skid_last;
+            r1_skid_valid <= '0';
+          else
+            r1_out_valid <= '0';
+          end if;
         end if;
 
         if r1_out_valid = '1' and r1_out_last = '1' and m_r1_s2m.ready = '1' then
