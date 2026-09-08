@@ -5,8 +5,11 @@
 Shared output-quantization stage used after `cnn_accel_pe_array`
 (`CONV2D`/`DWCONV2D`/`FC`) and after `cnn_accel_pool`'s avg-sum path
 (`bias_en=0`): per lane, `int32 accumulator -> (+ bias) -> (x
-requant_scale) -> (>> requant_shift, rounded) -> saturate to int8 ->
-(optional ReLU clamp at 0)`; when `requant_scale`/shift are bypassed
+requant_scale) -> (>> requant_shift, rounded) -> (+ output_offset) ->
+clamp(lo, hi)`, where `(lo, hi)` is the general `[clamp_min, clamp_max]`
+when `cfg_clamp_en='1'` (ISA v1.1, HW milestone H1) or the legacy
+`(0 if relu_en else -128, 127)` (saturate to int8 with optional ReLU at
+0); when `requant_scale`/shift are bypassed
 (`cfg_requant_en='0'`) the result is still saturated to int8, not wrapped
 (architectural decision D2: a single overflow semantic across both
 paths). Generic wrapper composing `math.saturate_signed` (genuinely
@@ -42,7 +45,11 @@ Constraints (enforced by `assert ... severity failure` at elaboration):
 | `reset` | in | `std_ulogic` | Synchronous active-high; `= reset_internal` at the top level. |
 | `cfg_bias_en` | in | `std_ulogic` | From `layer_desc.flags`; sampled combinationally at beat-accept time. |
 | `cfg_requant_en` | in | `std_ulogic` | Same. `'0'` selects the bypass path. |
-| `cfg_relu_en` | in | `std_ulogic` | Same. |
+| `cfg_relu_en` | in | `std_ulogic` | Same. Ignored while `cfg_clamp_en='1'`. |
+| `cfg_clamp_en` | in | `std_ulogic` | Same (`flags` bit4, ISA v1.1/H1). `'1'` selects the general `[cfg_clamp_min, cfg_clamp_max]` clamp instead of ReLU + int8 saturate. |
+| `cfg_output_offset` | in | `std_ulogic_vector(15 downto 0)` | Signed int16 (`layer_desc.output_offset`, W13[15:0], ISA v1.1/H1), added to the rounded requant result (or to the bypass sum) before the clamp. `0` = v1.0 behaviour. |
+| `cfg_clamp_min` | in | `std_ulogic_vector(7 downto 0)` | Signed int8 lower clamp bound (`layer_desc.clamp_min`, W13[23:16]); used only when `cfg_clamp_en='1'`. |
+| `cfg_clamp_max` | in | `std_ulogic_vector(7 downto 0)` | Signed int8 upper clamp bound (`layer_desc.clamp_max`, W13[31:24]); used only when `cfg_clamp_en='1'`. |
 | `cfg_requant_scale` | in | `std_ulogic_vector(31 downto 0)` | Signed Q15 fixed-point multiplier. |
 | `cfg_requant_shift` | in | `std_ulogic_vector(7 downto 0)` | Runtime arithmetic-right-shift amount, folded with the fixed Q15 shift (15) into one combined rounding step. |
 | `bias_rd_addr` | out | `std_ulogic_vector(g_bias_addr_width - 1 downto 0)` | Always all-zeros (v1 single-bias-row design decision). |
@@ -76,14 +83,23 @@ Per lane `l` (0 to `g_pe_rows - 1`), per accepted `s_accum` beat:
    (15 + clamp(cfg_requant_shift, g_max_requant_shift)))` = `floor((product_l
    + 2^(S-1)) / 2^S)` with `S` the combined shift — ties round towards
    +infinity, identical to TOSA `apply_scale_32` SINGLE_ROUND (HW
-   milestone H0, 2026-09-07; previously round-to-even); if
-   `cfg_relu_en='1'` and `scaled_l < 0`, clamp to 0 (before saturate);
-   `result_l = saturate_signed(scaled_l, 8)`.
-3. If `cfg_requant_en='0'` (bypass): if `cfg_relu_en='1'` and `total_l <
-   0`, clamp `total_l` to 0; `result_l = saturate_signed(total_l, 8)` (no
-   scaling, but SATURATED like the requant path -- a single overflow
-   semantic across both paths, per architectural decision D2, matching
+   milestone H0, 2026-09-07; previously round-to-even);
+   `biased_l = scaled_l + cfg_output_offset` (exact, full width; ISA v1.1,
+   H1); `result_l = clamp(biased_l, lo, hi)`.
+3. If `cfg_requant_en='0'` (bypass): `biased_l = total_l +
+   cfg_output_offset`; `result_l = clamp(biased_l, lo, hi)` (no scaling,
+   but CLAMPED like the requant path -- a single overflow semantic across
+   both paths, per architectural decision D2, matching
    `cnn_accel_model.py`'s golden reference).
+
+The clamp bounds `(lo, hi)` are `(cfg_clamp_min, cfg_clamp_max)` when
+`cfg_clamp_en='1'` (`cfg_relu_en` is then ignored), else the ISA v1.0
+legacy `(0 if cfg_relu_en='1' else -128, 127)` -- i.e. "ReLU before
+saturate" is exactly `clamp(x, 0, 127)`, so v1.0 programs
+(`cfg_output_offset=0`, `cfg_clamp_en='0'`) are bit-identical to the
+pre-H1 module. The clamp is `min(max(x, lo), hi)`; the encoder rejects
+`clamp_min > clamp_max`, and the RTL pins that case to `hi` like the
+model does.
 
 `bias_rd_addr` is driven constant all-zeros (see "Implementation notes").
 
@@ -96,11 +112,14 @@ cfg_bias_en else 0)`; `scaled <= sum * cfg_requant_scale` (signed,
 Q15 multiplier, so the raw product is right-shifted by 15 internally
 before `cfg_requant_shift` is applied, or folded into one combined shift
 amount at `vhdesign` time); `truncate_round_signed` rounds the shifted
-result; `saturate_signed` clamps to the int8 range; when `cfg_relu_en`,
-negative results are clamped to 0 *before* the int8 saturate (so a
-large positive value still saturates at +127, not at ReLU's unbounded
-upper range). When `cfg_requant_en='0'`, the pipeline still applies
-bias/ReLU (no scaling) and then saturates to int8 (debug/bypass path, not
+result; `cfg_output_offset` is added to the rounded result (ISA v1.1,
+H1: TOSA `output_zp`); then either the general `[cfg_clamp_min,
+cfg_clamp_max]` clamp (`cfg_clamp_en='1'`) or, legacy, `saturate_signed`
+clamps to the int8 range and, when `cfg_relu_en`, negative results are
+clamped to 0 *before* the int8 saturate (so a large positive value still
+saturates at +127, not at ReLU's unbounded upper range). When
+`cfg_requant_en='0'`, the pipeline still applies bias/offset and the same
+clamp (no scaling) (debug/bypass path, not
 expected in normal compiled programs) -- saturating rather than wrapping
 so both paths share a single overflow semantic (architectural decision
 D2), matching the golden model.
@@ -124,12 +143,17 @@ critical path of `cnn_accel_conv_core`):
 |---|---|
 | 1 | capture the accepted beat, its bias word and its `cfg_*` values |
 | 2 | bias add (`total = accum + bias`) |
-| 3 | requant multiply (DSP48E1 MREG) + the finished bypass result |
-| 4 | product pipeline register (bare DSP48E1 PREG, no logic) |
-| 5 | quotient and the round-up decision (guard bit) |
-| 6 | the rounding incrementer, alone so its carry chain gets a full cycle |
-| 7 | ReLU before the int8 clamp, saturate, path mux, output register |
+| 3 | requant multiply (DSP48E1 MREG) + the bypass sum saturated to 17 bits |
+| 4 | product pipeline register (bare DSP48E1 PREG, no logic); bypass: `+ cfg_output_offset` (18 bits) |
+| 5 | quotient and the round-up decision (guard bit); in parallel `offset + round_up` (17 bits); bypass: saturate to int8 |
+| 6 | `quotient + (offset + round_up)`, alone so its carry chain gets a full cycle (same cost as the pre-H1 incrementer) |
+| 7 | saturate to int8, `clamp(lo, hi)` (general or legacy ReLU/saturate bounds), path mux, output register |
 
+H1 (ISA v1.1) added the offset and the general clamp without a new stage:
+the 16-bit offset is folded into the stage-6 rounding adder
+(`round + offset == round_up + offset` pre-added at stage 5, exact on the
+full-width quotient), and the clamp reuses the stage-7 saturate cone with
+muxed bounds. Latency stays seven cycles.
 Per-beat `cfg_*` values are captured *with* the beat at stage 1 rather
 than read live at the stage that consumes them, because the module is
 seven cycles deep: `cfg_*` may therefore change as soon as a beat has
@@ -208,8 +232,17 @@ pass/fail result. Key corner cases: round-half-up ties (both quotient
 parities, both signs; `test_round_half_up_ties`), saturation both directions, ReLU-before-saturate ordering,
 all 8 `bias_en`/`requant_en`/`relu_en` combinations, the
 `cfg_requant_en='0'` bypass path's int8 saturation (both directions, plus
-ReLU-before-saturate ordering), and full-throughput/randomized-
-backpressure handshake behavior. Expected
+ReLU-before-saturate ordering), full-throughput/randomized-
+backpressure handshake behavior, and the ISA v1.1 (H1) epilogue:
+`test_output_offset_after_shift` (offset is exact and post-rounding,
+saturates both ways, bypass path, random int16 offsets),
+`test_general_clamp` (CLAMP_EN replaces ReLU/saturate, `relu_en` ignored,
+offset + clamp together, `min = max`, full-range bounds == saturate,
+random bounds, `min > max` pinned to `hi`) and
+`test_clamp_en_zero_is_legacy` (garbage `clamp_min/max` with
+`cfg_clamp_en='0'` has no effect). `tb_cnn_accel_conv_core`'s
+`conv3x3_offset_clamp` vector case (offset -7, clamp [-100, 90], both
+bounds hit) covers the descriptor plumbing end to end. Expected
 values are computed by a testbench-local reference function independently
 transliterated from `cnn_accel_model.py` (not copied from this module's
 own RTL structure).

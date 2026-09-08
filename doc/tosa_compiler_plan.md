@@ -635,6 +635,16 @@ pre-existing vector files byte-identical; `targets/cnn_accel_v1.json`
 bumped to `isa_version 1.1`, `output_zp: true`, `clamp_ranges: "any"`.
 TESTS: 3 new tb tests; model tests for offset+clamp corner cases
 (`s+offset` beyond int8 both sides, `lo=hi`, `lo>hi` rejected by encoder).
+STATUS: DONE (2026-09-08). `cnn_accel.*` VUnit all green (real run, incl.
+`test_output_offset_after_shift`/`test_general_clamp`/
+`test_clamp_en_zero_is_legacy` and the new `conv3x3_offset_clamp`
+`conv_core` case); model + compiler pytest green; pre-existing vector data
+byte-identical (`desc.txt` +3 zero records per case). The target is
+discovered, not a JSON file: `discover.py` reports `isa_version 1.1`,
+`output_zp: true`, `clamp_ranges: "any"` from the constants. Until M11 the
+compiler rejects nonzero `out_zp`/general clamps with a `CapabilityError`
+naming M11 (`to_hir._H1_FIELDS_LOWERING_IMPLEMENTED`). Details:
+`modules/cnn_accel/flow_status.md` §H1.
 
 **M11 — compiler: output_zp + general clamp (after H1)**
 INPUT: M9, H1.

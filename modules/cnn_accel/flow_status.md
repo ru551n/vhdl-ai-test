@@ -942,3 +942,51 @@ vunit-mcp, this clone: all 5 `*conv_core*` configs pass, incl.
 `compiler/`: 291 passed, 7 IREE-skipped (unrelated, pre-existing).
 Negative-path check: emptying `cases.txt` reproduces the intended
 `severity failure` (confirmed the fail-loud guarantee is not dead code).
+
+## H1 — ISA v1.1: output offset + general clamp (2026-09-08)
+
+`doc/tosa_compiler_plan.md` §5 extension 1 / milestone H1. The ISA stays
+64 B; reserved W13 becomes `output_offset` (int16, [15:0]), `clamp_min`
+(int8, [23:16]), `clamp_max` (int8, [31:24]); `flags` bit4 = `CLAMP_EN`.
+All new fields default to 0, so a v1.0 program is bit-identical under
+v1.1 (proved: every pre-existing `conv_core` vector file is byte-identical
+after regeneration; `desc.txt` gains exactly three zero records per case).
+
+- `cnn_accel_constants.py`: `FLAGS["CLAMP_EN"] = 4`, `ISA_LAYOUT` W13
+  fields; the generated `cnn_accel_isa_pkg.vhd` follows.
+- `cnn_accel_model.py`: `LayerDesc.output_offset/clamp_min/clamp_max`,
+  `clamp_en` property, `bias_requantize_relu(..., output_offset, clamp_en,
+  clamp_min, clamp_max)` = `clamp(round(...) + offset, lo, hi)`, encoder
+  rejects `clamp_min > clamp_max`, decode round-trips. 9 new pytest.
+- `cnn_accel_bias_requant.vhd`: `cfg_output_offset`, `cfg_clamp_en`,
+  `cfg_clamp_min/max` ports. Still seven stages: the offset is folded into
+  the stage-6 rounding adder (`offset + round_up` pre-added at stage 5),
+  the clamp reuses the stage-7 saturate cone with bounds muxed between
+  `[clamp_min, clamp_max]` and the legacy `[0|-128, 127]`. Bypass path
+  saturates to 17 bits, adds the offset at 18, then clamps (exact w.r.t.
+  the int8 result). `conv_core`/`cnn_accel_pkg` plumb the descriptor.
+- `tb_cnn_accel_bias_requant`: `test_output_offset_after_shift`,
+  `test_general_clamp`, `test_clamp_en_zero_is_legacy`; the reference
+  function carries the new parameters (defaults = v1.0).
+  `tb_cnn_accel_conv_core` reads the W13 fields/`CLAMP_EN` from
+  `desc.txt`; new `generate_vectors.py` case `conv3x3_offset_clamp`
+  (offset -7, clamp [-100, 90], both bounds hit, pe8 + pe16).
+- Compiler (pre-M11 MVP): target discovery now reports `isa_version 1.1`,
+  `output_zp: true`, `clamp_ranges: "any"`; `emit.Descriptor` carries the
+  three fields (encode skips absent-but-zero fields, decode tolerates
+  them); `to_hir` rejects nonzero `out_zp` and general clamps loudly with
+  a `CapabilityError` naming M11 (`_H1_FIELDS_LOWERING_IMPLEMENTED =
+  False`) rather than compiling a numerically wrong program. Tests split
+  into ISA v1.0 (`conftest.v10_target`) and v1.1 variants. The
+  `two_layer` fused-GIR/HIR text goldens changed only by the identity
+  clamp now being kept on an `"any"` target (normalize's documented
+  M11-preview rule) and the resulting `%20 -> %21` renumbering; the
+  program bytes are unchanged.
+- Docs: `doc/cnn_accel_arch.md` ISA table, `cnn_accel_bias_requant.md`.
+
+### Verification
+
+`run.py -o vunit_out_h1 "cnn_accel.*"` (this clone): **all passed**, incl.
+`*bias_requant*` 13/13 and `*conv_core*` 5/5 with the new case. `pytest
+--ignore=verify-stride` at the root: 630 passed / 7 skipped; `pytest
+compiler`: 294 passed / 7 IREE-skipped.

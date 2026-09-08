@@ -128,7 +128,7 @@ module below for `vhsynth`/resource-estimation purposes:
 - `cnn_accel_window_gen`, `cnn_accel_weight_buffer`: BRAM-inference intent
   for line buffers / weight banks.
 
-## Instruction Set (v1)
+## Instruction Set (v1, current ISA version 1.1)
 
 Fixed-width **64-byte (16 x 32-bit word) descriptor**, byte-addressed,
 naturally aligned, stored contiguously in DDR unless redirected by its own
@@ -139,7 +139,7 @@ this_addr + 64` for straight-line programs today).
 | Word | Bits | Field | Notes |
 |---|---|---|---|
 | W0 | [7:0] | `opcode` | `0x00 HALT`, `0x01 CONV2D`, `0x02 DWCONV2D`, `0x03 POOL_MAX`, `0x04 POOL_AVG`, `0x05 FC` |
-| W0 | [15:8] | `flags` | bit0 `relu_en`, bit1 `bias_en`, bit2 `requant_en`, bit3 `pad_en`, bits4-7 reserved(0) |
+| W0 | [15:8] | `flags` | bit0 `relu_en`, bit1 `bias_en`, bit2 `requant_en`, bit3 `pad_en`, bit4 `clamp_en` (ISA v1.1, H1), bits5-7 reserved(0) |
 | W0 | [31:16] | reserved | must be 0 |
 | W1 | [31:0] | `in_addr` | DDR byte address, input activations |
 | W2 | [31:0] | `out_addr` | DDR byte address, output activations |
@@ -153,7 +153,19 @@ this_addr + 64` for straight-line programs today).
 | W10 | [7:0] | `requant_shift` | arithmetic right-shift applied post-multiply, pre-saturate |
 | W11 | [7:0]x4 | `pool_kernel_h`,`pool_kernel_w`,`pool_stride_h`,`pool_stride_w` | `POOL_*` only |
 | W12 | [31:0] | `next_instr_addr` | DDR byte address of the next instruction; program's own linear default is `+64` |
-| W13-W15 | [31:0]x3 | reserved | must be 0 |
+| W13 | [15:0] | `output_offset` | ISA v1.1 (H1): signed int16 added to the rounded, shifted requant result *before* the clamp (TOSA `output_zp`); 0 = v1.0 behaviour |
+| W13 | [23:16]/[31:24] | `clamp_min` / `clamp_max` | ISA v1.1 (H1): signed int8 clamp bounds, used only when `clamp_en=1` (then `relu_en` is ignored); encoder rejects `clamp_min > clamp_max` |
+| W14-W15 | [31:0]x2 | reserved | must be 0 |
+
+ISA v1.1 (HW milestone H1, `doc/tosa_compiler_plan.md` §5 extension 1)
+added `clamp_en` and W13 with all-zero defaults, so every v1.0 program is
+bit-identical under v1.1. Epilogue per lane: `s = round_half_up((acc +
+bias) * requant_scale >> (15 + requant_shift))`; `result = clamp(s +
+output_offset, lo, hi)` with `(lo, hi) = (clamp_min, clamp_max)` when
+`clamp_en=1`, else the legacy `(0 if relu_en else -128, 127)`. The
+compiler reads `isa_version 1.1`, `output_zp: true`, `clamp_ranges: "any"`
+from these constants (`compiler/cnnc/target/discover.py`); lowering onto
+them is compiler milestone M11.
 
 `FC` is decoded and executed identically to `CONV2D` with
 `in_width=in_height=1`, `kernel_h=kernel_w=1` — a degenerate 1x1-spatial

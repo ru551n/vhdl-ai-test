@@ -22,7 +22,10 @@ Each `<case>/` directory contains:
   `in_width`, `kernel_h`, `requant_scale`, ...). Address fields
   (`in_addr`/`out_addr`/`weight_addr`/`bias_addr`/`next_instr_addr`) are
   always `0` -- these vectors are consumed as bare tensors, not through
-  `run_layer`/a memory image. `CONV2D`/`FC` cases additionally have two
+  `run_layer`/a memory image. Since ISA v1.1 (H1) the list also carries
+  `output_offset`, `clamp_min` and `clamp_max` (all `0` for pre-H1 cases;
+  `flags` bit4 is `CLAMP_EN`), read by `tb_cnn_accel_conv_core` into the
+  matching `cfg_*` ports. `CONV2D`/`FC` cases additionally have two
   appended lines, `tile_channels <n>` and `pe_rows <n>` -- NOT `LayerDesc`
   fields, the host-compiler-time packing parameters
   `weights_packed.txt` (below) was built with (ratified D10, see
