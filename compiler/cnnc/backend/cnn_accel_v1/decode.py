@@ -36,7 +36,7 @@ def decode_descriptor(data: bytes, target: "Target") -> Descriptor:
         spec = fields.get(f.name)
         if spec is None:
             if f.default == 0:
-                # A later-ISA-version field (v1.1 W13) absent from this
+                # A later-ISA-version field (v1.1 W13, v1.2 W14) absent from this
                 # target: its bytes are reserved-zero there, so the
                 # `Descriptor` default (0) is the decoded value.
                 continue

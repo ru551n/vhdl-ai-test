@@ -106,6 +106,10 @@ class Descriptor:
     output_offset: int = 0
     clamp_min: int = 0
     clamp_max: int = 0
+    # ISA v1.2 (HW milestone H2) per-channel requant table address, W14.
+    # Meaningful only with FLAG_PER_CHANNEL_EN; always 0 until a lowering
+    # writes the table (same v1.0/v1.1 reserved-zero rule as W13 above).
+    scale_addr: int = 0
 
 
 @dataclasses.dataclass(frozen=True)

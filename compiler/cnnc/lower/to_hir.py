@@ -50,6 +50,13 @@ _STAGE = "to_hir"
 # the reference for the TOSA side; see tests/test_fixtures_m11.py).
 _W13_ISA_VERSION = "1.1"
 _INT8_RANGE = (-128, 127)
+# ISA v1.2 (HW milestone H2) added PER_CHANNEL_EN/`scale_addr`: a per-
+# output-channel (multiplier, shift) table in DDR. Emitting that table as a
+# constant buffer and pointing `scale_addr` at it is a later compiler
+# milestone (M12); until then a per-channel rescale the target CAN take is
+# rejected here, at the fused op, rather than silently lowered with only
+# channel 0's pair.
+_H2_PER_CHANNEL_LOWERING_IMPLEMENTED = False
 
 _ENV_FIELDS = (
     "in_width",
@@ -233,6 +240,11 @@ def _check_capabilities(op: Op, x: Tensor, w: Tensor, b: Tensor, y: Tensor, unit
     if rescale.per_channel and not caps.per_channel:
         raise CapabilityError(
             "per-channel rescale not supported by target",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="rescale.per_channel",
+        )
+    if rescale.per_channel and not _H2_PER_CHANNEL_LOWERING_IMPLEMENTED:
+        raise CapabilityError(
+            "per-channel rescale: scale table (PER_CHANNEL_EN/scale_addr) lowering not implemented yet (M12)",
             op_id=op.id, stage=_STAGE, unit=unit.name, constraint="rescale.per_channel",
         )
 

@@ -26,6 +26,12 @@ own `LayerDesc` dataclass (`dataclasses.fields`), never hard-coded here,
 so a `LayerDesc` field rename/reorder cannot silently desync this
 module's output from what `tb_cnn_accel_conv_core.vhd` reads.
 
+ISA v1.2 (H2): a descriptor with `PER_CHANNEL_EN` set additionally gets a
+`scale_table_packed.txt` -- the padded `pack_scale_table_for_hw` image the
+model read from DDR at `scale_addr`, decoded with the model's own
+`unpack_scale_table_from_hw` into `generate_vectors._write_scale_table_
+packed`'s two-records-per-entry format (doc/cnn_accel_test_vectors.md).
+
 Before any of this is trusted enough to write to disk, the compiler's
 two independent CPU-side oracles for `program`/`inputs` -- the emitted
 `Program` run through `cnn_accel_model.run_program` and the un-lowered
@@ -137,6 +143,7 @@ def write_conv_core_vectors(
     plane_channels = manifest["memory"]["activation_plane_channels"]
     buffers_by_addr = {buf["addr"]: buf for buf in manifest["buffers"]}
     layer_desc_fields = [f.name for f in dataclasses.fields(model.LayerDesc)]
+    per_channel_bit = target.isa.flags.get("PER_CHANNEL_EN")
 
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -197,6 +204,21 @@ def write_conv_core_vectors(
         b_data = program.constants_bytes[b_offset : b_offset + bias_buf["size_bytes"]]
         bias_all = np.frombuffer(b_data, dtype="<i4")
         _write_int_lines(case_dir / "bias.txt", bias_all[:out_channels])
+
+        # ISA v1.2 (H2, module docstring): the per-channel table the model
+        # itself consumed, read back out of the DDR image at scale_addr
+        # (padded to whole pe_rows tiles, `packed_scale_table_bytes`).
+        if per_channel_bit is not None and (desc.flags >> per_channel_bit) & 1:
+            layer_desc = model.LayerDesc(**{name: getattr(desc, name) for name in layer_desc_fields})
+            n_bytes = model.packed_scale_table_bytes(layer_desc, pe_rows)
+            table = model.unpack_scale_table_from_hw(
+                bytes(memory[desc.scale_addr : desc.scale_addr + n_bytes]),
+                n_bytes // model.SCALE_TABLE_ENTRY_BYTES,
+            )
+            _write_int_lines(
+                case_dir / "scale_table_packed.txt",
+                [v for multiplier, shift in table for v in (multiplier, shift)],
+            )
 
         in_arr = read_activation_buffer(memory, in_buf, plane_channels)
         out_arr = read_activation_buffer(memory, out_buf, plane_channels)

@@ -257,14 +257,29 @@ def test_conv_in_zp_rejected(target):
     assert exc_info.value.constraint == "conv.zero_point"
 
 
-def test_per_channel_rescale_stays_unfused_and_rejected(target):
-    # MVP `epilogue.rescale.per_channel=False`: `FusePass` refuses to fuse
-    # a per_channel rescale in the first place (doc/tosa_compiler_plan.md
-    # §9), so `to_hir` sees a standalone `conv2d`, not a `fused_conv` with
-    # `per_channel=True`.
+def test_per_channel_rescale_stays_unfused_and_rejected_on_isa_v11_target(target):
+    # Pre-H2 (ISA v1.1) target, `epilogue.rescale.per_channel=False`:
+    # `FusePass` refuses to fuse a per_channel rescale in the first place
+    # (doc/tosa_compiler_plan.md §9), so `to_hir` sees a standalone
+    # `conv2d`, not a `fused_conv` with `per_channel=True`.
+    from conftest import v11_target
+
+    with pytest.raises(CapabilityError) as exc_info:
+        _to_hir(v11_target(target), per_channel=True, mult=(1073741824,) * 8, shift=(38,) * 8)
+    assert "%4" in str(exc_info.value)
+
+
+def test_per_channel_fused_but_rejected_until_m11(target):
+    # Real ISA v1.2 target (H2, `per_channel: true`): the per-channel
+    # rescale IS fused, and `to_hir` must still reject it -- loudly, at the
+    # fused op -- until M11 emits the scale table and `scale_addr`.
+    # Silently lowering channel 0's pair would compile a numerically wrong
+    # program.
     with pytest.raises(CapabilityError) as exc_info:
         _to_hir(target, per_channel=True, mult=(1073741824,) * 8, shift=(38,) * 8)
-    assert "%4" in str(exc_info.value)
+    assert exc_info.value.constraint == "rescale.per_channel"
+    assert "M11" in str(exc_info.value)
+    assert "%10" in str(exc_info.value)
 
 
 def test_out_zp_stays_unfused_and_rejected_on_isa_v10_target(target):
@@ -357,7 +372,7 @@ def test_direct_general_clamp_rejected_on_isa_v10_target(target):
 # --------------------------------------------------------------------------
 # to_hir's own rescale capability checks (direct GIR construction,
 # bypassing `FusePass`'s upstream admissibility filter -- see
-# `test_per_channel_rescale_stays_unfused_and_rejected` /
+# `test_per_channel_rescale_stays_unfused_and_rejected_on_isa_v11_target` /
 # `test_out_zp_stays_unfused_and_rejected` above for why the normal
 # pipeline never reaches these checks with an MVP target).
 # --------------------------------------------------------------------------
@@ -381,6 +396,11 @@ def _direct_fused_graph(rescale: RescaleParams, clamp: ClampAttrs | None = Clamp
 
 
 def test_to_hir_rejects_per_channel_directly(target):
+    # Capability path (`caps.per_channel=False`, ISA v1.1 target); the
+    # real v1.2 target's M11 gate is `test_per_channel_fused_but_rejected_
+    # until_m11` above.
+    from conftest import v11_target
+
     rescale = RescaleParams(
         multiplier=(1073741824,) * 8, shift=(38,) * 8, per_channel=True, in_zp=0, out_zp=0,
         rounding="SINGLE_ROUND", scale32=True, input_unsigned=False, output_unsigned=False,
@@ -388,9 +408,10 @@ def test_to_hir_rejects_per_channel_directly(target):
     graph = _direct_fused_graph(rescale)
     verify_gir(graph)
     with pytest.raises(CapabilityError) as exc_info:
-        to_hir(graph, target)
+        to_hir(graph, v11_target(target))
     assert exc_info.value.constraint == "rescale.per_channel"
     assert exc_info.value.op_id == "%10"
+    assert "not supported by target" in str(exc_info.value)
 
 
 def test_to_hir_rejects_out_zp_directly_on_isa_v10_target(target):

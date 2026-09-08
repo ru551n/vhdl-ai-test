@@ -90,6 +90,21 @@ def test_rounding_and_implicit_shift_are_discovered_not_hardcoded(cnn_accel_mode
     assert rescale.implicit_shift == 15
 
 
+def test_isa_v12_per_channel_is_discovered_from_constants(cnn_accel_constants):
+    # HW milestone H2 (ISA v1.2): `scale_addr` (W14) and PER_CHANNEL_EN are
+    # discovered off cnn_accel_constants, never hard-coded -- and the
+    # version string follows from the fields present.
+    target = load_target("cnn_accel")
+    unit = target.unit("conv_engine")
+    assert unit.isa_version == "1.2"
+    assert unit.epilogue.rescale.per_channel is True
+    expected = next(f for f in cnn_accel_constants.isa_field_offsets() if f.name == "scale_addr")
+    assert target.isa.fields["scale_addr"] == (expected.offset_bytes, expected.width_bytes, expected.signed)
+    assert expected.width_bytes == 4 and expected.signed is False
+    assert expected.offset_bytes == 14 * 4  # W14
+    assert target.isa.flags["PER_CHANNEL_EN"] == cnn_accel_constants.FLAGS["PER_CHANNEL_EN"]
+
+
 def test_discovery_has_no_hardcoded_accelerator_properties(tmp_path):
     (tmp_path / "cnn_accel_model.py").write_text((ACCEL_ROOT / "cnn_accel_model.py").read_text())
 
