@@ -1101,3 +1101,42 @@ Byte-identity: `generate_vectors.py` from the pre-H2 base (`bd693a2`) vs.
 this branch differs only by `desc.txt`'s appended `scale_addr 0` (13
 cases), `cases.txt`'s appended `conv3x3_per_channel`, and the new case
 directory.
+
+## M12 — compiler lowers per-channel rescale onto ISA v1.2 (2026-09-08)
+
+`doc/tosa_compiler_plan.md` §M12 — compiler-side follow-up to H2; no
+RTL, model or constants change. The `_H2_PER_CHANNEL_LOWERING_IMPLEMENTED
+= False` rejection in `to_hir` is replaced by the real lowering: a fused
+per-channel rescale becomes a `Buffer(role=const, layout=SCALE_TABLE)`
+(`layout.pack_scale_table`, byte-identical to
+`cnn_accel_model.pack_scale_table_for_hw` incl. zero-padding to whole
+`PE_ROWS` tiles) read by the `conv_layer` op, `PER_CHANNEL_EN=1`, scalar
+`requant_scale/shift = 0`, and the planner-assigned address in W14
+`scale_addr`. Targets below `isa_version 1.2` reject with a
+`CapabilityError`. `legalize_rescale` was already per element, so shifts
+below `shift_min` in the table are rewritten `(mult << k, 15)` per
+channel before packing. Fixtures `per_channel` (16 channels, two tiles)
+and `per_channel_oc8` (8 channels) with gir/fused/hir/program goldens;
+`compiler/tests/test_fixtures_m12.py` (`run_program == interp == IREE`
+×3 seeds each, descriptor/planner checks, v1.1 rejection).
+
+RTL touchpoint: `module_cnn_accel._COMPILER_VECTORS_FIXTURES` gains
+`per_channel_oc8` (1×8×8×8, 8 out channels = `PE_ROWS`). The 16-channel
+fixture is intentionally not listed: `write_conv_core_vectors(...,
+max_out_channels=PE_ROWS)` would skip it because `conv_core` sees one
+output tile per descriptor. `tb_cnn_accel_conv_core.test_bitexact_compiler_cases`
+now checks 5 cases and is the first RTL run in which `PER_CHANNEL_EN`,
+`scale_addr` and a `scale_table_packed.txt` arrive from the compiler's
+own emitted bytes rather than a hand-authored `generate_vectors.py`
+case. `doc/cnn_accel_test_vectors.md` updated.
+
+### Verification
+
+`run.py -o vunit_out_m12 "*test_bitexact_compiler_cases"` (real GHDL run,
+this clone): **all passed**, `cases.txt` = `clamp_5_100_op0
+conv_rescale_clamp_op0 first_layer_cin3_op0 out_zp_relu_op0
+per_channel_oc8_op0`; `per_channel_oc8_op0/scale_table_packed.txt`
+present with 8 distinct `(multiplier, shift)` pairs (three with
+hardware shift 0 = the legalized `shift<15` channels). `pytest
+compiler`: 366 passed (332 + 34, incl. 6 new IREE tests); `pytest
+modules/cnn_accel`: 344 passed (unchanged).

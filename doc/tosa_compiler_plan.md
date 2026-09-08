@@ -11,7 +11,7 @@ Decisions already ratified by the user for this plan:
 | Rounding mismatch | Change `cnn_accel` RTL + golden model from round-half-even to TOSA round-half-up (separate HW milestone) |
 | Tiling in MVP | Capability checking only; tiling pass designed, implemented post-MVP |
 | TOSA input | Hand-written `.mlir` in MLIR **generic form** |
-| Zero points / per-channel | MVP verifier rejects `zp != 0` and `per_channel`; ISA extensions 1 (output offset + general clamp) and 2 (per-channel scale) are **scheduled** (H1/H2 + M11/M12), `input_zp`/`weight_zp` remain rejected |
+| Zero points / per-channel | ISA extensions 1 (output offset + general clamp) and 2 (per-channel scale) are **DONE** (H1/H2 + M11/M12): `output_zp != 0`, general clamps and `per_channel=true` lower onto ISA v1.1/v1.2 (older targets reject with `CapabilityError`); `input_zp`/`weight_zp` remain rejected |
 
 Empirical facts this plan is grounded in (verified in this session, see
 memory `tosa_compiler_env_findings.md`):
@@ -734,6 +734,34 @@ descriptor has the flag and a table address inside the constants region;
 `isa_version 1.1` target → `CapabilityError`.
 TESTS: 1 e2e, 1 rejection, planner test that the table is aligned and
 non-overlapping.
+STATUS: DONE (2026-09-08). Importer, `legalize_rescale` (per element),
+`interp`, `verify` and `fuse` were already per-channel capable from H2;
+M12 adds the lowering. `layout.pack_scale_table` builds the padded
+`[OT][PE_ROWS]` image (`int32 LE mult | u8 shift | 3 zero bytes`,
+byte-identical to `cnn_accel_model.pack_scale_table_for_hw`, tested ×5
+`Cout`); `to_hir._scale_table_buffer` emits a `Buffer(role=const,
+layout=SCALE_TABLE, id=%<y>.scale)` as the fourth `conv_layer` read with
+`per_channel_en=1` and zeroed scalar `requant_scale/shift`, gated on
+`isa_version >= 1.2` (`v11_target` → `CapabilityError`); `emit` writes
+the buffer's planned address into W14 `scale_addr`; `decode` prints
+`scale_addr=` when the flag is set. Fixtures from `gen_fixtures.py`:
+`per_channel.mlir` (16 channels = two `PE_ROWS` tiles, distinct
+multipliers, shifts cycling `10,12,14,20,26,30,32,34` so three fall
+below `shift_min=15` and are rewritten `(mult << k, 15)` per element)
+and `per_channel_oc8.mlir` (8-channel sibling for the RTL). Goldens
+(gir/fused/hir/program) for both; `compiler/tests/test_fixtures_m12.py`
+(26 tests): goldens, per-element legalization, `PER_CHANNEL_EN` + W14
+inside the constants region, planner alignment/no-overlap,
+`run_program == interp == IREE` ×3 seeds per fixture (6 IREE tests pass
+locally), broadcast-channel-0 sanity (output differs), v1.1 rejection,
+`write_conv_core_vectors` emitting `scale_table_packed.txt` for the
+8-channel case and skipping the 16-channel one (`out_channels >
+PE_ROWS`). RTL cross-check: `per_channel_oc8` added to
+`module_cnn_accel._COMPILER_VECTORS_FIXTURES`;
+`test_bitexact_compiler_cases` now streams 5 cases — real GHDL run
+passed with `per_channel_oc8_op0/scale_table_packed.txt` (8 distinct
+pairs) present. `pytest compiler`: 366 passed (332 + 34); `pytest
+modules/cnn_accel`: 344 passed.
 
 **M13 (post-MVP) — tiling pass, row bands, synthetic target**
 INPUT: §7, `targets/synthetic_tiled.json`.
