@@ -1,4 +1,4 @@
-# CNN Accelerator Top Level — Architecture rev 2 (`cnn_accel_top`, ISA v2.0)
+# CNN Accelerator Top Level — Architecture rev 2 (`cnn_accel_top`, ISA v2.1)
 
 Supersedes the top-level portion of `doc/cnn_accel_arch.md` rev 1
 (`cnn_accel_top_req.md`, `cnn_accel_sequencer_req.md`,
@@ -239,11 +239,37 @@ first line of defense.
 
 ---
 
-## 5 ISA v2.0 — command/program format
+## 5 ISA v2.1 — command/program format
 
 Fixed 64-byte (16 x 32-bit little-endian word) descriptor, 8-byte-aligned,
-byte-addressed, chained by `next_instr_addr`. `c_isa_version = 0x0200`,
+byte-addressed, chained by `next_instr_addr`. `c_isa_version = 0x0201`,
 readable from `CSR.HW_INFO2`.
+
+**v2.1 (2026-09, the YOLOv8n sizing pass)** adds exactly two things, both
+in bytes that were `reserved, must be 0` before, so every v2.0 program is
+a valid v2.1 program with identical behaviour:
+
+* `pad_value` (W10 byte 41): the int8 value a **padded** tap takes.
+* pooling honours `flags.pad_en` and the `pad_top/bottom/left/right`
+  fields, which `POOL_MAX`/`POOL_AVG` previously ignored outright (the
+  golden model rejected `pad_en` on a pooling instruction).
+
+`pad_value` exists because "pad with zero" is wrong for a quantized
+tensor whose zero-point is not 0: a padded tap of 0 is not the absence of
+a value, it is the real value `(0 - zero_point) * scale`. For a max pool
+that is not a rounding-level error but a correctness one — YOLOv8n's
+activations have `zero_point = -128`, so a 0-filled border tap is larger
+than nearly every real activation in the window and silently wins the max
+at every border output position. The host sets `pad_value` to the input
+tensor's zero-point; 0 (the pre-v2.1 value of that byte) reproduces the
+old zero-fill exactly.
+
+Scope note: `CONV2D` has the same theoretical issue and is deliberately
+**unchanged** in v2.1. Its `cnn_accel_window_gen` instance has the
+`cfg_pad_value` port like every other, but `cnn_accel_conv_core` ties it
+to zero, so conv still zero-pads. Making conv honour the field is a
+behaviour change to every existing convolution and belongs in its own
+change, with its own re-verification.
 
 ### 5.1 Word layout
 
@@ -266,6 +292,8 @@ readable from `CSR.HW_INFO2`.
 | W8 | [7:0] x4 | `pad_top`, `pad_bottom`, `pad_left`, `pad_right` | |
 | W9 | [31:0] | `requant_scale` | signed Q15 |
 | W10 | [7:0] | `requant_shift` | |
+| W10 | [15:8] | `pad_value` | **v2.1**, signed int8: the value padded taps take (the input tensor's zero-point). Consumed by `POOL_MAX`/`POOL_AVG`; ignored by `CONV2D`, which always pads with 0. Reserved-must-be-0 before v2.1, so 0 = the old zero-fill |
+| W10 | [31:16] | reserved | must be 0 (`ERR_BAD_RESERVED`) |
 | W11 | [7:0] x4 | `pool_kernel_h/w`, `pool_stride_h/w` | |
 | W12 | [31:0] | `next_instr_addr` | DDR byte address; always DDR space |
 | W13 | [15:0] | `output_offset` | signed int16 |
@@ -303,8 +331,8 @@ local weight memory" role `scale_addr` plays for `CONV2D`. `ACT` keeps its
 | `0x00` | `HALT` | end of program; pulse `done` | — |
 | `0x01` | `CONV2D` | `dst = epilogue(conv(src0, weights))` | `conv_core` |
 | `0x02` | `DWCONV2D` | allocated, **rejected** (`ERR_UNSUPPORTED_OP`) | — |
-| `0x03` | `POOL_MAX` | max pool | `window_gen`+`pool` |
-| `0x04` | `POOL_AVG` | average pool (divide via `bias_requant`) | `window_gen`+`pool`+`bias_requant` |
+| `0x03` | `POOL_MAX` | max pool; **v2.1** honours `pad_en` + the pad fields + `pad_value` | `window_gen`+`pool` |
+| `0x04` | `POOL_AVG` | average pool (divide via `bias_requant`); padding as `POOL_MAX`, and padded taps are part of the sum (count-include-pad) | `window_gen`+`pool`+`bias_requant` |
 | `0x05` | `FC` | degenerate 1x1 CONV2D | `conv_core` |
 | `0x10` | `LOAD` | `xfer_bytes` from `src0` to `dst`; intended DDR->LOCAL_TENSOR | DMA |
 | `0x11` | `STORE` | `xfer_bytes` from `src0` to `dst`; intended LOCAL_TENSOR->DDR (this is the **spill**) | DMA |
@@ -453,7 +481,7 @@ this system, so rev 2 **does** validate, in `cmd_proc`, before dispatch:
 | `0x4` | `ERR_LOCAL_RANGE` | `LOCAL_TENSOR` access beyond `g_tensor_bytes` |
 | `0x5` | `ERR_DDR_RANGE` | DDR access beyond `g_ddr_limit` |
 | `0x6` | `ERR_BAD_RESERVED` | `W0[31:24] /= 0`, or `xfer_bytes /= 0` on a v1.2 opcode |
-| `0x7` | `ERR_BAD_GEOMETRY` | zero/oversized dim, `kernel > g_max_kernel_size`, `in_width*ceil(Cin/8) > g_max_row_tile_words`, `stride = 0` |
+| `0x7` | `ERR_BAD_GEOMETRY` | zero/oversized dim, `kernel > g_max_kernel_size`, `pool_kernel > g_max_pool_kernel_size` (a **separate, larger** bound — see §12a), `in_width*ceil(Cin/8) > g_max_row_tile_words`, `stride = 0` |
 | `0x8` | `ERR_AXI` | AXI `RRESP`/`BRESP` not OKAY |
 | `0x9` | `ERR_TIMEOUT` | engine failed to complete within `g_watchdog_cycles` |
 
@@ -522,14 +550,15 @@ adding a test adds a Python function, never VHDL.
    overlap addable later without an ISA or port change; the OT loop
    already overlaps weight refill with nothing.
 2. No `PSUM` in/out, so `Cin` tiling is still impossible — unchanged from
-   the gap analysis (H7), and unnecessary once `g_max_row_tile_words` is
-   raised (H2).
+   the gap analysis (H7), and unnecessary now that `g_max_row_tile_words`
+   has been raised (H2, §12a).
 3. `DWCONV2D` remains unimplemented by design.
 4. Scratchpad contents after `reset` are undefined by contract.
 5. Only nearest-2x2 `UPSAMPLE` is implemented (the only mode YOLOv8n
    needs), not general `resize`.
-6. `g_max_row_tile_words` stays at its current value in this phase; the
-   H2 bump is a separate, independent change.
+6. ~~`g_max_row_tile_words` stays at its current value in this phase; the
+   H2 bump is a separate, independent change.~~ **Done (2026-09):** raised
+   512 -> 1920, see §12a.
 7. `dma_store` shares read channel `r0` with `engine_in_a` (§4), so a
    `STORE` cannot overlap a compute command's activation reads even once
    limitation 1 is lifted. Overlapping writeback with compute — the
@@ -537,3 +566,68 @@ adding a test adds a Python function, never VHDL.
    channel. This costs nothing today because `cmd_proc` is sequential
    anyway, and it is a `cnn_accel_tensor_mem` port addition when wanted,
    not an ISA or memory-map change.
+
+---
+
+## 12a Datapath bounds (2026-09, the YOLOv8n sizing pass)
+
+Three bounds moved, all of them generics of `cnn_accel_top` defaulted from
+generated constants (`cnn_accel_constants.py` -> `cnn_accel_regs_pkg.vhd`),
+never hand-written literals.
+
+| Generic | Was | Is | Why |
+|---|---|---|---|
+| `g_max_kernel_size` | 3 | **3** (unchanged) | every YOLOv8n convolution is 1x1 or 3x3 |
+| `g_max_pool_kernel_size` | (did not exist) | **5** | YOLOv8n's SPPF block pools 5x5, stride 1, padding 2 |
+| `g_max_row_tile_words` | 512 | **1920** | `in_width * ceil(Cin/8) <= g_max_row_tile_words` was violated by 35 of YOLOv8n's 63 convolutions at a 640x640 input |
+
+### Why the pool kernel bound is separate
+
+`g_max_kernel_size` sizes **both** datapaths: the `cnn_accel_pe_array`
+tap sequencing and weight-buffer row width for convolution, and the
+`cnn_accel_window_gen` bank count / `cnn_accel_pool` reduction network for
+pooling. Raising the shared bound to 5 would have widened convolution to
+25 taps per lane for no benefit whatsoever. So pooling got its own,
+larger bound and only the pool path is sized to it: `cnn_accel_top`
+elaborates its pool `cnn_accel_window_gen` instance and its
+`cnn_accel_pool` lane bank at `g_max_pool_kernel_size`, and everything
+else at `g_max_kernel_size`.
+
+One thing had to change to make that possible. The pool lane window used
+to travel in an `axi_stream_m2s_t`, whose payload is a fixed
+`axi_stream_data_sz = 128` bits — an hdl-modules-wide constant. A 5x5x8
+window is 25 taps x 8 bits = 200 bits and does not fit; that is what
+`cnn_accel_top`'s old `c_max_taps * 8 <= axi_stream_data_sz` assertion
+was about. Rather than widen a constant every stream in the design pays
+for, the pool lane window moved onto `window_m2s_t` — the unconstrained
+tap-array record (`cnn_accel_pkg.vhd`) the conv path already uses, which
+has no width ceiling. The assertion it replaces now checks the thing that
+is actually load-bearing: `g_max_pool_kernel_size >= g_max_kernel_size`.
+
+### What the bounds cost (Vivado 2026.1, xc7a200tfbg484-2, out-of-context)
+
+| Build | LUT | FF | RAMB36 | DSP | Fmax |
+|---|---|---|---|---|---|
+| `window_gen` (conv geometry) before | 2785 | 1171 | 3 | 0 | 165.73 MHz |
+| `window_gen` (conv geometry) after | 3314 | 1202 | **12** | 4 | 183.92 MHz |
+| `window_gen` (pool geometry, K=5) | 9169 | 2316 | **20** | 4 | 185.19 MHz |
+| `conv_core` before | 14279 | 8708 | 18 | 32 | 159.95 MHz |
+| `conv_core` after | 14196 | 8727 | **27** | 36 | 170.33 MHz |
+| `pool` (K=3 -> K=5) | 293 -> 899 | 27 | 0 | 0 | — |
+
+A `cnn_accel_window_gen` row bank is `g_max_row_tile_words x (8 *
+g_tile_channels)` bits, so 1920 x 64 needs 4 RAMB36 where 512 x 64 needed
+1: the conv instance goes 3 -> 12 (3 banks), the pool instance is 20
+(5 banks). The `conv_core` RAMB36 total of 27 is 12 (window_gen) + 15
+(weight_buffer), measured hierarchically.
+
+### The timing fix this forced
+
+At the pool geometry the design initially **missed** 150 MHz: 139.55 MHz,
+with the critical path running from `kr_capture_q` through the runtime
+`kr * kernel_w` tap-index multiply into the clock enables of all
+`g_max_pool_kernel_size**2 * g_tile_channels` = 200 tap-assembly lanes.
+That multiply only ever changes at an output-row boundary, so it is now
+maintained there as a register (`kr_base_q`) and the per-cycle capture
+stage does one small add instead. The fix helps every geometry:
+`conv_core` went 159.95 -> 170.33 MHz with it.

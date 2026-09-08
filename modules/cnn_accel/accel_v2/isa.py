@@ -157,7 +157,12 @@ class DescV2:
     clamp_max: int = 0
     scale_addr: int = 0
     xfer_bytes: int = 0
-    # The `reserved, must be 0` gaps (W0 byte 3, W10 bytes 41-43). A
+    # ISA v2.1, W10 byte 41: signed int8 value a padded tap takes (the
+    # input tensor's quantization zero-point). 0 -- the value every v2.0
+    # program left in this then-reserved byte -- means "pad with zero",
+    # i.e. exactly v2.0 behaviour. Only the POOL_* path consumes it.
+    pad_value: int = 0
+    # The `reserved, must be 0` gaps (W0 byte 3, W10 bytes 42-43). A
     # well-formed program always leaves these zero, and they are exposed
     # here for exactly one purpose: letting the error-case tests emit a
     # deliberately malformed program to prove the hardware raises
@@ -245,6 +250,7 @@ def encode_desc(d: DescV2) -> bytes:
     struct.pack_into("<b", buf, _OFF_CLAMP_MAX, d.clamp_max)
     struct.pack_into("<I", buf, _OFF_SCALE_ADDR, d.scale_addr & 0xFFFFFFFF)
     struct.pack_into("<I", buf, _OFF_XFER_BYTES, d.xfer_bytes & 0xFFFFFFFF)
+    struct.pack_into("<b", buf, _OFF_PAD_VALUE, d.pad_value)
     return bytes(buf)
 
 
@@ -294,6 +300,7 @@ def decode_desc(data: bytes) -> DescV2:
         clamp_max=struct.unpack_from("<b", data, _OFF_CLAMP_MAX)[0],
         scale_addr=struct.unpack_from("<I", data, _OFF_SCALE_ADDR)[0],
         xfer_bytes=struct.unpack_from("<I", data, _OFF_XFER_BYTES)[0],
+        pad_value=struct.unpack_from("<b", data, _OFF_PAD_VALUE)[0],
     )
 
 

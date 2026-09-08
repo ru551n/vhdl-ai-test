@@ -15,6 +15,7 @@ use axi_stream.axi_stream_pkg.all;
 library cnn_accel;
 use cnn_accel.cnn_accel_pkg.all;
 use cnn_accel.cnn_accel_isa_pkg.all;
+use cnn_accel.cnn_accel_regs_pkg.all;
 
 -- VUnit-5 testbench for cnn_accel_pool. See
 -- modules/cnn_accel/doc/cnn_accel_pool_req.md and
@@ -39,10 +40,13 @@ end entity tb_cnn_accel_pool;
 
 architecture tb of tb_cnn_accel_pool is
 
-  -- Small, directed generics: g_max_kernel_size**2 * 8 = 72 <= 128
-  -- (axi_stream_data_sz), well within the module's own contract
-  -- (g_max_kernel_size <= 4) -- see proposal doc.
-  constant c_kernel_max : positive := 3;
+  -- The real pool bound this design elaborates with
+  -- ('cnn_accel_constant_max_pool_kernel_size' = 5, sized for YOLOv8n's
+  -- 5x5 SPPF pool). 25 taps x 8 = 200 bits, which is why 's_window' is
+  -- the unconstrained 'window_m2s_t' tap array and not the fixed 128-bit
+  -- 'axi_stream_m2s_t' it used to be -- exercising the 5x5 shape here is
+  -- exactly what proves that move.
+  constant c_kernel_max : positive := cnn_accel_constant_max_pool_kernel_size;
   constant c_max_taps : positive := c_kernel_max * c_kernel_max;
   -- Not a power-of-two multiple/typical 32: proves the reduction is not
   -- silently relying on some other fixed width.
@@ -57,8 +61,11 @@ architecture tb of tb_cnn_accel_pool is
   signal cfg_pool_kernel_h : std_ulogic_vector(7 downto 0) := (others => '0');
   signal cfg_pool_kernel_w : std_ulogic_vector(7 downto 0) := (others => '0');
 
-  signal s_window_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
-  signal s_window_s2m : axi_stream_s2m_t;
+  signal s_window_m2s : window_m2s_t(data(0 to c_max_taps - 1)) := (
+    valid => '0', last => '0', first_tile => '1', last_tile => '1',
+    data => (others => (others => '0'))
+  );
+  signal s_window_s2m : window_s2m_t;
 
   signal m_max_m2s : axi_stream_m2s_t;
   signal m_max_s2m : axi_stream_s2m_t := (ready => '0');
@@ -85,8 +92,11 @@ architecture tb of tb_cnn_accel_pool is
     w : natural;
   end record;
   type shape_arr_t is array (natural range <>) of shape_t;
-  constant c_shapes : shape_arr_t(0 to 4) := (
-    (1, 1), (2, 2), (3, 3), (2, 3), (3, 2)
+  constant c_shapes : shape_arr_t(0 to 7) := (
+    (1, 1), (2, 2), (3, 3), (2, 3), (3, 2),
+    -- The pool-only shapes the conv datapath is deliberately NOT sized
+    -- for; (5, 5) is YOLOv8n's SPPF kernel.
+    (5, 5), (4, 5), (5, 2)
   );
 
   function to_sl(cond : boolean) return std_ulogic is
@@ -128,20 +138,22 @@ architecture tb of tb_cnn_accel_pool is
     return result;
   end function;
 
-  -- Packs a tap array into the low bits of an 's_window_m2s.data'-shaped
-  -- vector, per the tap-packing convention documented on cnn_accel_pool's
-  -- 's_window_m2s' port (row-major, ascending index from the low bits).
-  function pack_window(taps : taps_arr_t; active_count : natural) return std_ulogic_vector is
-    variable result : std_ulogic_vector(axi_stream_data_sz - 1 downto 0) := (others => '0');
+  -- Packs a tap array into an 's_window_m2s.data' tap array, per the
+  -- element layout documented on cnn_accel_pool's 's_window_m2s' port
+  -- (row-major, ascending index).
+  function pack_window(taps : taps_arr_t; active_count : natural) return tap_array_t is
+    variable result : tap_array_t(0 to c_max_taps - 1) := (others => (others => '0'));
   begin
     for i in 0 to c_max_taps - 1 loop
       if i < active_count then
-        result(8 * i + 7 downto 8 * i) := std_ulogic_vector(to_signed(taps(i), 8));
+        result(i) := std_ulogic_vector(to_signed(taps(i), 8));
       else
-        -- Don't-care lanes: filled with an out-of-range-looking pattern
-        -- (not 0) so a bug that accidentally includes them in the
-        -- reduction is likely to be caught by the golden-model mismatch.
-        result(8 * i + 7 downto 8 * i) := std_ulogic_vector(to_signed(-1, 8));
+        -- Inactive lanes: filled with 127, the largest int8, so a bug
+        -- that accidentally includes them in the max reduction cannot
+        -- hide behind a coincidentally-larger real tap. (The window
+        -- generator fills them with the pad value; the point here is that
+        -- whatever they hold must not reach the result.)
+        result(i) := std_ulogic_vector(to_signed(127, 8));
       end if;
     end loop;
     return result;

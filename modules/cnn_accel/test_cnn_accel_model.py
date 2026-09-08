@@ -643,7 +643,7 @@ def test_isa_layout_self_consistent() -> None:
     assert offset == cnn_accel_constants.INSTR_WORD_BYTES
     assert all(occupied), "instruction word has unaccounted-for byte(s)"
 
-    assert cnn_accel_constants.isa_reserved_ranges() == [(3, 3), (41, 43)]
+    assert cnn_accel_constants.isa_reserved_ranges() == [(3, 3), (42, 43)]
 
     # Every non-reserved field name is unique and does not collide with the
     # `RESERVED` sentinel.
@@ -1080,17 +1080,138 @@ def test_fix4_nonpositive_output_dims_raises() -> None:
         conv2d([1] * 4, [1] * 9, [0], desc)
 
 
-def test_fix5_pool_pad_en_raises() -> None:
-    desc = LayerDesc(
-        opcode=OPCODE_POOL_MAX, flags=(1 << FLAG_PAD_EN),
+def _naive_pool_max(
+    values: list[int],
+    in_h: int,
+    in_w: int,
+    channels: int,
+    kernel: tuple[int, int],
+    stride: tuple[int, int],
+    pad: tuple[int, int, int, int],
+    pad_value: int,
+) -> list[int]:
+    """From-scratch max pooling, written without touching any
+    `cnn_accel_model` internals, so it is an independent check of
+    `pool_max` rather than a restatement of it."""
+    k_h, k_w = kernel
+    s_h, s_w = stride
+    pad_t, pad_b, pad_l, pad_r = pad
+    out_h = (in_h + pad_t + pad_b - k_h) // s_h + 1
+    out_w = (in_w + pad_l + pad_r - k_w) // s_w + 1
+    out: list[int] = []
+    for oy in range(out_h):
+        for ox in range(out_w):
+            for ch in range(channels):
+                best = -129
+                for ky in range(k_h):
+                    for kx in range(k_w):
+                        y = oy * s_h - pad_t + ky
+                        x = ox * s_w - pad_l + kx
+                        if 0 <= y < in_h and 0 <= x < in_w:
+                            tap = values[(y * in_w + x) * channels + ch]
+                        else:
+                            tap = pad_value
+                        best = max(best, tap)
+                out.append(best)
+    return out
+
+
+def test_pool_padding_uses_pad_value() -> None:
+    """ISA v2.1: pooling honours PAD_EN, and a padded tap takes
+    `pad_value` (the tensor's zero-point), not 0. The exact YOLOv8n SPPF
+    shape: 5x5, stride 1, padding 2."""
+    random.seed(1234)
+    in_h = in_w = 6
+    channels = 2
+    values = [random.randint(-128, 127) for _ in range(in_h * in_w * channels)]
+
+    def desc_for(pad_value: int) -> LayerDesc:
+        return LayerDesc(
+            opcode=OPCODE_POOL_MAX,
+            flags=(1 << FLAG_PAD_EN),
+            in_width=in_w, in_height=in_h, in_channels=channels,
+            pool_kernel_h=5, pool_kernel_w=5, pool_stride_h=1, pool_stride_w=1,
+            pad_top=2, pad_bottom=2, pad_left=2, pad_right=2,
+            pad_value=pad_value,
+        )
+
+    for pad_value in (-128, 0, 40):
+        got = pool_max(values, desc_for(pad_value))
+        expected = _naive_pool_max(
+            values, in_h, in_w, channels, (5, 5), (1, 1), (2, 2, 2, 2), pad_value
+        )
+        assert got == expected, f"pad_value={pad_value}"
+        # stride 1 with 'same' padding is shape-preserving
+        assert len(got) == in_h * in_w * channels
+
+    # The whole reason the field exists. With zero_point = -128 -- the
+    # YOLOv8n activation case -- every real activation of a ReLU-like
+    # tensor is a *negative* int8, so a zero-filled pad tap (0) is larger
+    # than all of them and wins every border max, while the correct
+    # zero-point pad (-128) never does.
+    relu_like = [random.randint(-128, -40) for _ in range(in_h * in_w * channels)]
+    with_zp = pool_max(relu_like, desc_for(-128))
+    with_zero = pool_max(relu_like, desc_for(0))
+    assert with_zp != with_zero
+    # Every output position whose window touches the pad reads back a
+    # spurious 0 in the zero-filled version -- pure corruption -- while
+    # the zero-point version stays in the tensor's real value range.
+    assert 0 in with_zero
+    assert max(with_zp) < 0
+    assert with_zp == _naive_pool_max(
+        relu_like, in_h, in_w, channels, (5, 5), (1, 1), (2, 2, 2, 2), -128
+    )
+
+
+def test_pool_padding_defaults_to_zero_fill() -> None:
+    """`pad_value` defaults to 0, so a v2.0-style pooling descriptor keeps
+    its exact previous behaviour (and an unpadded pool ignores the field
+    entirely)."""
+    random.seed(99)
+    values = [random.randint(-128, 127) for _ in range(4 * 4)]
+    unpadded = LayerDesc(
+        opcode=OPCODE_POOL_MAX,
         in_width=4, in_height=4, in_channels=1,
         pool_kernel_h=2, pool_kernel_w=2, pool_stride_h=2, pool_stride_w=2,
+        pad_top=1, pad_bottom=1, pad_left=1, pad_right=1,  # ignored: no PAD_EN
+        pad_value=-128,
+    )
+    assert pool_max(values, unpadded) == _naive_pool_max(
+        values, 4, 4, 1, (2, 2), (2, 2), (0, 0, 0, 0), 0
+    )
+
+    padded_default = LayerDesc(
+        opcode=OPCODE_POOL_MAX,
+        flags=(1 << FLAG_PAD_EN),
+        in_width=4, in_height=4, in_channels=1,
+        pool_kernel_h=3, pool_kernel_w=3, pool_stride_h=1, pool_stride_w=1,
         pad_top=1, pad_bottom=1, pad_left=1, pad_right=1,
     )
-    with pytest.raises(ValueError):
-        pool_max([1] * 16, desc)
-    with pytest.raises(ValueError):
-        pool_avg([1] * 16, LayerDesc(**{**desc.__dict__, "opcode": OPCODE_POOL_AVG}))
+    assert pool_max(values, padded_default) == _naive_pool_max(
+        values, 4, 4, 1, (3, 3), (1, 1), (1, 1, 1, 1), 0
+    )
+
+
+def test_pool_avg_padding_counts_padded_taps() -> None:
+    """`POOL_AVG` sums the same padded window `POOL_MAX` maxes over: the
+    padded taps are `pad_value`, and they are part of the sum (the divide
+    is a fixed `requant_scale`, so the model cannot and does not do
+    count-exclude averaging)."""
+    values = [10] * 16
+    desc = LayerDesc(
+        opcode=OPCODE_POOL_AVG,
+        flags=(1 << FLAG_PAD_EN),
+        in_width=4, in_height=4, in_channels=1,
+        pool_kernel_h=3, pool_kernel_w=3, pool_stride_h=3, pool_stride_w=3,
+        pad_top=1, pad_bottom=1, pad_left=1, pad_right=1,
+        pad_value=-2,
+        requant_scale=0, requant_shift=0,
+    )
+    # out dims: (4 + 2 - 3)//3 + 1 = 2 in each axis.
+    # Top-left window covers 1 pad row + 1 pad column: 5 padded taps of -2
+    # and 4 real taps of 10 -> 30. REQUANT_EN is clear, so the sum is
+    # emitted (clamped to int8) unchanged.
+    assert pool_avg(values, desc)[0] == 30
 
 
 # ---------------------------------------------------------------------------

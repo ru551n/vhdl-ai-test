@@ -230,14 +230,20 @@ class Conv2dOp(Op):
 
 @dataclass
 class PoolOp(Op):
-    """`OPCODE_POOL_MAX`/`OPCODE_POOL_AVG`. No padding: ISA v1/v2 has no
-    pooling-specific padding fields (`cnn_accel_model._pool_windows`
-    rejects `pad_en`), a limitation this builder inherits rather than
-    silently working around."""
+    """`OPCODE_POOL_MAX`/`OPCODE_POOL_AVG`.
+
+    ISA v2.1: pooling now has padding, reusing `CONV2D`'s own
+    `FLAG_PAD_EN` + `pad_top/bottom/left/right` fields, plus `pad_value`
+    -- the int8 value padded taps take, which for a real quantized tensor
+    is its zero-point and NOT 0 (see `cnn_accel_model._pool_windows`).
+    YOLOv8n's SPPF block is the motivating shape: 5x5 max pool, stride 1,
+    padding 2, on a tensor with zero_point = -128."""
 
     mode: str  # "max" | "avg"
     kernel: tuple[int, int]
     stride: tuple[int, int]
+    padding: tuple[int, int, int, int] = (0, 0, 0, 0)  # (top, bottom, left, right)
+    pad_value: int = 0
     activation: Activation = Activation.NONE
     clamp: tuple[int, int] | None = None
     requant_scale: int = 0
@@ -258,6 +264,8 @@ class PoolOp(Op):
             f |= 1 << golden.FLAG_CLAMP_EN
         elif self.activation == Activation.RELU:
             f |= 1 << golden.FLAG_RELU_EN
+        if any(self.padding):
+            f |= 1 << golden.FLAG_PAD_EN
         return f
 
 
@@ -465,6 +473,8 @@ class Model:
         mode: str,
         kernel: tuple[int, int],
         stride: tuple[int, int],
+        padding: tuple[int, int, int, int],
+        pad_value: int,
         activation: Activation,
         clamp: tuple[int, int] | None,
         requant_scale: int | None,
@@ -473,10 +483,13 @@ class Model:
     ) -> Tensor:
         kh, kw = kernel
         sh, sw = stride
-        out_h = (x.height - kh) // sh + 1
-        out_w = (x.width - kw) // sw + 1
+        pt, pb, pl, pr = padding
+        out_h = (x.height + pt + pb - kh) // sh + 1
+        out_w = (x.width + pl + pr - kw) // sw + 1
         if out_h <= 0 or out_w <= 0:
             raise ValueError(f"{mode} pool: non-positive output dims out_h={out_h} out_w={out_w}")
+        if not -128 <= pad_value <= 127:
+            raise ValueError(f"{mode} pool: pad_value must be int8, got {pad_value}")
 
         if mode == "avg":
             if requant_scale is None or requant_shift is None:
@@ -498,6 +511,8 @@ class Model:
             mode=mode,
             kernel=kernel,
             stride=stride,
+            padding=padding,
+            pad_value=pad_value,
             activation=activation,
             clamp=clamp,
             requant_scale=requant_scale,
@@ -513,12 +528,27 @@ class Model:
         *,
         kernel: tuple[int, int] = (2, 2),
         stride: tuple[int, int] = (2, 2),
+        padding: tuple[int, int, int, int] = (0, 0, 0, 0),
+        pad_value: int = 0,
         name: str | None = None,
     ) -> Tensor:
         """`OPCODE_POOL_MAX`: no epilogue at all in the golden model
         (`cnn_accel_model.pool_max` bypasses `bias_requantize_relu`), so
-        `activation`/`clamp`/`requant` are not exposed here."""
-        return self._pool(x, "max", kernel, stride, Activation.NONE, None, None, None, name)
+        `activation`/`clamp`/`requant` are not exposed here.
+
+        `padding` is `(top, bottom, left, right)` and `pad_value` is the
+        int8 value padded taps take -- the input tensor's quantization
+        zero-point in a real network, not 0. `QuantParams` has no
+        zero-point field of its own (it models symmetric quantization
+        only), so this is passed explicitly rather than derived; the
+        default of 0 keeps every pre-v2.1 program bit-identical.
+
+        YOLOv8n's SPPF: `kernel=(5, 5), stride=(1, 1), padding=(2, 2, 2,
+        2), pad_value=-128`."""
+        return self._pool(
+            x, "max", kernel, stride, padding, pad_value,
+            Activation.NONE, None, None, None, name,
+        )
 
     def pool_avg(
         self,
@@ -526,6 +556,8 @@ class Model:
         *,
         kernel: tuple[int, int] = (2, 2),
         stride: tuple[int, int] = (2, 2),
+        padding: tuple[int, int, int, int] = (0, 0, 0, 0),
+        pad_value: int = 0,
         activation: Activation = Activation.NONE,
         clamp: tuple[int, int] | None = None,
         requant_scale: int | None = None,
@@ -535,8 +567,13 @@ class Model:
         """`OPCODE_POOL_AVG`: divides by the pool area via
         `requant_scale`/`requant_shift`, defaulted to `1/(kh*kw)` unless
         overridden (matching `cnn_accel_model.pool_avg`'s documented
-        "division via bias_requant")."""
-        return self._pool(x, "avg", kernel, stride, activation, clamp, requant_scale, requant_shift, name)
+        "division via bias_requant"). `padding`/`pad_value` as for
+        `pool_max`; note the padded taps are summed like any other, so a
+        padded average is a "count-include-pad" average."""
+        return self._pool(
+            x, "avg", kernel, stride, padding, pad_value,
+            activation, clamp, requant_scale, requant_shift, name,
+        )
 
     def add(
         self,

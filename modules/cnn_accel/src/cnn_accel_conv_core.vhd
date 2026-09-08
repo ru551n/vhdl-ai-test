@@ -291,6 +291,15 @@ begin
       cfg_pad_bottom => cfg_pad_bottom,
       cfg_pad_left => cfg_pad_left,
       cfg_pad_right => cfg_pad_right,
+      -- Convolution zero-pads, deliberately and explicitly. ISA v2.1's
+      -- 'pad_value' (fill padded taps with the tensor's quantization
+      -- zero-point instead of 0) applies to the POOL path only: the same
+      -- issue exists in principle for conv, but honouring the field here
+      -- would change the result of every existing convolution, so it is
+      -- its own change with its own re-verification. Tied off rather than
+      -- left to the port's default so this is a decision in the source,
+      -- not an omission.
+      cfg_pad_value => (others => '0'),
       cfg_in_width => cfg_in_width,
       cfg_in_height => cfg_in_height,
       cfg_in_channels => cfg_in_channels,

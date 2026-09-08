@@ -63,6 +63,14 @@ entity cnn_accel_top is
     -- Datapath bounds.
     ----------------------------------------------------------------------
     g_max_kernel_size : positive := cnn_accel_constant_max_kernel_size;
+    -- Pooling's own, SEPARATE kernel bound. Larger than
+    -- 'g_max_kernel_size' (5 vs 3) because YOLOv8n's SPPF block pools 5x5
+    -- while every one of its convolutions is 1x1 or 3x3: sizing the
+    -- shared bound to 5 would widen the PE array to 25 taps per lane and
+    -- the weight buffer with it, for no benefit. Only the pool
+    -- 'cnn_accel_window_gen' instance and the 'cnn_accel_pool' lane bank
+    -- below are sized to this.
+    g_max_pool_kernel_size : positive := cnn_accel_constant_max_pool_kernel_size;
     g_max_row_tile_words : positive := cnn_accel_constant_max_row_tile_words;
     g_accum_width : positive := cnn_accel_constant_accum_width;
     g_weight_buffer_depth : positive := cnn_accel_constant_weight_buffer_depth;
@@ -116,10 +124,10 @@ architecture a of cnn_accel_top is
   -- rather than declared -- spec section 3.
   constant c_tensor_bytes : positive := g_num_banks * g_bank_words * c_word_bytes;
 
-  -- Maximum number of pooling taps in one window. Fixed by 'g_max_kernel_size'
-  -- alone: a pooling window is spatial only, the channel dimension is handled
-  -- by the parallel lanes below.
-  constant c_max_taps : positive := g_max_kernel_size * g_max_kernel_size;
+  -- Maximum number of pooling taps in one window. Fixed by
+  -- 'g_max_pool_kernel_size' alone: a pooling window is spatial only, the
+  -- channel dimension is handled by the parallel lanes below.
+  constant c_max_taps : positive := g_max_pool_kernel_size * g_max_pool_kernel_size;
 
   -- Read masters on the DDR port, in 'cnn_accel_axi_mux' input order.
   constant c_rd_instr : natural := 0;
@@ -270,6 +278,11 @@ architecture a of cnn_accel_top is
 
   signal pool_cfg_kernel_h, pool_cfg_kernel_w : std_ulogic_vector(7 downto 0);
   signal pool_cfg_stride_h, pool_cfg_stride_w : std_ulogic_vector(7 downto 0);
+  -- ISA v2.1 pooling padding: the four pad counts (already gated on
+  -- FLAG_PAD_EN by 'cmd_proc') and the int8 value padded taps take.
+  signal pool_cfg_pad_top, pool_cfg_pad_bottom : std_ulogic_vector(7 downto 0);
+  signal pool_cfg_pad_left, pool_cfg_pad_right : std_ulogic_vector(7 downto 0);
+  signal pool_cfg_pad_value : std_ulogic_vector(7 downto 0);
   signal pool_cfg_in_width, pool_cfg_in_height : std_ulogic_vector(15 downto 0);
   signal pool_cfg_opcode : std_ulogic_vector(7 downto 0);
   signal pool_cfg_requant_scale : std_ulogic_vector(31 downto 0);
@@ -283,14 +296,16 @@ architecture a of cnn_accel_top is
   signal pool_out_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
 
   signal pool_window_m2s :
-    window_m2s_t(data(0 to window_data_length(g_max_kernel_size, g_tile_channels) - 1));
+    window_m2s_t(data(0 to window_data_length(g_max_pool_kernel_size, g_tile_channels) - 1));
   signal pool_window_s2m : window_s2m_t;
 
-  -- One flat, pool-shaped ('data(8*i+7 downto 8*i)' = tap i) window per
-  -- channel lane, sliced out of the single 'window_gen' beat.
-  signal pool_lane_window_m2s : axi_stream_m2s_vec_t(0 to g_tile_channels - 1) :=
-    (others => axi_stream_m2s_init);
-  signal pool_lane_window_s2m : axi_stream_s2m_vec_t(0 to g_tile_channels - 1);
+  -- One lane's ready, collected out of the per-lane generate below. The
+  -- lane window records themselves are declared *inside* that generate
+  -- (one scalar 'window_m2s_t' per lane) rather than as one vector signal
+  -- here: 'window_m2s_t' has an unconstrained 'data' element, and an
+  -- array of such a record would need a two-level element constraint that
+  -- buys nothing over the per-lane declaration.
+  signal pool_lane_ready_vec : std_ulogic_vector(0 to g_tile_channels - 1);
   signal pool_lane_max_m2s : axi_stream_m2s_vec_t(0 to g_tile_channels - 1);
   signal pool_lane_avgsum_m2s : axi_stream_m2s_vec_t(0 to g_tile_channels - 1);
   signal pool_max_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
@@ -354,16 +369,23 @@ begin
       "): one OT pass writes exactly one output activation plane"
     severity failure;
 
-  -- 'cnn_accel_pool's own documented contract: one lane's window beat is
-  -- 'g_max_kernel_size**2' int8 taps packed into the low bits of the
-  -- fixed-width 'axi_stream_m2s_t.data'. It is deliberately NOT scaled by
-  -- 'g_tile_channels': the pool glue below gives each of the
-  -- 'g_tile_channels' lanes its own 'axi_stream_m2s_t' record (see
-  -- 'pool_lane_window_m2s'), so the lanes do not share one beat's width.
-  assert c_max_taps * 8 <= axi_stream_data_sz
-    report "cnn_accel_top: the pool lane window (" &
-      integer'image(c_max_taps * 8) & " bits) must fit axi_stream_data_sz (" &
-      integer'image(axi_stream_data_sz) & " bits)"
+  -- The pool lane window used to have to fit the fixed 128-bit
+  -- 'axi_stream_m2s_t.data' ('c_max_taps * 8 <= axi_stream_data_sz'),
+  -- which capped the pool kernel at 3 (9 taps = 72 bits; 5x5 would be 200
+  -- bits). It no longer travels in an AXI-Stream record at all: each lane
+  -- gets its own unconstrained 'window_m2s_t' tap array, the same record
+  -- type the conv path already uses, which has no width ceiling. Widening
+  -- the hdl-modules-wide 'axi_stream_data_sz' instead was rejected -- it
+  -- would inflate every stream in the design for one consumer's benefit.
+  --
+  -- What remains checkable here is that pooling is genuinely the *only*
+  -- consumer sized to the larger bound, i.e. that raising
+  -- 'g_max_pool_kernel_size' cannot silently drag the conv datapath along.
+  assert g_max_pool_kernel_size >= g_max_kernel_size
+    report "cnn_accel_top: g_max_pool_kernel_size (" &
+      positive'image(g_max_pool_kernel_size) & ") must be >= g_max_kernel_size (" &
+      positive'image(g_max_kernel_size) &
+      "): pooling reuses the conv path's window generator geometry bounds"
     severity failure;
 
   assert g_axi_data_width = 8 * g_tile_channels
@@ -426,6 +448,7 @@ begin
       g_pe_cols => g_pe_cols,
       g_tile_channels => g_tile_channels,
       g_max_kernel_size => g_max_kernel_size,
+      g_max_pool_kernel_size => g_max_pool_kernel_size,
       g_max_row_tile_words => g_max_row_tile_words,
       g_tensor_bytes => c_tensor_bytes,
       g_ddr_limit => g_ddr_limit,
@@ -538,6 +561,11 @@ begin
       pool_cfg_kernel_w => pool_cfg_kernel_w,
       pool_cfg_stride_h => pool_cfg_stride_h,
       pool_cfg_stride_w => pool_cfg_stride_w,
+      pool_cfg_pad_top => pool_cfg_pad_top,
+      pool_cfg_pad_bottom => pool_cfg_pad_bottom,
+      pool_cfg_pad_left => pool_cfg_pad_left,
+      pool_cfg_pad_right => pool_cfg_pad_right,
+      pool_cfg_pad_value => pool_cfg_pad_value,
       pool_cfg_in_width => pool_cfg_in_width,
       pool_cfg_in_height => pool_cfg_in_height,
       pool_cfg_opcode => pool_cfg_opcode,
@@ -916,7 +944,9 @@ begin
 
   pool_window_gen_inst : entity cnn_accel.cnn_accel_window_gen
     generic map (
-      g_max_kernel_size => g_max_kernel_size,
+      -- The POOL bound, not the conv one: this instance is what a 5x5
+      -- SPPF pool needs, and it is the only place that pays for it.
+      g_max_kernel_size => g_max_pool_kernel_size,
       g_max_row_tile_words => g_max_row_tile_words,
       g_tile_channels => g_tile_channels
     )
@@ -928,14 +958,20 @@ begin
       cfg_kernel_w => pool_cfg_kernel_w,
       cfg_stride_h => pool_cfg_stride_h,
       cfg_stride_w => pool_cfg_stride_w,
-      -- Pooling has no padding in this ISA revision: the descriptor has no
-      -- pooling pad fields and the golden model rejects 'pad_en' on a pooling
-      -- instruction outright, so zero here is the specified behaviour and not
-      -- a simplification.
-      cfg_pad_top => (others => '0'),
-      cfg_pad_bottom => (others => '0'),
-      cfg_pad_left => (others => '0'),
-      cfg_pad_right => (others => '0'),
+      -- ISA v2.1: pooling has padding. It reuses CONV2D's own
+      -- 'FLAG_PAD_EN' + pad_top/bottom/left/right fields ('cmd_proc'
+      -- gates them on the flag and zeroes them otherwise, exactly as it
+      -- does for conv), and 'cfg_pad_value' -- the int8 value a padded
+      -- tap takes. That value is the input tensor's quantization
+      -- zero-point, NOT 0: a 0 tap in a max pool over a zero_point =
+      -- -128 tensor is larger than nearly every real activation and
+      -- wins every border output. YOLOv8n's SPPF (5x5, stride 1, pad 2)
+      -- is the shape this exists for.
+      cfg_pad_top => pool_cfg_pad_top,
+      cfg_pad_bottom => pool_cfg_pad_bottom,
+      cfg_pad_left => pool_cfg_pad_left,
+      cfg_pad_right => pool_cfg_pad_right,
+      cfg_pad_value => pool_cfg_pad_value,
       cfg_in_width => pool_cfg_in_width,
       cfg_in_height => pool_cfg_in_height,
       cfg_in_channels => std_ulogic_vector(to_unsigned(g_tile_channels, 16)),
@@ -953,41 +989,36 @@ begin
       m_window_s2m => pool_window_s2m
     );
 
-  -- Static de-interleave of one window beat into 'g_tile_channels' flat,
-  -- pool-shaped lane windows. Every index is an elaboration-time constant, so
-  -- this is pure wiring, not a multiplexer.
-  pool_lane_slice : process(all)
-  begin
-    for lane in 0 to g_tile_channels - 1 loop
-      pool_lane_window_m2s(lane) <= axi_stream_m2s_init;
-      pool_lane_window_m2s(lane).valid <= pool_window_m2s.valid;
-      pool_lane_window_m2s(lane).last <= pool_window_m2s.last;
-      pool_lane_window_m2s(lane).data <= (others => '0');
-      for tap in 0 to c_max_taps - 1 loop
-        pool_lane_window_m2s(lane).data(8 * tap + 7 downto 8 * tap) <=
-          pool_window_m2s.data(tap * g_tile_channels + lane);
-      end loop;
-    end loop;
-  end process;
-
   -- The lanes are structurally identical and see identical inputs, so their
   -- readys are identical too; ANDing them is a zero-cost statement of that
   -- invariant rather than real arbitration.
-  pool_lane_ready : process(all)
-    variable v_ready : std_ulogic;
-  begin
-    v_ready := '1';
-    for lane in 0 to g_tile_channels - 1 loop
-      v_ready := v_ready and pool_lane_window_s2m(lane).ready;
-    end loop;
-    pool_window_s2m.ready <= v_ready;
-  end process;
+  pool_window_s2m.ready <= and pool_lane_ready_vec;
 
   pool_lane_gen : for lane in 0 to g_tile_channels - 1 generate
 
+    -- This lane's window: the same tap array 'cnn_accel_window_gen'
+    -- produces, de-interleaved down to one channel. Declared per lane
+    -- (see 'pool_lane_ready_vec') and driven by a static, elaboration-time
+    -- index expression, so this is pure wiring, not a multiplexer.
+    signal lane_window_m2s : window_m2s_t(data(0 to c_max_taps - 1));
+    signal lane_window_s2m : window_s2m_t;
+
+  begin
+
+    lane_window_m2s.valid <= pool_window_m2s.valid;
+    lane_window_m2s.last <= pool_window_m2s.last;
+    lane_window_m2s.first_tile <= pool_window_m2s.first_tile;
+    lane_window_m2s.last_tile <= pool_window_m2s.last_tile;
+
+    lane_slice_gen : for tap in 0 to c_max_taps - 1 generate
+      lane_window_m2s.data(tap) <= pool_window_m2s.data(tap * g_tile_channels + lane);
+    end generate;
+
+    pool_lane_ready_vec(lane) <= lane_window_s2m.ready;
+
     pool_inst : entity cnn_accel.cnn_accel_pool
       generic map (
-        g_max_kernel_size => g_max_kernel_size,
+        g_max_kernel_size => g_max_pool_kernel_size,
         g_accum_width => g_accum_width
       )
       port map (
@@ -998,8 +1029,8 @@ begin
         cfg_pool_kernel_h => pool_cfg_kernel_h,
         cfg_pool_kernel_w => pool_cfg_kernel_w,
 
-        s_window_m2s => pool_lane_window_m2s(lane),
-        s_window_s2m => pool_lane_window_s2m(lane),
+        s_window_m2s => lane_window_m2s,
+        s_window_s2m => lane_window_s2m,
 
         m_max_m2s => pool_lane_max_m2s(lane),
         m_max_s2m => pool_max_s2m,

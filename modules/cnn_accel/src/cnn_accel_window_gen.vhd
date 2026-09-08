@@ -11,8 +11,8 @@ use math.math_pkg.all;
 library cnn_accel;
 use cnn_accel.cnn_accel_pkg.all;
 
--- Configurable K_h x K_w / stride / zero-padding / input-channel-tiled
--- sliding-window generator. See modules/cnn_accel/doc/cnn_accel_window_gen_req.md,
+-- Configurable K_h x K_w / stride / padding (with a configurable pad
+-- value, ISA v2.1) / input-channel-tiled sliding-window generator. See modules/cnn_accel/doc/cnn_accel_window_gen_req.md,
 -- doc/cnn_accel_window_gen_proposal.md (pre-tiling design) and
 -- doc/cnn_accel_tiled_dataflow_proposal.md sections 1/2/9 (the channel-
 -- tiling retrofit implemented here).
@@ -97,6 +97,16 @@ entity cnn_accel_window_gen is
     cfg_pad_bottom : in std_ulogic_vector(7 downto 0);
     cfg_pad_left : in std_ulogic_vector(7 downto 0);
     cfg_pad_right : in std_ulogic_vector(7 downto 0);
+    -- ISA v2.1: the signed int8 value every PADDED tap of the window
+    -- takes -- the input tensor's quantization zero-point, not
+    -- necessarily 0. Defaults to zero, which is the pre-v2.1
+    -- zero-padding behaviour exactly; 'cnn_accel_top' ties the CONV
+    -- instance's input to zero deliberately and drives only the POOL
+    -- instance's from the descriptor. See the 'assembly_q' comment for
+    -- where it lands: an all-'pad value' clear at the start of every
+    -- column walk, so a tap that is never written (out of frame, or
+    -- beyond the runtime kernel size) reads back as padding.
+    cfg_pad_value : in std_ulogic_vector(7 downto 0) := (others => '0');
     cfg_in_width : in std_ulogic_vector(15 downto 0);
     cfg_in_height : in std_ulogic_vector(15 downto 0);
     cfg_in_channels : in std_ulogic_vector(15 downto 0);
@@ -265,10 +275,38 @@ architecture a of cnn_accel_window_gen is
     integer range 0 to g_max_kernel_size - 1;
   signal kr_of_q : kr_arr_t := (others => 0);
 
+  -- 'kr_of_q(b) * kernel_w_q', i.e. the first tap index of the kernel row
+  -- bank 'b' currently represents, maintained as a register alongside
+  -- 'kr_of_q' itself.
+  --
+  -- Why it is not just computed in the capture stage (measured, Vivado
+  -- xc7a200tfbg484-2, 500 MHz constraint, this entity at the POOL
+  -- geometry -- g_max_kernel_size = 5, g_max_row_tile_words = 1920):
+  -- 'kr_capture_q(b) * kernel_w_q + kc_capture_q' was the critical path
+  -- at 7.166 ns / 9 logic levels / 3 CARRY4 -- 139.55 MHz, i.e. BELOW the
+  -- 150 MHz target -- from 'kr_capture_q's output, through the runtime
+  -- multiply's carry chain, into the write-enable decode of all
+  -- 'g_max_kernel_size**2 * g_tile_channels' (200) 'assembly_q' lanes.
+  -- The multiply is the part that does not belong there: 'kr_of_q' only
+  -- ever changes at an output-row boundary, so the product can be
+  -- maintained on that (slow, non-critical) path instead of being
+  -- recomputed every cycle on the (fast, critical) one. What is left in
+  -- the capture stage is 'kr_base + kc', one small add.
+  --
+  -- 'kr_kw_q' is the 'k * kernel_w' table this is selected from, computed
+  -- once at 'start', so the per-output-row update is a mux over
+  -- 'g_max_kernel_size' registers and not a second runtime multiply.
+  type kr_base_arr_t is array (0 to g_max_kernel_size - 1) of
+    integer range 0 to g_max_kernel_size * g_max_kernel_size - 1;
+  signal kr_base_q : kr_base_arr_t := (others => 0);
+  signal kr_kw_q : kr_base_arr_t := (others => 0);
+
   -- One cycle behind 'in_frame_now'/'kr_of_q'/'kc_q' -- aligned with
   -- 'bank_rd_data', which lags the address by one registered read.
   signal in_frame_capture_q : flag_arr_t := (others => '0');
-  signal kr_capture_q : kr_arr_t := (others => 0);
+  -- (There is no 'kr_capture_q': the capture stage needs only the tap
+  -- base index, never the kernel-row number itself.)
+  signal kr_base_capture_q : kr_base_arr_t := (others => 0);
   signal kc_capture_q : unsigned(7 downto 0) := (others => '0');
   -- '1' the cycle after any cycle 'reading_q' was high -- i.e. this
   -- cycle's 'bank_rd_data' is meaningful and should be captured.
@@ -287,10 +325,19 @@ architecture a of cnn_accel_window_gen is
 
   -- Tap-assembly register: accumulates one full window's taps across the
   -- 'kc' walk, then is presented as 'm_window_m2s.data' once
-  -- 'window_valid' is asserted. Cleared to all-zero at the start of every
-  -- walk, so taps that are out-of-frame (padding) or beyond the runtime
-  -- 'kh'/'kw' simply stay '0' without being written -- same semantics as
-  -- the predecessor combinational 'data_i'.
+  -- 'window_valid' is asserted. Cleared to all-'cfg_pad_value' at the
+  -- start of every walk (ISA v2.1; it was all-zero before, which is what
+  -- the default 'cfg_pad_value' of 0 still gives), so taps that are
+  -- out-of-frame (padding) or beyond the runtime 'kh'/'kw' simply stay at
+  -- the pad value without being written -- same structure as the
+  -- predecessor combinational 'data_i', one fill value later.
+  --
+  -- Note this makes the *unused* taps (beyond 'kernel_h * kernel_w') read
+  -- as the pad value too, not as 0. Every consumer masks by the runtime
+  -- kernel size -- 'cnn_accel_pool' reduces only its 'active_count'
+  -- lowest taps, 'cnn_accel_pe_array' only walks 'kernel_h * kernel_w' --
+  -- so this is not observable; it is called out because a future consumer
+  -- that reduced over the whole fixed array would silently break.
   signal assembly_q : tap_array_t(0 to c_window_data_length - 1) :=
     (others => (others => '0'));
 
@@ -344,6 +391,8 @@ architecture a of cnn_accel_window_gen is
   signal kernel_h_q, kernel_w_q : unsigned(7 downto 0) := (others => '0');
   signal stride_h_q, stride_w_q : unsigned(7 downto 0) := (others => '0');
   signal pad_top_q, pad_left_q : unsigned(7 downto 0) := (others => '0');
+  -- ISA v2.1 pad value, latched at 'start' alongside the pad counts.
+  signal pad_value_q : std_ulogic_vector(7 downto 0) := (others => '0');
   signal in_width_q, in_height_q : unsigned(15 downto 0) := (others => '0');
   signal out_width_q, out_height_q : unsigned(15 downto 0) := (others => '0');
 
@@ -399,7 +448,7 @@ architecture a of cnn_accel_window_gen is
   --     bank-aliasing interlock argument carries over verbatim.
   --   * the read path gains NO latency: the walk's first address is still
   --     issued in the same cycle as before, so the 'kc_capture_q'/
-  --     'kr_capture_q'/'in_frame_capture_q'/'capture_valid_q' one-deep
+  --     'kr_base_capture_q'/'in_frame_capture_q'/'capture_valid_q' one-deep
   --     delay pipeline and 'walk_control's single 'kc_q = kernel_w_q'
   --     drain cycle are unchanged.
   ------------------------------------------------------------------------
@@ -660,6 +709,7 @@ begin
         stride_w_q <= unsigned(cfg_stride_w);
         pad_top_q <= unsigned(cfg_pad_top);
         pad_left_q <= unsigned(cfg_pad_left);
+        pad_value_q <= cfg_pad_value;
         in_width_q <= unsigned(cfg_in_width);
         in_height_q <= unsigned(cfg_in_height);
 
@@ -739,9 +789,19 @@ begin
             v_kr := v_kr - g_max_kernel_size;
           end if;
           kr_of_q(b) <= v_kr;
+          -- Start-time only: one narrow multiply per bank, off every
+          -- cycle-by-cycle path (see 'kr_base_q's declaration).
+          kr_base_q(b) <= v_kr * v_kw;
           row_ok_q(b) <= to_sl(
             v_kr < v_kh and v_row_top + v_kr >= 0 and v_row_top + v_kr <= v_inh - 1
           );
+        end loop;
+
+        -- 'k * kernel_w' for every possible kernel row, so the
+        -- per-output-row 'kr_base_q' update below is a mux, not a
+        -- multiply.
+        for k in 0 to g_max_kernel_size - 1 loop
+          kr_kw_q(k) <= k * v_kw;
         end loop;
 
         -- Per-kernel-row upper bound and validity, so the per-output-row
@@ -871,6 +931,7 @@ begin
                     v_kr := v_kr - g_max_kernel_size;
                   end if;
                   kr_of_q(b) <= v_kr;
+                  kr_base_q(b) <= kr_kw_q(v_kr);
                   row_ok_q(b) <= kr_valid_q(v_kr) and to_sl(
                     row_top_next_q >= -v_kr
                     and row_top_next_q <= row_hi_bound_q(v_kr)
@@ -1008,7 +1069,10 @@ begin
   -- 1. Capture stage: if 'capture_valid_q' (last cycle issued a real
   --    read address), pack 'bank_rd_data' -- now valid, one cycle after
   --    that address -- into 'assembly_q' at tap slot
-  --    'kr_capture_q(b) * kernel_w_q + kc_capture_q', for whichever banks
+  --    'kr_base_capture_q(b) + kc_capture_q' (= 'kr * kernel_w + kc',
+  --    with the multiply hoisted onto the output-row boundary path -- see
+  --    'kr_base_q's declaration for the measured timing reason), for
+  --    whichever banks
   --    were actually in-frame. 'tap_idx' depends on the runtime 'kw', so
   --    it cannot index 'assembly_q' directly here without becoming a
   --    decoder anyway; the destination slot is selected with a
@@ -1057,7 +1121,7 @@ begin
         capture_valid_q <= '0';
         kc_capture_q <= (others => '0');
         in_frame_capture_q <= (others => '0');
-        kr_capture_q <= (others => 0);
+        kr_base_capture_q <= (others => 0);
         assembly_q <= (others => (others => '0'));
         rd_addr_q <= 0;
         rd_word_q <= (others => '0');
@@ -1071,7 +1135,7 @@ begin
         capture_valid_q <= '0';
         kc_capture_q <= (others => '0');
         in_frame_capture_q <= (others => '0');
-        kr_capture_q <= (others => 0);
+        kr_base_capture_q <= (others => 0);
         assembly_q <= (others => (others => '0'));
         rd_addr_q <= 0;
         rd_word_q <= (others => '0');
@@ -1084,14 +1148,14 @@ begin
         -- mapping alongside this cycle's now-valid 'bank_rd_data'.
         capture_valid_q <= reading_q;
         kc_capture_q <= kc_q;
-        kr_capture_q <= kr_of_q;
+        kr_base_capture_q <= kr_base_q;
         in_frame_capture_q <= in_frame_now;
 
         if capture_valid_q = '1' then
           for b in 0 to g_max_kernel_size - 1 loop
             if in_frame_capture_q(b) = '1' then
               for t in 0 to g_max_kernel_size * g_max_kernel_size - 1 loop
-                if t = kr_capture_q(b) * to_integer(kernel_w_q) + to_integer(kc_capture_q) then
+                if t = kr_base_capture_q(b) + to_integer(kc_capture_q) then
                   for c in 0 to g_tile_channels - 1 loop
                     assembly_q(t * g_tile_channels + c) <= bank_rd_data(b)(8 * (c + 1) - 1 downto 8 * c);
                   end loop;
@@ -1140,7 +1204,7 @@ begin
           if active_q = '1' and row_ready_i = '1' then
             reading_q <= '1';
             kc_q <= (others => '0');
-            assembly_q <= (others => (others => '0'));
+            assembly_q <= (others => pad_value_q);
 
             v_next_ok := col_left_q >= 0 and col_left_q <= in_width_m1_q;
             rd_word_q <= rd_base_q;

@@ -213,8 +213,19 @@ def test_cout_not_divisible_rejected(target):
 
 
 def test_row_tile_words_exceeded_rejected(target):
+    # in_width * ceil(in_channels / 8) must be <= MAX_ROW_TILE_WORDS
+    # (1920 since the YOLOv8n sizing pass; it was 512). Pick a width just
+    # past the discovered bound rather than a literal, so this test keeps
+    # testing the rejection rather than the constant.
+    from cnnc.target.discover import discover_cnn_accel  # noqa: PLC0415
+
+    bound = next(
+        c.value
+        for c in discover_cnn_accel().unit("conv_engine").constraints
+        if "MAX_ROW_TILE_WORDS" in c.source
+    )
     with pytest.raises(CapabilityError) as exc_info:
-        _to_hir(target, in_w=600, in_c=8, out_c=8, bias=tuple([0] * 8))
+        _to_hir(target, in_w=bound + 8, in_c=8, out_c=8, bias=tuple([0] * 8))
     assert "in_width" in str(exc_info.value.constraint)
 
 

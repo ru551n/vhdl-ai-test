@@ -110,6 +110,15 @@ class Descriptor:
     # Meaningful only with FLAG_PER_CHANNEL_EN; always 0 until a lowering
     # writes the table (same v1.0/v1.1 reserved-zero rule as W13 above).
     scale_addr: int = 0
+    # ISA v2.1, W10 byte 41: the int8 value padded taps take (the input
+    # tensor's zero-point). This backend targets the v1.x ISA, where that
+    # byte is reserved-must-be-0, so the field exists here only to keep
+    # `Descriptor` field-for-field identical to `cnn_accel_model.LayerDesc`
+    # (see this class' docstring, and `vectors.py`, which walks
+    # `LayerDesc`'s fields to write `desc.txt`). `encode_descriptor` drops
+    # it silently while it is 0 and refuses to emit it otherwise, exactly
+    # as it does for the other version-gated fields above.
+    pad_value: int = 0
 
 
 @dataclasses.dataclass(frozen=True)

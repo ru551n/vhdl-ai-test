@@ -59,11 +59,14 @@ _WEIGHT_BUFFER_DEPTH = cnn_accel_constants.WEIGHT_BUFFER_DEPTH
 _BIAS_BUFFER_DEPTH = cnn_accel_constants.BIAS_BUFFER_DEPTH
 _ACCUM_WIDTH = cnn_accel_constants.ACCUM_WIDTH
 
-# Pooling is a separate, much smaller kernel bound: the target network only
-# pools 2x2. The entity's own contract is `g_max_kernel_size**2 * 8 <= 128`,
-# so 3 is the largest useful value; kept at 3 for headroom over 2x2.
-_POOL_MAX_KERNEL_SIZE = 3
-# Must hold `_POOL_MAX_KERNEL_SIZE**2 * 127` = 1143 without overflow.
+# Pooling is a separate kernel bound, LARGER than the convolution one:
+# YOLOv8n's SPPF pools 5x5 while all its convolutions are 1x1/3x3, so the
+# pool path alone is sized to 5 (see cnn_accel_constants.MAX_POOL_KERNEL_SIZE
+# for the full rationale). The old `g_max_kernel_size**2 * 8 <= 128` ceiling
+# is gone with the move of the pool lane window from `axi_stream_m2s_t` to
+# the unconstrained `window_m2s_t` tap array.
+_POOL_MAX_KERNEL_SIZE = cnn_accel_constants.MAX_POOL_KERNEL_SIZE
+# Must hold `_POOL_MAX_KERNEL_SIZE**2 * 127` = 3175 without overflow.
 _POOL_ACCUM_WIDTH = 16
 
 # D12 was XC7A100T; raised to XC7A200T once the real target network's 320x320
@@ -638,6 +641,16 @@ class Module(BaseModule):
             description="Largest K_h/K_w this accelerator's datapath supports.",
         )
         regs.add_constant(
+            name="max_pool_kernel_size",
+            value=cnn_accel_constants.MAX_POOL_KERNEL_SIZE,
+            description=(
+                "Largest pooling K_h/K_w this accelerator supports. Deliberately "
+                "separate from (and larger than) max_kernel_size: only the pool "
+                "path is sized to it, so a 5x5 pool costs nothing in the conv "
+                "datapath. See cnn_accel_constants.MAX_POOL_KERNEL_SIZE."
+            ),
+        )
+        regs.add_constant(
             name="isa_version",
             value=cnn_accel_constants.ISA_VERSION,
             description="Instruction-set version, `(major << 8) | minor`; same value "
@@ -880,11 +893,16 @@ class Module(BaseModule):
             },
         )
 
-        def build(name: str, generics: dict, checkers: list) -> YosysXilinxNetlistBuild:
+        def build(
+            name: str, generics: dict, checkers: list, top: str | None = None
+        ) -> YosysXilinxNetlistBuild:
+            # 'top' defaults to the project name; pass it explicitly to
+            # register the same entity twice at two different geometries
+            # (see 'cnn_accel_window_gen_pool').
             return YosysXilinxNetlistBuild(
                 name=name,
                 modules=modules,
-                top=name,
+                top=top if top is not None else name,
                 family="xc7",
                 generics=generics,
                 build_result_checkers=checkers,
@@ -999,8 +1017,21 @@ class Module(BaseModule):
                 # 468 CI baseline. FF/BRAM/DSP already had comparable
                 # headroom and are kept as the meaningful, near-measured
                 # structural checks (0 BRAM, 0 DSP -- purely combinational).
+                #
+                # Re-pinned 2026-09 (YOLOv8n sizing pass): this build now
+                # elaborates at the 5x5 pool bound (_POOL_MAX_KERNEL_SIZE
+                # 3 -> 5), so the reduction network went from 9 to 25 lanes
+                # and measures 1002 LUTs on a local dev Yosys (was ~342 at
+                # 3x3 on the same tool) -- 2.9x growth for a 2.8x lane
+                # count, i.e. exactly linear, which is the property worth
+                # gating on. Applying that same 2.9x to the 468-LUT CI
+                # baseline gives ~1370, and the standing ~1.8x structural
+                # headroom gives the limit below. FF/BRAM/DSP are
+                # unchanged: the extra lanes are pure combinational
+                # reduction, so 27 FFs (the one output register), 0 BRAM
+                # and 0 DSP must all stay put.
                 checkers=[
-                    TotalLuts(LessThan(850)),
+                    TotalLuts(LessThan(2500)),
                     Ffs(LessThan(60)),
                     BlockRams(LessThan(1)),
                     DspBlocks(LessThan(1)),
@@ -1121,7 +1152,38 @@ class Module(BaseModule):
                     # loosened: it is the entire reason the gate exists (see
                     # cnn_accel_window_gen_bram_proposal.md and the
                     # module-level comment above).
-                    BlockRams(EqualTo(3)),
+                    # Re-pinned 2026-09 (YOLOv8n sizing pass) from 3 to
+                    # 12: `_MAX_ROW_TILE_WORDS` went 512 -> 1920, and a
+                    # bank is `g_max_row_tile_words x 64` bits, so each of
+                    # the 3 banks now needs ceil(1920/512) = 4 RAMB36
+                    # instead of 1. 3 x 4 = 12, measured exactly. Still an
+                    # equality for the original reason: a drop to 0 means
+                    # BRAM inference broke again (M7).
+                    BlockRams(EqualTo(12)),
+                    DspBlocks(LessThan(12)),
+                ],
+            ),
+            build(
+                # The same entity at the POOL path's geometry -- 5 banks
+                # (for the 5x5 SPPF kernel) instead of 3. This is the
+                # instance 'cnn_accel_top' gives the pool lanes, and the
+                # conv-geometry build above cannot see its cost at all.
+                name="cnn_accel_window_gen_pool",
+                top="cnn_accel_window_gen",
+                generics={
+                    "g_max_kernel_size": _POOL_MAX_KERNEL_SIZE,
+                    "g_max_row_tile_words": _MAX_ROW_TILE_WORDS,
+                    "g_tile_channels": _TILE_CHANNELS,
+                },
+                checkers=[
+                    # Structural gate with the same generous headroom as
+                    # every other Yosys entry here; the authoritative
+                    # resource numbers are the Vivado twin's below.
+                    TotalLuts(LessThan(24000)),
+                    Ffs(LessThan(4000)),
+                    # 5 banks x ceil(1920/512) = 20. Exact, same rationale
+                    # as the 3-bank build above.
+                    BlockRams(EqualTo(20)),
                     DspBlocks(LessThan(12)),
                 ],
             ),
@@ -1301,7 +1363,12 @@ class Module(BaseModule):
                 checkers=[
                     TotalLuts(LessThan(34000)),
                     Ffs(LessThan(10500)),
-                    BlockRams(LessThan(20)),
+                    # Re-pinned 2026-09 (YOLOv8n sizing pass): measured 27
+                    # (12 window_gen + 15 weight_buffer), up from 18,
+                    # entirely from `_MAX_ROW_TILE_WORDS` 512 -> 1920
+                    # quadrupling each window_gen row bank -- see that
+                    # entity's own BlockRams checker above.
+                    BlockRams(LessThan(40)),
                     DspBlocks(LessThan(115)),
                 ],
             ),
@@ -1414,11 +1481,22 @@ class Module(BaseModule):
                         "g_max_kernel_size": _POOL_MAX_KERNEL_SIZE,
                         "g_accum_width": _POOL_ACCUM_WIDTH,
                     },
-                    # Measured 2026-09: 293 LUTs, 27 FFs, 0 BRAM, 0 DSP --
-                    # smaller than Yosys's 342/27/0/0 for the same RTL, a
-                    # rare case where Vivado's mapping is the tighter one.
+                    # Measured 2026-09 at the 3x3 bound: 293 LUTs, 27 FFs,
+                    # 0 BRAM, 0 DSP -- smaller than Yosys's 342/27/0/0 for
+                    # the same RTL, a rare case where Vivado's mapping is
+                    # the tighter one.
+                    #
+                    # Re-measured 2026-09 (YOLOv8n sizing pass) at the 5x5
+                    # bound this entity now elaborates with: **899 LUTs**,
+                    # 27 FFs, 0 BRAM, 0 DSP. 3.1x the LUTs for 2.8x the
+                    # taps (9 -> 25 lanes), and the FF count is *unchanged*
+                    # -- which is the real check here: the extra taps are
+                    # pure combinational reduction feeding the same single
+                    # output register, so anything that moved FFs, BRAM or
+                    # DSP would mean the reduction had stopped being
+                    # combinational.
                     checkers=[
-                        TotalLuts(LessThan(350)),
+                        TotalLuts(LessThan(1100)),
                         Ffs(LessThan(35)),
                         Ramb36(LessThan(1)),
                         Ramb18(LessThan(1)),
@@ -1502,12 +1580,43 @@ class Module(BaseModule):
                     # the M7 BRAM-inference fix, so this checker is kept
                     # just as exact here, on the authoritative backend, as
                     # it is on the CI-gating one.
+                    #
+                    # Re-measured 2026-09 (YOLOv8n sizing pass, three
+                    # changes at once -- `_MAX_ROW_TILE_WORDS` 512 -> 1920,
+                    # the new `cfg_pad_value`, and the `kr_base_q` timing
+                    # rework): **3314 LUTs, 1202 FFs, 12 RAMB36 + 0 RAMB18,
+                    # 4 DSP, 183.92 MHz** (was 2785/1171/3/0/0 at
+                    # 165.73 MHz).
+                    #
+                    #  * RAMB36 3 -> 12, exact. A bank is
+                    #    `g_max_row_tile_words x 8 * g_tile_channels` bits;
+                    #    1920 x 64 needs 4 RAMB36 where 512 x 64 needed 1.
+                    #    3 banks x 4 = 12. Kept exact for the M7 reason.
+                    #  * DSP 0 -> 4. This checker was previously an
+                    #    *exactly zero* guard whose stated meaning was "a
+                    #    runtime multiply has crept back into the read
+                    #    address path". It has not: Vivado's synthesis log
+                    #    names the four DSPs as `col_step_words_q`,
+                    #    `row_start_words_q` and `rd_base_q` -- the S7
+                    #    look-ahead accumulators' *seed* values, computed
+                    #    from `stride * n_tiles` at `start` and at output-
+                    #    row boundaries, never per read cycle. They became
+                    #    DSPs only because the deeper row buffer widened
+                    #    `word_t` from 9 to 11 bits. The max-frequency
+                    #    estimate going *up* (165.73 -> 183.92 MHz) is the
+                    #    corroborating evidence that nothing moved onto the
+                    #    critical path. Pinned exactly at 4 so a fifth --
+                    #    which would be a genuinely new multiply -- fails.
+                    #  * Fmax up despite the bigger memory: the `kr_base_q`
+                    #    rework took the runtime `kr * kernel_w` out of the
+                    #    per-cycle tap-index decode (see that signal's
+                    #    declaration in cnn_accel_window_gen.vhd).
                     checkers=[
-                        TotalLuts(LessThan(3200)),
-                        Ffs(LessThan(1300)),
-                        Ramb36(EqualTo(3)),
+                        TotalLuts(LessThan(4200)),
+                        Ffs(LessThan(1500)),
+                        Ramb36(EqualTo(12)),
                         Ramb18(LessThan(1)),
-                        DspBlocks(LessThan(1)),
+                        DspBlocks(EqualTo(4)),
                     ],
                     # Added 2026-09 (S7): this entity had never been timed,
                     # which is precisely why its 20.4 ns / 21-CARRY4
@@ -1518,6 +1627,65 @@ class Module(BaseModule):
                     # geometry cone is driven from `start`-time input
                     # ports), so it is worth watching for regressions but
                     # conv_core's figure is the one that decides.
+                    analyze_synthesis_timing=True,
+                ),
+                vivado_build(
+                    # The SAME entity as above, elaborated at the POOL
+                    # path's geometry instead of the conv path's: this is
+                    # the instance 'cnn_accel_top' gives the pool lanes,
+                    # and it is where the 5x5 pool kernel is actually paid
+                    # for (banks scale as K, and each bank is
+                    # 'g_max_row_tile_words x 64' bits). It exists as its
+                    # own netlist build because the conv-geometry build
+                    # above cannot see that cost at all, and a resource
+                    # regression nobody measures is a resource regression
+                    # nobody notices.
+                    "cnn_accel_window_gen_pool",
+                    "cnn_accel_window_gen",
+                    {
+                        "g_max_kernel_size": _POOL_MAX_KERNEL_SIZE,
+                        "g_max_row_tile_words": _MAX_ROW_TILE_WORDS,
+                        "g_tile_channels": _TILE_CHANNELS,
+                    },
+                    # Measured 2026-09 (first measurement of this build):
+                    # **9169 LUTs, 2316 FFs, 20 RAMB36 + 0 RAMB18, 4 DSP,
+                    # 185.19 MHz**.
+                    #
+                    # This is what the 5x5 pool kernel costs, and it is
+                    # worth being explicit that the cost is superlinear in
+                    # LUTs: the tap-assembly capture stage decodes a write
+                    # enable for every one of `g_max_kernel_size**2 *
+                    # g_tile_channels` lanes (200 at K=5, 72 at K=3), from
+                    # each of `g_max_kernel_size` banks -- so ~2.8x the
+                    # LUTs of the conv-geometry build for 1.67x the banks.
+                    # That is exactly why `g_max_pool_kernel_size` is a
+                    # separate generic and the conv path was NOT raised to
+                    # 5: this cost is paid once, by the one instance that
+                    # needs it.
+                    #
+                    # 185.19 MHz is after the `kr_base_q` rework. Before
+                    # it, this build was the one entity in the whole design
+                    # that MISSED the 150 MHz target -- 139.55 MHz, with
+                    # the critical path running `kr_capture_q` -> the
+                    # runtime `kr * kernel_w` multiply -> all 200 assembly
+                    # lanes' clock enables. See that signal's declaration
+                    # in cnn_accel_window_gen.vhd.
+                    checkers=[
+                        TotalLuts(LessThan(11000)),
+                        Ffs(LessThan(2800)),
+                        # One RAMB36 per kernel-row bank per 512 words of
+                        # depth: 5 banks x ceil(1920/512) = 5 x 4 = 20.
+                        # Exact for the same reason the conv-geometry
+                        # build's 12 is: a drop to 0 means block-RAM
+                        # inference broke again (M7), and an increase means
+                        # the bank geometry changed without anyone saying so.
+                        Ramb36(EqualTo(20)),
+                        Ramb18(LessThan(1)),
+                        # The same four look-ahead-seed DSPs the
+                        # conv-geometry build has, and for the same reason
+                        # -- they are row-count-independent.
+                        DspBlocks(EqualTo(4)),
+                    ],
                     analyze_synthesis_timing=True,
                 ),
                 vivado_build(
@@ -1642,12 +1810,40 @@ class Module(BaseModule):
                     # longer partially dissolves weight_buffer's bias
                     # memory into fabric. The old 10 was the anomaly; 14 is
                     # the leaf-additive truth. Do not "restore" it.
+                    #
+                    # Re-measured 2026-09 (YOLOv8n sizing pass): **14196
+                    # LUTs, 8727 FFs, 27 RAMB36 + 2 RAMB18, 36 DSP,
+                    # 170.33 MHz** (was 14279/8708/18/2/32 at 159.95 MHz
+                    # when this pass started -- note the FF and RAMB36
+                    # checkers below were ALREADY failing at that starting
+                    # point, i.e. they were stale before this change, not
+                    # broken by it).
+                    #
+                    # Leaf additivity still holds for the memory and DSP
+                    # counts, measured hierarchically:
+                    #   RAMB36 27 = 12 (window_gen, 3 banks x 4) + 15
+                    #                (weight_buffer)
+                    #   DSP    36 = 32 (bias_requant) + 4 (window_gen
+                    #                look-ahead seeds) + 0 + 0
+                    # weight_buffer contributes 15 RAMB36 here against its
+                    # own standalone build's 11 -- the same "Vivado
+                    # dissolves part of the bias memory into fabric,
+                    # depending on what feeds it" variability the previous
+                    # comment above already documents in the other
+                    # direction. The window_gen delta (3 -> 12) is the
+                    # whole of the intended `_MAX_ROW_TILE_WORDS` cost.
+                    #
+                    # Timing went UP, 159.95 -> 170.33 MHz, despite the
+                    # bigger row buffers, for the `kr_base_q` reason in
+                    # window_gen's own comment above. This is still the
+                    # only timing number in this file that is worth
+                    # trusting, and it is comfortably above 150 MHz.
                     checkers=[
                         TotalLuts(LessThan(16300)),
-                        Ffs(LessThan(8600)),
-                        Ramb36(EqualTo(14)),
+                        Ffs(LessThan(9500)),
+                        Ramb36(EqualTo(27)),
                         Ramb18(EqualTo(2)),
-                        DspBlocks(EqualTo(32)),
+                        DspBlocks(EqualTo(36)),
                     ],
                     analyze_synthesis_timing=True,
                 ),
@@ -1825,10 +2021,26 @@ class Module(BaseModule):
                     # PE lane's MAC/accumulate chain and does not scale with
                     # `g_pe_rows`. See flow_status.md S7 for the full
                     # six-entity summary and the timing-fix delegation.
+                    #
+                    # Re-measured 2026-09 (YOLOv8n sizing pass): **25413
+                    # LUTs, 15499 FFs, 43 RAMB36 + 2 RAMB18, 68 DSP,
+                    # 170.33 MHz** -- the 16-row point now also clears
+                    # 150 MHz, matching the 8-row build exactly (the
+                    # critical path is inside one PE lane and does not
+                    # scale with `g_pe_rows`, as the pair of measurements
+                    # above already showed for the failing case).
+                    #
+                    # Two of these checkers were badly stale before this
+                    # pass and are re-pinned here rather than left as
+                    # known-failing: FF was still at the pre-S7 4900 while
+                    # the entity really has ~15.5k (the 8-row build has
+                    # 8727, and FFs scale with `g_pe_rows`), and RAMB36 was
+                    # 17 against a real 43. Of that 43, the increase this
+                    # change is responsible for is window_gen's 3 -> 12.
                     checkers=[
                         TotalLuts(LessThan(29300)),
-                        Ffs(LessThan(4900)),
-                        Ramb36(EqualTo(17)),
+                        Ffs(LessThan(16500)),
+                        Ramb36(EqualTo(43)),
                         Ramb18(EqualTo(2)),
                         DspBlocks(EqualTo(68)),
                     ],
@@ -1870,11 +2082,16 @@ class Module(BaseModule):
         # needed to register these configs, and `module_cnn_accel.py` is
         # also loaded by `build_fpga.py` (the synthesis env), where
         # dragging in the whole model/planner/reference stack buys nothing.
-        from accel_v2 import cases  # noqa: PLC0415
+        from accel_v2 import cases, cases_pool_pad  # noqa: PLC0415
 
         tb = library.test_bench("tb_cnn_accel_top")
 
-        for case in cases.all_cases():
+        # Two catalogues, one registration loop. `cases_pool_pad.py` holds
+        # the ISA v2.1 pooling cases (padding, the zero-point pad value,
+        # the 5x5 SPPF kernel); it follows exactly the same contract as
+        # `cases.py` and is a separate file only so the two can be edited
+        # independently. Case names are unique across both.
+        for case in cases.all_cases() + cases_pool_pad.all_cases():
             # VUnit's own `add_config` rather than tsfpga's
             # `add_vunit_config` helper: the helper always appends every
             # generic to the config name, and these configs carry ten of

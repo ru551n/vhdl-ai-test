@@ -94,6 +94,10 @@ entity cnn_accel_cmd_proc is
     g_tile_channels : positive;
     -- Upper bound on kernel_h/kernel_w, for 'c_err_bad_geometry'.
     g_max_kernel_size : positive;
+    -- Upper bound on pool_kernel_h/pool_kernel_w, for
+    -- 'c_err_bad_geometry'. Separate from (and larger than)
+    -- 'g_max_kernel_size' -- see cnn_accel_top's own generic comment.
+    g_max_pool_kernel_size : positive;
     -- Upper bound on 'in_width * ceil(in_channels/g_tile_channels)', for
     -- 'c_err_bad_geometry' and for sizing the transpose buffer above.
     g_max_row_tile_words : positive;
@@ -240,6 +244,16 @@ entity cnn_accel_cmd_proc is
     pool_cfg_kernel_w : out std_ulogic_vector(7 downto 0) := (others => '0');
     pool_cfg_stride_h : out std_ulogic_vector(7 downto 0) := (others => '0');
     pool_cfg_stride_w : out std_ulogic_vector(7 downto 0) := (others => '0');
+    -- ISA v2.1 pooling padding. The four counts are already gated on
+    -- FLAG_PAD_EN here (zero when the flag is clear), exactly as the
+    -- conv path's are, so the window generator never has to know about
+    -- the flag. 'pool_cfg_pad_value' is the int8 value a padded tap
+    -- takes -- the tensor's zero-point, not 0.
+    pool_cfg_pad_top : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_pad_bottom : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_pad_left : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_pad_right : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_pad_value : out std_ulogic_vector(7 downto 0) := (others => '0');
     pool_cfg_in_width : out std_ulogic_vector(15 downto 0) := (others => '0');
     pool_cfg_in_height : out std_ulogic_vector(15 downto 0) := (others => '0');
     pool_cfg_opcode : out std_ulogic_vector(7 downto 0) := (others => '0');
@@ -754,7 +768,7 @@ begin
           -- on old hardware.
           if v_err = c_err_none
             and (desc_q.reserved_w0 /= x"00"
-              or desc_q.reserved_w10 /= x"000000"
+              or desc_q.reserved_w10 /= x"0000"
               or (is_v12_opcode(desc_q.opcode) and desc_q.xfer_bytes /= 0)) then
             v_err := c_err_bad_reserved;
           end if;
@@ -821,8 +835,8 @@ begin
               v_ok := v_ok and desc_q.pool_kernel_h /= 0
                 and desc_q.pool_kernel_w /= 0
                 and desc_q.pool_stride_h /= 0 and desc_q.pool_stride_w /= 0
-                and desc_q.pool_kernel_h <= g_max_kernel_size
-                and desc_q.pool_kernel_w <= g_max_kernel_size;
+                and desc_q.pool_kernel_h <= g_max_pool_kernel_size
+                and desc_q.pool_kernel_w <= g_max_pool_kernel_size;
             end if;
             if not v_ok then
               v_err := c_err_bad_geometry;
@@ -943,7 +957,12 @@ begin
               state <= st_div_w;
             end if;
           else
+            -- ISA v2.1: pooling is padded too, with the same fields and
+            -- the same 'pad_en' gate the conv branch above uses.
             v_padded := resize(desc_q.in_width, 32);
+            if desc_q.flags(c_flag_pad_en) = '1' then
+              v_padded := v_padded + desc_q.pad_left + desc_q.pad_right;
+            end if;
             if v_padded < desc_q.pool_kernel_w then
               pending_err_q <= c_err_bad_geometry;
               state <= st_error;
@@ -987,6 +1006,9 @@ begin
               end if;
             else
               v_padded := resize(desc_q.in_height, 32);
+              if desc_q.flags(c_flag_pad_en) = '1' then
+                v_padded := v_padded + desc_q.pad_top + desc_q.pad_bottom;
+              end if;
               if v_padded < desc_q.pool_kernel_h then
                 pending_err_q <= c_err_bad_geometry;
                 state <= st_error;
@@ -1907,6 +1929,15 @@ begin
   pool_cfg_kernel_w <= std_ulogic_vector(desc_q.pool_kernel_w);
   pool_cfg_stride_h <= std_ulogic_vector(desc_q.pool_stride_h);
   pool_cfg_stride_w <= std_ulogic_vector(desc_q.pool_stride_w);
+  pool_cfg_pad_top <=
+    std_ulogic_vector(desc_q.pad_top) when desc_q.flags(c_flag_pad_en) = '1' else x"00";
+  pool_cfg_pad_bottom <=
+    std_ulogic_vector(desc_q.pad_bottom) when desc_q.flags(c_flag_pad_en) = '1' else x"00";
+  pool_cfg_pad_left <=
+    std_ulogic_vector(desc_q.pad_left) when desc_q.flags(c_flag_pad_en) = '1' else x"00";
+  pool_cfg_pad_right <=
+    std_ulogic_vector(desc_q.pad_right) when desc_q.flags(c_flag_pad_en) = '1' else x"00";
+  pool_cfg_pad_value <= std_ulogic_vector(desc_q.pad_value);
   pool_cfg_in_width <= std_ulogic_vector(desc_q.in_width);
   pool_cfg_in_height <= std_ulogic_vector(desc_q.in_height);
   pool_cfg_opcode <= desc_q.opcode;

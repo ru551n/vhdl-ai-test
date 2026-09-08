@@ -67,6 +67,11 @@ package cnn_accel_pkg is
     -- channel), consumed only while FLAG_PER_CHANNEL_EN is set. Zero in a
     -- v1.0/v1.1 program.
     scale_addr      : unsigned(31 downto 0);
+    -- ISA v2.1, instruction word W10 byte 41: the signed int8 value a
+    -- padded tap takes (the input tensor's quantization zero-point).
+    -- Zero in a program from any earlier revision, where the byte was
+    -- reserved-must-be-0.
+    pad_value       : signed(7 downto 0);
   end record;
 
   -- Handshake wrapper records, per shared/InterfaceRecords.md.

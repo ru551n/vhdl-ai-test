@@ -16,8 +16,20 @@ from accel_v2 import isa
 
 
 def test_isa_version_and_word_size() -> None:
-    assert isa.ISA_VERSION == 0x0200
+    # v2.1 adds the W10 'pad_value' byte and pooling padding; both were
+    # reserved-must-be-0 in v2.0, so the word size is unchanged and every
+    # v2.0 program is still valid.
+    assert isa.ISA_VERSION == 0x0201
     assert isa.INSTR_WORD_BYTES == 64
+
+
+def test_pad_value_round_trips_signed() -> None:
+    for value in (-128, -1, 0, 1, 127):
+        d = isa.DescV2(opcode=isa.OPCODE_POOL_MAX, pad_value=value)
+        assert isa.decode_desc(isa.encode_desc(d)).pad_value == value
+    # Default-zero: a descriptor that never mentions pad_value encodes the
+    # byte as 0, i.e. exactly the v2.0 reserved-zero word.
+    assert isa.encode_desc(isa.DescV2())[41] == 0
 
 
 def test_space_tags() -> None:

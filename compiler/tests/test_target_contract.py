@@ -105,7 +105,7 @@ def test_isa_v12_per_channel_is_discovered_from_constants(cnn_accel_constants):
     assert target.isa.flags["PER_CHANNEL_EN"] == cnn_accel_constants.FLAGS["PER_CHANNEL_EN"]
 
 
-def test_discovery_has_no_hardcoded_accelerator_properties(tmp_path):
+def test_discovery_has_no_hardcoded_accelerator_properties(tmp_path, cnn_accel_constants):
     (tmp_path / "cnn_accel_model.py").write_text((ACCEL_ROOT / "cnn_accel_model.py").read_text())
 
     constants_src = (ACCEL_ROOT / "cnn_accel_constants.py").read_text()
@@ -113,7 +113,11 @@ def test_discovery_has_no_hardcoded_accelerator_properties(tmp_path):
     # PE_ROWS_SCALED must stay a *distinct* member of PE_ROWS_LEGAL (its own
     # elaboration-time assert), so swap it to the other legal value.
     patched = patched.replace("PE_ROWS_SCALED = 16\n", "PE_ROWS_SCALED = 8\n", 1)
-    patched = patched.replace("MAX_ROW_TILE_WORDS = 512\n", "MAX_ROW_TILE_WORDS = 1024\n", 1)
+    patched = patched.replace(
+        f"MAX_ROW_TILE_WORDS = {cnn_accel_constants.MAX_ROW_TILE_WORDS}\n",
+        "MAX_ROW_TILE_WORDS = 1024\n",
+        1,
+    )
     assert patched != constants_src
     (tmp_path / "cnn_accel_constants.py").write_text(patched)
 
@@ -134,7 +138,7 @@ def test_discovery_has_no_hardcoded_accelerator_properties(tmp_path):
     fake_row_tile = next(c for c in fake_unit.constraints if "MAX_ROW_TILE_WORDS" in c.source)
     real_row_tile = next(c for c in real_unit.constraints if "MAX_ROW_TILE_WORDS" in c.source)
     assert fake_row_tile.value == 1024
-    assert real_row_tile.value == 512
+    assert real_row_tile.value == cnn_accel_constants.MAX_ROW_TILE_WORDS
 
 
 # ---------------------------------------------------------------------------

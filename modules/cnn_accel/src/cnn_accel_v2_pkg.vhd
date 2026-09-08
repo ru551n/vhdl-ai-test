@@ -156,9 +156,16 @@ package cnn_accel_v2_pkg is
     space_dst       : space_t;
     space_wgt       : space_t;
     xfer_bytes      : unsigned(31 downto 0);
-    -- W0 byte 3 and W10 bytes 41-43: must be zero (section 5.1).
+    -- ISA v2.1, W10 byte 41: the signed int8 value a padded tap takes --
+    -- the input tensor's quantization zero-point. Consumed by the POOL
+    -- path only; zero (the value every v2.0 program left in this
+    -- then-reserved byte) is the old zero-padding behaviour.
+    pad_value       : signed(7 downto 0);
+    -- W0 byte 3 and W10 bytes 42-43: must be zero (section 5.1). The W10
+    -- gap shrank from three bytes to two when v2.1 claimed byte 41 for
+    -- 'pad_value'.
     reserved_w0     : std_ulogic_vector(7 downto 0);
-    reserved_w10    : std_ulogic_vector(23 downto 0);
+    reserved_w10    : std_ulogic_vector(15 downto 0);
   end record;
 
   -- All-zero descriptor (opcode HALT, space DDR everywhere), useful as a
@@ -250,6 +257,7 @@ package body cnn_accel_v2_pkg is
       space_wgt       => (others => '0'),
       xfer_bytes      => (others => '0'),
       reserved_w0     => (others => '0'),
+      pad_value       => (others => '0'),
       reserved_w10    => (others => '0')
     );
   begin
@@ -319,13 +327,15 @@ package body cnn_accel_v2_pkg is
 
     result.xfer_bytes      := unsigned(field(c_off_xfer_bytes, 32));
 
+    result.pad_value       := signed(field(c_off_pad_value, 8));
+
     -- The two reserved gaps. Their positions are derived, not stated: W0
     -- byte 3 is the byte after the 'spaces' tag byte, and the W10 gap is
-    -- the three bytes after 'requant_shift'. If a future ISA revision
-    -- turns either gap into a real field, the generator stops emitting it
-    -- as a gap and these two lines are what must be revisited.
+    -- the two bytes after 'pad_value' (it was the three bytes after
+    -- 'requant_shift' until v2.1 claimed the first of them for
+    -- 'pad_value' -- exactly the revisit this comment used to predict).
     result.reserved_w0     := field(c_off_spaces + 1, 8);
-    result.reserved_w10    := field(c_off_requant_shift + 1, 24);
+    result.reserved_w10    := field(c_off_pad_value + 1, 16);
 
     return result;
   end function;

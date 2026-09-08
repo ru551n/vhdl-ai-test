@@ -94,7 +94,35 @@ assert ACTIVATION_PLANE_CHANNELS & (ACTIVATION_PLANE_CHANNELS - 1) == 0, (
 )
 
 MAX_KERNEL_SIZE = 3
-MAX_ROW_TILE_WORDS = 512
+# Pooling's kernel bound is SEPARATE from, and larger than, the convolution
+# bound above. YOLOv8n's SPPF block pools 5x5 (stride 1, padding 2) while
+# every one of its convolutions is 1x1 or 3x3, so raising the shared
+# MAX_KERNEL_SIZE to 5 would widen the conv datapath to 25 taps per lane --
+# inflating cnn_accel_pe_array's per-window MAC sequencing and
+# cnn_accel_weight_buffer's row width -- to buy nothing. Only the pool path
+# (its own cnn_accel_window_gen instance and the cnn_accel_pool lanes) is
+# sized to this.
+#
+# Note the pool window can no longer travel in an 'axi_stream_m2s_t': 5*5*8
+# = 200 bits exceeds the hdl-modules-wide 'axi_stream_data_sz' (128). The
+# pool lane window therefore uses the same unconstrained 'window_m2s_t'
+# tap-array record the conv path already uses (cnn_accel_pkg.vhd), which has
+# no width ceiling -- see cnn_accel_pool.vhd's own contract assert.
+MAX_POOL_KERNEL_SIZE = 5
+# Bound on 'in_width * ceil(in_channels / TILE_CHANNELS)', the row-tile-word
+# count one cnn_accel_window_gen row bank must hold.
+#
+# 1920 (was 512): at a 640x640 input, 35 of YOLOv8n's 63 convolutions
+# violate the 512 bound. The largest requirement in that network is 1920,
+# from the two post-upsample concatenated layers -- 40 wide x ceil(384/8) =
+# 40 * 48, and 80 wide x ceil(192/8) = 80 * 24 -- so 1920 clears every one
+# of them exactly, with the next-largest requirement (1280, e.g. 320 wide x
+# ceil(32/8) x ... = 320 * 4) well inside it.
+#
+# The cost is block RAM, linearly: a cnn_accel_window_gen row bank is
+# MAX_ROW_TILE_WORDS x (8 * TILE_CHANNELS) bits, so 1920 x 64 needs 4
+# RAMB36 per bank where 512 x 64 needed 1.
+MAX_ROW_TILE_WORDS = 1920
 WEIGHT_BUFFER_DEPTH = 288
 BIAS_BUFFER_DEPTH = 8
 ACCUM_WIDTH = 32
@@ -104,7 +132,11 @@ ACCUM_WIDTH = 32
 # truth `accel_v2/isa.py`'s `ISA_VERSION` derives from -- previously that
 # module restated the `0x0200` literal itself, which this constant
 # replaces. Major.minor packed as `(major << 8) | minor`.
-ISA_VERSION = 0x0200
+# v2.1 (2026-09): adds the W10 'pad_value' byte and pooling padding
+# (POOL_* now honour FLAG_PAD_EN and the pad_top/bottom/left/right
+# fields). Both were reserved-must-be-0 before, so every v2.0 program is
+# still a valid, bit-identical v2.1 program.
+ISA_VERSION = 0x0201
 
 # ISA v1.2 (doc/tosa_compiler_plan.md section 5, extension 2 / HW milestone
 # H2): per-channel requantization table in DDR at `scale_addr`, one entry
@@ -340,7 +372,22 @@ ISA_LAYOUT: tuple[IsaField, ...] = (
     IsaField("pad_right", 1),
     IsaField("requant_scale", 4, signed=True),
     IsaField("requant_shift", 1),
-    IsaField(RESERVED, 3),  # W10 bytes 41-43
+    # W10 byte 41 (ISA v2.1): the int8 value padded taps take, i.e. the
+    # input tensor's quantization zero-point. Signed, reserved-must-be-0
+    # in every earlier revision, so a v2.0 program decodes as pad_value = 0
+    # = "pad with zero", which is exactly v2.0 semantics.
+    #
+    # Why this exists: for an int8 tensor whose zero-point is not 0, a
+    # padded tap of 0 is not "nothing", it is the real value
+    # (0 - zero_point) * scale. For MAX pooling that is fatal -- YOLOv8n's
+    # activations have zero_point = -128, so a 0 tap is larger than nearly
+    # every real value in the window and silently wins the max on every
+    # border output. Consumed by the POOL path; CONV2D deliberately keeps
+    # its hard-wired 0 for now (cnn_accel_top.vhd wires the conv
+    # window_gen's cfg_pad_value to zero), so this field changes no
+    # existing behaviour.
+    IsaField("pad_value", 1, signed=True),
+    IsaField(RESERVED, 2),  # W10 bytes 42-43
     IsaField("pool_kernel_h", 1),
     IsaField("pool_kernel_w", 1),
     IsaField("pool_stride_h", 1),

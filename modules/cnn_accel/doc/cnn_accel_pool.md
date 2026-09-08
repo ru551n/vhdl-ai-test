@@ -20,7 +20,7 @@ Entity `cnn_accel_pool`, architecture `a`.
 
 | Generic | Type | Meaning / constraints |
 |---|---|---|
-| `g_max_kernel_size` | `positive` | Upper bound on `cfg_pool_kernel_h`/`cfg_pool_kernel_w` individually; sizes the fixed `g_max_kernel_size**2`-lane tap array. **Contract: `g_max_kernel_size**2 * 8 <= 128`** (`axi_stream_pkg.axi_stream_data_sz`, a fixed package constant, not a generic) — so `g_max_kernel_size <= 4` for any instantiation of this module. Checked by an elaboration-time `assert`. |
+| `g_max_kernel_size` | `positive` | Upper bound on `cfg_pool_kernel_h`/`cfg_pool_kernel_w` individually; sizes the fixed `g_max_kernel_size**2`-lane tap array. This is the **pool** kernel bound (`cnn_accel_constant_max_pool_kernel_size` = 5), separate from and larger than the convolution datapath's own bound of 3. The old **`g_max_kernel_size**2 * 8 <= 128`** contract (`axi_stream_pkg.axi_stream_data_sz`), which capped this at 4, is **gone**: `s_window` is now the unconstrained `cnn_accel_pkg.window_m2s_t` tap array, not a fixed-width AXI-Stream payload. See `doc/cnn_accel_top_v2_arch.md` §12a. |
 | `g_accum_width` | `positive` | `OPCODE_POOL_AVG` sum width. Must be wide enough to hold `g_max_kernel_size**2 * 127` without overflow (no saturation/rounding applied here). **Contract: `g_accum_width <= 128`**, checked by an elaboration-time `assert`. |
 
 ## Ports
@@ -31,7 +31,7 @@ Entity `cnn_accel_pool`, architecture `a`.
 | `reset` | in | `std_ulogic` | Synchronous active-high reset (`reset_internal` at the IP top level). Default `'0'`. |
 | `cfg_opcode` | in | `std_ulogic_vector(7 downto 0)` | `OPCODE_POOL_MAX` vs `OPCODE_POOL_AVG` (`cnn_accel_pkg`), sampled at `s_window` accept time. Any value other than `OPCODE_POOL_AVG` is treated as the `OPCODE_POOL_MAX` path. |
 | `cfg_pool_kernel_h`, `cfg_pool_kernel_w` | in | `std_ulogic_vector(7 downto 0)` | Pool kernel height/width for the in-flight instruction. Contract: each in `1 .. g_max_kernel_size`. `cfg_pool_kernel_h * cfg_pool_kernel_w` taps are active. |
-| `s_window_m2s` / `s_window_s2m` | in / out | `axi_stream_pkg.axi_stream_m2s_t` / `axi_stream_s2m_t` | One pooling window per beat, from `cnn_accel_window_gen`. `data` low `cfg_pool_kernel_h * cfg_pool_kernel_w * 8` bits hold that many signed int8 taps: tap `i = row * cfg_pool_kernel_w + col` at bits `8*i + 7 downto 8*i` (row-major, ascending from the low bits). Remaining high bits are don't-care. |
+| `s_window_m2s` / `s_window_s2m` | in / out | `cnn_accel_pkg.window_m2s_t` / `window_s2m_t`, `data(0 to g_max_kernel_size**2 - 1)` | One pooling window per beat, from `cnn_accel_window_gen`. Element `i = row * cfg_pool_kernel_w + col` (row-major) is that tap as a signed int8; only the `cfg_pool_kernel_h * cfg_pool_kernel_w` lowest-indexed elements are active, the rest are ignored (they carry the window generator's pad value). `first_tile`/`last_tile` are unused: a pooling window is always exactly one tile. |
 | `m_max_m2s` / `m_max_s2m` | out / in | `axi_stream_pkg.axi_stream_m2s_t` / `axi_stream_s2m_t` | `OPCODE_POOL_MAX` result: int8 max, `data(7 downto 0)` (high bits `0`). To the final output `handshake_mux` (bypasses `cnn_accel_bias_requant`). |
 | `m_avgsum_m2s` / `m_avgsum_s2m` | out / in | `axi_stream_pkg.axi_stream_m2s_t` / `axi_stream_s2m_t` | `OPCODE_POOL_AVG` result: `g_accum_width`-bit sum, `data(g_accum_width - 1 downto 0)` (high bits `0`). To `cnn_accel_bias_requant`. |
 
@@ -91,7 +91,8 @@ combinationally by `cnn_accel_layer_ctrl`).
   tap array (masked by `active_count`, not by an identity-value
   substitution), not a literal balanced binary tree — functionally
   identical result/latency for this generic-bounded lane count
-  (`g_max_kernel_size <= 4`, i.e. at most 16 lanes).
+  (`g_max_kernel_size = 5`, i.e. 25 lanes; the old `<= 4` ceiling went
+  away with the move off `axi_stream_m2s_t`).
 - One shared one-entry output register (not two independent per-port
   registers) — see `doc/cnn_accel_pool_proposal.md` section 4 for why this
   structurally guarantees output mutual exclusion instead of relying on a

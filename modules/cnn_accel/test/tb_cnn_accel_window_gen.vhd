@@ -76,6 +76,8 @@ architecture tb of tb_cnn_accel_window_gen is
   signal cfg_pad_bottom : std_ulogic_vector(7 downto 0) := (others => '0');
   signal cfg_pad_left : std_ulogic_vector(7 downto 0) := (others => '0');
   signal cfg_pad_right : std_ulogic_vector(7 downto 0) := (others => '0');
+  -- ISA v2.1: the int8 value padded taps take (the tensor's zero-point).
+  signal cfg_pad_value : std_ulogic_vector(7 downto 0) := (others => '0');
   signal cfg_in_width : std_ulogic_vector(15 downto 0) := (others => '0');
   signal cfg_in_height : std_ulogic_vector(15 downto 0) := (others => '0');
   signal cfg_in_channels : std_ulogic_vector(15 downto 0) := (others => '0');
@@ -163,15 +165,19 @@ architecture tb of tb_cnn_accel_window_gen is
   -- Golden model.
   ------------------------------------------------------------------------
 
-  -- Returns 0 for any (row, col) outside '[0, in_h) x [0, in_w)' (spatial
-  -- zero-padding) or any 'channel' outside '[0, in_channels)' (D11's
-  -- final-tile-lane zero-padding), the real pixel otherwise.
+  -- Returns 'pad_value' for any (row, col) outside
+  -- '[0, in_h) x [0, in_w)' (spatial padding, ISA v2.1: the pad fill is
+  -- the tensor's zero-point, not necessarily 0) and 0 for any 'channel'
+  -- outside '[0, in_channels)' (D11's final-tile-lane zero-padding --
+  -- deliberately still 0: that is a *channel* lane that does not exist,
+  -- not a spatial position outside the frame), the real pixel otherwise.
   function golden_tap(
-    frame : frame_t; in_h, in_w, in_channels : natural; row, col, channel : integer
+    frame : frame_t; in_h, in_w, in_channels : natural; row, col, channel : integer;
+    pad_value : integer
   ) return integer is
   begin
     if row < 0 or col < 0 or row > in_h - 1 or col > in_w - 1 then
-      return 0;
+      return pad_value;
     end if;
     if channel > in_channels - 1 then
       return 0;
@@ -187,11 +193,19 @@ architecture tb of tb_cnn_accel_window_gen is
   function golden_window(
     frame : frame_t;
     in_h, in_w, in_channels, kh, kw, sh, sw, pad_top, pad_left : natural;
-    out_row, out_col, tile_idx : natural
+    out_row, out_col, tile_idx : natural;
+    pad_value : integer
   ) return std_ulogic_vector is
+    -- Every element starts at the pad value, not 0: the DUT clears its
+    -- whole tap-assembly register to 'cfg_pad_value' at the start of each
+    -- window, so the taps beyond the runtime 'kh * kw' (which no consumer
+    -- looks at) hold the pad value as well.
     variable result : std_ulogic_vector(c_max_window_bits - 1 downto 0) := (others => '0');
     variable input_row, input_col, tap_idx, abs_channel : integer;
   begin
+    for i in 0 to c_max_window_length - 1 loop
+      result(8 * (i + 1) - 1 downto 8 * i) := std_ulogic_vector(to_signed(pad_value, 8));
+    end loop;
     for kr in 0 to kh - 1 loop
       for kc in 0 to kw - 1 loop
         input_row := out_row * sh + kr - pad_top;
@@ -201,7 +215,9 @@ architecture tb of tb_cnn_accel_window_gen is
           abs_channel := tile_idx * c_tile_channels + c;
           result(8 * (tap_idx * c_tile_channels + c + 1) - 1 downto 8 * (tap_idx * c_tile_channels + c)) :=
             std_ulogic_vector(to_signed(
-              golden_tap(frame, in_h, in_w, in_channels, input_row, input_col, abs_channel), 8
+              golden_tap(
+                frame, in_h, in_w, in_channels, input_row, input_col, abs_channel, pad_value
+              ), 8
             ));
         end loop;
       end loop;
@@ -256,6 +272,7 @@ begin
       cfg_pad_bottom => cfg_pad_bottom,
       cfg_pad_left => cfg_pad_left,
       cfg_pad_right => cfg_pad_right,
+      cfg_pad_value => cfg_pad_value,
       cfg_in_width => cfg_in_width,
       cfg_in_height => cfg_in_height,
       cfg_in_channels => cfg_in_channels,
@@ -403,9 +420,11 @@ begin
     -- samples 'cfg_*' the same edge 'start' is high, so these must be
     -- assigned before (not after) the pulse.
     procedure begin_frame(
-      kh, kw, sh, sw, pt, pb, pl, pr, inw, inh, in_channels : natural
+      kh, kw, sh, sw, pt, pb, pl, pr, inw, inh, in_channels : natural;
+      pad_value : integer := 0
     ) is
     begin
+      cfg_pad_value <= std_ulogic_vector(to_signed(pad_value, 8));
       cfg_kernel_h <= std_ulogic_vector(to_unsigned(kh, 8));
       cfg_kernel_w <= std_ulogic_vector(to_unsigned(kw, 8));
       cfg_stride_h <= std_ulogic_vector(to_unsigned(sh, 8));
@@ -428,7 +447,8 @@ begin
     -- when 'T = 1'; 'last' fires only on the last tile beat of the final
     -- pixel.
     procedure enqueue_frame_expected(
-      in_h, in_w, in_channels, kh, kw, sh, sw, pad_top, pad_left, out_h, out_w : natural
+      in_h, in_w, in_channels, kh, kw, sh, sw, pad_top, pad_left, out_h, out_w : natural;
+      pad_value : integer := 0
     ) is
       variable t : natural;
     begin
@@ -437,7 +457,8 @@ begin
         for ocol in 0 to out_w - 1 loop
           for tile in 0 to t - 1 loop
             push(expected_q, golden_window(
-              frame, in_h, in_w, in_channels, kh, kw, sh, sw, pad_top, pad_left, orow, ocol, tile
+              frame, in_h, in_w, in_channels, kh, kw, sh, sw, pad_top, pad_left, orow, ocol,
+              tile, pad_value
             ));
             push(expected_q, to_sl(tile = 0));
             push(expected_q, to_sl(tile = t - 1));
@@ -469,17 +490,20 @@ begin
       in_h, in_w, kh, kw, sh, sw, pt, pb, pl, pr : natural;
       stall_in, stall_out : natural;
       max_wait_cycles : positive;
-      in_channels : natural := c_tile_channels
+      in_channels : natural := c_tile_channels;
+      pad_value : integer := 0
     ) is
       variable out_w, out_h : natural;
       variable last_row_needed, last_col_needed : integer;
       variable rows_to_stream : natural;
     begin
       do_reset;
-      begin_frame(kh, kw, sh, sw, pt, pb, pl, pr, in_w, in_h, in_channels);
+      begin_frame(kh, kw, sh, sw, pt, pb, pl, pr, in_w, in_h, in_channels, pad_value);
       out_w := (in_w + pl + pr - kw) / sw + 1;
       out_h := (in_h + pt + pb - kh) / sh + 1;
-      enqueue_frame_expected(in_h, in_w, in_channels, kh, kw, sh, sw, pt, pl, out_h, out_w);
+      enqueue_frame_expected(
+        in_h, in_w, in_channels, kh, kw, sh, sw, pt, pl, out_h, out_w, pad_value
+      );
       cur_stall_out <= stall_out;
       -- The DUT can legitimately finish a frame (deassert
       -- 's_stream_s2m.ready' via its own 'active_q', per 'done's contract
@@ -544,6 +568,49 @@ begin
           15, 15, 2000
         );
       end loop;
+
+    elsif run("test_pad_value") then
+      -- ISA v2.1: padded taps take 'cfg_pad_value', not 0. Swept over the
+      -- interesting int8 values -- 0 (the pre-v2.1 behaviour, which must
+      -- be bit-identical to what test_padding_all_sides already checks),
+      -- -128 (YOLOv8n's activation zero-point, the case this exists for),
+      -- +127 and an arbitrary positive -- across every padding
+      -- combination, so both the spatial pad taps and the
+      -- beyond-the-kernel taps are checked against the golden model.
+      for p in c_pads'range loop
+        random_frame(5, 5);
+        run_frame(
+          5, 5, 3, 3, 1, 1,
+          c_pads(p).top, c_pads(p).bottom, c_pads(p).left, c_pads(p).right,
+          15, 15, 2000, c_tile_channels, -128
+        );
+
+        random_frame(5, 5);
+        run_frame(
+          5, 5, 3, 3, 1, 1,
+          c_pads(p).top, c_pads(p).bottom, c_pads(p).left, c_pads(p).right,
+          15, 15, 2000, c_tile_channels, 127
+        );
+
+        random_frame(5, 5);
+        run_frame(
+          5, 5, 3, 3, 1, 1,
+          c_pads(p).top, c_pads(p).bottom, c_pads(p).left, c_pads(p).right,
+          15, 15, 2000, c_tile_channels, 37
+        );
+      end loop;
+
+      -- A pad value combined with channel tiling: the D11 unused-lane
+      -- fill stays 0 (it is a nonexistent channel, not a spatial pad),
+      -- while the spatial pad taps take -128. Getting these two confused
+      -- is the obvious way to implement this wrong.
+      random_frame(4, 4);
+      run_frame(4, 4, 3, 3, 1, 1, 1, 1, 1, 1, 30, 30, 2000, 3, -128);
+
+      -- Stride 2 with a pad value: the pad taps of the *bottom/right*
+      -- windows, which only exist because padding extends the frame.
+      random_frame(5, 5);
+      run_frame(5, 5, 3, 3, 2, 2, 1, 1, 1, 1, 20, 20, 2000, c_tile_channels, -128);
 
     elsif run("test_backpressure") then
       random_frame(6, 6);

@@ -154,6 +154,12 @@ class LayerDesc:
     # ISA v1.2 (H2), W14: byte address of the per-channel requant table
     # (`pack_scale_table_for_hw`), read only while `per_channel_en`.
     scale_addr: int = 0
+    # ISA v2.1, W10 byte 41: the int8 value a padded tap takes, i.e. the
+    # input tensor's quantization zero-point. 0 (the reserved-must-be-0
+    # value every earlier revision wrote) reproduces the old zero-padding
+    # exactly. Consumed by `_pool_windows`; `_conv_windows` deliberately
+    # still pads with 0 -- see `_pool_windows`' docstring.
+    pad_value: int = 0
 
     @property
     def relu_en(self) -> bool:
@@ -229,6 +235,7 @@ def encode_instruction(desc: LayerDesc) -> bytes:
     struct.pack_into("<b", buf, OFF_CLAMP_MIN, desc.clamp_min)
     struct.pack_into("<b", buf, OFF_CLAMP_MAX, desc.clamp_max)
     struct.pack_into("<I", buf, OFF_SCALE_ADDR, desc.scale_addr & 0xFFFFFFFF)
+    struct.pack_into("<b", buf, OFF_PAD_VALUE, desc.pad_value)
     return bytes(buf)
 
 
@@ -268,6 +275,7 @@ def decode_instruction(data: bytes) -> LayerDesc:
         clamp_min=struct.unpack_from("<b", data, OFF_CLAMP_MIN)[0],
         clamp_max=struct.unpack_from("<b", data, OFF_CLAMP_MAX)[0],
         scale_addr=struct.unpack_from("<I", data, OFF_SCALE_ADDR)[0],
+        pad_value=struct.unpack_from("<b", data, OFF_PAD_VALUE)[0],
     )
 
 
@@ -439,12 +447,15 @@ def _at(
     width: int,
     height: int,
     channels: int,
+    outside: int = 0,
 ) -> int:
-    """HWC-indexed read from a flat activation buffer, 0 outside
-    `[0, width) x [0, height)` (the zero-padding convention -- callers pass
-    already-shifted `row`/`col` so this only needs to bounds-check)."""
+    """HWC-indexed read from a flat activation buffer, returning `outside`
+    (default 0) outside `[0, width) x [0, height)` -- the padding
+    convention. Callers pass already-shifted `row`/`col` so this only needs
+    to bounds-check. `outside` is the ISA v2.1 `pad_value`; convolution
+    leaves it at its 0 default (see `_pool_windows`)."""
     if row < 0 or row >= height or col < 0 or col >= width:
-        return 0
+        return outside
     return values[(row * width + col) * channels + channel]
 
 
@@ -944,42 +955,69 @@ def unpack_scale_table_from_hw(packed: bytes, entries: int) -> list[tuple[int, i
     return table
 
 
+def _pool_padding(desc: LayerDesc) -> tuple[int, int, int, int]:
+    """`(pad_top, pad_bottom, pad_left, pad_right)` actually applied to a
+    pooling instruction: the descriptor's four pad fields when
+    `FLAG_PAD_EN` is set, all zero otherwise. Same `pad_en`-gates-the-pad-
+    fields rule the convolution path already follows, and the same one
+    `cnn_accel_cmd_proc.vhd` implements."""
+    if not desc.pad_en:
+        return (0, 0, 0, 0)
+    return (desc.pad_top, desc.pad_bottom, desc.pad_left, desc.pad_right)
+
+
 def _pool_windows(input_values: list[int], desc: LayerDesc) -> list[list[int]]:
     """Per-channel pooling windows in output-raster order, one list of
     `pool_kernel_h * pool_kernel_w` int8 taps per (output position,
     channel).
 
-    LIMITATION (v1): zero-padding is NOT modeled for pooling -- the v1
-    ISA has no pooling-specific padding fields, and `pad_en` is only
-    meaningful for `CONV2D`/`DWCONV2D`/`FC`. If `desc.pad_en` is set for
-    a pooling instruction this is a program-authoring error (the bit
-    would be silently ignored otherwise) and raises `ValueError`."""
-    if desc.pad_en:
-        raise ValueError(
-            "pooling has no padding support in v1 (pad_en must be 0 for "
-            "POOL_MAX/POOL_AVG)"
-        )
+    ISA v2.1: pooling honours `FLAG_PAD_EN` + `pad_top/bottom/left/right`
+    (previously rejected outright), and a padded tap takes
+    `desc.pad_value` -- NOT 0. That distinction is the whole point of the
+    field: for an int8 tensor whose zero-point is not 0, a 0 tap is a real,
+    often large, value. YOLOv8n's activations have zero_point = -128, so a
+    zero-filled border tap beats nearly every real activation and silently
+    wins every border max. `pad_value` defaults to 0, so a program that
+    never sets it behaves exactly as before.
+
+    `_conv_windows` deliberately still pads with a hard 0 (and so does the
+    RTL's conv `cnn_accel_window_gen` instance, whose `cfg_pad_value` is
+    tied off): convolution has the same theoretical issue, but changing it
+    would change every existing conv result, and is out of scope here."""
     in_w, in_h, channels = desc.in_width, desc.in_height, desc.in_channels
     k_h, k_w = desc.pool_kernel_h, desc.pool_kernel_w
     s_h, s_w = desc.pool_stride_h, desc.pool_stride_w
+    pad_t, pad_b, pad_l, pad_r = _pool_padding(desc)
     if s_h == 0 or s_w == 0:
         raise ValueError(f"pool: pool_stride_h/pool_stride_w must be nonzero, got ({s_h}, {s_w})")
-    out_h = (in_h - k_h) // s_h + 1
-    out_w = (in_w - k_w) // s_w + 1
+    if not -128 <= desc.pad_value <= 127:
+        raise ValueError(f"pool: pad_value must be int8, got {desc.pad_value}")
+    out_h = (in_h + pad_t + pad_b - k_h) // s_h + 1
+    out_w = (in_w + pad_l + pad_r - k_w) // s_w + 1
     if out_h <= 0 or out_w <= 0:
         raise ValueError(
             f"pool: computed output dims must be positive, got out_h={out_h} out_w={out_w} "
-            f"(input {in_h}x{in_w}, kernel {k_h}x{k_w}, stride {s_h}x{s_w})"
+            f"(input {in_h}x{in_w}, kernel {k_h}x{k_w}, stride {s_h}x{s_w}, "
+            f"pad {pad_t}/{pad_b}/{pad_l}/{pad_r})"
         )
 
     windows: list[list[int]] = []
     for out_row in range(out_h):
         for out_col in range(out_w):
-            base_row = out_row * s_h
-            base_col = out_col * s_w
+            base_row = out_row * s_h - pad_t
+            base_col = out_col * s_w - pad_l
             for ch in range(channels):
                 taps = [
-                    _at(input_values, base_row + kr, base_col + kc, ch, in_w, in_h, channels)
+                    _at(
+                        input_values,
+                        base_row + kr,
+                        base_col + kc,
+                        ch,
+                        in_w,
+                        in_h,
+                        channels,
+                        outside=desc.pad_value,
+                    )
                     for kr in range(k_h)
                     for kc in range(k_w)
                 ]
@@ -1002,8 +1040,7 @@ def pool_avg(input_values: list[int], desc: LayerDesc) -> list[int]:
     windows = _pool_windows(input_values, desc)
     channels = desc.in_channels
     # windows is in (out_row, out_col, channel) raster order, see _pool_windows.
-    out_h = (desc.in_height - desc.pool_kernel_h) // desc.pool_stride_h + 1
-    out_w = (desc.in_width - desc.pool_kernel_w) // desc.pool_stride_w + 1
+    out_w, out_h = _pool_output_dims(desc)
     output: list[int] = []
     idx = 0
     for out_row in range(out_h):
@@ -1057,8 +1094,9 @@ def _pool_output_dims(desc: LayerDesc) -> tuple[int, int]:
     """`(out_width, out_height)` for `POOL_MAX`/`POOL_AVG`, duplicating
     `_pool_windows`'s own formula for the same reason as
     `_conv_output_dims`."""
-    out_h = (desc.in_height - desc.pool_kernel_h) // desc.pool_stride_h + 1
-    out_w = (desc.in_width - desc.pool_kernel_w) // desc.pool_stride_w + 1
+    pad_t, pad_b, pad_l, pad_r = _pool_padding(desc)
+    out_h = (desc.in_height + pad_t + pad_b - desc.pool_kernel_h) // desc.pool_stride_h + 1
+    out_w = (desc.in_width + pad_l + pad_r - desc.pool_kernel_w) // desc.pool_stride_w + 1
     return out_w, out_h
 
 

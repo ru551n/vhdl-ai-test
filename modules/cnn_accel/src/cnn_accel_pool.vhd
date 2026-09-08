@@ -25,9 +25,20 @@ entity cnn_accel_pool is
   generic (
     -- Upper bound on 'cfg_pool_kernel_h'/'cfg_pool_kernel_w' individually;
     -- sizes the fixed 'g_max_kernel_size**2'-lane tap array/reduction
-    -- network. Contract: 'g_max_kernel_size**2 * 8 <= axi_stream_data_sz'
-    -- (128), since 's_window_m2s.data' uses the fixed-width
-    -- 'axi_stream_pkg' record type -- see proposal doc section 2.
+    -- network. This is the POOL kernel bound
+    -- ('cnn_accel_constant_max_pool_kernel_size', 5), deliberately
+    -- separate from and larger than the conv datapath's own
+    -- 'g_max_kernel_size' (3) -- YOLOv8n's SPPF pools 5x5 while all its
+    -- convolutions are 1x1/3x3, so only this path pays for it.
+    --
+    -- There is no longer an upper bound of the form 'g_max_kernel_size**2
+    -- * 8 <= axi_stream_data_sz': 's_window' is the unconstrained
+    -- 'window_m2s_t' tap-array record (cnn_accel_pkg) the conv path
+    -- already uses, not the fixed-128-bit 'axi_stream_m2s_t' it used to
+    -- be. That change is what makes 5x5 (25 taps = 200 bits) possible at
+    -- all, and it was made in preference to widening the
+    -- hdl-modules-wide 'axi_stream_data_sz', which would have inflated
+    -- every stream in the design.
     g_max_kernel_size : positive;
     -- 'OPCODE_POOL_AVG' sum width. Must be wide enough to hold
     -- 'g_max_kernel_size**2 * 127' (the maximum possible window sum)
@@ -48,20 +59,24 @@ entity cnn_accel_pool is
     cfg_opcode : in std_ulogic_vector(7 downto 0);
     -- Pool kernel height/width for the in-flight instruction. Contract:
     -- '1 <= cfg_pool_kernel_h, cfg_pool_kernel_w <= g_max_kernel_size'.
-    -- 'cfg_pool_kernel_h * cfg_pool_kernel_w' taps (the low bits of
-    -- 's_window_m2s.data') are active; the rest of the window beat is
-    -- ignored.
+    -- 'cfg_pool_kernel_h * cfg_pool_kernel_w' taps (the lowest-indexed
+    -- elements of 's_window_m2s.data') are active; the rest of the window
+    -- beat is ignored.
     cfg_pool_kernel_h : in std_ulogic_vector(7 downto 0);
     cfg_pool_kernel_w : in std_ulogic_vector(7 downto 0);
     --# {{}}
     -- One pooling window per beat, from 'cnn_accel_window_gen' (already
-    -- opcode-selected upstream by a 'handshake_splitter'). 'data' low
-    -- 'cfg_pool_kernel_h * cfg_pool_kernel_w * 8' bits hold that many
-    -- signed int8 taps, tap 'i' (row-major, 'i = row * cfg_pool_kernel_w +
-    -- col') at bits '8*i + 7 downto 8*i'; the remaining high bits are
-    -- don't-care.
-    s_window_m2s : in axi_stream_m2s_t;
-    s_window_s2m : out axi_stream_s2m_t;
+    -- opcode-selected upstream). Element 'i' of 'data' is tap 'i'
+    -- (row-major, 'i = row * cfg_pool_kernel_w + col') as a signed int8;
+    -- only the 'cfg_pool_kernel_h * cfg_pool_kernel_w' lowest-indexed
+    -- elements are active, the rest are ignored (they carry the window
+    -- generator's pad value).
+    --
+    -- 'first_tile'/'last_tile' are unused here: pooling is
+    -- channel-parallel across lanes, never channel-tiled, so a pooling
+    -- window is always exactly one tile.
+    s_window_m2s : in window_m2s_t(data(0 to g_max_kernel_size * g_max_kernel_size - 1));
+    s_window_s2m : out window_s2m_t;
     --# {{}}
     -- 'OPCODE_POOL_MAX' result: int8 max over the window's active taps, on
     -- 'data(7 downto 0)' ('data' high bits are 0). To the final output
@@ -89,16 +104,17 @@ architecture a of cnn_accel_pool is
   type tap_arr_t is array (0 to c_max_taps - 1) of signed(7 downto 0);
 
   ------------------------------------------------------------------------
-  -- Extracts the fixed-size tap array from the low bits of an
-  -- 's_window_m2s.data'-shaped vector, per the tap-packing convention
-  -- documented on the 's_window_m2s' port above.
+  -- Reinterprets the window record's int8 tap array as signed, per the
+  -- element layout documented on the 's_window_m2s' port above. A plain
+  -- element-wise cast now that 'data' is an array rather than a packed
+  -- vector -- no bit slicing left to get wrong.
   ------------------------------------------------------------------------
 
-  function extract_taps(data : std_ulogic_vector) return tap_arr_t is
+  function extract_taps(data : tap_array_t) return tap_arr_t is
     variable result : tap_arr_t;
   begin
     for i in 0 to c_max_taps - 1 loop
-      result(i) := signed(data(8 * i + 7 downto 8 * i));
+      result(i) := signed(data(i));
     end loop;
     return result;
   end function;
@@ -169,11 +185,11 @@ begin
   -- Static sizing contract checks -- see the generics' doc comments.
   ------------------------------------------------------------------------
 
-  assert c_max_taps * 8 <= axi_stream_data_sz
-    report "cnn_accel_pool: g_max_kernel_size**2 * 8 exceeds axi_stream_data_sz " &
-      "(the fixed-width axi_stream_pkg data field cannot carry that many taps)"
-    severity failure;
-
+  -- No tap-count ceiling any more: 's_window' is the unconstrained
+  -- 'window_m2s_t' tap array (see the generic's comment). The output
+  -- streams are still fixed-width 'axi_stream_m2s_t', so their payloads
+  -- are what needs checking -- 'm_max' is one int8 and can never
+  -- overflow, 'm_avgsum' is 'g_accum_width' wide.
   assert g_accum_width <= axi_stream_data_sz
     report "cnn_accel_pool: g_accum_width exceeds axi_stream_data_sz " &
       "(the fixed-width axi_stream_pkg data field cannot carry that wide a sum)"
