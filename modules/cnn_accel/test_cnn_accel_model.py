@@ -616,10 +616,12 @@ def test_isa_layout_self_consistent() -> None:
     above, which cross-checks the model's *exported* `OFF_*` names against
     independently hand-typed literals): no two fields overlap, no field
     (named or reserved) crosses the 64-byte word boundary, and the
-    documented reserved gaps (W0 bytes 2-3, W10 bytes 41-43, W15 bytes
-    60-63 -- doc/cnn_accel_arch.md's ISA table; W13 became the ISA v1.1
+    documented reserved gaps (W0 byte 3 and W10 bytes 41-43 --
+    doc/cnn_accel_arch.md's ISA table; W13 became the ISA v1.1
     output_offset/clamp_min/clamp_max fields in H1, W14 the ISA v1.2
-    scale_addr in H2) land exactly where specified. This is the guarantee that replaces the old hand-maintained
+    scale_addr in H2, and in ISA v2.0 W0 byte 2 became the `spaces`
+    tag byte and W15 bytes 60-63 became `xfer_bytes` --
+    doc/cnn_accel_top_v2_arch.md section 5) land exactly where specified. This is the guarantee that replaces the old hand-maintained
     "cnn_accel_model.py's encoder must agree with these byte-for-byte"
     comment with something a test actually enforces."""
     occupied = bytearray(cnn_accel_constants.INSTR_WORD_BYTES)
@@ -641,7 +643,7 @@ def test_isa_layout_self_consistent() -> None:
     assert offset == cnn_accel_constants.INSTR_WORD_BYTES
     assert all(occupied), "instruction word has unaccounted-for byte(s)"
 
-    assert cnn_accel_constants.isa_reserved_ranges() == [(2, 3), (41, 43), (60, 63)]
+    assert cnn_accel_constants.isa_reserved_ranges() == [(3, 3), (41, 43)]
 
     # Every non-reserved field name is unique and does not collide with the
     # `RESERVED` sentinel.

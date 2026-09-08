@@ -144,6 +144,8 @@ package cnn_accel_isa_pkg is
         vhdl += "\n"
         vhdl += self._flags()
         vhdl += "\n"
+        vhdl += self._spaces()
+        vhdl += "\n"
         vhdl += self._instruction_layout()
         vhdl += "\nend package cnn_accel_isa_pkg;\n"
 
@@ -167,6 +169,35 @@ package cnn_accel_isa_pkg is
         )
         for name, bit in cnn_accel_constants.FLAGS.items():
             result += f"  constant FLAG_{name} : natural := {bit};\n"
+        return result
+
+    def _spaces(self) -> str:
+        result = self.comment_block(
+            text=[
+                "Storage-space tag values (ISA v2.0), 2 bits per operand.",
+                "DDR is 0 so a v1.2 word's reserved-zero spaces byte means "
+                "'every operand in DDR', i.e. exact v1.2 semantics.",
+            ],
+            indent=2,
+        )
+        for name, value in cnn_accel_constants.SPACES.items():
+            result += (
+                f"  constant SPACE_{name} : std_ulogic_vector("
+                f"{cnn_accel_constants.SPACE_TAG_BITS - 1} downto 0) := "
+                f'"{value:0{cnn_accel_constants.SPACE_TAG_BITS}b}";\n'
+            )
+
+        result += "\n"
+        result += self.comment_block(
+            text=[
+                "Bit index of each operand's space tag inside the 'spaces' byte "
+                "(instruction word W0 bits [23:16]), same idiom as FLAG_* above.",
+            ],
+            indent=2,
+        )
+        for name, bit in cnn_accel_constants.SPACE_FIELDS.items():
+            result += f"  constant SPACE_SHIFT_{name} : natural := {bit};\n"
+
         return result
 
     def _instruction_layout(self) -> str:
@@ -197,8 +228,9 @@ package cnn_accel_isa_pkg is
                     if field.width_bytes == 1
                     else f"{offset}-{offset + field.width_bytes - 1}"
                 )
+                byte_noun = "byte" if field.width_bytes == 1 else "bytes"
                 result += self.comment(
-                    f"{word_label} bytes {byte_label}: reserved, must be 0.", indent=2
+                    f"{word_label} {byte_noun} {byte_label}: reserved, must be 0.", indent=2
                 )
             else:
                 result += f"  constant c_off_{field.name} : natural := {offset};\n"

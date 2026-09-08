@@ -206,6 +206,19 @@ OPCODES: dict[str, int] = {
     "POOL_MAX": 0x03,
     "POOL_AVG": 0x04,
     "FC": 0x05,
+    # ISA v2.0 (doc/cnn_accel_top_v2_arch.md section 5): explicit data
+    # movement between DDR and the local tensor scratchpad, plus the
+    # local-to-local elementwise/resample family. The v1.2 compute opcodes
+    # above keep their values (0x00-0x05), so a v1.2 program is a valid
+    # v2.0 program; the v2.0 family starts at 0x10 to leave 0x06-0x0F free
+    # for future compute opcodes rather than interleaving the two families.
+    "LOAD": 0x10,
+    "STORE": 0x11,
+    "LOADW": 0x12,
+    "ADD": 0x13,
+    "UPSAMPLE": 0x14,
+    "COPY": 0x15,
+    "ACT": 0x16,
 }
 
 # ---------------------------------------------------------------------------
@@ -229,6 +242,47 @@ FLAGS: dict[str, int] = {
     # channel) instead of the descriptor's requant_scale/requant_shift,
     # which are then ignored. Only meaningful with REQUANT_EN.
     "PER_CHANNEL_EN": 5,
+    # ISA v2.0 (doc/cnn_accel_top_v2_arch.md section 5): the epilogue's
+    # activation comes from the 256-entry int8->int8 LUT in LOCAL_WEIGHT
+    # instead of the RELU_EN/CLAMP_EN range logic. This is the H1
+    # general-activation path (SiLU etc.), and it is what the standalone
+    # `ACT` opcode uses unconditionally.
+    "ACT_LUT_EN": 6,
+    # ISA v2.0: this command's weights/bias/scale are already resident in
+    # LOCAL_WEIGHT from a previous LOADW or conv, so the weight buffer must
+    # not be refilled. This is the flag residency invariant R6 asserts on
+    # (a repeated conv adds zero to WEIGHT_LOAD_BYTES).
+    "WEIGHT_REUSE": 7,
+}
+
+# ---------------------------------------------------------------------------
+# Storage spaces (ISA v2.0, doc/cnn_accel_top_v2_arch.md section 5.1).
+#
+# Every address-bearing operand carries a 2-bit tag naming the address
+# space its address refers to. `DDR` is 0 so that a v1.2 instruction word
+# -- whose W0 bytes 2-3 were `reserved, must be 0` -- decodes as
+# "all operands in DDR", which is exactly v1.2 semantics. This is the
+# mechanism that makes v2.0 backward compatible by construction rather
+# than by convention.
+# ---------------------------------------------------------------------------
+
+SPACES: dict[str, int] = {
+    "DDR": 0,
+    "LOCAL_TENSOR": 1,
+    "LOCAL_WEIGHT": 2,
+    "RESERVED": 3,
+}
+
+SPACE_TAG_BITS = 2
+
+# Bit index of each operand's tag inside the `spaces` byte (W0 bits
+# [23:16]). Same idiom as `FLAGS` above: indices into a named byte of the
+# instruction word, not absolute bit positions.
+SPACE_FIELDS: dict[str, int] = {
+    "SRC0": 0,
+    "SRC1": 2,
+    "DST": 4,
+    "WGT": 6,
 }
 
 # ---------------------------------------------------------------------------
@@ -256,7 +310,11 @@ class IsaField(NamedTuple):
 ISA_LAYOUT: tuple[IsaField, ...] = (
     IsaField("opcode", 1),
     IsaField("flags", 1),
-    IsaField(RESERVED, 2),  # W0 bytes 2-3
+    # W0 byte 2 (ISA v2.0): the four 2-bit operand storage-space tags, see
+    # `SPACES`/`SPACE_FIELDS`. Reserved-must-be-0 in v1.2, and DDR == 0, so
+    # v1.2 programs decode unchanged.
+    IsaField("spaces", 1),
+    IsaField(RESERVED, 1),  # W0 byte 3
     IsaField("in_addr", 4),
     IsaField("out_addr", 4),
     IsaField("weight_addr", 4),
@@ -292,7 +350,12 @@ ISA_LAYOUT: tuple[IsaField, ...] = (
     # table (PER_CHANNEL_EN). Must be 0 in a v1.0/v1.1 program (reserved-
     # must-be-0), and is ignored while PER_CHANNEL_EN is clear.
     IsaField("scale_addr", 4),
-    IsaField(RESERVED, 4),  # W15 bytes 60-63
+    # W15 (ISA v2.0): transfer size in bytes for the data-movement and
+    # elementwise family (LOAD/STORE/LOADW/ADD/UPSAMPLE/COPY/ACT). For ADD
+    # these same bits instead carry the second source operand's address
+    # (`src1_addr`), since ADD's size is implied by its tensor geometry.
+    # Reserved-must-be-0 in v1.2, and every v1.2 opcode ignores it.
+    IsaField("xfer_bytes", 4),
 )
 
 
