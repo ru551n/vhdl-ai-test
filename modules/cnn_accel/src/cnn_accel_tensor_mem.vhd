@@ -156,9 +156,10 @@ architecture a of cnn_accel_tensor_mem is
     return result;
   end function;
 
+  -- 'bank_mem_t' is instantiated once per bank inside the 'bank_gen'
+  -- generate below as its own independent signal, not as an element of a
+  -- shared array -- see that generate's own header comment for why.
   type bank_mem_t is array (0 to g_bank_words - 1) of data_word_t;
-  type bank_mem_arr_t is array (natural range <>) of bank_mem_t;
-  signal bank_ram : bank_mem_arr_t(0 to g_num_banks - 1);
 
   -- Per-bank write arbitration: which channel (0 or 1) won the write
   -- port on the previous contended cycle, so the next contended cycle
@@ -263,27 +264,6 @@ begin
 
   s_w0_s2m.ready <= w0_grant;
   s_w1_s2m.ready <= w1_grant;
-
-  ------------------------------------------------------------------------
-  -- Per-bank physical write port: performs the actual RAM write for
-  -- whichever channel was granted this bank this cycle, and updates that
-  -- bank's round-robin memory.
-  ------------------------------------------------------------------------
-
-  bank_write_gen : for b in 0 to g_num_banks - 1 generate
-    bank_write : process(clk)
-    begin
-      if rising_edge(clk) then
-        if w0_grant = '1' and w0_bank = b then
-          bank_ram(b)(w0_offset) <= s_w0_m2s.data(g_data_width - 1 downto 0);
-          w_last_granted_bank(b) <= 0;
-        elsif w1_grant = '1' and w1_bank = b then
-          bank_ram(b)(w1_offset) <= s_w1_m2s.data(g_data_width - 1 downto 0);
-          w_last_granted_bank(b) <= 1;
-        end if;
-      end if;
-    end process;
-  end generate;
 
   ------------------------------------------------------------------------
   -- Write channel 0/1 FSMs: accept a request while idle, otherwise
@@ -474,17 +454,84 @@ begin
   end process;
 
   ------------------------------------------------------------------------
-  -- Per-bank physical read port: issues the read for whichever channel
-  -- was granted this bank this cycle, and tags the 1-cycle-later result
-  -- with its owner so only that channel captures it.
+  -- Per-bank RAM: one independently-declared 'bank_mem' signal per
+  -- generate branch, one write process and one read process sharing it,
+  -- instead of a shared 2D array indexed by 'b'. This is
+  -- cnn_accel_window_gen.vhd's own 'gen_banks'/'bank_mem' idiom (M7;
+  -- doc/cnn_accel_window_gen_bram_proposal.md section 7.1, option 3a),
+  -- applied here for the same reason: a shared array-of-arrays signal
+  -- (the old 'bank_ram : bank_mem_arr_t(0 to g_num_banks - 1)', each
+  -- element a whole 'bank_mem_t') defeats memory inference. That
+  -- proposal's own writeup blamed Yosys's 'memory_collect' specifically;
+  -- caught here for Vivado too, empirically, the first time this entity
+  -- ever got its own netlist build (module_cnn_accel.py's
+  -- 'cnn_accel_tensor_mem_vivado'): with the shared-array form, Vivado's
+  -- synthesizer emitted "Potential Runtime issue for 3D-RAM or RAM from
+  -- Record/Structs for RAM bank_ram_reg with 131072 registers" and
+  -- mapped the whole default 2-bank/1024-word/64-bit scratchpad to
+  -- flip-flops (131664 FFs, 76421 LUTs, 0 BRAM) instead of the 2 RAMB36
+  -- it should cost. One write port and one read port per branch, per
+  -- this file's single-physical-port-per-bank contract.
   ------------------------------------------------------------------------
 
-  bank_read_gen : for b in 0 to g_num_banks - 1 generate
-    bank_read : process(clk)
+  bank_gen : for b in 0 to g_num_banks - 1 generate
+    signal bank_mem : bank_mem_t;
+  begin
+
+    -- Vivado's memory inference needs exactly one textual
+    -- 'bank_mem(addr) <= data'/'... <= bank_mem(addr)' occurrence per
+    -- port to recognize the canonical simple-dual-port-RAM template
+    -- (UG901): the write/read address and data must be pre-selected
+    -- (via a variable here) rather than branched to two different array
+    -- accesses in an if/elsif, even though only one ever executes per
+    -- cycle. Without this, Vivado's default flow mapped 'bank_mem' to
+    -- distributed RAM (RAM64M x 1056 for the default 1024-deep bank,
+    -- 0 block RAM) instead of the RAMB36 this entity's own header
+    -- comment and doc/cnn_accel_top_v2_arch.md section 4 both say a
+    -- "simple-dual-port, ram_style block" bank should cost -- found only
+    -- once this entity got its own Vivado netlist build. Yosys, unlike
+    -- Vivado, infers block RAM for the old two-array-access shape
+    -- without this rework (see cnn_accel_window_gen.vhd's/
+    -- cnn_accel_weight_buffer.vhd's own 'bank_mem'/'memory_block' idiom,
+    -- both BRAM-inferred under Yosys with an unconditional single-
+    -- address read and, on the write side, a single writer per bank so
+    -- there was never a second array access to begin with) -- this
+    -- entity, with two write and two read channels genuinely contending
+    -- per bank, is the first place that gap between the two backends'
+    -- inference heuristics actually mattered enough to fix.
+    bank_write : process(clk)
+      variable wr_addr : word_off_t;
+      variable wr_data : data_word_t;
+      variable wr_en : boolean;
     begin
       if rising_edge(clk) then
+        wr_en := false;
+        if w0_grant = '1' and w0_bank = b then
+          wr_addr := w0_offset;
+          wr_data := s_w0_m2s.data(g_data_width - 1 downto 0);
+          wr_en := true;
+          w_last_granted_bank(b) <= 0;
+        elsif w1_grant = '1' and w1_bank = b then
+          wr_addr := w1_offset;
+          wr_data := s_w1_m2s.data(g_data_width - 1 downto 0);
+          wr_en := true;
+          w_last_granted_bank(b) <= 1;
+        end if;
+        if wr_en then
+          bank_mem(wr_addr) <= wr_data;
+        end if;
+      end if;
+    end process;
+
+    bank_read : process(clk)
+      variable rd_addr : word_off_t;
+      variable rd_en : boolean;
+    begin
+      if rising_edge(clk) then
+        rd_en := false;
         if r0_grant = '1' and r0_bank = b then
-          bank_rd_data_q(b) <= bank_ram(b)(r0_offset_next);
+          rd_addr := r0_offset_next;
+          rd_en := true;
           bank_rd_owner_q(b) <= 0;
           bank_rd_valid_q(b) <= '1';
           if r0_beats_to_issue = 1 then
@@ -494,7 +541,8 @@ begin
           end if;
           r_last_granted_bank(b) <= 0;
         elsif r1_grant = '1' and r1_bank = b then
-          bank_rd_data_q(b) <= bank_ram(b)(r1_offset_next);
+          rd_addr := r1_offset_next;
+          rd_en := true;
           bank_rd_owner_q(b) <= 1;
           bank_rd_valid_q(b) <= '1';
           if r1_beats_to_issue = 1 then
@@ -506,8 +554,12 @@ begin
         else
           bank_rd_valid_q(b) <= '0';
         end if;
+        if rd_en then
+          bank_rd_data_q(b) <= bank_mem(rd_addr);
+        end if;
       end if;
     end process;
+
   end generate;
 
   r0_capture <= bank_rd_valid_q(r0_bank) and to_sl(bank_rd_owner_q(r0_bank) = 0);
@@ -585,6 +637,7 @@ begin
           decode := decode_addr(r0_req_m2s.req.addr);
           raw_beats := to_integer(r0_req_m2s.req.length) / c_bytes_per_word;
 
+          -- A zero-length read is worse than the write-side equivalent:
           if decode.offset + raw_beats > g_bank_words then
             assert false
               report "cnn_accel_tensor_mem: r0 request crosses a bank boundary; clamping"

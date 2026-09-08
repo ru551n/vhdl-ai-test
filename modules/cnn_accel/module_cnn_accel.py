@@ -1651,6 +1651,90 @@ class Module(BaseModule):
                     ],
                     analyze_synthesis_timing=True,
                 ),
+                # Local tensor scratchpad (doc/cnn_accel_top_v2_arch.md
+                # section 4). No Yosys twin, by the same standing decision
+                # as the two scaled points below (this project synthesizes
+                # cnn_accel with Vivado only) -- and this entity had NO
+                # netlist build at all until now, so its cost (in
+                # particular the per-channel landing/skid register and the
+                # 2:1 output mux added in front of each read channel) had
+                # never been measured. Default generics (`g_num_banks`=2,
+                # `g_bank_words`=1024, `g_data_width`=64): no project-wide
+                # constant exists for this entity's sizing the way
+                # `_PE_ROWS`/`_TILE_CHANNELS`/etc. do for the PE-array
+                # family, so there is no "different convention" to follow.
+                vivado_build(
+                    "cnn_accel_tensor_mem",
+                    "cnn_accel_tensor_mem",
+                    {},
+                    # First-ever measurement of this entity (it had no
+                    # netlist build at all before now), and it took two
+                    # real RTL fixes to get a meaningful number -- see
+                    # 'bank_gen's own header comment in
+                    # cnn_accel_tensor_mem.vhd for the full story:
+                    #   1. The old 'bank_ram' was ONE shared 2D array
+                    #      signal (`bank_mem_arr_t`, an array of
+                    #      `bank_mem_t`) indexed by bank number, not one
+                    #      independent per-bank signal the way
+                    #      cnn_accel_window_gen.vhd's/
+                    #      cnn_accel_weight_buffer.vhd's own 'bank_mem'/
+                    #      'memory_block' idiom already does. Vivado
+                    #      cannot map that shape to a RAMB36 at all ("
+                    #      Potential Runtime issue for 3D-RAM or RAM from
+                    #      Record/Structs") and fell back to one flip-flop
+                    #      per bit: 76421 LUTs, 131664 FFs, 0 BRAM for the
+                    #      default 2-bank/1024-word/64-bit point --
+                    #      obviously not "what the mux costs".
+                    #   2. Splitting `bank_ram` into a per-bank 'bank_mem'
+                    #      fixed the FF blowup (789 FFs) but Vivado still
+                    #      would not use block RAM: 11030 LUTs (2774 logic
+                    #      + 8256 LUTRAM), 0 BRAM, because the write/read
+                    #      processes had two textually-different
+                    #      'bank_mem(addr)' accesses (one per w0/w1 or
+                    #      r0/r1 branch) instead of one pre-selected
+                    #      address/enable per port -- UG901's canonical
+                    #      simple-dual-port template needs exactly one
+                    #      textual access per port to be recognized, even
+                    #      though only one branch ever executes per cycle.
+                    #      Rewriting both processes to select the
+                    #      address/data/enable into a variable first, then
+                    #      doing the single 'bank_mem(addr)' access
+                    #      unconditionally on that variable, fixed it.
+                    # Final measured 2026-09 (Vivado 2026.1) with
+                    # `analyze_synthesis_timing=True`: 783 LUTs, 534 FFs,
+                    # 4 RAMB36 (2 per bank -- each bank is 1024 x 64 =
+                    # 65536 bits, which needs 2 cascaded RAMB36 (36864 bits
+                    # each) since a single one is too small; NOT 1 per
+                    # bank as this build was first pinned before the real
+                    # measurement) + 0 RAMB18, 0 DSP, 0 LUTRAM.
+                    # 150 MHz timing estimate: PASS, 221.63 MHz -- an
+                    # upper bound like every other leaf here (its
+                    # geometry/arbiter cone starts at registers, not input
+                    # ports, so this one is closer to trustworthy than
+                    # most, but conv_core-style composition is still the
+                    # real test). Comfortably clear, as expected: the only
+                    # combinational depth is the per-bank round-robin
+                    # arbiter plus the landing-register/output-mux read
+                    # path added since this entity was last touched, none
+                    # of the deep arithmetic cones pe_array/bias_requant/
+                    # window_gen had. 0 DSP matches the header comment (no
+                    # multiply anywhere in this design). The new
+                    # per-channel landing/skid register and its 2:1 output
+                    # mux are FFs/LUTs, not a new resource class, and
+                    # there is no prior baseline to compare against (this
+                    # is the first measurement) -- but 783 LUTs/534 FFs is
+                    # a small fraction of an XC7A200T (134600 LUTs,
+                    # 365 RAMB36, 740 DSP), so the mux does not cost
+                    # anything meaningful.
+                    checkers=[
+                        TotalLuts(LessThan(1000)),
+                        Ffs(LessThan(700)),
+                        Ramb36(EqualTo(4)),
+                        Ramb18(LessThan(1)),
+                        DspBlocks(LessThan(1)),
+                    ],
+                    analyze_synthesis_timing=True,
+                ),
                 # The 60 fps scaling point (flow_status.md S1-S7:
                 # `PE_ROWS_SCALED`, THE single scaling knob doubled, every
                 # other generic identical to the shipped default above).
