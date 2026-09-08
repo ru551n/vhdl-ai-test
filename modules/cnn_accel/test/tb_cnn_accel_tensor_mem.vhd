@@ -18,15 +18,25 @@ use axi_stream.axi_stream_pkg.all;
 -- VUnit-5 testbench for cnn_accel_tensor_mem.
 --
 -- This is the regression test for the read-path data-loss defect fixed in
--- cnn_accel_tensor_mem.vhd's 'r0_can_issue'/'r1_can_issue' ('and not
--- rN_capture' -- see that file's read_arbitrate header comment for the full
--- writeup). Before that fix, a channel that drained its output register on
--- cycle T re-issued a bank read on cycle T as well as T+1, and the T beat
--- was silently overwritten in the per-bank read register before the
--- consumer ever saw it -- one dropped scratchpad beat per consumer stall,
--- with no error and no assertion. This testbench previously did not exist
--- at all, which is how the bug reached integration (10/14 tb_cnn_accel_top
--- tests broken) before being caught here.
+-- cnn_accel_tensor_mem.vhd's read path (see that file's read_arbitrate
+-- header comment for the full writeup). Before the fix, a channel that
+-- drained its output register on cycle T re-issued a bank read on cycle T
+-- as well as T+1, and the T beat was silently overwritten in the per-bank
+-- read register before the consumer ever saw it -- one dropped scratchpad
+-- beat per consumer stall, with no error and no assertion. This testbench
+-- previously did not exist at all, which is how the bug reached integration
+-- (10/14 tb_cnn_accel_top tests broken) before being caught here.
+--
+-- The current, fixed design makes losslessness a property of the DUT's data
+-- path rather than of its issue timing: each read channel has a private
+-- two-deep buffer (an output register plus a landing/"skid" register), so a
+-- beat returning from the bank while the output register is still occupied
+-- has a second slot to land in instead of overwriting anything. The issue
+-- rule ('rN_can_issue') only has to prove there is room for the *next*
+-- returning beat before granting a new read; it no longer has to serialize
+-- issue and capture the way the earlier throttling fix did (see below), so
+-- the channel can keep a read in flight across a consumer stall and sustain
+-- one beat per cycle.
 --
 -- Write side: driven directly through 'w0' with a small backpressure-
 -- honoring push procedure (module has only one physical write port per
@@ -74,6 +84,31 @@ architecture tb of tb_cnn_accel_tensor_mem is
   -- that a latency regression still fails them.
   constant c_read_pipeline_cycles : natural := 2;
 
+  -- test_r0_no_refill_bubble_after_stall: how many cycles into the burst
+  -- (from request acceptance) to hold the pause, and for how many cycles.
+  -- 'c_stall_start_cycles' must comfortably exceed 'c_read_pipeline_cycles'
+  -- so the pipeline has already reached steady state before the pause.
+  constant c_stall_start_cycles : natural := 10;
+  constant c_stall_len : natural := 5;
+
+  -- test_r0_no_refill_bubble_after_stall: word count for r0's own range
+  -- (bank 0, offset 0..c_bubble_r0_words-1); r1 contends for the rest of
+  -- the same bank (offset c_bubble_r0_words..c_bank_words-1).
+  constant c_bubble_r0_words : natural := 20;
+
+  -- Exact expected cycle span for r0's transfer in
+  -- test_r0_no_refill_bubble_after_stall, determined empirically (the
+  -- pattern is fully deterministic): pipeline fill, 'c_bubble_r0_words'
+  -- beats each costing (on average) 2 contended bank cycles because r1
+  -- shares the bank continuously, plus the deliberate 'c_stall_len'-cycle
+  -- stall. A refill bubble after the stall adds cycles beyond this.
+  constant c_bubble_expected_span_cycles : natural := 43;
+
+  -- test_write_w0_w1_same_bank_round_robin: word count per channel (both
+  -- disjoint offset ranges within bank 0, so a subsequent read can check
+  -- each channel's data independently).
+  constant c_write_contend_words : natural := 20;
+
   signal clk : std_ulogic := '0';
   signal reset : std_ulogic := '0';
 
@@ -106,6 +141,11 @@ architecture tb of tb_cnn_accel_tensor_mem is
   signal r1_mode : natural := c_mode_random;
   signal r0_stall_pct : natural := 40;
   signal r1_stall_pct : natural := 40;
+
+  -- Directed mid-burst pause for c_mode_full_speed on r0 only, used by
+  -- test_r0_no_refill_bubble_after_stall (see that test for why). Ignored
+  -- by every other mode/test; defaults to never pausing.
+  signal r0_pause : std_ulogic := '0';
 
   -- Per-channel captured-beat queues: one entry per accepted output beat,
   -- pushed as (data, last) pairs, popped/checked by the main process.
@@ -198,10 +238,11 @@ begin
   -- deterministically: ready high for exactly one cycle (drains the output
   -- register), then low for exactly one cycle (a stall on the very next
   -- cycle) -- exactly the T/T+1 sequence described in
-  -- cnn_accel_tensor_mem.vhd's read_arbitrate header comment. Without the
-  -- 'and not rN_capture' term this pattern loses a beat on every single
-  -- drain, so it fails fast and deterministically rather than relying on
-  -- random luck.
+  -- cnn_accel_tensor_mem.vhd's read_arbitrate header comment. On a design
+  -- without the landing/skid register (or with an issue rule that lets a
+  -- second beat land while the first is still unaccepted and the skid slot
+  -- is unavailable), this pattern loses a beat on every single drain, so it
+  -- fails fast and deterministically rather than relying on random luck.
   ------------------------------------------------------------------------
 
   consume_r0 : process
@@ -224,7 +265,16 @@ begin
           wait until rising_edge(clk);
 
         when c_mode_full_speed =>
-          m_r0_s2m.ready <= '1';
+          -- 'r0_pause' lets a directed test hold this channel's 'ready' low
+          -- for a controlled number of cycles mid-burst without switching
+          -- away from full-speed mode; every accepted beat's time is also
+          -- recorded so that test can check the inter-beat spacing around
+          -- the pause for a post-stall refill bubble.
+          if r0_pause = '1' then
+            m_r0_s2m.ready <= '0';
+          else
+            m_r0_s2m.ready <= '1';
+          end if;
           wait until rising_edge(clk);
           if m_r0_m2s.valid = '1' and m_r0_s2m.ready = '1' then
             push(r0_captured_q, m_r0_m2s.data(c_data_width - 1 downto 0));
@@ -314,6 +364,15 @@ begin
     variable t_start_r1, t_end_r1 : time;
     variable r0_seen, r1_seen : boolean;
 
+    -- test_write_w0_w1_same_bank_round_robin bookkeeping.
+    variable wr_w0_left, wr_w1_left : natural;
+    variable wr_w0_idx, wr_w1_idx : natural;
+    variable wr_both_wanted : boolean;
+    variable wr_w0_won, wr_w1_won : boolean;
+    variable wr_prev_grant : natural range 0 to 1;
+    variable wr_have_prev : boolean;
+    variable wr_w0_done_seen, wr_w1_done_seen : boolean;
+
     procedure do_reset is
     begin
       reset <= '1';
@@ -349,6 +408,26 @@ begin
       for i in 0 to num_words - 1 loop
         push_write_beat(clk, wr_m2s, wr_s2m, word_value(salt, i));
       end loop;
+    end procedure;
+
+    -- Issues one write request on wr_req_*, non-blocking on request
+    -- acceptance (mirrors 'issue_read' below) so the caller can drive both
+    -- write channels' beats concurrently afterward instead of streaming one
+    -- channel's whole transfer before starting the other.
+    procedure issue_write(
+      signal wr_req_m2s : out dma_req_m2s_t;
+      signal wr_req_s2m : in dma_req_s2m_t;
+      bank : natural;
+      offset : natural;
+      num_words : natural
+    ) is
+    begin
+      wr_req_m2s.req.addr <= to_unsigned(word_addr_bytes(bank, offset), 32);
+      wr_req_m2s.req.length <= to_unsigned(num_words * c_bytes_per_word, 32);
+      wr_req_m2s.valid <= '1';
+      wait until rising_edge(clk) and wr_req_s2m.ready = '1';
+      wait for c_settle;
+      wr_req_m2s.valid <= '0';
     end procedure;
 
     -- Issues one read request on rN, non-blocking on request acceptance so
@@ -429,6 +508,33 @@ begin
         natural'image(stream_cycles) & " cycles for " & natural'image(num_words) &
         " beats, allowing " & natural'image(c_read_pipeline_cycles) &
         " cycles of pipeline fill)"
+      );
+    end procedure;
+
+    -- Post-stall refill-bubble check for test_r0_no_refill_bubble_after_
+    -- stall. With r1 contending for the same bank the whole time, r0's own
+    -- inter-beat spacing is not a flat 1 cycle/beat even under correct RTL
+    -- (bank contention interleaves the two channels' grants), so a
+    -- per-beat spacing check (as used by 'check_full_rate' on an
+    -- uncontested channel) does not apply here. Instead this checks r0's
+    -- TOTAL transfer span against an exact cycle count: the whole pattern
+    -- (no random-mode consumer on either channel) is fully deterministic,
+    -- so that span is a single exact number under correct RTL, and a
+    -- refill bubble after the stall can only inflate it.
+    procedure check_no_refill_bubble(t_from : time; t_to : time; num_words : natural; stall_len : natural; msg : string) is
+      variable span_cycles : natural;
+    begin
+      span_cycles := (t_to - t_from) / c_clk_period;
+      info(
+        msg & ": r0 span " & natural'image(span_cycles) & " cycles for " &
+        natural'image(num_words) & " beats with a " & natural'image(stall_len) &
+        "-cycle stall (bank 0 contended by r1 throughout)"
+      );
+      check_relation(
+        span_cycles <= c_bubble_expected_span_cycles,
+        msg & ": r0's transfer span exceeds the exact deterministic bound (" &
+        natural'image(span_cycles) & " > " & natural'image(c_bubble_expected_span_cycles) &
+        ") -- refill bubble after the stall?"
       );
     end procedure;
 
@@ -523,10 +629,11 @@ begin
       -- A lossless, non-backpressured read must sustain 1 beat/cycle.
       -- This is the acceptance test for the per-channel landing-register
       -- read path (see cnn_accel_tensor_mem.vhd's read_arbitrate header
-      -- comment). The earlier, correct-but-throttling 'and not
-      -- rN_capture' issue rule serialized issue-then-capture and managed
-      -- only 1 beat every 2 cycles, which this test caught. Do not "fix"
-      -- this test by loosening its bound; fix the RTL instead.
+      -- comment). An earlier, correct-but-throttling issue rule (one that
+      -- forbade issuing on any cycle a beat was landing, with no skid
+      -- register to catch it) serialized issue-then-capture and managed
+      -- only 1 beat every 2 cycles, which this test would catch. Do not
+      -- "fix" this test by loosening its bound; fix the RTL instead.
       write_words(w0_req_m2s, w0_req_s2m, s_w0_m2s, s_w0_s2m, 0, 0, c_bank_words, 200);
 
       r0_mode <= c_mode_full_speed;
@@ -602,6 +709,193 @@ begin
       check_captured(r1_captured_q, c_bank_words, 500, "concurrent full-rate r1 data integrity");
       check_full_rate(t_start, t_end, c_bank_words, "concurrent full-rate r0 (bank 0)");
       check_full_rate(t_start_r1, t_end_r1, c_bank_words, "concurrent full-rate r1 (bank 1)");
+
+    elsif run("test_r0_no_refill_bubble_after_stall") then
+      -- Targets the '(not r0_skid_valid and not r0_capture)' disjunct in
+      -- 'r0_can_issue' specifically, as opposed to the skid register it
+      -- guards (see cnn_accel_tensor_mem.vhd's read_arbitrate header
+      -- comment and the comment on 'r0_can_issue'/'r1_can_issue' for the
+      -- division of responsibility). The skid register plus the plain
+      -- 'not r0_out_valid or m_r0_s2m.ready' term is already enough for
+      -- losslessness -- test_r0_lossless_under_backpressure and the
+      -- throughput tests would all still pass without this disjunct.
+      --
+      -- Why r1 is also active here, contending for the SAME bank: with r0
+      -- running alone, 'not r0_out_valid' already lets it launch two reads
+      -- back to back during a request's initial pipeline ramp (before the
+      -- output register has anything in it), so a beat is always
+      -- coincidentally already in flight by the time the output register
+      -- first fills -- and that coincidence, not the disjunct under test,
+      -- is what fills the skid register during a later stall. That makes
+      -- the disjunct's effect unobservable with r0 alone: it was tried
+      -- first, and it does not distinguish (every existing r0-only test,
+      -- including this one in an earlier form, passes with the disjunct
+      -- removed). Running r1 at full speed against the same bank the whole
+      -- time forces the read-side round-robin arbiter to interleave the
+      -- two channels' grants, which breaks that ramp-up coincidence for
+      -- r0: r0's reads no longer arrive in an uninterrupted back-to-back
+      -- pair, so whether it can claim a *second* bank grant while stalled
+      -- and the output register is occupied genuinely depends on this
+      -- disjunct.
+      --
+      -- Directed pattern: r1 streams a disjoint offset range of the same
+      -- bank at full speed for the entire test (so bank 0 is contended for
+      -- every cycle either channel wants it). r0 streams its own disjoint
+      -- range, reaches steady state, then its consumer holds 'ready' low
+      -- for 'c_stall_len' cycles mid-burst before holding it high for the
+      -- rest of the transfer. The whole pattern is deterministic (no
+      -- random-mode consumer involved on either channel), so r0's total
+      -- transfer span is an exact cycle count, not a statistical average --
+      -- checked with the same exact-allowance style as 'check_full_rate'.
+      write_words(w0_req_m2s, w0_req_s2m, s_w0_m2s, s_w0_s2m, 0, 0, c_bank_words, 600);
+
+      r0_mode <= c_mode_full_speed;
+      r1_mode <= c_mode_full_speed;
+      r0_pause <= '0';
+      wait until rising_edge(clk);
+
+      -- Start r1's contention first so bank 0 is already contended from
+      -- r0's very first cycle onward.
+      issue_read(r1_req_m2s, r1_req_s2m, 0, c_bubble_r0_words, c_bank_words - c_bubble_r0_words);
+      issue_read(r0_req_m2s, r0_req_s2m, 0, 0, c_bubble_r0_words);
+      t_start := now - c_settle;
+
+      -- Run long enough (well past 'c_read_pipeline_cycles') to reach
+      -- steady state before pausing, and leave plenty of beats after the
+      -- stall for the post-stall spacing to be checked.
+      for i in 1 to c_stall_start_cycles loop
+        wait until rising_edge(clk);
+      end loop;
+      r0_pause <= '1';
+      for i in 1 to c_stall_len loop
+        wait until rising_edge(clk);
+      end loop;
+      r0_pause <= '0';
+
+      wait until rising_edge(clk) and r0_done = '1';
+      t_end := now;
+      wait until rising_edge(clk) and r1_done = '1';
+      wait for c_settle;
+
+      check_captured(r0_captured_q, c_bubble_r0_words, 600, "r0 no-refill-bubble-after-stall data integrity");
+      check_captured(
+        r1_captured_q, c_bank_words - c_bubble_r0_words, 600 + c_bubble_r0_words,
+        "r0 no-refill-bubble-after-stall: r1 contention data integrity"
+      );
+      check_no_refill_bubble(t_start, t_end, c_bubble_r0_words, c_stall_len, "test_r0_no_refill_bubble_after_stall");
+
+    elsif run("test_write_w0_w1_same_bank_round_robin") then
+      -- Write-side counterpart of
+      -- test_concurrent_r0_r1_same_bank_no_loss_no_hol_blocking: every
+      -- other write-side test only ever drives 'w1' sequentially (a
+      -- different bank, or after 'w0' has already finished), so the write
+      -- round-robin arbiter (cnn_accel_tensor_mem.vhd's write_arbitrate
+      -- process) is never actually exercised under contention. This test
+      -- drives both write channels into the SAME bank concurrently, each
+      -- holding 'valid' high for its entire transfer, so every cycle while
+      -- both still have data left is a contended cycle. That makes the
+      -- arbiter's "who won last time" alternation checkable cycle by
+      -- cycle, not just as an aggregate throughput number -- proving
+      -- neither channel can be starved, not merely that neither happened
+      -- to be starved this run.
+      issue_write(w0_req_m2s, w0_req_s2m, 0, 0, c_write_contend_words);
+      issue_write(w1_req_m2s, w1_req_s2m, 0, c_write_contend_words, c_write_contend_words);
+
+      wr_w0_left := c_write_contend_words;
+      wr_w1_left := c_write_contend_words;
+      wr_w0_idx := 0;
+      wr_w1_idx := 0;
+      wr_have_prev := false;
+
+      s_w0_m2s.data <= (others => '0');
+      s_w0_m2s.data(c_data_width - 1 downto 0) <= word_value(700, 0);
+      s_w0_m2s.valid <= '1';
+      s_w1_m2s.data <= (others => '0');
+      s_w1_m2s.data(c_data_width - 1 downto 0) <= word_value(800, 0);
+      s_w1_m2s.valid <= '1';
+
+      -- Loop until both channels' 'done' pulses have been observed --
+      -- checked every cycle inside this same loop, not in a separate loop
+      -- afterward, since a channel's one-cycle 'done' pulse can fall on the
+      -- very last iteration where its beat counter reaches zero (the two
+      -- channels do not finish on the same cycle, since the arbiter grants
+      -- only one of them per contended cycle) and would otherwise be
+      -- missed between the two loops.
+      wr_w0_done_seen := false;
+      wr_w1_done_seen := false;
+      while not (wr_w0_done_seen and wr_w1_done_seen) loop
+        wr_both_wanted := wr_w0_left > 0 and wr_w1_left > 0;
+        wait until rising_edge(clk);
+
+        wr_w0_won := s_w0_s2m.ready = '1' and wr_w0_left > 0;
+        wr_w1_won := s_w1_s2m.ready = '1' and wr_w1_left > 0;
+
+        check_false(
+          wr_w0_won and wr_w1_won,
+          "test_write_w0_w1_same_bank_round_robin: both channels granted the same bank on the same cycle"
+        );
+
+        if wr_both_wanted then
+          if wr_have_prev then
+            check_true(
+              (wr_w0_won and wr_prev_grant = 1) or (wr_w1_won and wr_prev_grant = 0),
+              "test_write_w0_w1_same_bank_round_robin: arbiter did not alternate on sustained same-bank contention " &
+              "(one channel granted twice in a row -- possible starvation)"
+            );
+          end if;
+          if wr_w0_won then
+            wr_prev_grant := 0;
+            wr_have_prev := true;
+          elsif wr_w1_won then
+            wr_prev_grant := 1;
+            wr_have_prev := true;
+          end if;
+        end if;
+
+        if wr_w0_won then
+          wr_w0_left := wr_w0_left - 1;
+          wr_w0_idx := wr_w0_idx + 1;
+          if wr_w0_left = 0 then
+            s_w0_m2s.valid <= '0';
+          else
+            s_w0_m2s.data(c_data_width - 1 downto 0) <= word_value(700, wr_w0_idx);
+          end if;
+        end if;
+
+        if wr_w1_won then
+          wr_w1_left := wr_w1_left - 1;
+          wr_w1_idx := wr_w1_idx + 1;
+          if wr_w1_left = 0 then
+            s_w1_m2s.valid <= '0';
+          else
+            s_w1_m2s.data(c_data_width - 1 downto 0) <= word_value(800, wr_w1_idx);
+          end if;
+        end if;
+
+        if w0_done = '1' then
+          wr_w0_done_seen := true;
+        end if;
+        if w1_done = '1' then
+          wr_w1_done_seen := true;
+        end if;
+      end loop;
+      wait for c_settle;
+
+      -- Read each channel's range back independently and check the data
+      -- landed correctly -- proof that concurrent same-bank contention
+      -- corrupted neither channel's beats.
+      r0_mode <= c_mode_full_speed;
+      wait until rising_edge(clk);
+      issue_read(r0_req_m2s, r0_req_s2m, 0, 0, c_write_contend_words);
+      wait until rising_edge(clk) and r0_done = '1';
+      wait for c_settle;
+      check_captured(r0_captured_q, c_write_contend_words, 700, "w0/w1 same-bank contention: w0 data readback");
+
+      wait until rising_edge(clk);
+      issue_read(r0_req_m2s, r0_req_s2m, 0, c_write_contend_words, c_write_contend_words);
+      wait until rising_edge(clk) and r0_done = '1';
+      wait for c_settle;
+      check_captured(r0_captured_q, c_write_contend_words, 800, "w0/w1 same-bank contention: w1 data readback");
     end if;
 
     test_runner_cleanup(runner);

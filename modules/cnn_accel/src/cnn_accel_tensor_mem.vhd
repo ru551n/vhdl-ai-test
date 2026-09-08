@@ -442,6 +442,16 @@ begin
   -- beat per consumer stall.
   ------------------------------------------------------------------------
 
+  -- Division of responsibility between the two disjuncts after
+  -- 'not rN_out_valid': 'm_rN_s2m.ready' is what makes the design lossless
+  -- -- together with the skid register, it is what proves L(T+1) <= 1 (see
+  -- above) whenever the output register is about to be freed this cycle, so
+  -- a landing beat always has a slot. 'not rN_skid_valid and not rN_capture'
+  -- adds nothing to losslessness (L(T+1) <= 1 already holds without it
+  -- whenever the skid register is empty and nothing is landing) -- it is
+  -- purely a throughput/prefetch term: it lets the channel keep a read in
+  -- flight while the output register is occupied and stalled, so the
+  -- pipeline does not drain and refill on every consumer stall.
   r0_can_issue <= r0_busy and to_sl(r0_beats_to_issue > 0) and
     (not r0_out_valid or m_r0_s2m.ready or (not r0_skid_valid and not r0_capture));
   r1_can_issue <= r1_busy and to_sl(r1_beats_to_issue > 0) and
