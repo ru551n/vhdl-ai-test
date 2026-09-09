@@ -273,6 +273,93 @@ def _pool_unit(constants, field_max_by_width, epilogue, isa_version: str, has_pa
     )
 
 
+def _elementwise_unit(
+    constants, model, field_max_by_width, isa_version: str, implicit_shift: int, rounding: str
+) -> Unit | None:
+    """The ISA v2.0 elementwise family as its own `Unit`.
+
+    A third unit alongside `conv_engine`/`pool_engine` for the same reason
+    `pool_engine` is a second one: it shares the descriptor stream and the
+    DDR activation layout, but not the MAC array or the window generator,
+    and its bounds are its own. It has no kernel, no stride, no padding
+    and no output-channel tiling at all -- every opcode here is a lane-by-
+    lane walk over one geometry -- so the only constraints are the ISA
+    field widths of that geometry.
+
+    Its epilogue is deliberately NOT `conv_engine`'s. `OPCODE_ADD` has one
+    `(requant_scale, requant_shift)` pair and nothing else: no bias, no
+    per-channel table, no output offset, no clamp bounds -- just the int8
+    saturate every opcode ends with. Advertising the conv epilogue here
+    would let `to_hir` fold an out_zp or a clamp into an instruction that
+    has no field for either.
+
+    The capability names are the GIR op kinds the frontend produces
+    (`add`, `table`, `upsample`), not the ISA opcode names (`ADD`, `ACT`,
+    `UPSAMPLE`) -- `upsample` has no TOSA op of its own at all, matching
+    how `conv_engine` advertises `conv2d` rather than `CONV2D`;
+    `hir.ir.KIND_TO_OP` maps the HIR kind (`act`) onto the capability.
+
+    Returns `None` for a constants file with no v2.0 elementwise opcodes
+    (an ISA v1.x accelerator), which is what makes `tosa.add`/`tosa.table`
+    refuse cleanly there instead of emitting an undefined opcode."""
+    ops = tuple(
+        name for opcode, name in (("ADD", "add"), ("ACT", "table"), ("UPSAMPLE", "upsample"))
+        if opcode in constants.OPCODES
+    )
+    if not ops:
+        return None
+
+    constraints = tuple(
+        Constraint(
+            kind="max", expr=name, value=field_max_by_width(name),
+            source=f"cnn_accel_constants.ISA_LAYOUT field {name!r} width",
+        )
+        for name in ("in_width", "in_height", "in_channels")
+    )
+    rescale = RescaleCaps(
+        multiplier_bits=8 * 4,  # requant_scale, W9
+        multiplier_signed=True,
+        # ADD's per-operand rescale is the SAME Q15 step the conv
+        # epilogue applies (`cnn_accel_model.elementwise_add` and
+        # `bias_requantize_relu` both scale by `requant_scale` and shift
+        # by `15 + requant_shift`), so it inherits the shift and rounding
+        # probed from `bias_requantize_relu` rather than restating them.
+        implicit_shift=implicit_shift,
+        shift_min=implicit_shift,
+        shift_max=implicit_shift + field_max_by_width("requant_shift"),
+        rounding=rounding,
+        per_channel=False,
+        input_zp=False,
+        output_zp=False,
+    )
+    return Unit(
+        name="elementwise_engine",
+        ops=ops,
+        dtypes={"input": "i8", "output": "i8"},
+        kernels=((1, 1),),
+        strides=((1, 1),),
+        dilation=((1, 1),),
+        padding="zero",
+        batch=1,
+        # `cin` is the DDR plane width the operands are read in; `cout` has
+        # no meaning (no output-channel tiling, no weights), so it is the
+        # same plane width rather than PE_ROWS.
+        internal_tiling=InternalTiling(
+            cin=constants.ACTIVATION_PLANE_CHANNELS, cout=constants.ACTIVATION_PLANE_CHANNELS
+        ),
+        constraints=constraints,
+        epilogue=Epilogue(bias=False, rescale=rescale, clamp_ranges=((-128, 127),)),
+        isa_version=isa_version,
+        partial_sum_io=False,
+        # Read from the golden model, never restated here: `UPSAMPLE` has
+        # no factor field, so whatever `cnn_accel_model.upsample_nearest`
+        # replicates by IS the hardware's factor, and a compiler that
+        # hard-coded a second copy of that number could disagree with the
+        # thing it is compiling for.
+        upsample_factor=getattr(model, "UPSAMPLE_FACTOR", None) if "upsample" in ops else None,
+    )
+
+
 def _build_target(root: Path, constants, model, constants_path: Path, model_path: Path) -> Target:
     field_specs = {
         f.name: (f.offset_bytes, f.width_bytes, f.signed) for f in constants.isa_field_offsets()
@@ -412,6 +499,11 @@ def _build_target(root: Path, constants, model, constants_path: Path, model_path
     pool_unit = _pool_unit(constants, field_max_by_width, epilogue, isa_version, has_pad_value)
     if pool_unit is not None:
         units.append(pool_unit)
+    elementwise = _elementwise_unit(
+        constants, model, field_max_by_width, isa_version, implicit_shift, rounding
+    )
+    if elementwise is not None:
+        units.append(elementwise)
 
     ddr_size = 2 ** (8 * field_width_bytes("in_addr"))
     memory = Memory(

@@ -16,16 +16,17 @@ from __future__ import annotations
 import dataclasses
 from types import MappingProxyType
 
-LAYOUTS = ("HWC", "PLANES", "OHWI", "TILED_OHWI", "I32_VEC", "I32_TILED", "SCALE_TABLE", "PROGRAM")
+LAYOUTS = ("HWC", "PLANES", "OHWI", "TILED_OHWI", "I32_VEC", "I32_TILED", "SCALE_TABLE", "ACT_LUT", "PROGRAM")
 ROLES = ("input", "output", "const", "intermediate", "program")
 STAGES = ("mapped", "scheduled", "planned")
+ALIAS_KINDS = ("view", "part")
 
 # HIR op kinds don't always match the target Unit.ops vocabulary 1:1 --
 # `conv_layer` (a fused conv+bias+requant+relu HIR op) maps to the `conv2d`
 # capability a Unit advertises, and `max_pool` to `max_pool2d` -- the HIR
 # kind names the instruction shape, the capability names what the unit can
 # do, and the two only coincide by accident.
-KIND_TO_OP = {"conv_layer": "conv2d", "max_pool": "max_pool2d"}
+KIND_TO_OP = {"conv_layer": "conv2d", "max_pool": "max_pool2d", "act": "table"}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -41,12 +42,59 @@ class Buffer:
     addr: int | None = None
     data: bytes | None = None  # const/program payload
     gir_tensor: str | None = None
+    # --- buffer views (§7) ---------------------------------------------
+    # A buffer with `alias_parent` set owns no storage of its own: it IS a
+    # channel-plane range of another buffer, at
+    # `parent.addr + alias_plane_offset * plane_channels * H * W`. Both
+    # halves of `tosa.concat`/`tosa.slice` lower to this and emit no
+    # instruction at all -- channel concatenation of S6 plane-tiled
+    # activations is address arithmetic, not data movement, exactly as
+    # `accel_v2.model.Tensor.alias_parent`/`alias_plane_offset` treat it.
+    #
+    # `alias_kind` says which DIRECTION the aliasing runs, and the two are
+    # not interchangeable:
+    #
+    #   "view"  -- a read-only window into a parent somebody else writes
+    #              (a `tosa.slice` result). The parent is written normally;
+    #              this buffer is never written.
+    #   "part"  -- a piece the PRODUCER is redirected to write into (a
+    #              `tosa.concat` operand). The parent is never written
+    #              directly; its parts write it between them, which is why
+    #              the concat itself costs nothing.
+    #
+    # `plane_channels` is not stored here because it is a target property,
+    # not a buffer one; callers that need bytes pass it to
+    # `alias_byte_offset`.
+    alias_parent: str | None = None
+    alias_plane_offset: int = 0
+    alias_kind: str | None = None  # None | "view" | "part"
+
+    def __post_init__(self) -> None:
+        if (self.alias_parent is None) != (self.alias_kind is None):
+            raise ValueError(
+                f"buffer {self.id!r}: alias_parent and alias_kind must be set together "
+                f"(alias_parent={self.alias_parent!r}, alias_kind={self.alias_kind!r})"
+            )
+        if self.alias_kind is not None and self.alias_kind not in ALIAS_KINDS:
+            raise ValueError(f"buffer {self.id!r}: alias_kind {self.alias_kind!r} not in {ALIAS_KINDS}")
+        if self.alias_plane_offset < 0:
+            raise ValueError(f"buffer {self.id!r}: alias_plane_offset {self.alias_plane_offset} is negative")
 
     @property
     def end(self) -> int:
         if self.addr is None:
             raise ValueError(f"buffer {self.id!r} has no addr")
         return self.addr + self.size_bytes
+
+    def alias_byte_offset(self, plane_channels: int) -> int:
+        """This view's byte offset from its parent's address: whole
+        channel planes, each `plane_channels * H * W` bytes (decision S6's
+        `[C/T][H][W][T]` layout, whose planes are contiguous and equal in
+        size -- which is the entire reason a channel concat can be free)."""
+        if self.alias_parent is None:
+            return 0
+        _n, h, w, _c = self.shape
+        return self.alias_plane_offset * plane_channels * h * w
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,6 +178,65 @@ class HirModule:
 
     def with_ops(self, ops) -> "HirModule":
         return self.replace(ops=tuple(ops))
+
+    def alias_root(self, buffer_id: str) -> str:
+        """The buffer that actually owns the storage `buffer_id` lives in:
+        follow `alias_parent` to the end. A buffer that is not a view is
+        its own root."""
+        seen = {buffer_id}
+        current = buffer_id
+        while True:
+            parent = self.buffers[current].alias_parent
+            if parent is None:
+                return current
+            if parent in seen:
+                raise ValueError(f"alias cycle through buffer {buffer_id!r}")
+            seen.add(parent)
+            current = parent
+
+    def alias_children(self, buffer_id: str) -> tuple[Buffer, ...]:
+        """Every buffer whose `alias_parent` is `buffer_id`, in id order."""
+        return tuple(
+            buf for _, buf in sorted(self.buffers.items()) if buf.alias_parent == buffer_id
+        )
+
+    def storage_dependencies(self, buffer_id: str) -> tuple[str, ...]:
+        """Every buffer whose writer must finish before `buffer_id` can be
+        read -- `buffer_id` itself plus the aliases that share its bytes.
+
+        Two directions, and they are not symmetric:
+
+        * ANCESTORS. A view is filled by whoever writes the buffer it
+          looks into, so reading it waits for that buffer's writer. (An
+          ancestor that is itself assembled from parts has no writer of
+          its own and so contributes nothing here -- correctly: reading
+          one half of a concat must not wait for the other half.)
+        * `part` DESCENDANTS. A concat result is filled by its parts
+          between them, so reading it waits for all of them.
+
+        Without this, an op reading a `tosa.slice` view would look
+        dependency-free -- nothing writes the view's id -- and the
+        scheduler would be free to hoist it above the op that actually
+        produces the bytes.
+        """
+        result = {buffer_id}
+
+        current = buffer_id
+        while True:
+            parent = self.buffers[current].alias_parent
+            if parent is None or parent in result:
+                break
+            result.add(parent)
+            current = parent
+
+        stack = [buffer_id]
+        while stack:
+            for child in self.alias_children(stack.pop()):
+                if child.alias_kind == "part" and child.id not in result:
+                    result.add(child.id)
+                    stack.append(child.id)
+
+        return tuple(sorted(result))
 
     def writer_of(self, buffer_id: str) -> HirOp | None:
         for op in self.ops:

@@ -9,7 +9,7 @@ import dataclasses
 import hashlib
 import json
 
-from cnnc.gir.ir import Attrs, ConvAttrs, FusedConvAttrs, Graph, Op, PoolAttrs, RescaleParams, Tensor
+from cnnc.gir.ir import AddAttrs, Attrs, ConvAttrs, FusedConvAttrs, Graph, Op, PoolAttrs, RescaleParams, Tensor
 
 
 def _shape_dtype(shape: tuple[int, ...], dtype: str) -> str:
@@ -79,6 +79,20 @@ def _format_op(graph: Graph, op: Op) -> str:
             f"{op.id} = pool_{a.mode} {operands} "
             f"{{kernel={_fmt_list(a.kernel)} stride={_fmt_list(a.stride)} pad={_fmt_list(a.pad)} "
             f"pad_value={a.pad_value}}} : {shape_str}"
+        )
+    if op.kind == "add":
+        a: AddAttrs = op.attrs
+        return f"{op.id} = add {operands} {{mult={a.multiplier} shift={a.shift}}} : {shape_str}"
+    if op.kind == "table":
+        return f"{op.id} = table {operands} : {shape_str}"
+    if op.kind == "upsample":
+        return f"{op.id} = upsample {operands} {{factor={op.attrs.factor}}} : {shape_str}"
+    if op.kind == "concat":
+        return f"{op.id} = concat {operands} {{axis={op.attrs.axis}}} : {shape_str}"
+    if op.kind == "slice":
+        return (
+            f"{op.id} = slice {operands} "
+            f"{{start={_fmt_list(op.attrs.start)} size={_fmt_list(op.attrs.size)}}} : {shape_str}"
         )
     if op.kind == "fused_conv":
         a: FusedConvAttrs = op.attrs

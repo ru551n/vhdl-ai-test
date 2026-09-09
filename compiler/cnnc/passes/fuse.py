@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import dataclasses
 
-from cnnc.gir.ir import ClampAttrs, FusedConvAttrs, Graph, Op, RescaleParams
+from cnnc.gir.ir import AddAttrs, ClampAttrs, FusedConvAttrs, Graph, Op, RescaleParams
 from cnnc.target.contract import Epilogue, Target
 
 
@@ -59,6 +59,117 @@ def _clamp_admissible(attrs: ClampAttrs, clamp_ranges) -> bool:
     return (attrs.min, attrs.max) in clamp_ranges
 
 
+def _add_rescale_foldable(rescale_op: Op, graph: Graph, epilogue: Epilogue) -> bool:
+    """Can this `rescale` be folded into the `add` that consumes it?
+
+    The accelerator's ADD computes `sat_i8(scale(a) + scale(b))` -- one
+    saturation, after the sum. TOSA's `rescale(i8 -> i8)` clamps each
+    operand to int8 *before* the add, so the fold is only exact while
+    that per-operand clamp cannot fire. It cannot when the scale is <= 1
+    (`multiplier <= 2**shift`): every int8 input then maps into int8, and
+    the two expressions coincide for every input. A scale > 1 is left
+    unfused (and `to_hir` then rejects the standalone rescale by name)
+    rather than fused into a silently different program.
+
+    The input dtype check is load-bearing and not a formality: a
+    convolution's OWN epilogue rescale (i32 -> i8) would otherwise match
+    every other condition here, and folding it into a following add would
+    strip the convolution of its epilogue -- leaving a standalone
+    `conv2d` that `to_hir` then rejects. Only an i8 -> i8 rescale is an
+    operand rescale. That check is also what makes this fold independent
+    of the order it runs in relative to the conv fusion below.
+
+    The rest are shape constraints of the single `(requant_scale,
+    requant_shift)` pair the descriptor carries: per-tensor only, and no
+    zero points, since ADD has neither an input nor an output offset."""
+    params: RescaleParams = rescale_op.attrs
+    if graph.tensors[rescale_op.inputs[0]].dtype != "i8":
+        return False
+    if graph.tensors[rescale_op.outputs[0]].dtype != "i8":
+        return False
+    if params.per_channel or len(params.multiplier) != 1 or len(params.shift) != 1:
+        return False
+    if params.in_zp != 0 or params.out_zp != 0:
+        return False
+    if params.rounding != "SINGLE_ROUND":
+        return False
+    if params.input_unsigned or params.output_unsigned or not params.scale32:
+        return False
+    caps = epilogue.rescale
+    shift = params.shift[0]
+    if not (caps.shift_min <= shift <= caps.shift_max):
+        return False
+    return params.multiplier[0] <= (1 << shift)
+
+
+def _fold_add_rescales(graph: Graph, epilogue: Epilogue) -> Graph:
+    """`rescale(a, m, s) , rescale(b, m, s) -> add` => one `add` carrying
+    `(m, s)` in its `AddAttrs`.
+
+    This is the quantized residual-shortcut idiom, and it is the only
+    shape the hardware can execute: `OPCODE_ADD` holds ONE
+    `(requant_scale, requant_shift)` pair for both operands, so the two
+    rescales must be identical to fold at all. Both must feed only this
+    add (and not be graph outputs), since they are about to be deleted.
+
+    Like the conv fusion above, this only re-groups ops -- no quantization
+    parameter is recomputed -- and `_add_rescale_foldable` bounds it to
+    the cases where the regrouping is value-preserving, so `gir.interp`
+    gives identical results before and after (pinned by
+    `tests/test_add.py`)."""
+    skip_ids: set[str] = set()
+    removed_tensors: set[str] = set()
+    new_ops: list[Op] = []
+    changed = False
+
+    for op in graph.ops:
+        if op.kind != "add":
+            continue
+        producers = [graph.producer(tid) for tid in op.inputs]
+        if any(p is None or p.kind != "rescale" for p in producers):
+            continue
+        lhs, rhs = producers
+        if lhs is rhs:
+            # One rescale feeding both operands: it has two users, so the
+            # "sole user" rule below would reject it anyway, and folding
+            # it would delete a tensor the add still reads twice.
+            continue
+        if not all(_add_rescale_foldable(p, graph, epilogue) for p in producers):
+            continue
+        if lhs.attrs.multiplier != rhs.attrs.multiplier or lhs.attrs.shift != rhs.attrs.shift:
+            continue
+        if any(
+            p.outputs[0] in graph.outputs or len(graph.users(p.outputs[0])) != 1 for p in producers
+        ):
+            continue
+        skip_ids.update(p.id for p in producers)
+        removed_tensors.update(p.outputs[0] for p in producers)
+        changed = True
+
+    if not changed:
+        return graph
+
+    for op in graph.ops:
+        if op.id in skip_ids:
+            continue
+        if op.kind != "add" or not any(graph.producer(tid) is not None and graph.producer(tid).id in skip_ids for tid in op.inputs):
+            new_ops.append(op)
+            continue
+        lhs, rhs = (graph.producer(tid) for tid in op.inputs)
+        new_ops.append(
+            Op(
+                id=op.id,
+                kind="add",
+                inputs=(lhs.inputs[0], rhs.inputs[0]),
+                outputs=op.outputs,
+                attrs=AddAttrs(multiplier=int(lhs.attrs.multiplier[0]), shift=int(lhs.attrs.shift[0])),
+            )
+        )
+
+    new_tensors = {tid: t for tid, t in graph.tensors.items() if tid not in removed_tensors}
+    return graph.replace(ops=tuple(new_ops), tensors=new_tensors)
+
+
 class FusePass:
     name = "fuse"
 
@@ -66,6 +177,7 @@ class FusePass:
         if ctx.target is None:
             return graph
         epilogue = _epilogue(ctx.target)
+        graph = _fold_add_rescales(graph, epilogue)
         if not epilogue.bias:
             return graph
 

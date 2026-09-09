@@ -14,6 +14,17 @@ exactly like `cnn_accel_model.LayerDesc` fields. Two op kinds lower today:
 * `pool` (mode `max`) -> a `max_pool` on the unit advertising
   `max_pool2d`, reading only its input -- pooling needs no constants at
   all.
+* `add` -> an `add` on the unit advertising `add` (ISA v2.0's
+  `OPCODE_ADD`), reading two activation buffers and no constants.
+* `table` -> an `act` on the unit advertising `table` (ISA v2.0's
+  `OPCODE_ACT`), reading its input plus a 256-byte ACT_LUT const.
+* `upsample` -> an `upsample` on the unit advertising `upsample` (ISA
+  v2.0's `OPCODE_UPSAMPLE`), reading only its input.
+* `concat`/`slice` -> NO op at all, only buffer views: a channel range of
+  an S6 plane-tiled activation is a contiguous range of its buffer, so a
+  channel concat is its operands' producers writing into one buffer at
+  different plane offsets, and a channel slice is a window into a buffer
+  somebody else wrote (see `_lower_concat`/`_lower_slice`).
 
 Any GIR op that survived `fuse` unfused (a standalone `conv2d`/`rescale`/
 `clamp`) has no accelerator instruction and is rejected here, not silently
@@ -29,12 +40,25 @@ bias image packed for that tensor depends on the op that consumes it (see
 
 from __future__ import annotations
 
+import dataclasses
+
 from cnnc.errors import CapabilityError
-from cnnc.gir.ir import FusedConvAttrs, Graph, Op, PoolAttrs, Tensor
+from cnnc.gir.ir import (
+    AddAttrs,
+    ConcatAttrs,
+    FusedConvAttrs,
+    Graph,
+    Op,
+    PoolAttrs,
+    SliceAttrs,
+    Tensor,
+    UpsampleAttrs,
+)
 from cnnc.hir.ir import Buffer, HirModule, HirOp
 from cnnc.hir.verify import verify_hir
 from cnnc.lower.layout import (
     activation_bytes,
+    pack_act_lut,
     pack_bias_tiled,
     pack_scale_table,
     pack_weights_tiled,
@@ -620,6 +644,546 @@ def _lower_pool(
     return hir_op, y_buf
 
 
+# ISA v2.0 added the elementwise/resample family (`ADD` and friends). It
+# is a separate rung from the v2.1 `pad_value` one because it is a
+# separate thing: v2.0 added opcodes, v2.1 added a descriptor byte.
+_ELEMENTWISE_ISA_VERSION = "2.0"
+
+_ADD_ENV_FIELDS = ("in_width", "in_height", "in_channels")
+
+
+def _lower_add(
+    op: Op, graph: Graph, unit: Unit, *, space_name: str, align: int,
+    activation_layout: str, plane_channels: int,
+) -> tuple[HirOp, Buffer]:
+    """A GIR `add` -> one `add` `HirOp` + its output buffer.
+
+    Reads TWO activation buffers and writes one; no constants at all (the
+    single `(requant_scale, requant_shift)` pair rides in the descriptor's
+    own W9 fields, and the second operand's ADDRESS rides in W15
+    `xfer_bytes` -- the backend's job, see `emit._build_add_descriptor`).
+    """
+    a_id, b_id = op.inputs
+    y_id = op.outputs[0]
+    a, b, y = graph.tensor(a_id), graph.tensor(b_id), graph.tensor(y_id)
+    attrs: AddAttrs = op.attrs
+    caps: RescaleCaps = unit.epilogue.rescale
+
+    if not _isa_at_least(unit.isa_version, _ELEMENTWISE_ISA_VERSION):
+        raise CapabilityError(
+            f"elementwise add needs the ISA v{_ELEMENTWISE_ISA_VERSION} ADD opcode; unit "
+            f"{unit.name!r} is isa_version {unit.isa_version}",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="add",
+        )
+    if a.shape[0] != unit.batch:
+        raise CapabilityError(
+            f"batch {a.shape[0]} != unit batch {unit.batch}",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="batch",
+        )
+    for role, actual in (("input", a.dtype), ("input", b.dtype), ("output", y.dtype)):
+        want = unit.dtypes.get(role)
+        if want is not None and actual != want:
+            raise CapabilityError(
+                f"{role} dtype {actual!r} != required {want!r}",
+                op_id=op.id, stage=_STAGE, unit=unit.name, constraint=f"dtypes.{role}",
+            )
+    if a.shape != b.shape or y.shape != a.shape:
+        raise CapabilityError(
+            f"add shapes {a.shape}/{b.shape}/{y.shape} must be identical (no broadcasting)",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="shape",
+        )
+    if not (caps.shift_min <= attrs.shift <= caps.shift_max):
+        raise CapabilityError(
+            f"add shift {attrs.shift} outside [{caps.shift_min}, {caps.shift_max}]",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="rescale.shift",
+        )
+    mult_max = 2 ** (caps.multiplier_bits - 1) - 1
+    if not (0 <= attrs.multiplier <= mult_max):
+        raise CapabilityError(
+            f"add multiplier {attrs.multiplier} outside [0, {mult_max}]",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="rescale.multiplier",
+        )
+
+    params = {
+        "in_width": a.shape[2],
+        "in_height": a.shape[1],
+        "in_channels": a.shape[3],
+    }
+    _check_constraints(op, unit, {name: params[name] for name in _ADD_ENV_FIELDS})
+    params["requant_en"] = True
+    params["requant_scale"] = int(attrs.multiplier)
+    params["requant_shift"] = int(attrs.shift) - caps.implicit_shift
+
+    hir_op = HirOp(
+        id=y_id,  # placeholder; renumbered by the caller once all ops are known
+        unit=unit.name,
+        kind="add",
+        params=params,
+        reads=(f"%{a_id}", f"%{b_id}"),
+        writes=(f"%{y_id}",),
+        deps=(),
+        gir_op=op.id,
+    )
+    y_buf = Buffer(
+        id=f"%{y_id}",
+        space=space_name,
+        size_bytes=activation_bytes(y.shape, plane_channels, _dtype_bytes(y.dtype)),
+        align=align,
+        role="output" if y_id in graph.outputs else "intermediate",
+        layout=activation_layout,
+        shape=y.shape,
+        dtype=y.dtype,
+        gir_tensor=y_id,
+    )
+    return hir_op, y_buf
+
+
+def _lower_table(
+    op: Op, graph: Graph, unit: Unit, *, space_name: str, align: int,
+    activation_layout: str, plane_channels: int,
+) -> tuple[HirOp, Buffer, Buffer]:
+    """A GIR `table` -> one `act` `HirOp`, its output buffer, AND the
+    256-byte ACT_LUT const buffer it reads.
+
+    The LUT buffer is built here rather than in `to_hir`'s generic const
+    loop because its byte image is not the tensor's own values: TOSA and
+    the hardware index the same 256 answers differently, and
+    `lower.layout.pack_act_lut` is the rotation between them.
+    """
+    x_id, table_id = op.inputs
+    y_id = op.outputs[0]
+    x, table, y = graph.tensor(x_id), graph.tensor(table_id), graph.tensor(y_id)
+
+    if not _isa_at_least(unit.isa_version, _ELEMENTWISE_ISA_VERSION):
+        raise CapabilityError(
+            f"table activation needs the ISA v{_ELEMENTWISE_ISA_VERSION} ACT opcode; unit "
+            f"{unit.name!r} is isa_version {unit.isa_version}",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="table",
+        )
+    if x.shape[0] != unit.batch:
+        raise CapabilityError(
+            f"batch {x.shape[0]} != unit batch {unit.batch}",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="batch",
+        )
+    for role, actual in (("input", x.dtype), ("output", y.dtype)):
+        want = unit.dtypes.get(role)
+        if want is not None and actual != want:
+            raise CapabilityError(
+                f"{role} dtype {actual!r} != required {want!r}",
+                op_id=op.id, stage=_STAGE, unit=unit.name, constraint=f"dtypes.{role}",
+            )
+
+    params = {
+        "in_width": x.shape[2],
+        "in_height": x.shape[1],
+        "in_channels": x.shape[3],
+    }
+    _check_constraints(op, unit, {name: params[name] for name in _ADD_ENV_FIELDS})
+    params["act_lut_en"] = True
+
+    lut_data = pack_act_lut(table.values)
+    lut_buf = Buffer(
+        id=f"%{table_id}",
+        space=space_name,
+        size_bytes=len(lut_data),
+        align=align,
+        role="const",
+        layout="ACT_LUT",
+        shape=table.shape,
+        dtype=table.dtype,
+        data=lut_data,
+        gir_tensor=table_id,
+    )
+    hir_op = HirOp(
+        id=y_id,  # placeholder; renumbered by the caller once all ops are known
+        unit=unit.name,
+        kind="act",
+        params=params,
+        reads=(f"%{x_id}", lut_buf.id),
+        writes=(f"%{y_id}",),
+        deps=(),
+        gir_op=op.id,
+    )
+    y_buf = Buffer(
+        id=f"%{y_id}",
+        space=space_name,
+        size_bytes=activation_bytes(y.shape, plane_channels, _dtype_bytes(y.dtype)),
+        align=align,
+        role="output" if y_id in graph.outputs else "intermediate",
+        layout=activation_layout,
+        shape=y.shape,
+        dtype=y.dtype,
+        gir_tensor=y_id,
+    )
+    return hir_op, y_buf, lut_buf
+
+
+#: The only replication factor `OPCODE_UPSAMPLE` implements. Read from
+#: the golden model rather than restated, so a hardware that ever grows a
+#: second factor does not leave a stale 2 here -- see
+#: `_hardware_upsample_factor`.
+_UPSAMPLE_FACTOR_CONSTRAINT = "upsample.factor"
+
+
+def _lower_upsample(
+    op: Op, graph: Graph, unit: Unit, *, space_name: str, align: int,
+    activation_layout: str, plane_channels: int, hw_factor: int,
+) -> tuple[HirOp, Buffer]:
+    """A GIR `upsample` -> one `upsample` `HirOp` + its output buffer.
+
+    The descriptor carries only the INPUT geometry: the output is
+    `hw_factor` times larger in both spatial dimensions by definition of
+    the opcode, and there is no field to say otherwise. So any other
+    factor is refused here rather than encoded into an instruction that
+    would quietly do 2x."""
+    x_id = op.inputs[0]
+    y_id = op.outputs[0]
+    x, y = graph.tensor(x_id), graph.tensor(y_id)
+    attrs: UpsampleAttrs = op.attrs
+
+    if not _isa_at_least(unit.isa_version, _ELEMENTWISE_ISA_VERSION):
+        raise CapabilityError(
+            f"nearest-neighbour upsample needs the ISA v{_ELEMENTWISE_ISA_VERSION} UPSAMPLE opcode; "
+            f"unit {unit.name!r} is isa_version {unit.isa_version}",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="upsample",
+        )
+    if attrs.factor != hw_factor:
+        raise CapabilityError(
+            f"upsample factor {attrs.factor} != {hw_factor}: OPCODE_UPSAMPLE replicates by exactly "
+            f"{hw_factor} in both spatial dimensions and has no field for any other factor "
+            "(doc/cnn_accel_top_v2_arch.md section 12 limitation 5)",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint=_UPSAMPLE_FACTOR_CONSTRAINT,
+        )
+    if x.shape[0] != unit.batch:
+        raise CapabilityError(
+            f"batch {x.shape[0]} != unit batch {unit.batch}",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="batch",
+        )
+    for role, actual in (("input", x.dtype), ("output", y.dtype)):
+        want = unit.dtypes.get(role)
+        if want is not None and actual != want:
+            raise CapabilityError(
+                f"{role} dtype {actual!r} != required {want!r}",
+                op_id=op.id, stage=_STAGE, unit=unit.name, constraint=f"dtypes.{role}",
+            )
+
+    params = {
+        "in_width": x.shape[2],
+        "in_height": x.shape[1],
+        "in_channels": x.shape[3],
+    }
+    # The unit's geometry bounds are ISA field widths, and it is the INPUT
+    # geometry that goes in those fields -- but the OUTPUT is what has to
+    # fit in memory and in any downstream op, so check both.
+    _check_constraints(op, unit, {name: params[name] for name in _ADD_ENV_FIELDS})
+    _check_constraints(
+        op, unit,
+        {"in_width": y.shape[2], "in_height": y.shape[1], "in_channels": y.shape[3]},
+    )
+
+    hir_op = HirOp(
+        id=y_id,  # placeholder; renumbered by the caller once all ops are known
+        unit=unit.name,
+        kind="upsample",
+        params=params,
+        reads=(f"%{x_id}",),
+        writes=(f"%{y_id}",),
+        deps=(),
+        gir_op=op.id,
+    )
+    y_buf = Buffer(
+        id=f"%{y_id}",
+        space=space_name,
+        size_bytes=activation_bytes(y.shape, plane_channels, _dtype_bytes(y.dtype)),
+        align=align,
+        role="output" if y_id in graph.outputs else "intermediate",
+        layout=activation_layout,
+        shape=y.shape,
+        dtype=y.dtype,
+        gir_tensor=y_id,
+    )
+    return hir_op, y_buf
+
+
+# ---------------------------------------------------------------------------
+# Buffer views: `concat` and `slice` (doc/tosa_compiler_plan.md §7).
+#
+# Neither emits an instruction. Activations live in DDR as decision-S6
+# channel planes, `[C/T][H][W][T]`, so a channel range of a tensor is a
+# CONTIGUOUS range of whole planes -- which means:
+#
+#   * a channel `slice` is a window into the buffer its input already
+#     lives in (`alias_kind="view"`), and
+#   * a channel `concat` is its operands' producers being redirected to
+#     write into one buffer at different plane offsets
+#     (`alias_kind="part"`), i.e. producer-directed placement, exactly
+#     what `accel_v2.model.Model.concat` does with
+#     `Tensor.alias_parent`/`alias_plane_offset`.
+#
+# Two limits follow from the plane granularity itself, and both are
+# enforced below rather than assumed:
+#
+#   * the axis must be the CHANNEL axis. GIR is NHWC, so that is axis 3.
+#     (The real YOLOv8n artifact's concats say `axis = 1` because it is
+#     NCHW; a graph that reaches this compiler has already been converted,
+#     and if it has not, its convolutions would not have imported either.)
+#   * only the LAST operand of a concat may have a channel count that is
+#     not a whole number of planes. A non-final operand with, say, 12
+#     channels occupies 2 planes, of which 4 lanes are padding -- and
+#     those padding lanes are exactly where the next operand's first
+#     channels have to be. Its producer would overwrite them.
+# ---------------------------------------------------------------------------
+
+_CHANNEL_AXIS = 3
+
+
+def _alias_buffer(buf: Buffer, parent_id: str, plane_offset: int, kind: str) -> Buffer:
+    return dataclasses.replace(
+        buf, alias_parent=parent_id, alias_plane_offset=plane_offset, alias_kind=kind
+    )
+
+
+def _check_channel_axis(op: Op, axis: int, rank: int, what: str) -> None:
+    if axis == _CHANNEL_AXIS and rank == 4:
+        return
+    raise CapabilityError(
+        f"{what} on axis {axis} of a rank-{rank} tensor has no zero-cost lowering: activations are "
+        f"stored as channel planes [C/{{T}}][H][W][T] (decision S6), so only the channel axis "
+        f"(axis {_CHANNEL_AXIS} of an NHWC tensor) is a contiguous range of a buffer. Any other "
+        "axis would interleave every plane and needs a real copy, which this compiler does not "
+        "emit",
+        op_id=op.id, stage=_STAGE, constraint=f"{what}.axis",
+    )
+
+
+def _lower_slice(
+    op: Op, graph: Graph, buffers: dict, *, space_name: str, align: int,
+    activation_layout: str, plane_channels: int,
+) -> Buffer:
+    """A GIR channel `slice` -> a read-only `view` Buffer over its input's
+    buffer. No `HirOp` at all."""
+    x_id = op.inputs[0]
+    y_id = op.outputs[0]
+    x, y = graph.tensor(x_id), graph.tensor(y_id)
+    attrs: SliceAttrs = op.attrs
+
+    _check_channel_axis(op, _CHANNEL_AXIS, len(x.shape), "slice")
+    for axis in range(3):
+        if attrs.start[axis] != 0 or attrs.size[axis] != x.shape[axis]:
+            raise CapabilityError(
+                f"slice takes [{attrs.start[axis]}, {attrs.start[axis] + attrs.size[axis]}) of axis "
+                f"{axis} (extent {x.shape[axis]}): only the channel axis may be sliced, every other "
+                "axis must be taken whole",
+                op_id=op.id, stage=_STAGE, constraint="slice.axis",
+            )
+
+    start_c, size_c = attrs.start[_CHANNEL_AXIS], attrs.size[_CHANNEL_AXIS]
+    if start_c % plane_channels != 0:
+        raise CapabilityError(
+            f"slice starts at channel {start_c}, which is not a multiple of the {plane_channels}-"
+            f"channel activation plane: a view can only begin on a plane boundary, since a plane is "
+            "the smallest thing that is contiguous in DDR",
+            op_id=op.id, stage=_STAGE, constraint="slice.start",
+        )
+
+    parent_id = f"%{x_id}"
+    parent = buffers.get(parent_id)
+    if parent is None:
+        raise CapabilityError(
+            f"slice input %{x_id} has no buffer to view into", op_id=op.id, stage=_STAGE, constraint="slice"
+        )
+    if parent.layout != activation_layout:
+        raise CapabilityError(
+            f"slice input %{x_id} has layout {parent.layout!r}, not the {activation_layout!r} "
+            "channel-plane activation layout a view is defined over",
+            op_id=op.id, stage=_STAGE, constraint="slice",
+        )
+
+    return Buffer(
+        id=f"%{y_id}",
+        space=space_name,
+        size_bytes=activation_bytes(y.shape, plane_channels, _dtype_bytes(y.dtype)),
+        align=align,
+        role="output" if y_id in graph.outputs else "intermediate",
+        layout=activation_layout,
+        shape=y.shape,
+        dtype=y.dtype,
+        gir_tensor=y_id,
+        alias_parent=parent_id,
+        alias_plane_offset=start_c // plane_channels,
+        alias_kind="view",
+    )
+
+
+def _storage_sources(buffer_id: str, buffers: dict) -> list:
+    """`HirModule.storage_dependencies` over the plain dict `to_hir` is
+    still building (no `HirModule` exists yet at that point).
+
+    Only the ancestor direction is needed here: a concat's parts are
+    aliased when the concat is lowered, which is always after the ops that
+    read them, so nothing lowered so far can be reading a concat result.
+    """
+    sources = [buffer_id]
+    current = buffer_id
+    while True:
+        buf = buffers.get(current)
+        if buf is None or buf.alias_parent is None or buf.alias_parent in sources:
+            return sources
+        sources.append(buf.alias_parent)
+        current = buf.alias_parent
+
+
+def _concat_groups(op: Op, graph: Graph, buffers: dict, plane_channels: int) -> list:
+    """Collapse a concat's operand list into the buffers that will
+    actually be placed, as `[(buffer id, channels, description)]`.
+
+    Usually one operand is one buffer. The exception is the shape that
+    makes YOLOv8n's C2f block work: several operands that are already
+    `slice` VIEWS of one tensor. Their addresses are not theirs to choose
+    -- they follow their parent -- so what has to move into the concat
+    result is the PARENT, once, covering all of them. That is legal
+    exactly when the run of operands are consecutive views tiling the
+    whole parent in order, which is checked here; anything else would
+    require the parent's pieces to sit at addresses that are not a fixed
+    distance apart, and is refused.
+    """
+    def planes(channels: int) -> int:
+        return -(-channels // plane_channels)
+
+    groups: list = []
+    seen: set[str] = set()
+    index = 0
+    while index < len(op.inputs):
+        part_id = op.inputs[index]
+        buffer_id = f"%{part_id}"
+        buf = buffers.get(buffer_id)
+        if buf is None:
+            raise CapabilityError(
+                f"concat operand %{part_id} has no buffer", op_id=op.id, stage=_STAGE, constraint="concat"
+            )
+
+        if buf.alias_kind != "view":
+            groups.append((buffer_id, graph.tensor(part_id).shape[_CHANNEL_AXIS], f"%{part_id}"))
+            index += 1
+        else:
+            root_id = buf.alias_parent
+            root = buffers[root_id]
+            members: list[str] = []
+            offset = 0
+            cursor = index
+            while cursor < len(op.inputs):
+                candidate = buffers.get(f"%{op.inputs[cursor]}")
+                if candidate is None or candidate.alias_kind != "view" or candidate.alias_parent != root_id:
+                    break
+                if candidate.alias_plane_offset != offset:
+                    break
+                offset += planes(graph.tensor(op.inputs[cursor]).shape[_CHANNEL_AXIS])
+                members.append(op.inputs[cursor])
+                cursor += 1
+            root_channels = root.shape[_CHANNEL_AXIS]
+            if offset != planes(root_channels):
+                raise CapabilityError(
+                    f"concat operand %{part_id} is a view of {root_id!r}, and the operands around it "
+                    f"do not cover {root_id!r} completely and in order (they cover {offset} of its "
+                    f"{planes(root_channels)} channel planes). A view cannot be moved on its own -- "
+                    "its address is its parent's plus a fixed offset -- so the whole parent has to "
+                    "go into the concat result as one piece, which is only possible when its views "
+                    "are concatenated back-to-back in their original order",
+                    op_id=op.id, stage=_STAGE, constraint="concat.operand",
+                )
+            groups.append((root_id, root_channels, f"{root_id} (via views %" + ", %".join(members) + ")"))
+            index = cursor
+
+        if groups[-1][0] in seen:
+            raise CapabilityError(
+                f"concat places {groups[-1][0]!r} twice; a tensor cannot occupy two channel ranges "
+                "of one result",
+                op_id=op.id, stage=_STAGE, constraint="concat.operand",
+            )
+        seen.add(groups[-1][0])
+
+    return groups
+
+
+def _lower_concat(
+    op: Op, graph: Graph, buffers: dict, *, space_name: str, align: int,
+    activation_layout: str, plane_channels: int,
+) -> tuple[Buffer, dict]:
+    """A GIR channel `concat` -> the result Buffer plus a rewritten
+    (aliased) Buffer for every operand. No `HirOp` at all: the operands'
+    own producers write the result between them.
+
+    Returns `(result_buffer, {operand buffer id: aliased Buffer})`."""
+    y_id = op.outputs[0]
+    y = graph.tensor(y_id)
+    attrs: ConcatAttrs = op.attrs
+
+    _check_channel_axis(op, attrs.axis, len(y.shape), "concat")
+
+    y_buf = Buffer(
+        id=f"%{y_id}",
+        space=space_name,
+        size_bytes=activation_bytes(y.shape, plane_channels, _dtype_bytes(y.dtype)),
+        align=align,
+        role="output" if y_id in graph.outputs else "intermediate",
+        layout=activation_layout,
+        shape=y.shape,
+        dtype=y.dtype,
+        gir_tensor=y_id,
+    )
+
+    groups = _concat_groups(op, graph, buffers, plane_channels)
+
+    rewritten: dict = {}
+    channel = 0
+    last = len(groups) - 1
+    for index, (buffer_id, group_channels, what) in enumerate(groups):
+        part_buf = buffers[buffer_id]
+        if part_buf.role != "intermediate":
+            # An input/const/output operand already lives somewhere else,
+            # and redirecting its producer is not an option (it has none,
+            # or its address is pinned). Moving it would need a COPY
+            # instruction, which this compiler does not schedule.
+            raise CapabilityError(
+                f"concat operand {what} is a {part_buf.role!r} buffer, which cannot be placed "
+                "inside the concat result: only a tensor produced by another op in this graph can "
+                "be redirected to write there. Materialising it would need a COPY instruction, "
+                "which this compiler does not emit yet",
+                op_id=op.id, stage=_STAGE, constraint="concat.operand",
+            )
+        if part_buf.alias_parent is not None:
+            raise CapabilityError(
+                f"concat operand {what} is already a view of {part_buf.alias_parent!r}; a tensor "
+                "cannot be placed inside two buffers at once",
+                op_id=op.id, stage=_STAGE, constraint="concat.operand",
+            )
+        if part_buf.layout != activation_layout:
+            raise CapabilityError(
+                f"concat operand {what} has layout {part_buf.layout!r}, not the "
+                f"{activation_layout!r} channel-plane activation layout",
+                op_id=op.id, stage=_STAGE, constraint="concat.operand",
+            )
+        if index != last and group_channels % plane_channels != 0:
+            raise CapabilityError(
+                f"concat operand {index} ({what}) has {group_channels} channels, which is not a "
+                f"multiple of the {plane_channels}-channel activation plane, and it is not the last "
+                f"operand. Its last plane's {(-group_channels) % plane_channels} padding lanes sit "
+                f"exactly where operand {index + 1}'s first channels must go, so its producer would "
+                "overwrite them. Only the final operand may have a partial plane",
+                op_id=op.id, stage=_STAGE, constraint="concat.operand",
+            )
+
+        rewritten[buffer_id] = _alias_buffer(part_buf, y_buf.id, channel // plane_channels, "part")
+        channel += group_channels
+
+    if channel != y.shape[_CHANNEL_AXIS]:
+        raise CapabilityError(
+            f"concat operands cover {channel} channels, result has {y.shape[_CHANNEL_AXIS]}",
+            op_id=op.id, stage=_STAGE, constraint="concat",
+        )
+    return y_buf, rewritten
+
+
 def to_hir(graph: Graph, target: Target) -> HirModule:
     conv_unit = _rounding_gate(target)
 
@@ -631,7 +1195,7 @@ def to_hir(graph: Graph, target: Target) -> HirModule:
     tiling = conv_unit.internal_tiling
 
     for op in graph.ops:
-        if op.kind not in ("const", "fused_conv", "pool"):
+        if op.kind not in ("const", "fused_conv", "pool", "add", "table", "upsample", "concat", "slice"):
             reason = _UNFUSED_REASON.get(op.kind, "the accelerator has no addressable instruction for this op kind")
             raise CapabilityError(
                 f"no unit implements {op.kind} standalone; not fused because {reason}",
@@ -642,10 +1206,21 @@ def to_hir(graph: Graph, target: Target) -> HirModule:
     # the HIR op order (which `schedule` then only re-orders within the
     # dependency constraints) has to follow the source order, not group by
     # kind.
-    compute_ops = [op for op in graph.ops if op.kind in ("fused_conv", "pool")]
+    compute_ops = [
+        op for op in graph.ops
+        if op.kind in ("fused_conv", "pool", "add", "table", "upsample", "concat", "slice")
+    ]
     pool_unit = select_unit(target, "max_pool2d") if any(op.kind == "pool" for op in compute_ops) else None
+    add_unit = select_unit(target, "add") if any(op.kind == "add" for op in compute_ops) else None
+    table_unit = select_unit(target, "table") if any(op.kind == "table" for op in compute_ops) else None
+    upsample_unit = select_unit(target, "upsample") if any(op.kind == "upsample" for op in compute_ops) else None
 
     weight_of: dict[str, str] = {}
+    # ACT LUT operands are consts too, but their byte image is not their
+    # own values (`pack_act_lut` rotates the index order), and `_lower_table`
+    # builds their buffer itself. Excluded from the generic const loop
+    # below so they are packed exactly once, by the code that knows how.
+    act_lut_tensors = {op.inputs[1] for op in graph.ops if op.kind == "table"}
     # bias tensor id -> the zero-point-folded values that must be packed
     # instead of the tensor's own (see `_fold_bias_for_zero_point`).
     folded_bias: dict[str, tuple[int, ...]] = {}
@@ -686,6 +1261,8 @@ def to_hir(graph: Graph, target: Target) -> HirModule:
         if op.kind != "const":
             continue
         tid = op.outputs[0]
+        if tid in act_lut_tensors:
+            continue
         t = graph.tensor(tid)
         layout = weight_of.get(tid, "TILED_OHWI" if len(t.shape) == 4 else "I32_TILED")
         if layout == "TILED_OHWI":
@@ -700,20 +1277,71 @@ def to_hir(graph: Graph, target: Target) -> HirModule:
     ops: list[HirOp] = []
     notes: list[str] = []
     writer_of: dict[str, str] = {}
-    for idx, op in enumerate(compute_ops):
+    idx = 0
+    for op in compute_ops:
+        # `concat`/`slice` produce no instruction at all -- they are the
+        # buffer-view lowering (see `_lower_concat`/`_lower_slice`), so
+        # they consume no op index and add nothing to `ops`. They still
+        # have to run HERE, in GIR order, because a concat REWRITES the
+        # buffers its operands' producers already claimed.
+        if op.kind == "slice":
+            view = _lower_slice(
+                op, graph, buffers, space_name=space_name, align=space.align,
+                activation_layout=activation_layout, plane_channels=plane_channels,
+            )
+            buffers[view.id] = view
+            continue
+        if op.kind == "concat":
+            y_buf, rewritten = _lower_concat(
+                op, graph, buffers, space_name=space_name, align=space.align,
+                activation_layout=activation_layout, plane_channels=plane_channels,
+            )
+            buffers[y_buf.id] = y_buf
+            buffers.update(rewritten)
+            continue
+
         if op.kind == "pool":
             hir_op, y_buf = _lower_pool(
                 op, graph, pool_unit, space_name=space_name, align=space.align,
                 activation_layout=activation_layout, plane_channels=plane_channels,
             )
             scale_buf, note = None, None
+        elif op.kind == "add":
+            hir_op, y_buf = _lower_add(
+                op, graph, add_unit, space_name=space_name, align=space.align,
+                activation_layout=activation_layout, plane_channels=plane_channels,
+            )
+            scale_buf, note = None, None
+        elif op.kind == "upsample":
+            hir_op, y_buf = _lower_upsample(
+                op, graph, upsample_unit, space_name=space_name, align=space.align,
+                activation_layout=activation_layout, plane_channels=plane_channels,
+                hw_factor=upsample_unit.upsample_factor,
+            )
+            scale_buf, note = None, None
+        elif op.kind == "table":
+            # `scale_buf` is the generic "this op also brought a const
+            # buffer with it" slot; for `table` that const is the ACT LUT.
+            hir_op, y_buf, scale_buf = _lower_table(
+                op, graph, table_unit, space_name=space_name, align=space.align,
+                activation_layout=activation_layout, plane_channels=plane_channels,
+            )
+            note = None
         else:
             hir_op, y_buf, scale_buf, note = _lower_fused_conv(
                 op, graph, conv_unit, space_name=space_name, align=space.align,
                 activation_layout=activation_layout, plane_channels=plane_channels,
             )
         op_id = f"#{idx}"
-        hir_op = hir_op.replace(id=op_id, deps=tuple(sorted({writer_of[bid] for bid in hir_op.reads if bid in writer_of})))
+        idx += 1
+        # Reads resolve through aliases: an op consuming a `tosa.slice`
+        # view depends on whoever wrote the buffer that view looks into.
+        deps = set()
+        for bid in hir_op.reads:
+            for source in _storage_sources(bid, buffers):
+                if source in writer_of:
+                    deps.add(writer_of[source])
+        hir_op = hir_op.replace(id=op_id, deps=tuple(sorted(deps)))
         ops.append(hir_op)
         if scale_buf is not None:
             buffers[scale_buf.id] = scale_buf

@@ -268,10 +268,25 @@ class Unit:
     epilogue: Epilogue
     isa_version: str
     partial_sum_io: bool
+    #: The spatial replication factor this unit's `upsample` capability
+    #: implements, or `None` for a unit that has no such capability.
+    #: `OPCODE_UPSAMPLE` has no factor field -- the factor is baked into
+    #: the datapath -- so this is a capability statement, not a
+    #: programmable parameter, and `lower.to_hir` refuses any other
+    #: factor rather than encoding it into an instruction that would
+    #: silently do this one.
+    upsample_factor: int | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
             raise TargetError("Unit.name must be non-empty")
+        if self.upsample_factor is not None and self.upsample_factor < 1:
+            raise TargetError("Unit.upsample_factor must be positive when present")
+        if ("upsample" in self.ops) != (self.upsample_factor is not None):
+            raise TargetError(
+                f"Unit {self.name!r}: 'upsample' in ops and upsample_factor must be given together "
+                f"(ops={self.ops}, upsample_factor={self.upsample_factor})"
+            )
         if not self.ops:
             raise TargetError("Unit.ops must be non-empty")
         if not isinstance(self.internal_tiling, InternalTiling):
@@ -299,6 +314,7 @@ class Unit:
             "epilogue": self.epilogue.to_dict(),
             "isa_version": self.isa_version,
             "partial_sum_io": self.partial_sum_io,
+            "upsample_factor": self.upsample_factor,
         }
 
     @classmethod
@@ -323,6 +339,9 @@ class Unit:
             epilogue=Epilogue.from_dict(_require(data, "epilogue", "Unit")),
             isa_version=_require(data, "isa_version", "Unit"),
             partial_sum_io=_require(data, "partial_sum_io", "Unit"),
+            # Absent from a target JSON written before the capability
+            # existed, which is exactly a unit that does not have it.
+            upsample_factor=data.get("upsample_factor"),
         )
 
 

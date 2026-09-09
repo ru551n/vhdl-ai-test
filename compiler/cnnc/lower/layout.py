@@ -16,6 +16,9 @@ independently; `tests/test_layout.py` pins the two against each other.
   `out_channels`/`in_channels` are written as 0, never omitted.
 - Bias: `[OT][pe_rows]` int32 little-endian, zero-padded like the weights'
   output-channel tiles.
+- ACT LUT (ISA v2.0, `OPCODE_ACT`): 256 int8 bytes, the TOSA `TABLE`
+  operand rotated by 128 into the hardware's raw-byte index order; see
+  `pack_act_lut`.
 - Scale table (ISA v1.2 / H2, doc/tosa_compiler_plan.md §5 extension 2):
   `[OT][pe_rows]` entries of `SCALE_TABLE_ENTRY_BYTES` (8) bytes each,
   `multiplier int32 LE | shift uint8 | 3 zero bytes`, padded with all-zero
@@ -99,6 +102,31 @@ def pack_bias_tiled(values: tuple[int, ...], pe_rows: int) -> bytes:
     oc = len(values)
     padded = list(values) + [0] * (_ceil_div(oc, pe_rows) * pe_rows - oc)
     return struct.pack(f"<{len(padded)}i", *padded)
+
+
+ACT_LUT_ENTRIES = 256
+
+
+def pack_act_lut(values: tuple[int, ...]) -> bytes:
+    """A TOSA `TABLE` operand -> the accelerator's 256-byte ACT LUT image.
+
+    The two tables hold the same 256 answers in a DIFFERENT ORDER, and
+    that rotation is the whole content of this function:
+
+    * TOSA indexes an int8 TABLE by `value - type_min`, i.e. entry `i`
+      answers input `i - 128`; the table runs -128, -127, ... 127.
+    * the hardware indexes by the raw byte, `lut[v & 0xFF]`, i.e. entry
+      `i` answers input `i` for `i < 128` and `i - 256` above it; the
+      table runs 0, 1, ... 127, -128, ... -1
+      (`cnn_accel_model.act_lut`).
+
+    So `hw[i] = tosa[(i + 128) % 256]`. Getting this backwards is not a
+    crash, it is a silently wrong activation on every value, which is why
+    it lives in one named function with one test rather than inline at the
+    lowering site."""
+    if len(values) != ACT_LUT_ENTRIES:
+        raise ValueError(f"ACT LUT must have exactly {ACT_LUT_ENTRIES} entries, got {len(values)}")
+    return bytes(int(values[(i + 128) % ACT_LUT_ENTRIES]) & 0xFF for i in range(ACT_LUT_ENTRIES))
 
 
 SCALE_TABLE_ENTRY_BYTES = 8

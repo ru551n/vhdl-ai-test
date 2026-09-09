@@ -92,6 +92,81 @@ class PoolAttrs:
 
 
 @dataclasses.dataclass(frozen=True)
+class AddAttrs:
+    """Two-input elementwise add of int8 tensors, with ONE shared rescale
+    applied to each operand before the sum:
+
+        out = sat_i8(apply_scale_32(a, multiplier, shift)
+                     + apply_scale_32(b, multiplier, shift))
+
+    Written in TOSA primitives (`interp.apply_scale_32`), but shaped by
+    the accelerator's `OPCODE_ADD`, which carries exactly one
+    `(requant_scale, requant_shift)` pair for both operands and rounds
+    each operand *before* the sum. Two roundings, not one: that is
+    observable, so the GIR op says so rather than leaving it to the
+    backend.
+
+    `multiplier = 1 << 15, shift = 15` is the identity rescale
+    (`apply_scale_32(v, 2**15, 15) == v` exactly) and is what a bare
+    `tosa.add` on two int8 tensors imports as; a quantized residual add
+    reaches non-identity values through `passes.fuse`, which folds the
+    two per-operand `tosa.rescale`s in.
+
+    Saturation, not wraparound, is the final step -- what the hardware
+    does. TOSA leaves an int8 ADD whose exact sum is unrepresentable
+    undefined, so the two agree wherever TOSA is defined.
+    """
+
+    multiplier: int
+    shift: int
+
+
+@dataclasses.dataclass(frozen=True)
+class UpsampleAttrs:
+    """Nearest-neighbour spatial upsample of an NHWC tensor:
+
+        out[0, y, x, c] = in[0, y // factor, x // factor, c]
+
+    A pure index permutation -- no arithmetic, no rounding, nothing to
+    requantize -- which is why it has no scale of any kind.
+
+    TOSA has no such op. What a TOSA producer emits for a nearest-2x
+    upsample is a `reshape -> tile -> reshape -> tile -> reshape` chain
+    over a rank-5 intermediate, and `frontend.tosa_import` recognises
+    that chain by *evaluating* it rather than by matching its shapes (see
+    `_match_upsample_chains`). This op is what the chain collapses to,
+    and it exists because the accelerator has a single instruction for
+    it (`OPCODE_UPSAMPLE`).
+    """
+
+    factor: int
+
+
+@dataclasses.dataclass(frozen=True)
+class ConcatAttrs:
+    """TOSA `CONCAT` along one axis.
+
+    Only the channel axis is ever lowered (see
+    `lower.to_hir._lower_concat`): activations live in DDR as
+    `[C/T][H][W][T]` channel planes (decision S6), so concatenating along
+    C is contiguous plane ranges of one buffer and costs nothing, while
+    concatenating along H or W would interleave every plane and cost a
+    full copy. The axis is carried here rather than assumed so the GIR
+    stays a faithful record of the TOSA it came from.
+    """
+
+    axis: int
+
+
+@dataclasses.dataclass(frozen=True)
+class SliceAttrs:
+    """TOSA `SLICE`: `out = in[start : start + size]` per axis."""
+
+    start: tuple[int, ...]
+    size: tuple[int, ...]
+
+
+@dataclasses.dataclass(frozen=True)
 class FusedConvAttrs:
     """Composition of conv2d + rescale + optional clamp (M5). Defined now
     so the `Op.attrs` union is stable; nothing produces `fused_conv` yet."""
@@ -101,13 +176,16 @@ class FusedConvAttrs:
     clamp: ClampAttrs | None
 
 
-Attrs = Union[ConvAttrs, RescaleParams, ClampAttrs, PoolAttrs, FusedConvAttrs, None]
+Attrs = Union[
+    ConvAttrs, RescaleParams, ClampAttrs, PoolAttrs, AddAttrs, UpsampleAttrs,
+    ConcatAttrs, SliceAttrs, FusedConvAttrs, None,
+]
 
 
 @dataclasses.dataclass(frozen=True)
 class Op:
     id: str  # f"%{outputs[0]}", i.e. the MLIR SSA name of its first output
-    kind: str  # const | conv2d | rescale | clamp | pool | fused_conv
+    kind: str  # const | conv2d | rescale | clamp | pool | add | table | upsample | concat | slice | fused_conv
     inputs: tuple[str, ...]
     outputs: tuple[str, ...]
     attrs: Attrs = None
@@ -161,6 +239,15 @@ def conv2d_output_shape(
     out_h = (in_h + pad_t + pad_b - dil_h * (kh - 1) - 1) // stride_h + 1
     out_w = (in_w + pad_l + pad_r - dil_w * (kw - 1) - 1) // stride_w + 1
     return (n, out_h, out_w, oc)
+
+
+def upsample_output_shape(
+    in_shape: tuple[int, int, int, int], factor: int
+) -> tuple[int, int, int, int]:
+    """Nearest-neighbour upsample output shape, NHWC `[N, H, W, C]`: both
+    spatial dimensions scaled by `factor`, batch and channels untouched."""
+    n, h, w, c = in_shape
+    return (n, h * factor, w * factor, c)
 
 
 def pool2d_output_shape(

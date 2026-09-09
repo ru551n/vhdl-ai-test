@@ -16,6 +16,7 @@ import numpy as np
 
 from cnnc.errors import CompilerError
 from cnnc.gir.ir import (
+    AddAttrs,
     ClampAttrs,
     ConvAttrs,
     FusedConvAttrs,
@@ -152,6 +153,44 @@ def _pool_int64(x: np.ndarray, attrs: PoolAttrs, op_id: str) -> np.ndarray:
     return acc
 
 
+def _add_int64(a: np.ndarray, b: np.ndarray, attrs: AddAttrs) -> np.ndarray:
+    """`sat_i8(apply_scale_32(a) + apply_scale_32(b))` with one shared
+    `(multiplier, shift)`, vectorised (see `AddAttrs` for why each operand
+    is rounded before the sum rather than after it)."""
+    scale = RescaleParams(
+        multiplier=(attrs.multiplier,), shift=(attrs.shift,), per_channel=False,
+        in_zp=0, out_zp=0, rounding="SINGLE_ROUND", scale32=True,
+        input_unsigned=False, output_unsigned=False,
+    )
+    # rescale_array clamps each operand to i32, which is a no-op at these
+    # magnitudes; the int8 saturation that matters is the one below, after
+    # the sum -- exactly the hardware's single saturating step.
+    ra = rescale_array(a, scale, "i32")
+    rb = rescale_array(b, scale, "i32")
+    lo, hi = dtype_range("i8")
+    return np.clip(ra + rb, lo, hi)
+
+
+def _table_int64(x: np.ndarray, table: np.ndarray) -> np.ndarray:
+    """TOSA `TABLE` on an int8 input: `out[..] = table[in[..] - type_min]`,
+    i.e. entry 0 answers -128 and entry 255 answers 127.
+
+    The accelerator indexes the same 256 answers by the raw byte instead;
+    `lower.layout.pack_act_lut` is where that rotation happens, and it is
+    the only place it happens."""
+    lo, _hi = dtype_range("i8")
+    flat = np.asarray(table, dtype=np.int64).reshape(-1)
+    return flat[(x.astype(np.int64) - np.int64(lo))]
+
+
+def _upsample_int64(x: np.ndarray, attrs) -> np.ndarray:
+    """`out[0, y, x, c] = in[0, y // factor, x // factor, c]` -- each
+    pixel replicated `factor` times in both spatial dimensions, channels
+    carried along whole."""
+    f = attrs.factor
+    return np.repeat(np.repeat(x.astype(np.int64), f, axis=1), f, axis=2)
+
+
 def evaluate_all(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Execute every op in `graph` and return every tensor, keyed by tensor
     id (no `%`), cast to its declared GIR dtype's numpy type."""
@@ -183,6 +222,21 @@ def evaluate_all(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.nd
             result = _clamp(values[op.inputs[0]], op.attrs)
         elif op.kind == "pool":
             result = _pool_int64(values[op.inputs[0]], op.attrs, op.id)
+        elif op.kind == "add":
+            a, b = (values[i] for i in op.inputs)
+            result = _add_int64(a, b, op.attrs)
+        elif op.kind == "table":
+            x, table = (values[i] for i in op.inputs)
+            result = _table_int64(x, table)
+        elif op.kind == "upsample":
+            result = _upsample_int64(values[op.inputs[0]], op.attrs)
+        elif op.kind == "concat":
+            result = np.concatenate([values[i] for i in op.inputs], axis=op.attrs.axis)
+        elif op.kind == "slice":
+            index = tuple(
+                slice(start, start + size) for start, size in zip(op.attrs.start, op.attrs.size)
+            )
+            result = values[op.inputs[0]][index]
         elif op.kind == "fused_conv":
             fused: FusedConvAttrs = op.attrs
             x, w, b = (values[i] for i in op.inputs)

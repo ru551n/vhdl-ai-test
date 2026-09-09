@@ -367,6 +367,326 @@ def per_channel_oc8_text() -> str:
     return build_module([layer])
 
 
+# ---------------------------------------------------------------------------
+# M14 `tosa.table` fixtures: the 256-entry int8 -> int8 LUT that carries a
+# general activation (SiLU, in YOLOv8n) to the accelerator's OPCODE_ACT.
+# ---------------------------------------------------------------------------
+
+#: Quantization the SiLU LUT below is built at: an int8 code `q` means the
+#: real value `q * _SILU_STEP`, for both input and output. 16/128 puts the
+#: representable range at [-8, +8), which covers SiLU's interesting region
+#: (it is essentially linear above +4 and essentially 0 below -4).
+_SILU_STEP = 16.0 / 128.0
+
+
+def silu_lut() -> np.ndarray:
+    """A real SiLU (`x * sigmoid(x)`) sampled onto the 256 int8 codes, in
+    TOSA `TABLE` order: entry `i` answers input `i - 128`.
+
+    Not a synthetic ramp: the point of the ACT LUT is a function the
+    hardware cannot compute any other way, and SiLU is the one YOLOv8n
+    actually needs. Values are rounded half-away-from-zero and clamped to
+    int8, so the table is exactly representable and the fixture is
+    reproducible from this function alone."""
+    codes = np.arange(-128, 128, dtype=np.float64)
+    x = codes * _SILU_STEP
+    y = x / (1.0 + np.exp(-x))
+    q = np.trunc(y / _SILU_STEP + np.copysign(0.5, y))
+    return np.clip(q, -128, 127).astype(np.int64)
+
+
+def _table_module(shape: tuple[int, int, int, int], n_tables: int) -> str:
+    """A module of `n_tables` chained `tosa.table` ops over one input, all
+    sharing one `tosa.const` LUT (which also pins that a const read by two
+    ops is placed once, not twice)."""
+    dims = "x".join(str(d) for d in shape)
+    ty = f"tensor<{dims}xi8>"
+    lines = [
+        '"builtin.module"() ({',
+        f'  "func.func"() <{{function_type = ({ty}) -> {ty}, sym_name = "main"}}> ({{',
+        f"  ^bb0(%arg0: {ty}):",
+        f'    %lut = "tosa.const"() <{{values = {_dense(silu_lut(), "256xi8")}}}> : () -> tensor<256xi8>',
+    ]
+    value = "%arg0"
+    for i in range(n_tables):
+        result = f"%t{i}"
+        lines.append(
+            f'    {result} = "tosa.table"({value}, %lut) : ({ty}, tensor<256xi8>) -> {ty}'
+        )
+        value = result
+    lines += [
+        f'    "func.return"({value}) : ({ty}) -> ()',
+        "  }) : () -> ()",
+        "}) : () -> ()",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def table_silu_text() -> str:
+    """One SiLU LUT over a `1x4x6x12` tensor. C=12 is deliberately not a
+    multiple of the 8-channel DDR plane, so the padding lanes ride along."""
+    return _table_module((1, 4, 6, 12), 1)
+
+
+def table_twice_text() -> str:
+    """The same LUT applied twice, so the program is a real two-instruction
+    chain through an intermediate buffer -- and both ACTs read one shared
+    LUT const."""
+    return _table_module((1, 8, 8, 8), 2)
+
+
+# ---------------------------------------------------------------------------
+# M14 nearest-2x upsample fixtures. TOSA has no upsample op, so a producer
+# spells it as `reshape -> tile -> reshape -> tile -> reshape` over a
+# rank-5 intermediate; this generator writes that chain in NHWC (the
+# layout GIR uses), which is the same chain YOLOv8n's NCHW artifact
+# contains with the spatial axes in the other place.
+# ---------------------------------------------------------------------------
+
+
+def _shape_const(name: str, values: list[int]) -> str:
+    dims = ", ".join(str(v) for v in values)
+    return (
+        f'    {name} = "tosa.const_shape"() <{{values = dense<[{dims}]> : '
+        f"tensor<{len(values)}xindex>}}> : () -> !tosa.shape<{len(values)}>"
+    )
+
+
+def upsample_chain_lines(
+    source: str, shape: tuple[int, int, int, int], prefix: str, out_name: str
+) -> tuple[list[str], tuple[int, int, int, int]]:
+    """The five ops that spell nearest-2x upsample of an NHWC `shape`.
+
+    H is replicated first (a rank-5 `[1, H, 1, W, C]` tiled on axis 2,
+    then folded back into `[1, 2H, W, 1, C]`), then W. Written out rather
+    than emitted by a helper op so the fixture is exactly what a real
+    exporter produces -- the whole point is that the compiler recognises
+    the chain, not a shorthand for it."""
+    n, h, w, c = shape
+    ty = lambda dims: "tensor<" + "x".join(str(d) for d in dims) + "xi8>"  # noqa: E731
+    lines = [
+        _shape_const(f"%{prefix}s0", [n, h, 1, w, c]),
+        _shape_const(f"%{prefix}s1", [1, 1, 2, 1, 1]),
+        _shape_const(f"%{prefix}s2", [n, 2 * h, w, 1, c]),
+        _shape_const(f"%{prefix}s3", [1, 1, 1, 2, 1]),
+        _shape_const(f"%{prefix}s4", [n, 2 * h, 2 * w, c]),
+        f'    %{prefix}0 = "tosa.reshape"({source}, %{prefix}s0) : '
+        f"({ty((n, h, w, c))}, !tosa.shape<5>) -> {ty((n, h, 1, w, c))}",
+        f'    %{prefix}1 = "tosa.tile"(%{prefix}0, %{prefix}s1) : '
+        f"({ty((n, h, 1, w, c))}, !tosa.shape<5>) -> {ty((n, h, 2, w, c))}",
+        f'    %{prefix}2 = "tosa.reshape"(%{prefix}1, %{prefix}s2) : '
+        f"({ty((n, h, 2, w, c))}, !tosa.shape<5>) -> {ty((n, 2 * h, w, 1, c))}",
+        f'    %{prefix}3 = "tosa.tile"(%{prefix}2, %{prefix}s3) : '
+        f"({ty((n, 2 * h, w, 1, c))}, !tosa.shape<5>) -> {ty((n, 2 * h, w, 2, c))}",
+        f'    {out_name} = "tosa.reshape"(%{prefix}3, %{prefix}s4) : '
+        f"({ty((n, 2 * h, w, 2, c))}, !tosa.shape<4>) -> {ty((n, 2 * h, 2 * w, c))}",
+    ]
+    return lines, (n, 2 * h, 2 * w, c)
+
+
+def _upsample_module(shape: tuple[int, int, int, int], times: int) -> str:
+    ty = lambda dims: "tensor<" + "x".join(str(d) for d in dims) + "xi8>"  # noqa: E731
+    body: list[str] = []
+    value, current = "%arg0", shape
+    for i in range(times):
+        out_name = f"%u{i}"
+        lines, current = upsample_chain_lines(value, current, f"c{i}_", out_name)
+        body += lines
+        value = out_name
+    return "\n".join(
+        [
+            '"builtin.module"() ({',
+            f'  "func.func"() <{{function_type = ({ty(shape)}) -> {ty(current)}, sym_name = "main"}}> ({{',
+            f"  ^bb0(%arg0: {ty(shape)}):",
+            *body,
+            f'    "func.return"({value}) : ({ty(current)}) -> ()',
+            "  }) : () -> ()",
+            "}) : () -> ()",
+            "",
+        ]
+    )
+
+
+def upsample2x_text() -> str:
+    """One nearest-2x upsample of `1x3x5x8`. Non-square and odd spatial
+    dims so a transposed or swapped-axis match cannot pass by symmetry."""
+    return _upsample_module((1, 3, 5, 8), 1)
+
+
+def upsample4x_text() -> str:
+    """Two chained 2x upsamples -- a two-instruction program, and the
+    shape YOLOv8n's neck reaches by upsampling twice."""
+    return _upsample_module((1, 2, 3, 12), 2)
+
+
+# ---------------------------------------------------------------------------
+# M14 `tosa.concat` / `tosa.slice` fixtures: the buffer-view lowering.
+#
+# Both are shaped like YOLOv8n's C2f block, which is where they actually
+# occur: a tensor is SLICED into two halves along channels, one half is
+# convolved, and the pieces are CONCATENATED back together. Written in
+# NHWC (axis 3), the layout GIR uses; the shipped NCHW artifact says
+# `axis = 1` for the same thing.
+# ---------------------------------------------------------------------------
+
+
+def _conv_layer_lines(
+    in_value: str,
+    in_shape: tuple[int, int, int, int],
+    out_channels: int,
+    counter: "_ValueCounter",
+    lines: list[str],
+    *,
+    weight_seed: int,
+    bias_seed: int,
+    mult: int,
+    shift: int,
+) -> tuple[str, tuple[int, int, int, int]]:
+    """A 3x3 same-padding conv + rescale + [0,127] clamp, appended to
+    `lines`. Returns `(result value, output shape)`."""
+    spec = LayerSpec(
+        in_shape=in_shape,
+        out_channels=out_channels,
+        kernel=3,
+        stride=(1, 1),
+        pad=(1, 1, 1, 1),
+        weight_seed=weight_seed,
+        bias_seed=bias_seed,
+        mult=mult,
+        shift=shift,
+        clamp=(0, 127),
+    )
+    value, _ty = _emit_layer(spec, in_value, counter, lines)
+    n, h, w, _c = in_shape
+    return value, (n, h, w, out_channels)
+
+
+def _ty(shape: tuple[int, ...]) -> str:
+    return "tensor<" + "x".join(str(d) for d in shape) + "xi8>"
+
+
+def _slice_lines(
+    source: str,
+    in_shape: tuple[int, int, int, int],
+    start_c: int,
+    size_c: int,
+    counter: "_ValueCounter",
+    lines: list[str],
+) -> tuple[str, tuple[int, int, int, int]]:
+    n, h, w, _c = in_shape
+    out_shape = (n, h, w, size_c)
+    start = counter.next()
+    size = counter.next()
+    result = counter.next()
+    lines.append(
+        f'    {start} = "tosa.const_shape"() <{{values = dense<[0, 0, 0, {start_c}]> : '
+        "tensor<4xindex>}> : () -> !tosa.shape<4>"
+    )
+    lines.append(
+        f'    {size} = "tosa.const_shape"() <{{values = dense<[{n}, {h}, {w}, {size_c}]> : '
+        "tensor<4xindex>}> : () -> !tosa.shape<4>"
+    )
+    lines.append(
+        f'    {result} = "tosa.slice"({source}, {start}, {size}) : '
+        f"({_ty(in_shape)}, !tosa.shape<4>, !tosa.shape<4>) -> {_ty(out_shape)}"
+    )
+    return result, out_shape
+
+
+def _concat_lines(
+    parts: list[tuple[str, tuple[int, int, int, int]]],
+    counter: "_ValueCounter",
+    lines: list[str],
+) -> tuple[str, tuple[int, int, int, int]]:
+    n, h, w, _c = parts[0][1]
+    total = sum(shape[3] for _v, shape in parts)
+    out_shape = (n, h, w, total)
+    result = counter.next()
+    operands = ", ".join(v for v, _s in parts)
+    in_types = ", ".join(_ty(s) for _v, s in parts)
+    lines.append(
+        f'    {result} = "tosa.concat"({operands}) <{{axis = 3 : i32}}> : '
+        f"({in_types}) -> {_ty(out_shape)}"
+    )
+    return result, out_shape
+
+
+def _module_text(in_shape: tuple[int, ...], out_shape: tuple[int, ...], body: list[str], out_value: str) -> str:
+    return "\n".join(
+        [
+            '"builtin.module"() ({',
+            f'  "func.func"() <{{function_type = ({_ty(in_shape)}) -> {_ty(out_shape)}, '
+            'sym_name = "main"}> ({',
+            f"  ^bb0(%arg0: {_ty(in_shape)}):",
+            *body,
+            f'    "func.return"({out_value}) : ({_ty(out_shape)}) -> ()',
+            "  }) : () -> ()",
+            "}) : () -> ()",
+            "",
+        ]
+    )
+
+
+def concat_two_convs_text() -> str:
+    """Two convolutions over one input, concatenated on channels: the
+    plainest producer-directed placement there is -- each conv is told to
+    write its own plane range of the result."""
+    counter = _ValueCounter()
+    lines: list[str] = []
+    in_shape = (1, 8, 8, 8)
+    a, a_shape = _conv_layer_lines(
+        "%arg0", in_shape, 8, counter, lines, weight_seed=801, bias_seed=802, mult=1073741824, shift=38
+    )
+    b, b_shape = _conv_layer_lines(
+        "%arg0", in_shape, 16, counter, lines, weight_seed=803, bias_seed=804, mult=1073741824, shift=38
+    )
+    out, out_shape = _concat_lines([(a, a_shape), (b, b_shape)], counter, lines)
+    return _module_text(in_shape, out_shape, lines, out)
+
+
+def concat_equal_halves_text() -> str:
+    """Two 8-channel convolutions concatenated: both operands are exactly
+    one channel plane, so their plane offsets can be SWAPPED and every
+    address stays legal (contained, disjoint, tiling the result). That is
+    the one concat mis-placement no structural check can catch, which is
+    what makes this fixture worth having -- only reading the result back
+    finds it."""
+    counter = _ValueCounter()
+    lines: list[str] = []
+    in_shape = (1, 8, 8, 8)
+    a, a_shape = _conv_layer_lines(
+        "%arg0", in_shape, 8, counter, lines, weight_seed=821, bias_seed=822, mult=1073741824, shift=38
+    )
+    b, b_shape = _conv_layer_lines(
+        "%arg0", in_shape, 8, counter, lines, weight_seed=823, bias_seed=824, mult=1073741824, shift=38
+    )
+    out, out_shape = _concat_lines([(a, a_shape), (b, b_shape)], counter, lines)
+    return _module_text(in_shape, out_shape, lines, out)
+
+
+def slice_concat_c2f_text() -> str:
+    """YOLOv8n's C2f shape: one convolution's output is split in half on
+    channels, the second half is convolved again, and all three pieces are
+    concatenated. Exercises a view and producer-directed placement in the
+    same graph, with a slice whose parent is itself a conv output."""
+    counter = _ValueCounter()
+    lines: list[str] = []
+    in_shape = (1, 8, 8, 8)
+    stem, stem_shape = _conv_layer_lines(
+        "%arg0", in_shape, 16, counter, lines, weight_seed=811, bias_seed=812, mult=1073741824, shift=38
+    )
+    first, first_shape = _slice_lines(stem, stem_shape, 0, 8, counter, lines)
+    second, second_shape = _slice_lines(stem, stem_shape, 8, 8, counter, lines)
+    branch, branch_shape = _conv_layer_lines(
+        second, second_shape, 8, counter, lines, weight_seed=813, bias_seed=814, mult=1073741824, shift=38
+    )
+    out, out_shape = _concat_lines(
+        [(first, first_shape), (second, second_shape), (branch, branch_shape)], counter, lines
+    )
+    return _module_text(in_shape, out_shape, lines, out)
+
+
 def main() -> None:
     (FIXTURES_DIR / "two_layer.mlir").write_text(two_layer_text())
     (FIXTURES_DIR / "first_layer_cin3.mlir").write_text(first_layer_cin3_text())
@@ -374,6 +694,13 @@ def main() -> None:
     (FIXTURES_DIR / "clamp_5_100.mlir").write_text(clamp_5_100_text())
     (FIXTURES_DIR / "per_channel.mlir").write_text(per_channel_text())
     (FIXTURES_DIR / "per_channel_oc8.mlir").write_text(per_channel_oc8_text())
+    (FIXTURES_DIR / "table_silu.mlir").write_text(table_silu_text())
+    (FIXTURES_DIR / "table_twice.mlir").write_text(table_twice_text())
+    (FIXTURES_DIR / "upsample2x.mlir").write_text(upsample2x_text())
+    (FIXTURES_DIR / "upsample4x.mlir").write_text(upsample4x_text())
+    (FIXTURES_DIR / "concat_two_convs.mlir").write_text(concat_two_convs_text())
+    (FIXTURES_DIR / "slice_concat_c2f.mlir").write_text(slice_concat_c2f_text())
+    (FIXTURES_DIR / "concat_equal_halves.mlir").write_text(concat_equal_halves_text())
 
 
 if __name__ == "__main__":

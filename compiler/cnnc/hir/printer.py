@@ -31,10 +31,17 @@ def _format_buffers(module: HirModule) -> list[str]:
     size_w = max(len(str(b.size_bytes)) for b in bufs)
     lines = []
     for b, sd in zip(bufs, shape_dtypes):
+        # A buffer view owns no bytes; saying so on its own line is what
+        # keeps a dump readable when two buffers share an address range.
+        alias = (
+            f" {b.alias_kind} of {b.alias_parent} +{b.alias_plane_offset} planes"
+            if b.alias_parent is not None
+            else ""
+        )
         lines.append(
             f"  {b.id.ljust(id_w)} {b.space.ljust(space_w)} {b.layout.ljust(layout_w)} "
             f"{sd.ljust(sd_w)} {str(b.size_bytes).rjust(size_w)} B align {b.align} "
-            f"addr {_fmt_addr(b.addr)} role {b.role}"
+            f"addr {_fmt_addr(b.addr)} role {b.role}{alias}"
         )
     return lines
 
@@ -102,6 +109,9 @@ def _buffer_to_json(buf: Buffer) -> dict:
         "addr": buf.addr,
         "data": _data_to_json(buf.data),
         "gir_tensor": buf.gir_tensor,
+        "alias_parent": buf.alias_parent,
+        "alias_plane_offset": buf.alias_plane_offset,
+        "alias_kind": buf.alias_kind,
     }
 
 

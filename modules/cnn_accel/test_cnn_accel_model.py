@@ -31,6 +31,12 @@ from cnn_accel_model import (
     OPCODE_HALT,
     OPCODE_POOL_AVG,
     OPCODE_POOL_MAX,
+    OPCODE_ACT,
+    OPCODE_ADD,
+    OPCODE_COPY,
+    OPCODE_LOAD,
+    OPCODE_UPSAMPLE,
+    UPSAMPLE_FACTOR,
     OFF_BIAS_ADDR,
     OFF_CLAMP_MAX,
     OFF_CLAMP_MIN,
@@ -66,6 +72,7 @@ from cnn_accel_model import (
     FLAG_PER_CHANNEL_EN,
     FLAG_RELU_EN,
     FLAG_REQUANT_EN,
+    act_lut,
     activation_bytes,
     activation_plane_count,
     bias_requantize_relu,
@@ -73,6 +80,7 @@ from cnn_accel_model import (
     conv2d,
     decode_instruction,
     dwconv2d,
+    elementwise_add,
     encode_instruction,
     encode_program,
     fc,
@@ -93,6 +101,7 @@ from cnn_accel_model import (
     unpack_activation_planes,
     unpack_scale_table_from_hw,
     unpack_weights_from_hw,
+    upsample_nearest,
 )
 
 
@@ -2733,3 +2742,256 @@ def test_frame_budget_default_pe_rows_meets_30fps() -> None:
         f"pe_rows={cnn_accel_constants.PE_ROWS}: {cycles} cycles/frame "
         f"exceeds the {budget}-cycle, 30 fps budget by {cycles / budget:.3f}x"
     )
+
+
+# ---------------------------------------------------------------------------
+# ISA v2.0 elementwise/resample family: `elementwise_add`, `upsample_nearest`,
+# `act_lut`, and `run_layer`'s ADD/UPSAMPLE/ACT/COPY dispatch.
+#
+# These are the opcodes a compiler needs in order to emit a residual add, a
+# nearest-2x upsample or a LUT activation into a flat, DDR-only program.
+# `accel_v2/reference.py` executes the same three functions (it calls them
+# rather than re-deriving them), so `accel_v2/tests/test_reference.py` and
+# these tests are checking one definition from two directions.
+# ---------------------------------------------------------------------------
+
+
+def test_elementwise_add_rescales_each_operand_before_summing() -> None:
+    """`requant_scale = 2**15, requant_shift = 0` is the identity rescale,
+    so ADD degenerates to a saturating int8 sum."""
+    desc = LayerDesc(opcode=OPCODE_ADD, requant_scale=1 << 15, requant_shift=0)
+    assert elementwise_add([10, -10, 100, -100], [5, 5, 100, -100], desc) == [15, -5, 127, -128]
+
+
+def test_elementwise_add_rounds_each_operand_separately_not_the_sum() -> None:
+    """Two roundings, not one: the hardware rescales each operand before
+    the add, so `requant(1) + requant(1)` (0.5 -> 1, twice) is 2, whereas
+    rounding the sum once would give 1. Pinned because the difference is
+    exactly the kind of thing a second implementation gets wrong."""
+    # scale/2**15 == 0.5 -> each operand's 1 becomes an exact tie, rounded
+    # towards +infinity by round_shift_right_signed.
+    desc = LayerDesc(opcode=OPCODE_ADD, requant_scale=1 << 14, requant_shift=0)
+    assert elementwise_add([1], [1], desc) == [1 + 1]
+
+
+def test_elementwise_add_rejects_mismatched_operand_lengths() -> None:
+    desc = LayerDesc(opcode=OPCODE_ADD, requant_scale=1 << 15)
+    with pytest.raises(ValueError, match="length mismatch"):
+        elementwise_add([1, 2], [1], desc)
+
+
+def test_upsample_nearest_replicates_each_pixel_factor_squared_times() -> None:
+    desc = LayerDesc(opcode=OPCODE_UPSAMPLE, in_width=2, in_height=2, in_channels=2)
+    # HWC: (0,0)=[1,2] (0,1)=[3,4] / (1,0)=[5,6] (1,1)=[7,8]
+    out = upsample_nearest([1, 2, 3, 4, 5, 6, 7, 8], desc)
+    assert out == [
+        1, 2, 1, 2, 3, 4, 3, 4,
+        1, 2, 1, 2, 3, 4, 3, 4,
+        5, 6, 5, 6, 7, 8, 7, 8,
+        5, 6, 5, 6, 7, 8, 7, 8,
+    ]
+
+
+def test_upsample_nearest_rejects_an_input_that_is_not_its_declared_geometry() -> None:
+    desc = LayerDesc(opcode=OPCODE_UPSAMPLE, in_width=2, in_height=2, in_channels=2)
+    with pytest.raises(ValueError, match="input length"):
+        upsample_nearest([1, 2, 3], desc)
+
+
+def test_act_lut_is_indexed_by_the_unsigned_byte_value() -> None:
+    """Entry `i` answers input `i` for `i < 128` and `i - 256` above it --
+    the order the 256 bytes actually sit in memory."""
+    lut = [(i if i < 128 else i - 256) for i in range(256)]  # identity
+    assert act_lut([0, 1, 127, -1, -128], lut) == [0, 1, 127, -1, -128]
+    negated = [-(i if i < 128 else i - 256) for i in range(256)]
+    assert act_lut([5, -5], negated) == [-5, 5]
+
+
+def test_act_lut_rejects_a_table_that_is_not_256_entries() -> None:
+    with pytest.raises(ValueError, match="256 entries"):
+        act_lut([0], [0] * 255)
+
+
+def test_isa_round_trips_xfer_bytes() -> None:
+    """W15 is a real field now; a v1.2 descriptor still encodes it as the
+    zero those bytes were reserved to hold."""
+    desc = LayerDesc(opcode=OPCODE_ADD, in_addr=0x1000, out_addr=0x2000, xfer_bytes=0xDEADBEEF)
+    assert decode_instruction(encode_instruction(desc)).xfer_bytes == 0xDEADBEEF
+    assert decode_instruction(encode_instruction(LayerDesc(opcode=OPCODE_CONV2D))).xfer_bytes == 0
+
+
+def test_decode_instruction_refuses_a_descriptor_with_non_ddr_operand_spaces() -> None:
+    """This model has ONE flat address space, so a LOCAL_TENSOR-tagged
+    operand cannot be honoured; decoding it into a `LayerDesc` with no
+    field for it would silently read DDR instead."""
+    word = bytearray(encode_instruction(LayerDesc(opcode=OPCODE_CONV2D)))
+    word[cnn_accel_constants.isa_field_offsets()[2].offset_bytes] = (
+        cnn_accel_constants.SPACES["LOCAL_TENSOR"] << cnn_accel_constants.SPACE_FIELDS["SRC0"]
+    )
+    with pytest.raises(ValueError, match="single flat address space"):
+        decode_instruction(bytes(word))
+
+
+def test_run_layer_add_end_to_end_via_memory_image() -> None:
+    """W15 carries src1's ADDRESS for ADD, not a byte count."""
+    rng = random.Random(52001)
+    in_w, in_h, in_c = 3, 4, 5
+    a = [rng.randint(-128, 127) for _ in range(in_w * in_h * in_c)]
+    b = [rng.randint(-128, 127) for _ in range(in_w * in_h * in_c)]
+
+    a_addr, b_addr, out_addr = 0x1000, 0x2000, 0x3000
+    desc = LayerDesc(
+        opcode=OPCODE_ADD,
+        flags=(1 << FLAG_REQUANT_EN),
+        in_addr=a_addr, out_addr=out_addr, xfer_bytes=b_addr,
+        in_width=in_w, in_height=in_h, in_channels=in_c,
+        requant_scale=1 << 14, requant_shift=0,
+    )
+    mem = build_memory_image(
+        {
+            a_addr: _activation_chunk(a, in_w, in_h, in_c),
+            b_addr: _activation_chunk(b, in_w, in_h, in_c),
+        },
+        size=0x4000,
+    )
+    run_layer(mem, desc)
+    assert _read_activation(mem, out_addr, in_w, in_h, in_c) == elementwise_add(a, b, desc)
+
+
+def test_run_layer_upsample_end_to_end_via_memory_image() -> None:
+    rng = random.Random(52002)
+    in_w, in_h, in_c = 3, 2, 9  # C=9 -> two planes, the second mostly padding
+    xs = [rng.randint(-128, 127) for _ in range(in_w * in_h * in_c)]
+
+    in_addr, out_addr = 0x1000, 0x2000
+    desc = LayerDesc(
+        opcode=OPCODE_UPSAMPLE,
+        in_addr=in_addr, out_addr=out_addr,
+        in_width=in_w, in_height=in_h, in_channels=in_c,
+    )
+    mem = build_memory_image({in_addr: _activation_chunk(xs, in_w, in_h, in_c)}, size=0x4000)
+    run_layer(mem, desc)
+
+    f = UPSAMPLE_FACTOR
+    actual = _read_activation(mem, out_addr, in_w * f, in_h * f, in_c)
+    assert actual == upsample_nearest(xs, desc)
+
+
+def test_run_layer_act_reads_its_lut_from_weight_addr() -> None:
+    rng = random.Random(52003)
+    in_w, in_h, in_c = 2, 2, 8
+    xs = [rng.randint(-128, 127) for _ in range(in_w * in_h * in_c)]
+    lut = [max(-128, min(127, (i if i < 128 else i - 256) // 2)) for i in range(256)]
+
+    in_addr, lut_addr, out_addr = 0x1000, 0x2000, 0x3000
+    desc = LayerDesc(
+        opcode=OPCODE_ACT,
+        flags=(1 << cnn_accel_constants.FLAGS["ACT_LUT_EN"]),
+        in_addr=in_addr, out_addr=out_addr, weight_addr=lut_addr,
+        in_width=in_w, in_height=in_h, in_channels=in_c,
+        xfer_bytes=in_w * in_h * in_c,
+    )
+    mem = build_memory_image(
+        {in_addr: _activation_chunk(xs, in_w, in_h, in_c), lut_addr: bytes(v & 0xFF for v in lut)},
+        size=0x4000,
+    )
+    run_layer(mem, desc)
+    assert _read_activation(mem, out_addr, in_w, in_h, in_c) == act_lut(xs, lut)
+
+
+def test_run_layer_copy_moves_opaque_bytes_without_interpreting_them() -> None:
+    payload = bytes(range(64))
+    desc = LayerDesc(opcode=OPCODE_COPY, in_addr=0x100, out_addr=0x200, xfer_bytes=len(payload))
+    mem = build_memory_image({0x100: payload}, size=0x300)
+    run_layer(mem, desc)
+    assert bytes(mem[0x200 : 0x200 + len(payload)]) == payload
+
+
+def test_run_layer_refuses_the_dma_family_it_cannot_model() -> None:
+    desc = LayerDesc(opcode=OPCODE_LOAD, in_addr=0x100, out_addr=0x200, xfer_bytes=8)
+    with pytest.raises(ValueError, match="accel_v2.reference"):
+        run_layer(build_memory_image({}, size=0x300), desc)
+
+
+def test_run_program_chains_a_v2_family_program() -> None:
+    """UPSAMPLE -> ACT -> ADD in one instruction chain, each reading the
+    previous instruction's output out of the DDR image."""
+    rng = random.Random(52004)
+    in_w, in_h, in_c = 2, 2, 8
+    xs = [rng.randint(-128, 127) for _ in range(in_w * in_h * in_c)]
+    other = [rng.randint(-128, 127) for _ in range(in_w * 2 * in_h * 2 * in_c)]
+    lut = [max(-128, min(127, (i if i < 128 else i - 256) + 3)) for i in range(256)]
+
+    prog_addr = 0x0
+    in_addr, lut_addr, other_addr = 0x1000, 0x2000, 0x3000
+    up_addr, act_addr, out_addr = 0x4000, 0x5000, 0x6000
+
+    up = LayerDesc(
+        opcode=OPCODE_UPSAMPLE, in_addr=in_addr, out_addr=up_addr,
+        in_width=in_w, in_height=in_h, in_channels=in_c,
+    )
+    up_w, up_h = in_w * UPSAMPLE_FACTOR, in_h * UPSAMPLE_FACTOR
+    act = LayerDesc(
+        opcode=OPCODE_ACT, flags=(1 << cnn_accel_constants.FLAGS["ACT_LUT_EN"]),
+        in_addr=up_addr, out_addr=act_addr, weight_addr=lut_addr,
+        in_width=up_w, in_height=up_h, in_channels=in_c,
+    )
+    add = LayerDesc(
+        opcode=OPCODE_ADD, flags=(1 << FLAG_REQUANT_EN),
+        in_addr=act_addr, out_addr=out_addr, xfer_bytes=other_addr,
+        in_width=up_w, in_height=up_h, in_channels=in_c,
+        requant_scale=1 << 15, requant_shift=0,
+    )
+    program = encode_program([up, act, add, LayerDesc(opcode=OPCODE_HALT)], program_addr=prog_addr)
+    mem = build_memory_image(
+        {
+            prog_addr: program,
+            in_addr: _activation_chunk(xs, in_w, in_h, in_c),
+            lut_addr: bytes(v & 0xFF for v in lut),
+            other_addr: _activation_chunk(other, up_w, up_h, in_c),
+        },
+        size=0x7000,
+    )
+    assert run_program(mem, prog_addr) == 3
+
+    expected = elementwise_add(
+        act_lut(upsample_nearest(xs, up), lut), other, add
+    )
+    assert _read_activation(mem, out_addr, up_w, up_h, in_c) == expected
+
+
+def test_run_layer_and_accel_v2_reference_agree_on_the_v2_family() -> None:
+    """The anti-fork check: `accel_v2/reference.py` executes ADD/UPSAMPLE/
+    ACT by calling these same three functions, so a change that made one
+    path diverge from the other would have to change both call sites."""
+    from accel_v2 import reference
+
+    rng = random.Random(52005)
+    xs = [rng.randint(-128, 127) for _ in range(8)]
+    ys = [rng.randint(-128, 127) for _ in range(8)]
+    lut = [(i if i < 128 else i - 256) // 3 for i in range(256)]
+
+    class _T:
+        width, height, channels = 2, 2, 2
+
+    class _AddOp:
+        inputs = [_T()]
+        requant_scale, requant_shift = 1 << 14, 0
+
+    class _UpOp:
+        inputs = [_T()]
+        factor = UPSAMPLE_FACTOR
+
+    class _ActOp:
+        inputs = [_T()]
+        lut = None
+
+    act_op = _ActOp()
+    act_op.lut = lut
+
+    add_desc = LayerDesc(opcode=OPCODE_ADD, requant_scale=1 << 14, requant_shift=0)
+    up_desc = LayerDesc(opcode=OPCODE_UPSAMPLE, in_width=2, in_height=2, in_channels=2)
+
+    assert reference._exec_add(_AddOp(), xs, ys) == elementwise_add(xs, ys, add_desc)
+    assert reference._exec_upsample(_UpOp(), xs) == upsample_nearest(xs, up_desc)
+    assert reference._exec_act(act_op, xs) == act_lut(xs, lut)

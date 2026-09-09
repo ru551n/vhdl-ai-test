@@ -3,7 +3,8 @@
 `schedule` turns a `stage='mapped'` `HirModule` into `stage='scheduled'`:
 a deterministic topological order over `HirOp.deps` unioned with the
 *implied* dependencies of the dataflow (an op reading a buffer depends on
-the op that writes it). Ties break on the original op order so the same
+the op that writes it -- or, for a buffer view, on whoever writes the
+bytes it shares, see `HirModule.storage_dependencies`). Ties break on the original op order so the same
 input always yields the same schedule. The implied deps are folded back
 into each op's `deps` so the dependency structure is explicit in dumps,
 not left implicit in the buffer graph.
@@ -30,9 +31,13 @@ def _implied_deps(module: HirModule) -> dict[str, set[str]]:
     implied: dict[str, set[str]] = {op.id: set() for op in module.ops}
     for op in module.ops:
         for buffer_id in op.reads:
-            writer = writer_of.get(buffer_id)
-            if writer is not None and writer != op.id:
-                implied[op.id].add(writer)
+            # Through aliases too: a buffer view has no writer of its own,
+            # so the op that fills it is the one writing the storage they
+            # share (`HirModule.storage_dependencies`).
+            for source in module.storage_dependencies(buffer_id):
+                writer = writer_of.get(source)
+                if writer is not None and writer != op.id:
+                    implied[op.id].add(writer)
     return implied
 
 

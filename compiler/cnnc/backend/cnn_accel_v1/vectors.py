@@ -158,8 +158,18 @@ def write_conv_core_vectors(
     # loop in `emit.emit_program`, so index i in one is index i in the
     # other by construction.
     for op_entry, desc in zip(manifest["ops"], program.descriptors):
-        out_channels = op_entry["params"]["out_channels"]
         name = f"{case_prefix}{_sanitize_op_id(op_entry['id'])}"
+
+        if op_entry["kind"] != "conv_layer":
+            # `tb_cnn_accel_conv_core` drives the convolution datapath, so
+            # only `conv_layer` descriptors describe a case it can run. A
+            # program that also contains a pool or an elementwise op is not
+            # an error here -- those ops simply have no conv_core vector --
+            # and saying so beats a KeyError on the `out_channels` param
+            # they legitimately do not have.
+            skipped.append((name, f"op kind {op_entry['kind']!r} is not a conv_core case"))
+            continue
+        out_channels = op_entry["params"]["out_channels"]
 
         if max_out_channels is not None and out_channels > max_out_channels:
             skipped.append((

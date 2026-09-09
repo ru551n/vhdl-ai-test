@@ -1,8 +1,11 @@
 """TOSA (MLIR generic form) -> GIR importer (doc/tosa_compiler_plan.md §2.1,
 §6, M2). `_IMPORTERS` (surfaced as `supported_ops()`) is the authoritative
 list of what is accepted -- today `tosa.conv2d`, `tosa.rescale`,
-`tosa.clamp`, `tosa.max_pool2d`, plus `tosa.const` and `func.return`, which
-are structural rather than computational.
+`tosa.clamp`, `tosa.max_pool2d`, `tosa.add`, `tosa.table`, `tosa.concat`
+and `tosa.slice`, plus `tosa.const`/`tosa.const_shape` and `func.return`,
+which are structural rather than computational. A nearest-2x upsample is
+also imported, but as a `reshape`/`tile` CHAIN rather than as one op --
+see `_match_upsample_chains`.
 
 Everything else raises `UnsupportedOp`, and the message distinguishes three
 genuinely different situations, because the reader's next action differs:
@@ -48,16 +51,21 @@ from cnnc.frontend.mlir_generic import (
 )
 from cnnc.gir.ir import (
     DTYPES,
+    AddAttrs,
     ClampAttrs,
+    ConcatAttrs,
     ConvAttrs,
     Graph,
     Op,
     PoolAttrs,
     RescaleParams,
+    SliceAttrs,
     Tensor,
+    UpsampleAttrs,
     conv2d_output_shape,
     dtype_range,
     pool2d_output_shape,
+    upsample_output_shape,
 )
 from cnnc.gir.verify import verify
 
@@ -200,6 +208,11 @@ class _Ctx:
     tensors: dict[str, Tensor]
     const_defs: dict[str, MlirOp]
     resources: dict[str, bytes]
+    #: `tosa.const_shape` definitions. Separate from `const_defs` because
+    #: a `!tosa.shape<N>` is never tensor data -- it is always folded into
+    #: an attribute (a slice's start/size), never materialised as a GIR
+    #: tensor.
+    shape_defs: dict[str, MlirOp] = dataclasses.field(default_factory=dict)
     used_consts: list[str] = dataclasses.field(default_factory=list)
 
     def take_used_consts(self) -> list[str]:
@@ -216,6 +229,14 @@ class _Ctx:
 
     def scalar_const(self, name: str, op_id: str, what: str) -> int:
         return _scalar_const_value(self.const_defs, name, op_id, what, self.resources)
+
+    def shape_const(self, name: str, op_id: str, what: str) -> tuple[int, ...]:
+        shape_op = self.shape_defs.get(name)
+        if shape_op is None:
+            raise TosaImportError(
+                f"{what} operand %{name} must be a tosa.const_shape", op_id=op_id, stage=_STAGE
+            )
+        return _const_elements(shape_op, op_id, self.resources, what)
 
     def define(self, tensor: Tensor) -> Tensor:
         self.tensors[tensor.id] = tensor
@@ -365,6 +386,452 @@ def _import_max_pool2d(op: MlirOp, ctx: _Ctx) -> Op:
     return Op(id=f"%{result_name}", kind="pool", inputs=(x.id,), outputs=(result_name,), attrs=attrs)
 
 
+#: The identity rescale in TOSA `apply_scale_32` terms:
+#: `(v * 2**15 + 2**14) >> 15 == v` for every `v`, exactly. A bare
+#: `tosa.add` rescales neither operand, so this is what it imports as;
+#: `passes.fuse` replaces it when it folds two real `tosa.rescale`s in.
+_IDENTITY_RESCALE = (1 << 15, 15)
+
+#: A TOSA int8 `TABLE` operand is exactly `2**8` entries; so is the
+#: accelerator's ACT LUT (`lower.layout.ACT_LUT_ENTRIES`).
+_ACT_LUT_ENTRIES = 256
+
+
+def _import_add(op: MlirOp, ctx: _Ctx) -> Op:
+    """`tosa.add` -> GIR `add` (the residual/skip-connection shortcut).
+
+    Only the int8 form is imported, and only with both operands the same
+    shape: the accelerator's `OPCODE_ADD` walks two ifmaps of one
+    geometry lane by lane, so it has no broadcasting to offer, and TOSA's
+    rank-1 broadcast would need a materialised copy the compiler does not
+    emit.
+
+    A bare add carries the identity rescale. A *quantized* residual add
+    reaches here as `rescale(a) -> rescale(b) -> add`, and `passes.fuse`
+    folds those two rescales into this op's `AddAttrs` -- which is the
+    only shape the hardware can execute, since its descriptor holds one
+    `(requant_scale, requant_shift)` pair for both operands.
+    """
+    result_name, result_type = op.results[0]
+    op_id = _op_id(op)
+    if len(op.operands) != 2:
+        raise TosaImportError(f"tosa.add expects 2 operands, got {len(op.operands)}", op_id=op_id, stage=_STAGE)
+
+    a = ctx.data_operand(op.operands[0], op_id, "lhs")
+    b = ctx.data_operand(op.operands[1], op_id, "rhs")
+    for what, t in (("lhs", a), ("rhs", b)):
+        _check_dtype(op_id, t.dtype)
+        if t.dtype != "i8":
+            raise UnsupportedAttribute(
+                f"tosa.add {what} dtype {t.dtype!r} != 'i8': the accelerator's ADD is an int8 "
+                "elementwise opcode. An i32 add (the unfused quantized idiom "
+                "'rescale i8->i32, add i32, rescale i32->i8') has no instruction; quantize the "
+                "add itself to int8 first",
+                op_id=op_id, stage=_STAGE,
+            )
+    if a.shape != b.shape:
+        raise UnsupportedAttribute(
+            f"tosa.add operand shapes {a.shape} != {b.shape}: the accelerator's ADD has no "
+            "broadcasting (one geometry, two ifmaps)",
+            op_id=op_id, stage=_STAGE,
+        )
+    if len(a.shape) != 4:
+        raise TosaImportError(f"tosa.add operand rank {len(a.shape)} != 4 (NHWC)", op_id=op_id, stage=_STAGE)
+    if a.shape[0] != 1:
+        raise UnsupportedAttribute(f"batch size {a.shape[0]} != 1", op_id=op_id, stage=_STAGE)
+
+    if not isinstance(result_type, TensorType):
+        raise TosaImportError("tosa.add result must be a tensor", op_id=op_id, stage=_STAGE)
+    _check_dtype(op_id, str(result_type.dtype))
+    if result_type.shape != a.shape:
+        raise TosaImportError(
+            f"declared result type {result_type.shape} != operand shape {a.shape}", op_id=op_id, stage=_STAGE
+        )
+
+    multiplier, shift = _IDENTITY_RESCALE
+    ctx.define(Tensor(id=result_name, shape=a.shape, dtype=str(result_type.dtype)))
+    return Op(
+        id=f"%{result_name}",
+        kind="add",
+        inputs=(a.id, b.id),
+        outputs=(result_name,),
+        attrs=AddAttrs(multiplier=multiplier, shift=shift),
+    )
+
+
+def _import_table(op: MlirOp, ctx: _Ctx) -> Op:
+    """`tosa.table` -> GIR `table` (the accelerator's `OPCODE_ACT` LUT).
+
+    This is how a general activation reaches the hardware: SiLU, sigmoid,
+    tanh and friends have no closed-form instruction, but an int8 -> int8
+    function is only 256 answers, and both TOSA and the accelerator say
+    exactly that. Only the int8 form is imported (a 512-entry int16 TABLE
+    would need interpolation the hardware does not do).
+
+    The table stays a GIR *tensor* rather than becoming an attribute --
+    like conv weights, it is 256 bytes of compile-time data that ends up
+    as a const buffer in DDR, and keeping it a tensor is what lets the
+    memory planner place it.
+    """
+    result_name, result_type = op.results[0]
+    op_id = _op_id(op)
+    if len(op.operands) != 2:
+        raise TosaImportError(f"tosa.table expects 2 operands, got {len(op.operands)}", op_id=op_id, stage=_STAGE)
+
+    x = ctx.data_operand(op.operands[0], op_id, "input")
+    _check_dtype(op_id, x.dtype)
+    if x.dtype != "i8":
+        raise UnsupportedAttribute(
+            f"tosa.table input dtype {x.dtype!r} != 'i8': the accelerator's ACT LUT is a "
+            "256-entry int8 -> int8 table, with no int16 interpolation path",
+            op_id=op_id, stage=_STAGE,
+        )
+    table = ctx.data_operand(op.operands[1], op_id, "table")
+    _check_dtype(op_id, table.dtype)
+    if table.dtype != "i8" or table.shape != (_ACT_LUT_ENTRIES,):
+        raise UnsupportedAttribute(
+            f"tosa.table table operand must be tensor<{_ACT_LUT_ENTRIES}xi8>, got "
+            f"{table.shape} of {table.dtype}",
+            op_id=op_id, stage=_STAGE,
+        )
+    if table.values is None:
+        raise TosaImportError("tosa.table table operand must be a constant", op_id=op_id, stage=_STAGE)
+
+    if not isinstance(result_type, TensorType):
+        raise TosaImportError("tosa.table result must be a tensor", op_id=op_id, stage=_STAGE)
+    _check_dtype(op_id, str(result_type.dtype))
+    if result_type.shape != x.shape:
+        raise TosaImportError(
+            f"declared result type {result_type.shape} != input shape {x.shape}", op_id=op_id, stage=_STAGE
+        )
+
+    ctx.define(Tensor(id=result_name, shape=x.shape, dtype=str(result_type.dtype)))
+    return Op(id=f"%{result_name}", kind="table", inputs=(x.id, table.id), outputs=(result_name,), attrs=None)
+
+
+# ---------------------------------------------------------------------------
+# The nearest-2x upsample idiom.
+#
+# TOSA has no upsample op that a real exporter reaches for. What YOLOv8n's
+# TOSA actually contains -- all four of its `nn.Upsample(scale_factor=2)`
+# layers, and zero `tosa.resize` -- is a five-op chain over a rank-5
+# intermediate:
+#
+#     reshape -> tile -> reshape -> tile -> reshape
+#
+# (in the shipped NCHW artifact: 1x256x20x20 -> 1x256x20x1x20 -> tile
+# [1,1,1,2,1] -> 1x256x40x20x1 -> tile [1,1,1,1,2] -> 1x256x40x40).
+#
+# This matcher does NOT pattern-match those shapes. Shape matching would
+# be brittle in exactly the way that matters -- the same upsample written
+# with the two tiles in the other order, or with the spatial dims in NHWC
+# instead of NCHW, is the same computation and a different shape sequence,
+# while a chain that differs by one transposed axis is a different
+# computation and an identical-looking shape sequence. Instead the chain
+# is *evaluated*: each tensor is tracked as the list of source element
+# indices it holds (a reshape is the identity on that list, since
+# row-major reshape does not move bytes; a tile is a modular gather), and
+# the chain matches only if the final index list is exactly what
+# nearest-neighbour replication would produce. That is a proof for the
+# specific shapes in front of us, not a guess.
+#
+# Anything else built from `tosa.reshape`/`tosa.tile` is refused by
+# `_reject_op` with its own diagnostic -- there is no partial credit here.
+# ---------------------------------------------------------------------------
+
+_CHAIN_OP_NAMES = ("tosa.reshape", "tosa.tile")
+
+#: The only replication factor `OPCODE_UPSAMPLE` implements
+#: (`cnn_accel_model.UPSAMPLE_FACTOR`; doc/cnn_accel_top_v2_arch.md
+#: section 12 limitation 5). A 3x or 4x chain will simply not match, and
+#: is then refused by name rather than lowered to the wrong instruction.
+_UPSAMPLE_FACTOR = 2
+
+#: Upper bound on the element count this matcher will evaluate a chain
+#: over. The check is linear in the tensor's element count, and a chain
+#: whose source is larger than this is not something the accelerator could
+#: hold in one instruction anyway (`in_width`/`in_height` are 16-bit ISA
+#: fields), so refusing to spend the time is not refusing a real program.
+_MAX_CHAIN_ELEMENTS = 1 << 22
+
+
+def _prod(shape: tuple[int, ...]) -> int:
+    n = 1
+    for d in shape:
+        n *= d
+    return n
+
+
+def _tile_indices(indices: list[int], shape: tuple[int, ...], multiples: tuple[int, ...]) -> list[int]:
+    """`tosa.tile`, applied to a list of source indices rather than to
+    data: `out[i0, .., ik] = in[i0 % s0, .., ik % sk]`, row-major."""
+    out_shape = tuple(s * m for s, m in zip(shape, multiples))
+    strides = [1] * len(shape)
+    for axis in range(len(shape) - 2, -1, -1):
+        strides[axis] = strides[axis + 1] * shape[axis + 1]
+
+    out: list[int] = []
+    for flat in range(_prod(out_shape)):
+        rest = flat
+        source = 0
+        for axis in range(len(out_shape) - 1, -1, -1):
+            rest, index = divmod(rest, out_shape[axis])
+            source += (index % shape[axis]) * strides[axis]
+        out.append(indices[source])
+    return out
+
+
+def _nearest_upsample_indices(shape: tuple[int, int, int, int], factor: int) -> list[int]:
+    """The source index of every element of `nearest_upsample(x, factor)`,
+    for an NHWC `x` of `shape`, row-major -- i.e. what the chain's index
+    list must equal, element for element, to be this upsample."""
+    _n, h, w, c = shape
+    out: list[int] = []
+    for y in range(h * factor):
+        row = (y // factor) * w
+        for x in range(w * factor):
+            base = (row + x // factor) * c
+            out.extend(range(base, base + c))
+    return out
+
+
+def _shape_of(op: MlirOp) -> tuple[int, ...] | None:
+    if not op.results:
+        return None
+    _name, ttype = op.results[0]
+    return ttype.shape if isinstance(ttype, TensorType) else None
+
+
+def _match_upsample_chains(
+    func: MlirFunc,
+) -> tuple[dict[str, tuple[str, int]], set[str], set[str]]:
+    """Find every `reshape`/`tile` chain that computes a nearest-neighbour
+    2x upsample.
+
+    Returns `({final SSA name: (source SSA name, factor)}, {SSA names of
+    the chain's interior ops}, {SSA names this matcher walked through
+    without matching})`. `import_tosa` emits one GIR `upsample` where a
+    chain ends and skips its interior; the third set is only used to pick
+    a better diagnostic for what is left -- an op that was reached while
+    following a `reshape`/`tile` chain gets told the chain did not compute
+    a nearest-2x upsample, rather than being told it looks like a
+    detection-head reshape.
+    """
+    use_count: dict[str, int] = {}
+    for op in func.ops:
+        for operand in op.operands:
+            use_count[operand] = use_count.get(operand, 0) + 1
+
+    producer: dict[str, MlirOp] = {op.results[0][0]: op for op in func.ops if op.results}
+    consumers: dict[str, list[MlirOp]] = {}
+    for op in func.ops:
+        for operand in op.operands:
+            consumers.setdefault(operand, []).append(op)
+
+    chains: dict[str, tuple[str, int]] = {}
+    interior: set[str] = set()
+    attempted: set[str] = set()
+
+    for start in func.ops:
+        if start.name not in _CHAIN_OP_NAMES or not start.operands:
+            continue
+        source_name = start.operands[0]
+        if source_name in interior:
+            continue  # already inside a chain we matched
+        source_producer = producer.get(source_name)
+        if (
+            source_producer is not None
+            and source_producer.name in _CHAIN_OP_NAMES
+            and source_name not in chains
+        ):
+            # Mid-chain: this op is not the root of its own chain. A source
+            # that ENDS an already-matched chain is fine, though -- that is
+            # a 4x upsample, written as two 2x chains back to back.
+            continue
+
+        source_shape: tuple[int, ...] | None = None
+        if source_producer is not None:
+            source_shape = _shape_of(source_producer)
+        else:
+            for name, ttype in zip(func.arg_names, func.arg_types):
+                if name == source_name and isinstance(ttype, TensorType):
+                    source_shape = ttype.shape
+        if source_shape is None or len(source_shape) != 4 or source_shape[0] != 1:
+            continue
+        if _prod(source_shape) > _MAX_CHAIN_ELEMENTS:
+            continue
+
+        want = _nearest_upsample_indices(source_shape, _UPSAMPLE_FACTOR)
+        want_shape = (
+            1,
+            source_shape[1] * _UPSAMPLE_FACTOR,
+            source_shape[2] * _UPSAMPLE_FACTOR,
+            source_shape[3],
+        )
+
+        shape: tuple[int, ...] = source_shape
+        indices = list(range(_prod(source_shape)))
+        current = start
+        walked: list[str] = []
+        matched = False
+        while True:
+            out_shape = _shape_of(current)
+            if out_shape is None:
+                break
+            if current.name == "tosa.reshape":
+                if _prod(out_shape) != _prod(shape):
+                    break
+                # Row-major reshape moves no data: the index list is
+                # unchanged, only its interpretation.
+                shape = out_shape
+            else:  # tosa.tile
+                if len(out_shape) != len(shape):
+                    break
+                if any(o % s or o < s for o, s in zip(out_shape, shape)):
+                    break
+                indices = _tile_indices(indices, shape, tuple(o // s for o, s in zip(out_shape, shape)))
+                shape = out_shape
+
+            name = current.results[0][0]
+            if shape == want_shape and indices == want:
+                chains[name] = (source_name, _UPSAMPLE_FACTOR)
+                interior.update(walked)
+                matched = True
+                break
+            walked.append(name)
+
+            if use_count.get(name, 0) != 1:
+                break  # a value read twice cannot be deleted with the chain
+            (next_op,) = consumers[name]
+            if next_op.name not in _CHAIN_OP_NAMES or next_op.operands[0] != name:
+                break
+            current = next_op
+
+        if not matched:
+            attempted.update(walked)
+            attempted.add(start.results[0][0])
+
+    return chains, interior, attempted
+
+
+def _upsample_from_chain(
+    op: MlirOp, ctx: _Ctx, source_name: str, factor: int
+) -> Op:
+    """Emit the GIR `upsample` a matched chain collapses to. `op` is the
+    chain's LAST op, so its result name and type are the upsample's."""
+    result_name, result_type = op.results[0]
+    op_id = _op_id(op)
+    x = ctx.data_operand(source_name, op_id, "upsample input")
+    _check_dtype(op_id, x.dtype)
+    if not isinstance(result_type, TensorType):
+        raise TosaImportError("upsample chain result must be a tensor", op_id=op_id, stage=_STAGE)
+    _check_dtype(op_id, str(result_type.dtype))
+    if str(result_type.dtype) != x.dtype:
+        raise TosaImportError(
+            f"upsample chain changes dtype {x.dtype!r} -> {result_type.dtype!r}", op_id=op_id, stage=_STAGE
+        )
+    computed = upsample_output_shape(x.shape, factor)
+    if result_type.shape != computed:
+        raise TosaImportError(
+            f"declared result type {result_type.shape} != computed {computed}", op_id=op_id, stage=_STAGE
+        )
+    ctx.define(Tensor(id=result_name, shape=computed, dtype=x.dtype))
+    return Op(
+        id=f"%{result_name}",
+        kind="upsample",
+        inputs=(x.id,),
+        outputs=(result_name,),
+        attrs=UpsampleAttrs(factor=factor),
+    )
+
+
+def _import_concat(op: MlirOp, ctx: _Ctx) -> Op:
+    """`tosa.concat` -> GIR `concat`.
+
+    Imported for any axis; only the channel axis has a lowering, and
+    `lower.to_hir._lower_concat` is where that is decided. Keeping the
+    axis check out of the frontend means the diagnostic can talk about
+    the DDR layout (`[C/T][H][W][T]` planes) that makes a channel concat
+    free and any other axis a copy -- which is a target property, not a
+    TOSA one.
+    """
+    result_name, result_type = op.results[0]
+    op_id = _op_id(op)
+    if not op.operands:
+        raise TosaImportError("tosa.concat has no operands", op_id=op_id, stage=_STAGE)
+
+    axis_attr = op.attrs.get("axis")
+    if not isinstance(axis_attr, IntAttr):
+        raise TosaImportError("missing or invalid 'axis' attribute", op_id=op_id, stage=_STAGE)
+
+    parts = [ctx.data_operand(name, op_id, f"operand {i}") for i, name in enumerate(op.operands)]
+    for part in parts:
+        _check_dtype(op_id, part.dtype)
+    if len(set(op.operands)) != len(op.operands):
+        raise UnsupportedAttribute(
+            "tosa.concat repeats an operand: one tensor cannot occupy two different channel "
+            "ranges of the result at once",
+            op_id=op_id, stage=_STAGE,
+        )
+
+    if not isinstance(result_type, TensorType):
+        raise TosaImportError("tosa.concat result must be a tensor", op_id=op_id, stage=_STAGE)
+    _check_dtype(op_id, str(result_type.dtype))
+
+    ctx.define(Tensor(id=result_name, shape=result_type.shape, dtype=str(result_type.dtype)))
+    return Op(
+        id=f"%{result_name}",
+        kind="concat",
+        inputs=tuple(p.id for p in parts),
+        outputs=(result_name,),
+        attrs=ConcatAttrs(axis=int(axis_attr.value)),
+    )
+
+
+def _import_slice(op: MlirOp, ctx: _Ctx) -> Op:
+    """`tosa.slice` -> GIR `slice`.
+
+    `start` and `size` are `!tosa.shape<N>` OPERANDS (a `tosa.const_shape`
+    each), not attributes -- the result type gives `size` away but says
+    nothing about `start`, so the constant really has to be read.
+    """
+    result_name, result_type = op.results[0]
+    op_id = _op_id(op)
+    if len(op.operands) != 3:
+        raise TosaImportError(
+            f"tosa.slice expects 3 operands (input, start, size), got {len(op.operands)}",
+            op_id=op_id, stage=_STAGE,
+        )
+    x_name, start_name, size_name = op.operands
+
+    x = ctx.data_operand(x_name, op_id, "input")
+    _check_dtype(op_id, x.dtype)
+    start = ctx.shape_const(start_name, op_id, "slice start")
+    size = ctx.shape_const(size_name, op_id, "slice size")
+    if len(start) != len(x.shape) or len(size) != len(x.shape):
+        raise TosaImportError(
+            f"slice start {start} / size {size} must have {len(x.shape)} elements",
+            op_id=op_id, stage=_STAGE,
+        )
+
+    if not isinstance(result_type, TensorType):
+        raise TosaImportError("tosa.slice result must be a tensor", op_id=op_id, stage=_STAGE)
+    _check_dtype(op_id, str(result_type.dtype))
+    if result_type.shape != tuple(size):
+        raise TosaImportError(
+            f"declared result type {result_type.shape} != size {tuple(size)}", op_id=op_id, stage=_STAGE
+        )
+
+    ctx.define(Tensor(id=result_name, shape=tuple(size), dtype=str(result_type.dtype)))
+    return Op(
+        id=f"%{result_name}",
+        kind="slice",
+        inputs=(x.id,),
+        outputs=(result_name,),
+        attrs=SliceAttrs(start=tuple(start), size=tuple(size)),
+    )
+
+
 def _import_clamp(op: MlirOp, ctx: _Ctx) -> Op:
     result_name, result_type = op.results[0]
     op_id = _op_id(op)
@@ -394,10 +861,14 @@ def _import_clamp(op: MlirOp, ctx: _Ctx) -> Op:
 #: `supported_ops` both read, so "what does this frontend accept?" has one
 #: answer rather than an `elif` chain and a docstring that can drift.
 _IMPORTERS = {
+    "tosa.add": _import_add,
     "tosa.conv2d": _import_conv2d,
     "tosa.rescale": _import_rescale,
     "tosa.clamp": _import_clamp,
     "tosa.max_pool2d": _import_max_pool2d,
+    "tosa.table": _import_table,
+    "tosa.concat": _import_concat,
+    "tosa.slice": _import_slice,
 }
 
 #: TOSA ops the accelerator has an opcode for, but whose TOSA semantics
@@ -406,6 +877,22 @@ _IMPORTERS = {
 #: catch-all "not implemented" case, because the right response is
 #: different again: these need a numeric equivalence argument, not more
 #: code. Emitting the opcode anyway would be silently wrong.
+#: Ops that ARE lowered, but only as part of a larger idiom -- so a
+#: standalone one is refused with a message about the idiom rather than a
+#: bare "unsupported op". `tosa.reshape` is in `_HOST_SIDE_HEAD_OPS` too;
+#: this table wins, because "it has to be part of an upsample chain" is
+#: the more actionable of the two answers when a `tosa.tile` is present.
+_IDIOM_ONLY_OPS = {
+    "tosa.tile": (
+        "the accelerator's OPCODE_UPSAMPLE is nearest-neighbour replication by exactly "
+        f"{_UPSAMPLE_FACTOR}x in both spatial dimensions, and the only reshape/tile chain this "
+        "frontend lowers is the one that spells exactly that out (which is how every "
+        "nn.Upsample(scale_factor=2) in YOLOv8n's TOSA is written). This chain's index mapping "
+        f"was evaluated and is not a nearest-{_UPSAMPLE_FACTOR}x replication of an NHWC tensor, "
+        "so there is no instruction for it"
+    ),
+}
+
 _INEXACT_OPS = {
     "tosa.avg_pool2d": (
         "the target's POOL_AVG is count-include-pad and divides through the half_up epilogue "
@@ -421,10 +908,21 @@ def supported_ops() -> tuple[str, ...]:
     return tuple(sorted(_IMPORTERS))
 
 
-def _reject_op(op: MlirOp) -> None:
+def _reject_op(op: MlirOp, *, idiom_candidate: bool = False) -> None:
     """Refuse `op` with a diagnostic that says *why* it is refused --
-    host-side detection head vs simply not implemented -- and where it is."""
+    host-side detection head vs simply not implemented -- and where it is.
+
+    `idiom_candidate` marks an op the upsample matcher walked through
+    without matching. For a `tosa.reshape` that is the difference between
+    two very different pieces of advice ("split the graph, this is the
+    detection head" vs "this chain is not a nearest-2x upsample"), so it
+    picks the second."""
     op_id = _op_id(op)
+    idiom = _IDIOM_ONLY_OPS.get(op.name)
+    if idiom is None and idiom_candidate and op.name in _CHAIN_OP_NAMES:
+        idiom = _IDIOM_ONLY_OPS["tosa.tile"]
+    if idiom is not None:
+        raise UnsupportedOp(f"{op.name} is not lowered on its own: {idiom}", op_id=op_id, stage=_STAGE)
     inexact = _INEXACT_OPS.get(op.name)
     if inexact is not None:
         raise UnsupportedOp(f"{op.name} is not lowered: {inexact}", op_id=op_id, stage=_STAGE)
@@ -469,21 +967,45 @@ def import_tosa(module: MlirModule, func_name: str | None = None) -> Graph:
     inputs = tuple(func.arg_names)
 
     const_defs: dict[str, MlirOp] = {op.results[0][0]: op for op in func.ops if op.name == "tosa.const"}
-    ctx = _Ctx(tensors=tensors, const_defs=const_defs, resources=module.resources)
+    shape_defs: dict[str, MlirOp] = {
+        op.results[0][0]: op for op in func.ops if op.name == "tosa.const_shape"
+    }
+    ctx = _Ctx(
+        tensors=tensors, const_defs=const_defs, resources=module.resources, shape_defs=shape_defs
+    )
+
+    # A nearest-2x upsample arrives as a chain of `reshape`/`tile` ops, so
+    # it cannot be imported one op at a time: the whole chain collapses to
+    # a single GIR `upsample`. Matched up front, then the loop below emits
+    # one op where a chain ENDS and skips its interior.
+    upsample_chains, upsample_interior, upsample_attempted = _match_upsample_chains(func)
 
     ops: list[Op] = []
     outputs: tuple[str, ...] | None = None
     for op in func.ops:
         if op.name == "tosa.const":
             continue  # materialised lazily, only if referenced as data
+        if op.name == "tosa.const_shape":
+            # Structural, like `tosa.const`: it defines a `!tosa.shape<N>`
+            # that only `reshape`/`tile` read, and both of those are
+            # handled from their own declared result types. A shape const
+            # whose consumer is refused is simply never reached.
+            continue
         if op.name == "func.return":
             outputs = tuple(op.operands)
             continue
 
-        importer = _IMPORTERS.get(op.name)
-        if importer is None:
-            _reject_op(op)
-        gir_op = importer(op, ctx)
+        result_name = op.results[0][0] if op.results else None
+        if result_name in upsample_interior:
+            continue  # folded into the `upsample` its chain ends at
+        chain = upsample_chains.get(result_name) if result_name is not None else None
+        if chain is not None:
+            gir_op = _upsample_from_chain(op, ctx, *chain)
+        else:
+            importer = _IMPORTERS.get(op.name)
+            if importer is None:
+                _reject_op(op, idiom_candidate=result_name in upsample_attempted)
+            gir_op = importer(op, ctx)
 
         for cname in ctx.take_used_consts():
             ops.append(Op(id=f"%{cname}", kind="const", inputs=(), outputs=(cname,), attrs=None))

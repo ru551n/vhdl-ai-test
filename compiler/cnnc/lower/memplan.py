@@ -12,11 +12,18 @@ Region order, all A-aligned (`A = space.align`):
    the real descriptor stream is M8's `emit.py` job)
 2. constants, packed contiguously in module (insertion) order
 3. entry inputs, then entry outputs, pinned in module order
-4. intermediates, interval first-fit with reuse over a free list, sorted
+4. intermediates that own storage, interval first-fit with reuse over a
+   free list, sorted
    by (lifetime start, id); a block is only reused once its previous
    occupant's lifetime ended *strictly* before the new one starts
    (`end < start`), matching the HIR verifier's overlap rule in
    `hir.verify._verify_planned`.
+5. buffer views (`Buffer.alias_parent`), placed by derivation rather than
+   allocation: `parent.addr + alias_plane_offset * plane_channels * H * W`.
+   These own no bytes, which is the whole point -- a channel `tosa.concat`
+   is the parts' producers writing into one buffer at different plane
+   offsets, and a channel `tosa.slice` is a window into a buffer somebody
+   else already wrote.
 
 Policy, not a hardware requirement: buffers smaller than 4 KiB are placed
 so they never straddle a 4 KiB address boundary (the DMA splits bursts at
@@ -31,7 +38,7 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 from cnnc.hir.ir import Buffer, HirModule
-from cnnc.hir.verify import verify_hir
+from cnnc.hir.verify import MemoryPlanError, verify_hir
 
 if TYPE_CHECKING:
     from cnnc.target.contract import Target
@@ -57,19 +64,32 @@ def _place(cursor: int, size: int, align: int) -> int:
 
 def lifetimes(module: HirModule) -> dict[str, tuple[int, int]]:
     """`[writer.seq, max(reader.seq)]` (closed) for every `intermediate`
-    buffer -- the interval the planner's free-list reuse operates on.
-    Requires a scheduled module (every op has `seq`)."""
+    buffer that owns storage -- the interval the planner's free-list reuse
+    operates on. Requires a scheduled module (every op has `seq`).
+
+    Accesses to a buffer VIEW are charged to the buffer that owns the
+    bytes (`HirModule.alias_root`), and views themselves are left out:
+    they are placed by derivation, not by allocation. Charging them to the
+    root is what keeps the free list honest -- a parent whose slice is
+    still being read is still live, however long ago the parent itself was
+    last touched."""
     writer_seq: dict[str, int] = {}
     reader_seqs: dict[str, list[int]] = {}
     for op in module.ops:
         for buffer_id in op.writes:
-            writer_seq[buffer_id] = op.seq
+            root = module.alias_root(buffer_id)
+            writer_seq[root] = min(writer_seq.get(root, op.seq), op.seq)
+            if root != buffer_id:
+                writer_seq[buffer_id] = op.seq
         for buffer_id in op.reads:
             reader_seqs.setdefault(buffer_id, []).append(op.seq)
+            root = module.alias_root(buffer_id)
+            if root != buffer_id:
+                reader_seqs.setdefault(root, []).append(op.seq)
 
     result: dict[str, tuple[int, int]] = {}
     for buffer_id, buf in module.buffers.items():
-        if buf.role != "intermediate":
+        if buf.role != "intermediate" or buf.alias_parent is not None:
             continue
         start = writer_seq.get(buffer_id)
         reads = reader_seqs.get(buffer_id, [])
@@ -128,7 +148,7 @@ def plan_memory(
 
     # 2. constants, insertion order.
     for buffer_id, buf in module.buffers.items():
-        if buf.role != "const":
+        if buf.role != "const" or buf.alias_parent is not None:
             continue
         addr = _place(cursor, buf.size_bytes, align)
         placements[buffer_id] = dataclasses.replace(buf, addr=addr)
@@ -137,6 +157,11 @@ def plan_memory(
     # 3. entry inputs, then entry outputs, pinned in module order.
     for buffer_id in (*module.entry_inputs, *module.entry_outputs):
         buf = module.buffers[buffer_id]
+        if buf.alias_parent is not None:
+            # A graph output that is a view of something else is placed by
+            # derivation in step 5, not pinned here -- pinning it would
+            # give it a second, contradictory address.
+            continue
         addr = _place(cursor, buf.size_bytes, align)
         placements[buffer_id] = dataclasses.replace(buf, addr=addr)
         cursor = addr + buf.size_bytes
@@ -163,6 +188,35 @@ def plan_memory(
             free_blocks.append({"addr": addr, "size": buf.size_bytes, "end_seq": end})
         placements[buffer_id] = dataclasses.replace(buf, addr=addr)
     cursor = max(cursor, high_water)
+
+    # 5. buffer views: no allocation at all. Each one IS a channel-plane
+    # range of its parent, so its address is derived, parents first (a
+    # view of a view resolves once its own parent has an address). This is
+    # what makes `tosa.concat`/`tosa.slice` cost zero bytes and zero
+    # instructions -- and it is also why the HIR verifier re-derives every
+    # one of these addresses independently (`_verify_aliases_planned`).
+    plane_channels = target.memory.activation_plane_channels
+    pending = [bid for bid, buf in module.buffers.items() if buf.alias_parent is not None]
+    while pending:
+        progressed = False
+        still_pending = []
+        for buffer_id in pending:
+            buf = module.buffers[buffer_id]
+            parent = placements.get(buf.alias_parent) or module.buffers.get(buf.alias_parent)
+            if parent is None or parent.addr is None:
+                still_pending.append(buffer_id)
+                continue
+            placements[buffer_id] = dataclasses.replace(
+                buf, addr=parent.addr + buf.alias_byte_offset(plane_channels)
+            )
+            progressed = True
+        if not progressed:
+            raise MemoryPlanError(
+                f"buffer views {sorted(still_pending)} have no placeable parent "
+                "(unresolvable alias chain)",
+                stage="memplan",
+            )
+        pending = still_pending
 
     module = module.with_buffers(placements)
     memory_size = _align_up(

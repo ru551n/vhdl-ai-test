@@ -9,17 +9,22 @@ from __future__ import annotations
 from cnnc.errors import VerifyError
 from cnnc.gir.ir import (
     DTYPES,
+    AddAttrs,
     ClampAttrs,
+    ConcatAttrs,
     ConvAttrs,
     FusedConvAttrs,
     Graph,
     Op,
     PoolAttrs,
     RescaleParams,
+    SliceAttrs,
     Tensor,
+    UpsampleAttrs,
     conv2d_output_shape,
     dtype_range,
     pool2d_output_shape,
+    upsample_output_shape,
 )
 
 # TOSA v1.0 RESCALE: multiplier is a signed int32; MVP additionally
@@ -65,6 +70,16 @@ def verify(graph: Graph) -> None:
             _verify_clamp(graph, op)
         elif op.kind == "pool":
             _verify_pool(graph, op)
+        elif op.kind == "add":
+            _verify_add(graph, op)
+        elif op.kind == "table":
+            _verify_table(graph, op)
+        elif op.kind == "upsample":
+            _verify_upsample(graph, op)
+        elif op.kind == "concat":
+            _verify_concat(graph, op)
+        elif op.kind == "slice":
+            _verify_slice(graph, op)
         elif op.kind == "fused_conv":
             _verify_fused_conv(graph, op)
         else:
@@ -260,6 +275,131 @@ def _verify_pool(graph: Graph, op: Op) -> None:
     expected = pool2d_output_shape(x.shape, attrs)
     if out.shape != expected:
         _fail(op.id, f"pool output shape {out.shape} != computed {expected}")
+
+
+def _verify_add(graph: Graph, op: Op) -> None:
+    a, b = (graph.tensors[i] for i in op.inputs)
+    out = graph.tensors[op.outputs[0]]
+    attrs: AddAttrs = op.attrs
+    for name, t in (("lhs", a), ("rhs", b), ("output", out)):
+        if t.dtype != "i8":
+            _fail(op.id, f"add {name} dtype {t.dtype!r} must be i8")
+    if a.shape != b.shape:
+        _fail(op.id, f"add operand shapes {a.shape} != {b.shape} (no broadcasting)")
+    if out.shape != a.shape:
+        _fail(op.id, f"add output shape {out.shape} != operand shape {a.shape}")
+    # Same bounds `_verify_rescale_params` puts on a standalone rescale:
+    # the per-operand rescale IS a TOSA rescale, folded into the op.
+    if not (0 <= attrs.multiplier < _MULT_MAX):
+        _fail(op.id, f"add multiplier {attrs.multiplier} out of range [0, {_MULT_MAX})")
+    if not (_SHIFT_MIN <= attrs.shift <= _SHIFT_MAX):
+        _fail(op.id, f"add shift {attrs.shift} out of range [{_SHIFT_MIN}, {_SHIFT_MAX}]")
+    # Scale > 1 is refused, not because the accelerator cannot encode it,
+    # but because `passes.fuse`'s equivalence argument for folding the two
+    # per-operand rescales in only holds while the rescale cannot leave
+    # int8 (see `_add_rescale_foldable`). Keeping the bound here means a
+    # hand-built graph cannot sneak past that argument either.
+    if attrs.multiplier > (1 << attrs.shift):
+        _fail(
+            op.id,
+            f"add rescale multiplier {attrs.multiplier} > 2**shift {1 << attrs.shift} (scale > 1): "
+            "a per-operand rescale that can leave int8 is not equivalent to the accelerator's "
+            "sum-then-saturate ADD",
+        )
+
+
+#: TOSA `TABLE` on an int8 input takes exactly `2**8` entries, indexed by
+#: `value - type_min`.
+_TABLE_ENTRIES = 256
+
+
+def _verify_table(graph: Graph, op: Op) -> None:
+    x, table = (graph.tensors[i] for i in op.inputs)
+    out = graph.tensors[op.outputs[0]]
+    for name, t in (("input", x), ("table", table), ("output", out)):
+        if t.dtype != "i8":
+            _fail(op.id, f"table {name} dtype {t.dtype!r} must be i8")
+    if table.shape != (_TABLE_ENTRIES,):
+        _fail(op.id, f"table operand shape {table.shape} != ({_TABLE_ENTRIES},)")
+    if table.values is None:
+        # Without compile-time values there is no LUT image to pack, and a
+        # runtime-computed table has no instruction (the accelerator loads
+        # its LUT from a constant DDR address).
+        _fail(op.id, "table operand has no compile-time values")
+    if out.shape != x.shape:
+        _fail(op.id, f"table output shape {out.shape} != input shape {x.shape}")
+
+
+def _verify_upsample(graph: Graph, op: Op) -> None:
+    x = graph.tensors[op.inputs[0]]
+    out = graph.tensors[op.outputs[0]]
+    attrs: UpsampleAttrs = op.attrs
+    if len(x.shape) != 4:
+        _fail(op.id, f"upsample input rank {len(x.shape)} != 4")
+    if x.shape[0] != 1:
+        _fail(op.id, f"upsample input batch {x.shape[0]} != 1")
+    if out.dtype != x.dtype:
+        _fail(op.id, f"upsample output dtype {out.dtype} != input dtype {x.dtype}")
+    if attrs.factor < 1:
+        _fail(op.id, f"upsample factor {attrs.factor} must be >= 1")
+    expected = upsample_output_shape(x.shape, attrs.factor)
+    if out.shape != expected:
+        _fail(op.id, f"upsample output shape {out.shape} != computed {expected}")
+
+
+def _verify_concat(graph: Graph, op: Op) -> None:
+    parts = [graph.tensors[i] for i in op.inputs]
+    out = graph.tensors[op.outputs[0]]
+    attrs: ConcatAttrs = op.attrs
+    if not parts:
+        _fail(op.id, "concat has no operands")
+        return
+    rank = len(out.shape)
+    if not (0 <= attrs.axis < rank):
+        _fail(op.id, f"concat axis {attrs.axis} outside rank {rank}")
+        return
+    total = 0
+    for part in parts:
+        if len(part.shape) != rank:
+            _fail(op.id, f"concat operand %{part.id} rank {len(part.shape)} != output rank {rank}")
+            return
+        if part.dtype != out.dtype:
+            _fail(op.id, f"concat operand %{part.id} dtype {part.dtype} != output dtype {out.dtype}")
+        for axis, (p, o) in enumerate(zip(part.shape, out.shape)):
+            if axis != attrs.axis and p != o:
+                _fail(
+                    op.id,
+                    f"concat operand %{part.id} shape {part.shape} differs from output {out.shape} "
+                    f"on axis {axis}, which is not the concat axis {attrs.axis}",
+                )
+                return
+        total += part.shape[attrs.axis]
+    if total != out.shape[attrs.axis]:
+        _fail(
+            op.id,
+            f"concat operands sum to {total} on axis {attrs.axis}, output has {out.shape[attrs.axis]}",
+        )
+
+
+def _verify_slice(graph: Graph, op: Op) -> None:
+    x = graph.tensors[op.inputs[0]]
+    out = graph.tensors[op.outputs[0]]
+    attrs: SliceAttrs = op.attrs
+    rank = len(x.shape)
+    if len(attrs.start) != rank or len(attrs.size) != rank:
+        _fail(op.id, f"slice start/size must have {rank} elements, got {attrs.start}/{attrs.size}")
+        return
+    if out.dtype != x.dtype:
+        _fail(op.id, f"slice output dtype {out.dtype} != input dtype {x.dtype}")
+    for axis, (start, size, extent) in enumerate(zip(attrs.start, attrs.size, x.shape)):
+        if start < 0 or size < 1 or start + size > extent:
+            _fail(
+                op.id,
+                f"slice axis {axis}: [{start}, {start + size}) is not inside [0, {extent})",
+            )
+            return
+    if out.shape != tuple(attrs.size):
+        _fail(op.id, f"slice output shape {out.shape} != size {tuple(attrs.size)}")
 
 
 def _verify_fused_conv(graph: Graph, op: Op) -> None:

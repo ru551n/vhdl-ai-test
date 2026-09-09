@@ -42,6 +42,7 @@ _FLAG_PARAM_TO_FLAG_NAME = {
     "pad_en": "PAD_EN",
     "clamp_en": "CLAMP_EN",
     "per_channel_en": "PER_CHANNEL_EN",
+    "act_lut_en": "ACT_LUT_EN",
 }
 
 # `HirOp.params` keys copied verbatim onto a same-named `Descriptor`/ISA field.
@@ -69,6 +70,24 @@ _POOL_FIELD_PARAMS = (
     "pool_kernel_h", "pool_kernel_w", "pool_stride_h", "pool_stride_w",
     "pad_top", "pad_bottom", "pad_left", "pad_right",
 )
+
+# `HirOp.params` keys an ISA v2.0 `add` op sets. A subset of
+# `_CORE_FIELD_PARAMS`: ADD shares the geometry and the requant pair, and
+# has nothing else -- no out_channels, no kernel/stride, no padding.
+_ADD_FIELD_PARAMS = (
+    "in_width", "in_height", "in_channels", "requant_scale", "requant_shift",
+)
+
+# `HirOp.params` keys an ISA v2.0 `act` op sets: the geometry only. The
+# LUT's address is a buffer address (W3 `weight_addr`), and the enable is
+# a flag, so neither is a param here.
+_ACT_FIELD_PARAMS = ("in_width", "in_height", "in_channels")
+
+# `HirOp.params` keys an ISA v2.0 `upsample` op sets: the INPUT geometry
+# only. The output geometry is implied (`UPSAMPLE_FACTOR` in both spatial
+# dimensions) and has no descriptor field, which is why the factor is
+# checked at lowering time rather than encoded here.
+_UPSAMPLE_FIELD_PARAMS = ("in_width", "in_height", "in_channels")
 
 # ISA v2.1 W10 byte 41, opcode-agnostic (see `Descriptor.pad_value`).
 _PAD_VALUE_PARAM = "pad_value"
@@ -124,6 +143,13 @@ class Descriptor:
     # Meaningful only with FLAG_PER_CHANNEL_EN; always 0 until a lowering
     # writes the table (same v1.0/v1.1 reserved-zero rule as W13 above).
     scale_addr: int = 0
+    # ISA v2.0, W15: byte count for the data-movement/elementwise family
+    # (`COPY`/`ACT`), and the SECOND source operand's address for `ADD`
+    # (`accel_v2/program.py`'s "ambiguity #2", which
+    # `cnn_accel_model.run_layer` follows). 0 for every v1.2 opcode, which
+    # ignores the field, and 0 is also what a pre-v2.0 target -- where
+    # these bytes are reserved -- requires.
+    xfer_bytes: int = 0
     # ISA v2.1, W10 byte 41: the int8 value padded taps take. Kept
     # field-for-field identical to `cnn_accel_model.LayerDesc` (see this
     # class' docstring, and `vectors.py`, which walks `LayerDesc`'s fields
@@ -218,6 +244,9 @@ def _reject_unknown_params(op: HirOp, isa_version: str) -> None:
         set(_CORE_FIELD_PARAMS)
         | set(_W13_FIELD_PARAMS)
         | set(_POOL_FIELD_PARAMS)
+        | set(_ADD_FIELD_PARAMS)
+        | set(_ACT_FIELD_PARAMS)
+        | set(_UPSAMPLE_FIELD_PARAMS)
         | set(_FLAG_PARAM_TO_FLAG_NAME)
         | {_PAD_VALUE_PARAM}
     )
@@ -377,6 +406,168 @@ def _build_pool_descriptor(
     )
 
 
+def _build_add_descriptor(
+    op: HirOp, module: HirModule, target: "Target", program_addr: int, index: int, isa_version: str
+) -> Descriptor:
+    """One ISA v2.0 `ADD` instruction: two ifmaps of one geometry, one
+    ofmap, one shared `(requant_scale, requant_shift)` pair.
+
+    The second operand's ADDRESS goes in W15 `xfer_bytes`, not a byte
+    count -- the descriptor has only `in_addr`/`out_addr`/`weight_addr`/
+    `bias_addr` for addresses and ADD needs a third source slot. That is
+    the reading `accel_v2/program.py` ratified ("ambiguity #2") and what
+    `cnn_accel_model.run_layer` executes, so all three agree by
+    construction rather than by comment. `REQUANT_EN` is the only flag:
+    ADD has no bias, no padding, no clamp bounds and no per-channel
+    table."""
+    _reject_unknown_params(op, isa_version)
+
+    params = op.params
+    if len(op.reads) != 2:
+        raise CompilerError(
+            f"add op must read exactly 2 buffers (src0, src1), got {len(op.reads)}", op_id=op.id, stage=_STAGE
+        )
+    if len(op.writes) != 1:
+        raise CompilerError(
+            f"add op must write exactly 1 buffer, got {len(op.writes)}", op_id=op.id, stage=_STAGE
+        )
+    a_buf, b_buf = (module.buffer(bid) for bid in op.reads)
+    out_buf = module.buffer(op.writes[0])
+    for label, buf in (("src0", a_buf), ("src1", b_buf), ("out", out_buf)):
+        if buf.addr is None:
+            raise CompilerError(f"buffer {buf.id!r} ({label}) has no addr", op_id=op.id, stage=_STAGE)
+
+    opcode = target.isa.opcodes.get("ADD")
+    if opcode is None:
+        raise CapabilityError("target ISA has no ADD opcode", op_id=op.id, stage=_STAGE)
+    if "xfer_bytes" not in target.isa.fields:
+        # Without W15 there is nowhere to put src1's address, so the
+        # instruction cannot be encoded at all -- say that, rather than
+        # emitting an ADD that reads whatever happens to be at address 0.
+        raise CapabilityError(
+            "target ISA has no 'xfer_bytes' field (ISA v2.0 W15), which is where ADD's second "
+            "source address rides; refusing to emit",
+            op_id=op.id, stage=_STAGE, constraint="xfer_bytes",
+        )
+
+    for key in _ADD_FIELD_PARAMS:
+        if key not in params:
+            raise CompilerError(f"add op missing required param {key!r}", op_id=op.id, stage=_STAGE)
+
+    return Descriptor(
+        opcode=opcode,
+        flags=_assemble_flags(op, target),
+        in_addr=a_buf.addr,
+        out_addr=out_buf.addr,
+        xfer_bytes=b_buf.addr,
+        next_instr_addr=program_addr + (index + 1) * target.isa.instr_word_bytes,
+        **{key: params[key] for key in _ADD_FIELD_PARAMS},
+    )
+
+
+def _build_act_descriptor(
+    op: HirOp, module: HirModule, target: "Target", program_addr: int, index: int, isa_version: str
+) -> Descriptor:
+    """One ISA v2.0 `ACT` instruction: one ifmap, one ofmap, and the
+    256-byte int8 -> int8 LUT.
+
+    The LUT's address rides in W3 `weight_addr` -- section 5.1 names no
+    field for it, and `weight_addr` is the slot whose role already is
+    "the compile-time side table for this instruction" (it plays the same
+    part for CONV2D). That is `accel_v2/program.py`'s "ambiguity #3", and
+    `cnn_accel_model.run_layer` reads the LUT from the same place.
+    `xfer_bytes` carries the ifmap's byte length, matching what
+    `accel_v2/program.py` emits, even though the executor derives the
+    length from the geometry."""
+    _reject_unknown_params(op, isa_version)
+
+    params = op.params
+    if len(op.reads) != 2:
+        raise CompilerError(
+            f"act op must read exactly 2 buffers (input, LUT), got {len(op.reads)}", op_id=op.id, stage=_STAGE
+        )
+    if len(op.writes) != 1:
+        raise CompilerError(
+            f"act op must write exactly 1 buffer, got {len(op.writes)}", op_id=op.id, stage=_STAGE
+        )
+    in_buf, lut_buf = (module.buffer(bid) for bid in op.reads)
+    out_buf = module.buffer(op.writes[0])
+    if lut_buf.layout != "ACT_LUT" or lut_buf.role != "const":
+        raise CompilerError(
+            f"act op's 2nd read {lut_buf.id!r} must be a const ACT_LUT buffer, got role "
+            f"{lut_buf.role!r} layout {lut_buf.layout!r}",
+            op_id=op.id, stage=_STAGE,
+        )
+    for label, buf in (("in", in_buf), ("lut", lut_buf), ("out", out_buf)):
+        if buf.addr is None:
+            raise CompilerError(f"buffer {buf.id!r} ({label}) has no addr", op_id=op.id, stage=_STAGE)
+
+    opcode = target.isa.opcodes.get("ACT")
+    if opcode is None:
+        raise CapabilityError("target ISA has no ACT opcode", op_id=op.id, stage=_STAGE)
+
+    for key in _ACT_FIELD_PARAMS:
+        if key not in params:
+            raise CompilerError(f"act op missing required param {key!r}", op_id=op.id, stage=_STAGE)
+
+    return Descriptor(
+        opcode=opcode,
+        flags=_assemble_flags(op, target),
+        in_addr=in_buf.addr,
+        out_addr=out_buf.addr,
+        weight_addr=lut_buf.addr,
+        xfer_bytes=in_buf.size_bytes,
+        next_instr_addr=program_addr + (index + 1) * target.isa.instr_word_bytes,
+        **{key: params[key] for key in _ACT_FIELD_PARAMS},
+    )
+
+
+def _build_upsample_descriptor(
+    op: HirOp, module: HirModule, target: "Target", program_addr: int, index: int, isa_version: str
+) -> Descriptor:
+    """One ISA v2.0 `UPSAMPLE` instruction: one ifmap in, one ofmap
+    `UPSAMPLE_FACTOR` times larger in both spatial dimensions.
+
+    Everything is implied by the input geometry -- no flags, no weights,
+    no requant, and no factor field (the hardware has exactly one factor,
+    which `lower.to_hir` is what checks). `xfer_bytes` stays 0: this is a
+    shaped opcode, not a byte mover, so W15 has no role here
+    (`accel_v2/program.py` emits it the same way)."""
+    _reject_unknown_params(op, isa_version)
+
+    params = op.params
+    if len(op.reads) != 1:
+        raise CompilerError(
+            f"upsample op must read exactly 1 buffer (input), got {len(op.reads)}", op_id=op.id, stage=_STAGE
+        )
+    if len(op.writes) != 1:
+        raise CompilerError(
+            f"upsample op must write exactly 1 buffer, got {len(op.writes)}", op_id=op.id, stage=_STAGE
+        )
+    in_buf = module.buffer(op.reads[0])
+    out_buf = module.buffer(op.writes[0])
+    for label, buf in (("in", in_buf), ("out", out_buf)):
+        if buf.addr is None:
+            raise CompilerError(f"buffer {buf.id!r} ({label}) has no addr", op_id=op.id, stage=_STAGE)
+
+    opcode = target.isa.opcodes.get("UPSAMPLE")
+    if opcode is None:
+        raise CapabilityError("target ISA has no UPSAMPLE opcode", op_id=op.id, stage=_STAGE)
+
+    for key in _UPSAMPLE_FIELD_PARAMS:
+        if key not in params:
+            raise CompilerError(f"upsample op missing required param {key!r}", op_id=op.id, stage=_STAGE)
+
+    return Descriptor(
+        opcode=opcode,
+        flags=_assemble_flags(op, target),
+        in_addr=in_buf.addr,
+        out_addr=out_buf.addr,
+        next_instr_addr=program_addr + (index + 1) * target.isa.instr_word_bytes,
+        **{key: params[key] for key in _UPSAMPLE_FIELD_PARAMS},
+    )
+
+
 def _isa_version(target: "Target", ops: list) -> str:
     versions = {target.unit(op.unit).isa_version for op in ops}
     if not versions:
@@ -408,6 +599,16 @@ def _build_manifest(
             "size_bytes": buf.size_bytes,
             "gir_tensor": buf.gir_tensor,
         }
+        if buf.alias_parent is not None:
+            # A buffer view owns no bytes of its own: it is a channel-plane
+            # range of `alias_parent` (`tosa.concat`/`tosa.slice`). Recorded
+            # so a reader of the manifest can see that two buffers sharing
+            # an address range is intentional, not a planning bug.
+            entry["alias"] = {
+                "parent": buf.alias_parent,
+                "plane_offset": buf.alias_plane_offset,
+                "kind": buf.alias_kind,
+            }
         if buf.role == "const":
             entry["constants_offset"] = const_offsets[buf.id]
             entry["sha256"] = hashlib.sha256(buf.data).hexdigest()
@@ -478,7 +679,13 @@ def emit_program(module: HirModule, target: "Target") -> Program:
 
     descriptors: list[Descriptor] = []
     op_ids: list[str | None] = []
-    builders = {"conv_layer": _build_conv_descriptor, "max_pool": _build_pool_descriptor}
+    builders = {
+        "conv_layer": _build_conv_descriptor,
+        "max_pool": _build_pool_descriptor,
+        "add": _build_add_descriptor,
+        "act": _build_act_descriptor,
+        "upsample": _build_upsample_descriptor,
+    }
     for index, op in enumerate(ops_sorted):
         builder = builders.get(op.kind)
         if builder is None:

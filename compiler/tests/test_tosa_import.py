@@ -187,13 +187,16 @@ def test_reject_input_unsigned_true():
 
 
 def test_reject_unknown_op():
-    # tosa.add is a real TOSA op with no importer support in M2 (it is
-    # scheduled for M14).
-    text = _mutated('"tosa.clamp"', '"tosa.add"')
+    # tosa.matmul is a real TOSA op with no importer support and no
+    # accelerator instruction. (It stands in for `tosa.add`, which this
+    # test used until `tosa.add` became supported -- the point of the test
+    # is the diagnostic for an op the frontend does not know, so it needs
+    # an op the frontend does not know.)
+    text = _mutated('"tosa.clamp"', '"tosa.matmul"')
     with pytest.raises(UnsupportedOp) as exc:
         _import(text)
     assert "%10" in str(exc.value)
-    assert "tosa.add" in str(exc.value)
+    assert "tosa.matmul" in str(exc.value)
 
 
 def test_reject_zero_point_non_const_operand():

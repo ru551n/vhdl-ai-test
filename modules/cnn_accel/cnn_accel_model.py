@@ -8,7 +8,8 @@ models)") — same role `canny_model.py` plays for the Canny IP. Covers:
   which must agree byte-for-byte with `modules/cnn_accel/src/cnn_accel_pkg.vhd`
   and `doc/cnn_accel_arch.md`'s "Instruction Set (v1)" table.
 - Per-opcode reference math (`conv2d`, `dwconv2d`, `pool_max`, `pool_avg`,
-  `fc`) and the shared output-quantization step (`bias_requantize_relu`),
+  `fc`, and the ISA v2.0 family `elementwise_add`/`upsample_nearest`/
+  `act_lut`) and the shared output-quantization step (`bias_requantize_relu`),
   matching `cnn_accel_bias_requant`'s documented
   `int32 -> (+bias) -> (x requant_scale) -> (>>requant_shift) -> saturate
   -> (optional ReLU)` pipeline bit-exactly (round-half-up shift, ties
@@ -154,6 +155,16 @@ class LayerDesc:
     # ISA v1.2 (H2), W14: byte address of the per-channel requant table
     # (`pack_scale_table_for_hw`), read only while `per_channel_en`.
     scale_addr: int = 0
+    # ISA v2.0, W15: transfer size in bytes for the data-movement and
+    # elementwise family (`COPY`/`ACT`). For `ADD` these same bits instead
+    # carry the SECOND source operand's byte address (`src1_addr`) -- the
+    # ambiguity `accel_v2/program.py`'s module docstring resolves
+    # ("ambiguity #2"), and this model follows that resolution because
+    # `accel_v2/program.py` is what emits the descriptor bytes a real
+    # testbench runs. Reserved-must-be-0 in ISA v1.2, ignored by every
+    # v1.2 opcode, so the default of 0 leaves every pre-v2.0 program
+    # bit-identical.
+    xfer_bytes: int = 0
     # ISA v2.1, W10 byte 41: the int8 value a padded tap takes, i.e. the
     # input tensor's quantization zero-point. 0 (the reserved-must-be-0
     # value every earlier revision wrote) reproduces the old zero-padding
@@ -238,15 +249,34 @@ def encode_instruction(desc: LayerDesc) -> bytes:
     struct.pack_into("<b", buf, OFF_CLAMP_MIN, desc.clamp_min)
     struct.pack_into("<b", buf, OFF_CLAMP_MAX, desc.clamp_max)
     struct.pack_into("<I", buf, OFF_SCALE_ADDR, desc.scale_addr & 0xFFFFFFFF)
+    struct.pack_into("<I", buf, OFF_XFER_BYTES, desc.xfer_bytes & 0xFFFFFFFF)
     struct.pack_into("<b", buf, OFF_PAD_VALUE, desc.pad_value)
     return bytes(buf)
 
 
 def decode_instruction(data: bytes) -> LayerDesc:
     """Inverse of `encode_instruction`, for the encode/decode cross-check
-    test and for `run_program`'s instruction fetch."""
+    test and for `run_program`'s instruction fetch.
+
+    Rejects any descriptor whose ISA v2.0 `spaces` byte (W0 byte 2) is
+    non-zero. This model has exactly ONE flat address space -- `memory` --
+    so it cannot honour a `LOCAL_TENSOR`/`LOCAL_WEIGHT` operand tag, and
+    decoding one into a `LayerDesc` that has no field for it would let
+    `run_layer` read the wrong address space silently. `SPACE_DDR == 0`
+    (that is exactly why it is 0), so every all-DDR v2.0 program and every
+    v1.x program decodes unchanged; a residency-aware program belongs in
+    `accel_v2/reference.py`, which models both spaces."""
     if len(data) != INSTR_WORD_BYTES:
         raise ValueError(f"expected {INSTR_WORD_BYTES} bytes, got {len(data)}")
+
+    spaces = data[OFF_SPACES]
+    if spaces != 0:
+        raise ValueError(
+            f"decode_instruction: descriptor tags its operands with storage spaces "
+            f"0x{spaces:02x}, but cnn_accel_model has a single flat address space "
+            "(SPACE_DDR only). Run a program with LOCAL_TENSOR/LOCAL_WEIGHT operands "
+            "through accel_v2.reference.run_reference instead."
+        )
 
     return LayerDesc(
         opcode=data[OFF_OPCODE],
@@ -278,6 +308,7 @@ def decode_instruction(data: bytes) -> LayerDesc:
         clamp_min=struct.unpack_from("<b", data, OFF_CLAMP_MIN)[0],
         clamp_max=struct.unpack_from("<b", data, OFF_CLAMP_MAX)[0],
         scale_addr=struct.unpack_from("<I", data, OFF_SCALE_ADDR)[0],
+        xfer_bytes=struct.unpack_from("<I", data, OFF_XFER_BYTES)[0],
         pad_value=struct.unpack_from("<b", data, OFF_PAD_VALUE)[0],
     )
 
@@ -1102,6 +1133,95 @@ def pool_avg(input_values: list[int], desc: LayerDesc) -> list[int]:
     return output
 
 
+# ---------------------------------------------------------------------------
+# ISA v2.0 elementwise / resample family (doc/cnn_accel_top_v2_arch.md
+# section 5.2). Like `conv2d`/`pool_max`/`pool_avg` above, these operate
+# on the LOGICAL HWC layout only; `run_layer` is what converts to/from the
+# S6 DDR planes.
+#
+# These three functions are the SINGLE definition of what ADD/UPSAMPLE/ACT
+# compute. `accel_v2/reference.py` -- the second implementation the
+# residency tests trust -- calls straight into them (the same anti-fork
+# rule its docstring already states for CONV2D/POOL_*), so the semantics
+# cannot be re-derived differently in the two places.
+# ---------------------------------------------------------------------------
+
+#: `OPCODE_UPSAMPLE` replicates by exactly this factor in both dimensions.
+#: Fixed, not a descriptor field (doc/cnn_accel_top_v2_arch.md section 12
+#: limitation 5: nearest-neighbour 2x is the only mode YOLOv8n needs, and
+#: the ISA spends no bits on any other).
+UPSAMPLE_FACTOR = 2
+
+
+def elementwise_add(a_values: list[int], b_values: list[int], desc: LayerDesc) -> list[int]:
+    """`OPCODE_ADD`: `dst = sat_i8(requant(src0) + requant(src1))`
+    (section 5.2), where `requant(v) = round_shift_right_signed(v *
+    requant_scale, 15 + requant_shift)`.
+
+    That is the same Q15 core rescale step `bias_requantize_relu` applies
+    (see its docstring for the Q15 convention and the round-half-up rule),
+    built from the same two primitives -- so ADD's bit-exactness rests on
+    the already-tested `round_shift_right_signed`/`saturate_signed` rather
+    than on a second rounding implementation.
+
+    The descriptor carries only ONE `(requant_scale, requant_shift)` pair
+    for `ADD`, so it is applied identically to both operands: the opcode
+    assumes both are already on a common quantization scale, as a
+    residual/skip-connection add is. Each operand is rescaled and rounded
+    BEFORE the sum, not after -- that ordering is observable (two roundings
+    vs one) and is what the hardware does."""
+    if len(a_values) != len(b_values):
+        raise ValueError(f"ADD operand length mismatch: {len(a_values)} != {len(b_values)}")
+    divisor_shift = 15 + desc.requant_shift
+    out = []
+    for va, vb in zip(a_values, b_values):
+        ra = round_shift_right_signed(va * desc.requant_scale, divisor_shift)
+        rb = round_shift_right_signed(vb * desc.requant_scale, divisor_shift)
+        out.append(saturate_signed(ra + rb, 8))
+    return out
+
+
+def upsample_nearest(input_values: list[int], desc: LayerDesc, factor: int = UPSAMPLE_FACTOR) -> list[int]:
+    """`OPCODE_UPSAMPLE`: nearest-neighbour replication of an
+    `in_height x in_width x in_channels` LOGICAL tensor by `factor` in
+    both spatial dimensions (`out[oy][ox] = in[oy // f][ox // f]`, whole
+    pixels copied, channels untouched).
+
+    A pure index permutation: no arithmetic, no rounding, no saturation,
+    so there is nothing here for a second implementation to diverge on."""
+    if factor < 1:
+        raise ValueError(f"UPSAMPLE factor {factor} must be >= 1")
+    in_w, in_h, c = desc.in_width, desc.in_height, desc.in_channels
+    expected = in_w * in_h * c
+    if len(input_values) != expected:
+        raise ValueError(f"UPSAMPLE input length {len(input_values)} != {in_w}*{in_h}*{c} = {expected}")
+    out_h, out_w = in_h * factor, in_w * factor
+    out = [0] * (out_h * out_w * c)
+    for oy in range(out_h):
+        iy = oy // factor
+        for ox in range(out_w):
+            ix = ox // factor
+            src = (iy * in_w + ix) * c
+            dst = (oy * out_w + ox) * c
+            out[dst : dst + c] = input_values[src : src + c]
+    return out
+
+
+def act_lut(input_values: list[int], lut: list[int]) -> list[int]:
+    """`OPCODE_ACT`: the standalone 256-entry signed int8 -> int8 lookup
+    table (`FLAG_ACT_LUT_EN`), indexed by the input byte's UNSIGNED value,
+    i.e. `lut[v & 0xFF]` -- entry `i` is the result for input `i` while
+    `i < 128` and for `i - 256` otherwise, which is exactly the order the
+    256 bytes sit in DDR/LOCAL_WEIGHT.
+
+    This is how a general activation (SiLU, sigmoid, ...) reaches the
+    hardware; the table is a compile-time constant, so nothing is computed
+    here beyond the lookup."""
+    if len(lut) != 256:
+        raise ValueError(f"ACT LUT must have exactly 256 entries, got {len(lut)}")
+    return [lut[v & 0xFF] for v in input_values]
+
+
 def _conv_output_dims(desc: LayerDesc) -> tuple[int, int]:
     """`(out_width, out_height)` for `CONV2D`/`DWCONV2D`/`FC`, duplicating
     `_conv2d_generic`'s own formula (kept separate rather than factored
@@ -1151,6 +1271,19 @@ def run_layer(memory: bytearray, desc: LayerDesc) -> None:
     - per-channel requant table (`PER_CHANNEL_EN` only): exactly
       `pack_scale_table_for_hw`'s byte image at `scale_addr`
       (`packed_scale_table_bytes`), first `out_channels` entries used.
+
+    ISA v2.0 additions, all executing against the same S6 plane layout:
+
+    - `ADD`: two ifmaps of identical geometry, the second at the address
+      in W15 `xfer_bytes` (see that field's comment); `elementwise_add`.
+    - `UPSAMPLE`: one ifmap, output `UPSAMPLE_FACTOR` times larger in both
+      spatial dimensions; `upsample_nearest`.
+    - `ACT`: one ifmap plus the 256-byte int8->int8 LUT at `weight_addr`;
+      `act_lut`.
+    - `COPY`: an opaque `xfer_bytes`-long byte copy, no pack/unpack at
+      either end.
+    - `LOAD`/`STORE`/`LOADW` are rejected: they move bytes between two
+      address spaces, and this model has one (see `decode_instruction`).
     """
     in_w, in_h, in_c = desc.in_width, desc.in_height, desc.in_channels
 
@@ -1224,6 +1357,59 @@ def run_layer(memory: bytearray, desc: LayerDesc) -> None:
         )
         out_c = in_c  # pooling is channel-preserving
         out_w, out_h = _pool_output_dims(desc)
+
+    elif desc.opcode == OPCODE_COPY:
+        # An opaque `xfer_bytes`-long byte copy: COPY never interprets its
+        # payload as activation elements, so it neither unpacks nor packs
+        # (that is what makes it legal between any two equal-length ranges
+        # regardless of tensor shape). Returns early for the same reason --
+        # the shared pack/write tail below would be wrong here.
+        memory[desc.out_addr : desc.out_addr + desc.xfer_bytes] = memory[
+            desc.in_addr : desc.in_addr + desc.xfer_bytes
+        ]
+        return
+
+    elif desc.opcode in (OPCODE_ADD, OPCODE_UPSAMPLE, OPCODE_ACT):
+        in_size = activation_bytes(in_w, in_h, in_c)
+        input_bytes = memory[desc.in_addr : desc.in_addr + in_size]
+        input_planes = [b - 256 if b >= 128 else b for b in input_bytes]
+        input_values = unpack_activation_planes(input_planes, in_w, in_h, in_c)
+
+        if desc.opcode == OPCODE_ADD:
+            # W15 carries the SECOND operand's address for ADD, not a byte
+            # count (accel_v2/program.py "ambiguity #2"): the elementwise
+            # length comes from the shared in_width/in_height/in_channels
+            # geometry, like every other shaped opcode.
+            src1_bytes = memory[desc.xfer_bytes : desc.xfer_bytes + in_size]
+            src1_planes = [b - 256 if b >= 128 else b for b in src1_bytes]
+            src1_values = unpack_activation_planes(src1_planes, in_w, in_h, in_c)
+            output = elementwise_add(input_values, src1_values, desc)
+            out_w, out_h = in_w, in_h
+        elif desc.opcode == OPCODE_UPSAMPLE:
+            output = upsample_nearest(input_values, desc)
+            out_w, out_h = in_w * UPSAMPLE_FACTOR, in_h * UPSAMPLE_FACTOR
+        else:
+            # The 256-byte LUT rides in weight_addr, the same "compile-time
+            # side table for this instruction" slot CONV2D uses for its
+            # per-channel scale table (accel_v2/program.py "ambiguity #3").
+            lut_bytes = memory[desc.weight_addr : desc.weight_addr + 256]
+            lut = [b - 256 if b >= 128 else b for b in lut_bytes]
+            output = act_lut(input_values, lut)
+            out_w, out_h = in_w, in_h
+        out_c = in_c  # all three are channel-preserving
+
+    elif desc.opcode in (OPCODE_LOAD, OPCODE_STORE, OPCODE_LOADW):
+        # The DMA family only means anything with two address spaces to
+        # move bytes BETWEEN; this model has one flat `memory`, so a LOAD
+        # here would be an unobservable self-copy that silently pretends a
+        # scratchpad exists. `accel_v2/reference.py` models both spaces and
+        # executes these as `MoveStep`s.
+        raise ValueError(
+            f"run_layer: opcode 0x{desc.opcode:02x} (LOAD/STORE/LOADW) moves bytes between "
+            "DDR and the local tensor/weight scratchpad, which cnn_accel_model's single flat "
+            "address space does not model. Execute residency-aware programs through "
+            "accel_v2.reference.run_reference."
+        )
 
     else:
         raise ValueError(f"run_layer: unsupported opcode 0x{desc.opcode:02x}")

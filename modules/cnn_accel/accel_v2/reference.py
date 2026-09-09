@@ -19,12 +19,14 @@ rescale reuses `cnn_accel_model.round_shift_right_signed`/
 built from), so its bit-exactness rests on the same, already-tested
 rounding rule.
 
-The only genuinely new arithmetic here is `UPSAMPLE` (nearest-neighbour
-index replication) and the standalone `ACT` LUT (a 256-entry table
-lookup) -- both ISA v2.0-only opcodes with **no** v1.2 counterpart in
-`cnn_accel_model.py` to reuse or fork from, and both simple enough (a
-pure index permutation; a table lookup) that there is no rounding/
-saturation subtlety for a second implementation to silently diverge on.
+That guard now covers the ISA v2.0 family too: `ADD`, `UPSAMPLE` and
+`ACT` are `cnn_accel_model.elementwise_add`/`upsample_nearest`/`act_lut`,
+called on the unpacked LOGICAL activation exactly like the v1.2 opcodes
+above. This module hand-rolls no op arithmetic of its own at all; what it
+still owns alone is the *residency* model -- which address space each
+operand is read from, and what traffic that costs -- which is the thing
+the golden model deliberately does not have (it has one flat memory, see
+`cnn_accel_model.decode_instruction`).
 
 Weights/bias/per-channel scale tables are consumed directly from the
 `Conv2dOp` in their LOGICAL form (never packed/unpacked through a byte
@@ -155,41 +157,38 @@ def _exec_pool(op: PoolOp, input_values: list[int]) -> list[int]:
 
 
 def _exec_add(op: AddOp, a_values: list[int], b_values: list[int]) -> list[int]:
-    """`dst = sat_i8(requant(src0) + requant(src1))` (section 5.2),
-    `requant(v) = round_shift_right_signed(v * requant_scale, 15 +
-    requant_shift)` -- the same core rescale step `bias_requantize_relu`
-    performs, applied identically to both operands since the descriptor
-    carries only one `(requant_scale, requant_shift)` pair for `ADD`
-    (ambiguity #1, see `AddOp`'s docstring: this assumes both operands
-    are already expressed on a common scale, as is typical for a
-    residual/skip-connection add)."""
-    divisor_shift = 15 + op.requant_shift
-    out = []
-    for va, vb in zip(a_values, b_values):
-        ra = golden.round_shift_right_signed(va * op.requant_scale, divisor_shift)
-        rb = golden.round_shift_right_signed(vb * op.requant_scale, divisor_shift)
-        out.append(golden.saturate_signed(ra + rb, 8))
-    return out
+    """`dst = sat_i8(requant(src0) + requant(src1))` (section 5.2), via
+    `cnn_accel_model.elementwise_add` -- the same anti-fork rule as
+    `_exec_conv2d`/`_exec_pool` above: the arithmetic lives in the golden
+    model, this function only builds the descriptor that names it.
+
+    One `(requant_scale, requant_shift)` pair covers both operands
+    because the descriptor has only one (ambiguity #1, see `AddOp`'s
+    docstring: this assumes both operands are already expressed on a
+    common scale, as is typical for a residual/skip-connection add)."""
+    desc = golden.LayerDesc(
+        opcode=golden.OPCODE_ADD,
+        requant_scale=op.requant_scale,
+        requant_shift=op.requant_shift,
+    )
+    return golden.elementwise_add(a_values, b_values, desc)
 
 
 def _exec_upsample(op: UpsampleOp, input_values: list[int]) -> list[int]:
+    """Nearest-neighbour replication, via `cnn_accel_model.upsample_nearest`."""
     x = op.inputs[0]
-    f = op.factor
-    out_h, out_w, c = x.height * f, x.width * f, x.channels
-    out = [0] * (out_h * out_w * c)
-    for oy in range(out_h):
-        iy = oy // f
-        for ox in range(out_w):
-            ix = ox // f
-            src_base = (iy * x.width + ix) * c
-            dst_base = (oy * out_w + ox) * c
-            out[dst_base : dst_base + c] = input_values[src_base : src_base + c]
-    return out
+    desc = golden.LayerDesc(
+        opcode=golden.OPCODE_UPSAMPLE,
+        in_width=x.width,
+        in_height=x.height,
+        in_channels=x.channels,
+    )
+    return golden.upsample_nearest(input_values, desc, op.factor)
 
 
 def _exec_act(op: ActOp, input_values: list[int]) -> list[int]:
-    lut = op.lut
-    return [lut[v & 0xFF] for v in input_values]
+    """The standalone 256-entry LUT, via `cnn_accel_model.act_lut`."""
+    return golden.act_lut(input_values, op.lut)
 
 
 def _charge_weight_traffic(op: Conv2dOp, traffic: DdrTraffic) -> None:
