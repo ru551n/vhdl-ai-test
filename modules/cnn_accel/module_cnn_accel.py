@@ -2535,6 +2535,94 @@ class Module(BaseModule):
                 ),
             ]
 
+            # ================================================================
+            # TOP-LEVEL BUILDS (synthesis + place-and-route + bitstream).
+            #
+            # Everything above this line -- Yosys and Vivado alike -- is an
+            # out-of-context *netlist* build of one entity. Those give real
+            # resource counts but only an unrouted, register-to-register
+            # timing *estimate*, and only of the entity they build; nothing
+            # above measures 'cnn_accel_top', and until this block existed
+            # 'build_fpga.py --list-only' (full builds) listed nothing at
+            # all. The blocks that the system total was previously only
+            # estimated for -- 'cmd_proc', 'cmd_fetch', 'csr', the three
+            # 'axi_read_dma', 'ofmap_dma', 'axi_mux', 'elementwise',
+            # 'pool_requant' -- are measured for the first time here.
+            #
+            # Top level is 'cnn_accel_top_build', NOT 'cnn_accel_top': see
+            # that entity's header for why a full build cannot have the
+            # accelerator itself on top (~840 port bits versus this part's
+            # 285 I/O, and tsfpga's '-no_iobuf' out-of-context mode is
+            # synthesis-only by construction). The wrapper terminates the
+            # whole bus boundary in flip-flops inside the fabric and exposes
+            # five pins, so every accelerator path is a real
+            # register-to-register path and the hierarchical utilization
+            # report still attributes the accelerator separately.
+            #
+            # Constraints: 'tcl/cnn_accel_top_build_pinning.xdc', attached
+            # project-wide the same way tsfpga's own 'artyz7' example
+            # attaches 'tcl/artyz7_pinning.tcl'. It pins the five ports and
+            # creates the 150 MHz target clock. NOT a scoped constraint:
+            # 'create_clock' on a top-level port is a project-level
+            # constraint, and scoping it to a '-ref' entity would give it no
+            # port to attach to.
+            from tsfpga.constraint import Constraint
+            from tsfpga.vivado.project import VivadoProject
+
+            # A superset of the netlist builds' 'modules': the top pulls in
+            # 'dma_axi_write_simple' (via 'cnn_accel_ofmap_dma', which has no
+            # netlist build of its own), which in turn pulls in 'resync' and
+            # 'ring_buffer'. Rather than tracking that closure by hand, take
+            # all of hdl-modules with the same two exclusions 'run.py' uses:
+            # 'hard_fifo' is Xilinx-unisim-only, 'bfm' is simulation-only.
+            top_modules = get_modules(
+                modules_folder=self.path.parent, names_include={self.name}
+            ) + get_modules(
+                modules_folder=self.path.parent.parent / "hdl-modules" / "modules",
+                names_avoid={"hard_fifo", "bfm"},
+            )
+
+            pinning = Constraint(self.path / "tcl" / "cnn_accel_top_build_pinning.xdc")
+
+            def top_build(name: str, generics: dict) -> VivadoProject:
+                return VivadoProject(
+                    name=name,
+                    modules=top_modules,
+                    part=_VIVADO_PART,
+                    top="cnn_accel_top_build",
+                    generics=generics,
+                    constraints=[pinning],
+                    vivado_path=vivado_path,
+                    defined_at=Path(__file__),
+                )
+
+            # ONE design point only, deliberately. There is no
+            # 'cnn_accel_top_build_pe_rows_16' to match the '_pe_rows_16'
+            # netlist builds above, because at the top level
+            # '_PE_ROWS_SCALED' does not elaborate:
+            #
+            #   ERROR: [Synth 8-63] RTL assertion: "cnn_accel_top: g_pe_rows
+            #   (16) must equal the generated activation-plane channel count
+            #   (8): one OT pass writes exactly one output activation plane"
+            #   (cnn_accel_top.vhd, the 'g_pe_rows' assert)
+            #
+            # That assertion is a real contract of the rev-2 memory layout,
+            # not a build-script detail: one OT pass writes exactly one
+            # activation plane, and the plane's channel count 'T' is baked
+            # into the ISA/DDR layout via 'cnn_accel_constants.py'. So the
+            # 16-row point that 'cnn_accel_pe_array'/'cnn_accel_conv_core'
+            # are measured at is a *datapath* scaling point that the
+            # integrated accelerator cannot currently be built at; taking it
+            # to the top would mean scaling 'ACTIVATION_PLANE_CHANNELS' (and
+            # therefore 'MAX_AXI_DATA_WIDTH', the layout and the compiler)
+            # with it. Registering a project that can only ever fail
+            # elaboration would be worse than not registering one, and
+            # relaxing the assert to make it build is exactly the kind of
+            # "weaken the checker until it passes" this file warns against
+            # everywhere else. Add the variant back the day the top supports
+            # it.
+            projects += [top_build("cnn_accel_top_build", {"g_pe_rows": _PE_ROWS})]
+
         return projects
 
     def setup_vunit(self, vunit_proj: VUnit, **kwargs) -> None:
