@@ -49,6 +49,7 @@ _PE_COLS = cnn_accel_constants.PE_COLS
 _TILE_CHANNELS = cnn_accel_constants.TILE_CHANNELS  # = _PE_COLS, see proposal section 3.
 _MAX_KERNEL_SIZE = cnn_accel_constants.MAX_KERNEL_SIZE
 _MAX_ROW_TILE_WORDS = cnn_accel_constants.MAX_ROW_TILE_WORDS
+_ASSEMBLY_BUFFERS = cnn_accel_constants.ASSEMBLY_BUFFERS
 # = K^2 * ceil(C_max/8) = 9*32 for the target backbone's worst layer
 # (3x3x256, layer 9) -- replaces the old arbitrary 512 now that weights are
 # streamed per output-channel pass from DDR4 instead of double-buffered
@@ -696,6 +697,19 @@ class Module(BaseModule):
             description="Weight-buffer row-tile-word sizing bound.",
         )
         regs.add_constant(
+            name="assembly_buffers",
+            value=cnn_accel_constants.ASSEMBLY_BUFFERS,
+            description=(
+                "Tap-assembly buffers in the CONV path's cnn_accel_window_gen "
+                "instance (its g_assembly_buffers), i.e. how many windows may be in "
+                "flight between the row banks and the PE array at once. Exposed as a "
+                "generated constant so cnn_accel_conv_core derives it from this "
+                "single source instead of restating a literal, exactly as "
+                "cnn_accel_v2_pkg does for isa_version. The POOL instance keeps the "
+                "entity default of 1. See cnn_accel_constants.ASSEMBLY_BUFFERS."
+            ),
+        )
+        regs.add_constant(
             name="weight_buffer_depth",
             value=cnn_accel_constants.WEIGHT_BUFFER_DEPTH,
             description="cnn_accel_weight_buffer's g_weight_buffer_depth reference value.",
@@ -1122,6 +1136,11 @@ class Module(BaseModule):
                     "g_max_kernel_size": _MAX_KERNEL_SIZE,
                     "g_max_row_tile_words": _MAX_ROW_TILE_WORDS,
                     "g_tile_channels": _TILE_CHANNELS,
+                    # The CONV instance's depth, i.e. what
+                    # `cnn_accel_conv_core` actually elaborates -- see
+                    # `cnn_accel_constants.ASSEMBLY_BUFFERS`. The POOL
+                    # build below deliberately keeps the default of 1.
+                    "g_assembly_buffers": _ASSEMBLY_BUFFERS,
                 },
                 # M7 FIXED (was: 23950 LUTs, 199 FFs, 0 BRAM, 8 DSP on CI's
                 # Yosys -- the combinational random-access read across
@@ -1170,9 +1189,27 @@ class Module(BaseModule):
                 # up); FF given ~1.75x headroom over the measured 789 (FFs
                 # are structural, so 789 is trusted as the real CI figure
                 # too, per the note above).
+                #
+                # ===== DOUBLE-BUFFERED TAP ASSEMBLY (2026-09) =====
+                # Re-measured (same local dev Yosys) after
+                # `g_assembly_buffers` went 1 -> 3 on this, the CONV,
+                # instance: **7611 LUTs, 2483 FFs, 12 RAMB36, 4 DSP48E1**.
+                # BRAM and DSP are unmoved and stay exact; LUT still sits
+                # far inside its existing 13000 structural gate (7611, i.e.
+                # 1.71x headroom) so that limit is left alone.
+                #
+                # FF is the one that has to move, 1400 -> 4400: three
+                # tap-assembly banks instead of one is +1152 flip-flops by
+                # construction (72 bytes x 8 bits x 2 extra buffers), which
+                # no headroom over the old single-buffered 789 could ever
+                # have absorbed. Re-pinned with the same ~1.75x headroom
+                # over the new measurement that the old limit carried over
+                # the old one -- still a loose structural regression gate,
+                # not a tight baseline, per this file's standing rule that
+                # real LUT/FF limits come from CI and not a local Yosys.
                 checkers=[
                     TotalLuts(LessThan(13000)),
-                    Ffs(LessThan(1400)),
+                    Ffs(LessThan(4400)),
                     # Exact, not an upper bound: 0 BRAM (inference silently
                     # broken again, the whole point of M7) must fail CI just
                     # as loudly as an unexpected increase would. Safe as an
@@ -1205,6 +1242,12 @@ class Module(BaseModule):
                     "g_max_kernel_size": _POOL_MAX_KERNEL_SIZE,
                     "g_max_row_tile_words": _MAX_ROW_TILE_WORDS,
                     "g_tile_channels": _TILE_CHANNELS,
+                    # Single-buffered on purpose: at K=5 one tap-assembly
+                    # bank is 200 bytes, and the pool path is nowhere near
+                    # window-generator-bound. Stated explicitly rather
+                    # than left to the entity default so the difference
+                    # from the conv build above is visible here.
+                    "g_assembly_buffers": 1,
                 },
                 checkers=[
                     # Structural gate with the same generous headroom as
@@ -1642,6 +1685,7 @@ class Module(BaseModule):
                         "g_max_kernel_size": _MAX_KERNEL_SIZE,
                         "g_max_row_tile_words": _MAX_ROW_TILE_WORDS,
                         "g_tile_channels": _TILE_CHANNELS,
+                        "g_assembly_buffers": _ASSEMBLY_BUFFERS,
                     },
                     # Measured 2026-09 (pre-S7): 2900 LUTs, 815 FFs,
                     # 3 RAMB36 + 0 RAMB18, 4 DSP.
@@ -1708,9 +1752,49 @@ class Module(BaseModule):
                     #    rework took the runtime `kr * kernel_w` out of the
                     #    per-cycle tap-index decode (see that signal's
                     #    declaration in cnn_accel_window_gen.vhd).
+                    #
+                    # ===== DOUBLE-BUFFERED TAP ASSEMBLY (2026-09) =====
+                    # Re-measured after `g_assembly_buffers` went 1 -> 3 on
+                    # this (the CONV) instance: **5108 LUTs, 2451 FFs,
+                    # 12 RAMB36 + 0 RAMB18, 4 DSP, 183.39 MHz** (was
+                    # 3314 / 1202 / 12 + 0 / 4 / 183.92 MHz).
+                    #
+                    #  * FF 1202 -> 2451, +1249. Two extra tap-assembly
+                    #    banks at `MAX_KERNEL_SIZE**2 * TILE_CHANNELS` = 72
+                    #    bytes = 576 FFs each is +1152; the remaining ~92
+                    #    are the per-buffer `full_q`/`meta_*_q` sidebands,
+                    #    the `buf_*_q` pointers, the `n_res_q`/
+                    #    `anchor_res_q` reservation queue and the
+                    #    `kr_base_walk_q`/`row_ok_walk_q` per-walk
+                    #    snapshots. This is the whole cost of the change
+                    #    and it is exactly what was predicted.
+                    #  * LUT 3314 -> 5108, +1794. Dominated by the 3:1
+                    #    output mux over 576 bits of tap data (~576 LUT6,
+                    #    a 4:1 mux being one LUT6 per bit) plus the
+                    #    per-buffer write-enable decode the capture stage
+                    #    now needs on all 72 lanes x 3 buffers.
+                    #  * **Fmax essentially unmoved**, 183.92 ->
+                    #    183.39 MHz (-0.3%, i.e. inside the noise of this
+                    #    estimate), which is the load-bearing number here:
+                    #    the extra buffers are pure fan-out on already-
+                    #    registered paths, and deleting the
+                    #    `kc_q = kernel_w_q` drain state plus the
+                    #    pending-window term of `s_stream_s2m.ready` took
+                    #    logic *out* of the control cone, paying for the
+                    #    wider output mux. 22% above the 150 MHz target.
+                    #  * RAMB36 and DSP deliberately still EXACT and
+                    #    unmoved -- the row banks and the `start`-time
+                    #    look-ahead seeds are untouched by this rework, so
+                    #    any movement there would mean something
+                    #    unintended happened to the memory or the address
+                    #    arithmetic.
+                    #
+                    # LUT/FF re-pinned at the same ~1.27x headroom over the
+                    # measurement that the previous pair carried (4200 over
+                    # 3314, 1500 over 1202).
                     checkers=[
-                        TotalLuts(LessThan(4200)),
-                        Ffs(LessThan(1500)),
+                        TotalLuts(LessThan(6500)),
+                        Ffs(LessThan(3100)),
                         Ramb36(EqualTo(12)),
                         Ramb18(LessThan(1)),
                         DspBlocks(EqualTo(4)),
@@ -1743,6 +1827,7 @@ class Module(BaseModule):
                         "g_max_kernel_size": _POOL_MAX_KERNEL_SIZE,
                         "g_max_row_tile_words": _MAX_ROW_TILE_WORDS,
                         "g_tile_channels": _TILE_CHANNELS,
+                        "g_assembly_buffers": 1,
                     },
                     # Measured 2026-09 (first measurement of this build):
                     # **9169 LUTs, 2316 FFs, 20 RAMB36 + 0 RAMB18, 4 DSP,
@@ -1783,6 +1868,27 @@ class Module(BaseModule):
                         # -- they are row-count-independent.
                         DspBlocks(EqualTo(4)),
                     ],
+                    # ===== DOUBLE-BUFFERED TAP ASSEMBLY (2026-09) =====
+                    # Re-measured after that rework, which this instance
+                    # deliberately does NOT buy into (`g_assembly_buffers`
+                    # stays 1 here -- a second 200-byte tap bank at K=5 for
+                    # a path that is not window-generator-bound): **8522
+                    # LUTs, 2367 FFs, 20 RAMB36 + 0 RAMB18, 4 DSP,
+                    # 180.96 MHz** (was 9169 / 2316 / 20 + 0 / 4 /
+                    # 185.19 MHz).
+                    #
+                    # LUTs went *down* 647 (-7%) and FFs up only 51 (+2%):
+                    # the single-buffered path still gains the parts of the
+                    # rework that cost nothing -- the `kc_q = kernel_w_q`
+                    # drain state and the idle re-arm cycle are gone, and
+                    # `s_stream_s2m.ready` lost its pending-window term --
+                    # while paying only for the reservation queue and the
+                    # per-walk geometry snapshots. Fmax 185.19 -> 180.96
+                    # MHz, -2.3%, still 21% clear of the 150 MHz target.
+                    # Checkers left as they were (8522 < 11000,
+                    # 2367 < 2800): both moved in the safe direction, and
+                    # re-pinning a gate downward on a build this rework was
+                    # meant NOT to touch would only make it fragile.
                     analyze_synthesis_timing=True,
                 ),
                 vivado_build(
@@ -2100,9 +2206,40 @@ class Module(BaseModule):
                     # cnn_accel_window_gen's per-window column walk, the
                     # next bottleneck to attack).
                     # Checkers unchanged: 10197 < 11200, 7668 < 8400.
+                    #
+                    # ===== DOUBLE-BUFFERED TAP ASSEMBLY (2026-09) =====
+                    # Re-measured after `cnn_accel_window_gen` gained
+                    # `g_assembly_buffers` (= 3 here, see that entry
+                    # above): **12039 LUTs, 8921 FFs, 27 RAMB36 +
+                    # 2 RAMB18, 68 DSP, 178.57 MHz** (was 10197 / 7668 /
+                    # 27 + 2 / 68 / 178.57).
+                    #
+                    # +1842 LUTs and +1253 FFs, against window_gen's own
+                    # standalone delta of +1794 / +1249 -- i.e. the whole
+                    # composition's growth IS the window generator's, to
+                    # within 48 LUTs and 4 FFs of boundary optimization.
+                    # Nothing else moved: block RAM, **DSP (68 = 32
+                    # pe_array + 32 bias_requant + 4 window_gen) and Fmax
+                    # are all bit-identical**, which is the check that
+                    # matters -- the PE array's DSP packing and the
+                    # critical path are untouched by a change that is
+                    # purely window_gen-internal scheduling.
+                    #
+                    # What it buys, measured the same way as the
+                    # cross-position pipelining entry above (VCD of
+                    # `test_bitexact_full_throughput` at zero stall,
+                    # accumulator output beats per output position):
+                    # **1x1 conv 4.0 -> 1.0 cycles/position** (the PE
+                    # array's own ideal for a 1x1 window, so the array is
+                    # now 100% busy there too), 3x3 **9.0 -> 9.0** and
+                    # 3-tile 3x3 **27.25 -> 27.25** (both already PE-array-
+                    # bound, so unchanged by construction).
+                    #
+                    # Re-pinned at the same ~1.10x headroom the previous
+                    # pair carried (11200 over 10197, 8400 over 7668).
                     checkers=[
-                        TotalLuts(LessThan(11200)),
-                        Ffs(LessThan(8400)),
+                        TotalLuts(LessThan(13200)),
+                        Ffs(LessThan(9800)),
                         Ramb36(EqualTo(27)),
                         Ramb18(EqualTo(2)),
                         DspBlocks(EqualTo(68)),
@@ -2373,9 +2510,23 @@ class Module(BaseModule):
                     # Fmax, so the 60 fps scaled point still clears
                     # 150 MHz with the same 19% margin. Checkers
                     # unchanged: 17033 < 18700, 13379 < 14700.
+                    #
+                    # ===== DOUBLE-BUFFERED TAP ASSEMBLY (2026-09) =====
+                    # Re-measured after the same change: **18863 LUTs,
+                    # 14620 FFs, 42 RAMB36 + 2 RAMB18, 132 DSP,
+                    # 178.57 MHz** (was 17033 / 13379 / 42 + 2 / 132 /
+                    # 178.57). +1830 LUTs, +1241 FFs -- the same absolute
+                    # delta as the 8-row build (+1842 / +1253), which is
+                    # the expected result and worth stating: the tap
+                    # assembly is sized by `g_max_kernel_size` and
+                    # `g_tile_channels`, not by `g_pe_rows`, so this cost
+                    # does NOT scale with the array. Block RAM, DSP and
+                    # Fmax again bit-identical; the 60 fps scaled point
+                    # still clears 150 MHz with a 19% margin. Re-pinned at
+                    # the same ~1.10x headroom as before.
                     checkers=[
-                        TotalLuts(LessThan(18700)),
-                        Ffs(LessThan(14700)),
+                        TotalLuts(LessThan(20700)),
+                        Ffs(LessThan(16100)),
                         Ramb36(EqualTo(42)),
                         Ramb18(EqualTo(2)),
                         DspBlocks(EqualTo(132)),
@@ -2390,12 +2541,37 @@ class Module(BaseModule):
         library = vunit_proj.library(self.library_name)
 
         self._setup_cnn_accel_bias_requant(library)
+        self._setup_cnn_accel_window_gen(library)
         self._setup_cnn_accel_pool(library)
         self._setup_cnn_accel_pe_array(library)
         self._setup_cnn_accel_pe_array_from_vectors(library)
         self._setup_cnn_accel_conv_core(library)
         self._setup_cnn_accel_tensor_mem(library)
         self._setup_cnn_accel_top(library)
+
+    def _setup_cnn_accel_window_gen(self, library) -> None:
+        """Run the whole window-generator suite at BOTH shipped tap-assembly
+        buffer depths.
+
+        `g_assembly_buffers` is a pure scheduling knob -- how many windows
+        may be in flight between the row banks and `m_window` at once --
+        so every golden-window expectation in `tb_cnn_accel_window_gen` is
+        identical for both, and running the suite twice is a real check
+        rather than a duplicated one. The two values are the two the
+        design actually instantiates: 1 for `cnn_accel_top`'s POOL
+        instance (K=5, where a second 200-byte tap register bank would be
+        paid for nothing) and `_ASSEMBLY_BUFFERS` for the CONV instance
+        inside `cnn_accel_conv_core`, where a 1x1 convolution is
+        window-generator-bound and every cycle counts.
+        """
+        tb = library.test_bench("tb_cnn_accel_window_gen")
+        for buffers in (1, _ASSEMBLY_BUFFERS):
+            for test in tb.get_tests():
+                self.add_vunit_config(
+                    test=test,
+                    name=f"g_assembly_buffers_{buffers}",
+                    generics={"g_assembly_buffers": buffers},
+                )
 
     def _setup_cnn_accel_top(self, library) -> None:
         """The rev-2 top-level integration testbench (arch doc section 11).

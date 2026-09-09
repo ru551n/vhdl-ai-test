@@ -33,7 +33,17 @@ use cnn_accel.cnn_accel_pkg.all;
 -- tb_cnn_accel_weight_buffer.vhd/tb_cnn_accel_pool.vhd's identical choice
 -- for record-typed ports.
 entity tb_cnn_accel_window_gen is
-  generic (runner_cfg : string);
+  generic (
+    -- Tap-assembly buffer depth of the DUT (cnn_accel_window_gen's own
+    -- 'g_assembly_buffers'). module_cnn_accel.py runs every test below at
+    -- BOTH shipped values: 1, the single-buffered POOL instance, and 3,
+    -- the pipelined CONV instance where up to three windows are in flight
+    -- at once. The golden model is identical for both -- buffering is a
+    -- scheduling property, not a numerical one -- which is exactly what
+    -- makes running the whole suite twice the right check.
+    g_assembly_buffers : positive := 1;
+    runner_cfg : string
+  );
 end entity tb_cnn_accel_window_gen;
 
 architecture tb of tb_cnn_accel_window_gen is
@@ -96,6 +106,17 @@ architecture tb of tb_cnn_accel_window_gen is
   -- tb_cnn_accel_pool.vhd's per-link stall generics, but as a plain
   -- signal (no per-test generic sweep support in module_cnn_accel.py yet).
   signal cur_stall_out : natural := 0;
+
+  -- Output-ready shaping mode for the monitor:
+  --   0 -- the historical randomized stall, probability 'cur_stall_out'.
+  --   1 -- a DETERMINISTIC 4-low/1-high burst. With
+  --        'g_assembly_buffers > 1' and a 1x1 kernel (a one-cycle column
+  --        walk) that guarantees the DUT has every buffer it owns filled
+  --        and waiting while 'ready' is low -- i.e. several windows in
+  --        flight at once, held, not merely one pending window as the
+  --        single-buffered design could ever have. See
+  --        'test_multi_window_in_flight_backpressure'.
+  signal cur_ready_mode : natural := 0;
 
   -- Reset synchronously clears this; counts 'done' pulses since the last
   -- reset, so 'run_frame' can assert "exactly one 'done' per frame" --
@@ -255,11 +276,51 @@ begin
   end process;
 
   ------------------------------------------------------------------------
+  -- Structural safety net #2 (whole-simulation): AXI4-Stream handshake
+  -- stability on 'm_window' -- once 'valid' is asserted it must stay
+  -- asserted, with an unchanged payload, until the beat is accepted
+  -- (shared/Axi4.md). This is the check that makes multi-window-in-flight
+  -- backpressure meaningful: with several assembly buffers the DUT is
+  -- holding one window on the output while it keeps filling others, so a
+  -- buffer-allocation or pointer bug shows up here as a payload that
+  -- mutates under a stalled consumer, one cycle after it happens, rather
+  -- than as a scoreboard mismatch many beats later (or, worse, not at all
+  -- when the mutation happens to reorder rather than corrupt).
+  ------------------------------------------------------------------------
+  window_hold_check : process(clk)
+    variable v_held : std_ulogic := '0';
+    variable v_data : std_ulogic_vector(c_max_window_bits - 1 downto 0) := (others => '0');
+    variable v_first_tile, v_last_tile, v_last : std_ulogic := '0';
+  begin
+    if rising_edge(clk) then
+      if reset = '1' or start = '1' then
+        -- A reset or a new 'start' legitimately drops a held beat
+        -- ('test_reset_mid_frame_abort' does exactly that).
+        v_held := '0';
+      else
+        if v_held = '1' then
+          check_equal(m_window_m2s.valid, '1', "m_window valid dropped while stalled");
+          check_equal(to_slv(m_window_m2s.data), v_data, "m_window data changed while stalled");
+          check_equal(m_window_m2s.first_tile, v_first_tile, "m_window first_tile changed while stalled");
+          check_equal(m_window_m2s.last_tile, v_last_tile, "m_window last_tile changed while stalled");
+          check_equal(m_window_m2s.last, v_last, "m_window last changed while stalled");
+        end if;
+        v_held := m_window_m2s.valid and not m_window_s2m.ready;
+        v_data := to_slv(m_window_m2s.data);
+        v_first_tile := m_window_m2s.first_tile;
+        v_last_tile := m_window_m2s.last_tile;
+        v_last := m_window_m2s.last;
+      end if;
+    end if;
+  end process;
+
+  ------------------------------------------------------------------------
   dut : entity cnn_accel.cnn_accel_window_gen
     generic map (
       g_max_kernel_size => c_kernel_max,
       g_max_row_tile_words => c_row_tile_words_max,
-      g_tile_channels => c_tile_channels
+      g_tile_channels => c_tile_channels,
+      g_assembly_buffers => g_assembly_buffers
     )
     port map (
       clk => clk,
@@ -307,6 +368,13 @@ begin
       if rnd.RandInt(0, 99) < cur_stall_out then
         m_window_s2m.ready <= '0';
         for i in 1 to rnd.RandInt(1, 3) loop
+          wait until rising_edge(clk);
+        end loop;
+      end if;
+
+      if cur_ready_mode = 1 then
+        m_window_s2m.ready <= '0';
+        for i in 1 to 4 loop
           wait until rising_edge(clk);
         end loop;
       end if;
@@ -491,7 +559,8 @@ begin
       stall_in, stall_out : natural;
       max_wait_cycles : positive;
       in_channels : natural := c_tile_channels;
-      pad_value : integer := 0
+      pad_value : integer := 0;
+      ready_mode : natural := 0
     ) is
       variable out_w, out_h : natural;
       variable last_row_needed, last_col_needed : integer;
@@ -505,6 +574,7 @@ begin
         in_h, in_w, in_channels, kh, kw, sh, sw, pt, pl, out_h, out_w, pad_value
       );
       cur_stall_out <= stall_out;
+      cur_ready_mode <= ready_mode;
       -- The DUT can legitimately finish a frame (deassert
       -- 's_stream_s2m.ready' via its own 'active_q', per 'done's contract
       -- of firing once the final *output* window beat is accepted) before
@@ -679,9 +749,91 @@ begin
       random_frame(6, 6);
       run_frame(6, 6, 3, 3, 1, 1, 1, 1, 1, 1, 40, 40, 4000, 2 * c_tile_channels);
 
+    elsif run("test_multi_window_in_flight_backpressure") then
+      -- The multi-buffer backpressure case, and the one test here whose
+      -- point is scheduling rather than window content.
+      --
+      -- 'ready_mode = 1' holds 'm_window_s2m.ready' low for four cycles
+      -- out of every five, deterministically, while the input side runs
+      -- at full rate. A 1x1 kernel makes each column walk exactly one
+      -- cycle long, so the DUT fills every assembly buffer it owns and
+      -- then has to HOLD them: at 'g_assembly_buffers = 3' there are
+      -- three windows in flight, one presented and stalled and two
+      -- complete behind it, for four cycles at a time, over and over.
+      -- (At 'g_assembly_buffers = 1' the same stimulus degenerates to
+      -- the old one-pending-window case, which is exactly why this test
+      -- runs at both values.)
+      --
+      -- What proves it: 'window_hold_check' above (the held beat must
+      -- not change or vanish), the ordinary scoreboard (no window lost,
+      -- duplicated or reordered -- a reorder desynchronizes 'data' and
+      -- the tile flags immediately) and the single 'done' pulse.
+      random_frame(6, 6);
+      run_frame(6, 6, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 3000, c_tile_channels, 0, 1);
+
+      -- Same stall shape with a 3x3 kernel and padding: the walk is now
+      -- three cycles, so the in-flight windows are at different walk
+      -- positions when the stall hits, and consecutive ones share two of
+      -- their three row banks (the halo case the row-bank invariant is
+      -- written around).
+      random_frame(6, 6);
+      run_frame(6, 6, 3, 3, 1, 1, 1, 1, 1, 1, 0, 0, 4000, c_tile_channels, 0, 1);
+
+      -- And with T = 2 tiles per pixel, so the held beats are mid-tile-
+      -- sequence: 'first_tile'/'last_tile' must survive the hold too.
+      random_frame(5, 5);
+      run_frame(5, 5, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 4000, 2 * c_tile_channels, 0, 1);
+
     elsif run("test_full_throughput") then
       random_frame(8, 7);
       run_frame(8, 7, 3, 3, 1, 1, 0, 0, 0, 0, 0, 0, 500);
+
+    elsif run("test_row_bank_interlock_full_rate") then
+      -- The row-bank interlock ('write_freeze_i' against
+      -- 'anchor_head_c'), swept at ZERO stall on both links -- the only
+      -- pacing where it is load-bearing.
+      --
+      -- Since the M7 rework that interlock is the sole thing protecting a
+      -- row bank from being overwritten under a window that still needs
+      -- it (see cnn_accel_window_gen.vhd's 's_stream_s2m.ready' comment
+      -- for the derivation), and it only bites when the write side is
+      -- allowed to run flat out. Every other test here paces one or both
+      -- links, which hides it: the writer never gets far enough ahead.
+      --
+      -- The specific hazard the sweep is shaped for is the *anchor* being
+      -- taken from the wrong window. 'control' advances the output
+      -- position at walk LAUNCH, so 'anchor_limit_q' already describes
+      -- the next window while the current one is still reading; at an
+      -- output-row boundary that is one whole input row too permissive,
+      -- and the writer -- released the same cycle -- restarts at column 0
+      -- of a bank the in-flight window is reading. Whether it actually
+      -- overtakes the reader depends on where in the row that window
+      -- starts, which is why LEFT/TOP padding is swept: a last-window
+      -- 'col_left' of 0 or below is what puts the writer ahead of the
+      -- reader in the aliased bank instead of in lockstep behind it.
+      -- Verified as a real detector by mutation ('anchor_head_c <=
+      -- anchor_limit_q', i.e. ignoring the reservation queue): this test
+      -- fails at BOTH buffer depths, every other test in this file still
+      -- passes.
+      --
+      -- Narrow frames only, deliberately: the effect needs the write side
+      -- to reach the reader's column inside a 'kernel_w'-cycle walk.
+      for w in 2 to 6 loop
+        for h in 3 to 6 loop
+          for kh in 1 to 3 loop
+            for kw in 1 to 3 loop
+              for pl in 0 to 2 loop
+                for pt in 0 to 2 loop
+                  if w + pl >= kw and h + pt >= kh then
+                    random_frame(h, w);
+                    run_frame(h, w, kh, kw, 1, 1, pt, 0, pl, 0, 0, 0, 3000);
+                  end if;
+                end loop;
+              end loop;
+            end loop;
+          end loop;
+        end loop;
+      end loop;
 
     elsif run("test_channel_tiling_partial_single") then
       -- T = 1, partial: in_channels = 3 < c_tile_channels (8). The 5

@@ -123,6 +123,23 @@ MAX_POOL_KERNEL_SIZE = 5
 # MAX_ROW_TILE_WORDS x (8 * TILE_CHANNELS) bits, so 1920 x 64 needs 4
 # RAMB36 per bank where 512 x 64 needed 1.
 MAX_ROW_TILE_WORDS = 1920
+# Tap-assembly buffers in the CONV path's `cnn_accel_window_gen` instance
+# (its `g_assembly_buffers`). The POOL instance keeps the default of 1.
+#
+# A buffer is reserved from the cycle a window's column walk is launched
+# until that window is accepted on `m_window`, which is `kernel_w + 2`
+# cycles, so N buffers sustain one window every
+# `max(kernel_w, ceil((kernel_w + 2) / N))` cycles. Every kernel_w >= 2 is
+# already walk-bound at N = 2; `kernel_w = 1` -- half of YOLOv8n's
+# convolutions by count, every C2f cv1/cv2 and the SPPF caps -- needs N = 3
+# to reach one window per cycle and stop starving the PE array (which needs
+# only kernel_h * kernel_w = 1 cycle per 1x1 window).
+#
+# The cost is real and linear: one MAX_KERNEL_SIZE**2 * TILE_CHANNELS-byte
+# tap register bank (72 bytes = 576 flip-flops at 3x3/8) per buffer, plus an
+# N:1 output mux of the same width. That is why this is not applied to the
+# pool instance, whose buffer would be 200 bytes for no throughput gain.
+ASSEMBLY_BUFFERS = 3
 WEIGHT_BUFFER_DEPTH = 288
 BIAS_BUFFER_DEPTH = 8
 ACCUM_WIDTH = 32

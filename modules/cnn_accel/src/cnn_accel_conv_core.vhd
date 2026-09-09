@@ -287,7 +287,21 @@ begin
     generic map (
       g_max_kernel_size => g_max_kernel_size,
       g_max_row_tile_words => g_max_row_tile_words,
-      g_tile_channels => g_tile_channels
+      g_tile_channels => g_tile_channels,
+      -- The conv path is the throughput-critical window_gen instance, so
+      -- it is the one that pays for a pipelined tap assembly: with
+      -- 'g_assembly_buffers' windows in flight the generator sustains one
+      -- window every 'max(kernel_w, ceil((kernel_w + 2) / N))' cycles
+      -- instead of 'kernel_w + 3'. At 3x3 that changes nothing measurable
+      -- (the PE array needs 9 cycles per window and the generator already
+      -- beat that); at 1x1 -- half of YOLOv8n's convolutions -- it is the
+      -- difference between 4 cycles per output position and 1. From the
+      -- generated constant, not a literal, so cnn_accel_constants.py stays
+      -- the single source (same pattern as cnn_accel_v2_pkg's
+      -- 'c_isa_version'). The POOL instance in cnn_accel_top deliberately
+      -- keeps the entity default of 1 -- see that constant's own comment.
+      g_assembly_buffers =>
+        cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_assembly_buffers
     )
     port map (
       clk => clk,

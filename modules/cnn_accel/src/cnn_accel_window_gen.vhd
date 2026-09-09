@@ -81,7 +81,23 @@ entity cnn_accel_window_gen is
     -- one tile's channels must fit in 's_stream_m2s.data''s low bytes.
     -- 'cfg_in_channels' need not be a multiple of this -- see the
     -- entity-level comment on channel tiling / D11 zero-padding.
-    g_tile_channels : positive
+    g_tile_channels : positive;
+    -- Number of tap-assembly buffers a window can be built into ("N"
+    -- below). 1 is the historical single-buffered behaviour; >= 2 lets
+    -- the next window's column walk overlap the current window's
+    -- presentation, which is what turns the read side from
+    -- 'kernel_w + 3' cycles per window beat into 'max(kernel_w,
+    -- (kernel_w + 2) / N)' -- see the 'assembly_q' declaration and the
+    -- 'walk_control' comment for the pipeline that makes that true, and
+    -- the 's_stream_s2m.ready' comment for the row-bank invariant that
+    -- has to hold with more than one window in flight.
+    --
+    -- Cost: one full 'g_max_kernel_size**2 * g_tile_channels'-byte tap
+    -- register bank per buffer, plus an N:1 output mux of the same
+    -- width. That is why this is a generic and not a constant: the CONV
+    -- instance is throughput-critical and pays it, the POOL instance
+    -- (K = 5, so 200 bytes per buffer) is not and does not.
+    g_assembly_buffers : positive := 1
   );
   port (
     clk : in std_ulogic;
@@ -308,20 +324,41 @@ architecture a of cnn_accel_window_gen is
   -- base index, never the kernel-row number itself.)
   signal kr_base_capture_q : kr_base_arr_t := (others => 0);
   signal kc_capture_q : unsigned(7 downto 0) := (others => '0');
-  -- '1' the cycle after any cycle 'reading_q' was high -- i.e. this
+  -- '1' the cycle after any cycle 'issue_q' was high -- i.e. this
   -- cycle's 'bank_rd_data' is meaningful and should be captured.
   signal capture_valid_q : std_ulogic := '0';
+  -- '1' when the column being captured this cycle is the LAST column
+  -- ('kc = kernel_w - 1') of its window: the buffer it lands in is
+  -- complete at the end of this cycle and is marked full.
+  signal capture_last_q : std_ulogic := '0';
+  -- Which assembly buffer this cycle's capture belongs to (one cycle
+  -- behind 'buf_issue_q', like every other signal in this pipeline).
+  signal buf_capture_q : natural range 0 to g_assembly_buffers - 1 := 0;
 
-  -- Column walk position, 0 .. kernel_w_q (inclusive: 'kernel_w_q' itself
-  -- is the one extra cycle needed to let the last column's registered
-  -- read land -- see 'walk_control's comment). Bounded by a *registered*
-  -- 'kernel_w_q' compare, not a variable-bound 'for' loop (the latter
-  -- crashes GHDL's synthesis backend -- see the 'control' process' D11
-  -- comment for the identical, already-hit issue).
+  -- Column walk position, 0 .. kernel_w_q - 1. Unlike the predecessor
+  -- design there is no extra 'kc_q = kernel_w_q' drain step: the drain is
+  -- now implicit in the capture stage (the last column's registered read
+  -- lands one cycle after its address was issued, and *that* cycle is
+  -- what marks the buffer full), which is one of the two cycles per
+  -- window this rework removes. Bounded by a *registered* 'kernel_w_q'
+  -- compare, not a variable-bound 'for' loop (the latter crashes GHDL's
+  -- synthesis backend -- see the 'control' process' D11 comment for the
+  -- identical, already-hit issue).
   signal kc_q : unsigned(7 downto 0) := (others => '0');
-  -- '1' while a column walk (read side) is in progress for the window at
-  -- 'out_row_q'/'out_col_q'/'rd_tile_q'.
-  signal reading_q : std_ulogic := '0';
+  -- '1' while this cycle's 'rd_addr_q' is a real column address of a
+  -- window being walked (the predecessor's 'reading_q', minus the drain
+  -- cycle it also covered).
+  signal issue_q : std_ulogic := '0';
+  -- Which assembly buffer the walk currently issuing addresses is
+  -- filling. Advances (mod 'g_assembly_buffers') at every walk start, so
+  -- buffers are allocated strictly in launch order and, since windows are
+  -- consumed in that same order, freed strictly in that order too.
+  signal buf_issue_q : natural range 0 to g_assembly_buffers - 1 := 0;
+  -- Buffer currently being presented on 'm_window_m2s'. Advances on every
+  -- accepted beat; always the oldest buffer still holding a window.
+  signal buf_out_q : natural range 0 to g_assembly_buffers - 1 := 0;
+  -- Combinational: the buffer the *next* walk would be launched into.
+  signal buf_next_c : natural range 0 to g_assembly_buffers - 1;
 
   -- Tap-assembly register: accumulates one full window's taps across the
   -- 'kc' walk, then is presented as 'm_window_m2s.data' once
@@ -338,21 +375,72 @@ architecture a of cnn_accel_window_gen is
   -- lowest taps, 'cnn_accel_pe_array' only walks 'kernel_h * kernel_w' --
   -- so this is not observable; it is called out because a future consumer
   -- that reduced over the whole fixed array would silently break.
-  signal assembly_q : tap_array_t(0 to c_window_data_length - 1) :=
-    (others => (others => '0'));
+  --
+  -- N-buffered ('g_assembly_buffers'). A buffer is *reserved* from the
+  -- cycle its window's walk is launched until the cycle that window is
+  -- accepted on 'm_window'; with 'kernel_w' columns issued one per cycle
+  -- and a two-cycle read/capture pipeline behind them, that reservation
+  -- lasts 'kernel_w + 2' cycles, so N buffers sustain one window every
+  -- 'max(kernel_w, ceil((kernel_w + 2) / N))' cycles. At 'kernel_w = 1'
+  -- that is 4 cycles for N = 1 (the pre-rework figure, counting the idle
+  -- re-arm cycle this rework also removes), 1.5 for N = 2 and 1 for
+  -- N = 3.
+  subtype window_taps_t is tap_array_t(0 to c_window_data_length - 1);
+  type assembly_arr_t is array (0 to g_assembly_buffers - 1) of window_taps_t;
+  signal assembly_q : assembly_arr_t := (others => (others => (others => '0')));
+
+  -- Per-buffer "holds a complete, not-yet-accepted window" flag. Set by
+  -- the capture stage on the window's last column, cleared on acceptance.
+  signal full_q : std_ulogic_vector(0 to g_assembly_buffers - 1) := (others => '0');
+
+  -- Per-buffer stream sidebands, latched at walk launch. With more than
+  -- one window in flight these can no longer be decoded from
+  -- 'out_row_q'/'out_col_q'/'rd_tile_q' at presentation time -- those
+  -- counters now belong to the walk being *launched*, which is up to
+  -- 'g_assembly_buffers - 1' windows ahead of the one being presented.
+  signal meta_first_tile_q : std_ulogic_vector(0 to g_assembly_buffers - 1) :=
+    (others => '0');
+  signal meta_last_tile_q : std_ulogic_vector(0 to g_assembly_buffers - 1) :=
+    (others => '0');
+  signal meta_last_q : std_ulogic_vector(0 to g_assembly_buffers - 1) :=
+    (others => '0');
+
+  -- Per-walk snapshots of the two 'control'-maintained geometry values the
+  -- column walk consumes *while it runs*. They used to be read live from
+  -- 'kr_base_q'/'row_ok_q', which was safe only because 'control' advanced
+  -- 'out_row_q' on acceptance, i.e. never during the walk. Now 'control'
+  -- advances on *launch*, so by the time a walk's second column is issued
+  -- the live registers may already describe the next output row. Latching
+  -- them at launch keeps the walk reading its own window's geometry, and
+  -- costs one flip-flop stage on a path ('kr_base_walk_q' -> registered
+  -- 'kr_base_capture_q') that was already register-to-register.
+  signal kr_base_walk_q : kr_base_arr_t := (others => 0);
+  signal row_ok_walk_q : flag_arr_t := (others => '0');
 
   signal fire : std_ulogic;
-  -- Registered: '1' once the 'kc' walk for the current window has fully
-  -- landed. Unlike the predecessor design this is *not* a same-cycle
-  -- function of 'row_ready' -- it trails it by the walk's pipeline
-  -- latency (proposal doc section 7.1 item 4). Nothing downstream
-  -- ('cnn_accel_pe_array', the testbench's scoreboard) depends on the
-  -- old same-cycle timing; both only ever look for
-  -- 'window_valid = 1 and m_window_s2m.ready = 1'.
-  signal window_valid : std_ulogic := '0';
+  -- '1' once the buffer currently at the head of the presentation order
+  -- holds a fully assembled window. A 'g_assembly_buffers'-wide mux of
+  -- registers, never a combinational function of any handshake input, so
+  -- 'm_window_m2s.valid' still cannot depend on 'm_window_s2m.ready'.
+  signal window_valid : std_ulogic;
   signal consume : std_ulogic;
-  signal last_pixel : std_ulogic;
-  signal first_tile_flag, last_tile_flag : std_ulogic;
+  -- Stream sidebands of the *launching* window (they become that window's
+  -- 'meta_*_q(buf)' entry), as opposed to the presented one.
+  signal launch_last_pixel : std_ulogic;
+  signal launch_first_tile, launch_last_tile : std_ulogic;
+  -- '1' when a new column walk starts this cycle: the read side is free,
+  -- a buffer is (or is being) freed, and this window's inputs are all
+  -- written. Everything it depends on is either a register or
+  -- 'm_window_s2m.ready' -- never 'window_valid', so no loop.
+  signal walk_start : std_ulogic;
+  -- '1' while the read side is free to take a new walk: no walk in
+  -- progress, or the one in progress is issuing its final column.
+  signal issue_free : std_ulogic;
+  -- '1' while fewer than 'g_assembly_buffers' windows are reserved, or
+  -- one is being freed this very cycle.
+  signal buffer_free : std_ulogic;
+  -- Windows launched but not yet accepted, i.e. buffers reserved.
+  signal n_res_q : natural range 0 to g_assembly_buffers := 0;
   -- Combinational: '1' once every real (unpadded) row/column this window
   -- needs has been fully written -- unchanged formula from the
   -- predecessor design (cnn_accel_window_gen_proposal.md section 4), just
@@ -361,28 +449,31 @@ architecture a of cnn_accel_window_gen is
   -- loop through 's_stream_m2s.valid'/'m_window_s2m.ready').
   signal row_ready_i : std_ulogic;
 
-  -- M7 correctness fix: combinational, '1' once the write side is about
-  -- to advance into a physical row that would alias (same 'mod
-  -- g_max_kernel_size' bank) the earliest real row 'out_row_q''s window
-  -- still needs, before that whole output row (every 'out_col'/tile) has
-  -- been consumed. Gates 's_stream_s2m.ready' below. Without this, the
-  -- registered-read walk's lower read throughput (proposal doc section
-  -- 7.1 item 4: ~'kw + 1' cycles/window versus the predecessor's
-  -- same-cycle read) lets the write side, unblocked between 'reading_q'/
-  -- 'window_valid' pulses, race more than 'g_max_kernel_size' physical
-  -- rows ahead of 'out_row_q' -- wrapping the bank index back onto a row
-  -- still pending read and silently corrupting it (caught by
-  -- 'test_kernel_stride_shapes' et al: a slow 1x1-kernel consumer lets
-  -- the writer outrun the reader by exactly 'g_max_kernel_size' rows).
-  -- This is plain backpressure (freezes 's_stream_s2m.ready', the same
-  -- knob the predecessor already used), not the out-of-scope
-  -- double-buffering mitigation -- see the proposal doc section 8 risk 3.
+  -- M7 correctness fix, N-buffer generalization: combinational, '1' once
+  -- the write side is about to advance into a physical row that would
+  -- alias (same 'mod g_max_kernel_size' bank) the earliest real row that
+  -- the OLDEST window still in flight needs. Gates 's_stream_s2m.ready'
+  -- below, and since the M7 rework it is the ONLY thing that protects a
+  -- row bank -- see the 's_stream_s2m.ready' comment for the full
+  -- invariant and why the predecessor's additional "freeze while a window
+  -- is pending" term is both unnecessary and, with several windows in
+  -- flight, fatal to throughput.
   signal write_freeze_i : std_ulogic;
 
+  -- The anchor 'write_freeze_i' compares against: the reservation queue's
+  -- head when any window is in flight, the next-to-launch position's own
+  -- anchor otherwise. Combinational, over registers only.
+  signal anchor_head_c : coord_t;
+
   -- '1' once a frame is in progress (between 'start' and the final
-  -- window's acceptance); gates 's_stream_s2m.ready'/'window_valid' so
-  -- nothing is accepted/emitted before the first 'start'.
+  -- window's acceptance); gates 's_stream_s2m.ready' so nothing is
+  -- accepted before the first 'start' or after the frame's last beat.
   signal active_q : std_ulogic := '0';
+  -- '1' while windows remain to be *launched* (between 'start' and the
+  -- launch of the final window). Distinct from 'active_q', which only
+  -- drops 'kernel_w + 2' cycles later, when that final window is
+  -- accepted.
+  signal launch_active_q : std_ulogic := '0';
 
   ------------------------------------------------------------------------
   -- Configuration, latched at 'start'.
@@ -474,6 +565,18 @@ architecture a of cnn_accel_window_gen is
   signal col_left_q : coord_t := 0;
   signal real_col_right_q : coord_t := 0;
   signal has_real_col_q : std_ulogic := '0';
+
+  -- Reservation queue of 'anchor_limit_q' snapshots, one per window in
+  -- flight, oldest first: pushed at walk launch, popped on acceptance,
+  -- at most 'g_assembly_buffers' deep by construction (that is exactly
+  -- what 'n_res_q' counts). 'anchor_limit_q' itself is a property of the
+  -- window being LAUNCHED, and with several windows in flight that is no
+  -- longer the window whose row banks are most at risk -- the oldest one
+  -- is. Since 'row_top' is non-decreasing in the output row, so is
+  -- 'anchor_limit', which makes the head of this queue the minimum and
+  -- therefore the only entry 'write_freeze_i' has to compare against.
+  type anchor_arr_t is array (0 to g_assembly_buffers - 1) of coord_t;
+  signal anchor_res_q : anchor_arr_t := (others => g_max_kernel_size);
 
   -- 'row_top mod g_max_kernel_size', kept as a ring counter (step
   -- 'stride_h_mod_q') so 'kr_of_q' never needs a runtime modulo of a
@@ -569,6 +672,32 @@ architecture a of cnn_accel_window_gen is
     return '0';
   end function;
 
+  -- Next index in the 'g_assembly_buffers'-deep round-robin buffer ring.
+  --
+  -- Deliberately written through a WIDENED intermediate instead of the
+  -- obvious '0 when idx = g_assembly_buffers - 1 else idx + 1'. At
+  -- 'g_assembly_buffers = 1' -- the POOL instance -- the buffer-index
+  -- subtype is '0 to 0', and GHDL's synthesis frontend statically
+  -- range-checks BOTH arms of a conditional, including the one the guard
+  -- makes unreachable, so 'idx + 1' is rejected outright with "value out
+  -- of range". Simulation is perfectly happy with the same code (the else
+  -- arm is never selected), so this is invisible to the whole testbench
+  -- suite at either buffer depth -- it was caught by this module's own
+  -- netlist build at the pool geometry, and only there. Same class of
+  -- GHDL-synthesis strictness as the variable-loop-bound trap documented
+  -- in 'control's D11 comment, and the reason 'v' is bounded at
+  -- '2 * g_assembly_buffers' is simply that it must hold the intermediate
+  -- 'idx + 1' for every legal 'idx', N = 1 included.
+  function next_buf(idx : natural) return natural is
+    variable v : natural range 0 to 2 * g_assembly_buffers;
+  begin
+    v := idx + 1;
+    if v >= g_assembly_buffers then
+      return 0;
+    end if;
+    return v;
+  end function;
+
 begin
 
   assert g_max_kernel_size >= 2
@@ -659,15 +788,89 @@ begin
 
   end generate;
 
-  -- Freeze further input acceptance whenever a window is pending (its
-  -- 'kc' walk in progress, 'reading_q') or has landed and not yet been
-  -- consumed ('window_valid') -- a row bank must not be overwritten until
-  -- every tap that still needs it has been read out. Both 'reading_q'
-  -- and 'window_valid' depend only on registered state (never on
-  -- 's_stream_m2s.valid'/'m_window_s2m.ready'), so this has no
-  -- combinational loop.
-  s_stream_s2m.ready <= active_q and not write_freeze_i and
-    (not (window_valid or reading_q) or (window_valid and m_window_s2m.ready));
+  ------------------------------------------------------------------------
+  -- THE ROW-BANK INVARIANT.
+  --
+  -- What has to be true: a row bank must not be overwritten while any
+  -- window that reads from it is still being assembled or presented.
+  --
+  -- The rule this module used to enforce was a conjunction of two:
+  --
+  --   (a) "freeze input acceptance whenever a window is pending" --
+  --       'not (window_valid or reading_q)', relaxed only on the cycle
+  --       the pending window is accepted; and
+  --   (b) 'write_freeze_i': freeze once 'cur_row_q' reaches
+  --       'anchor_limit = max(row_top, 0) + g_max_kernel_size', i.e. the
+  --       first physical input row whose bank number
+  --       ('row mod g_max_kernel_size') aliases the earliest real row the
+  --       current output row's windows still need.
+  --
+  -- (a) is the older, coarse rule; (b) was added by M7 precisely because
+  -- (a) turned out NOT to be sufficient (a slow 1x1 consumer let the
+  -- writer outrun the reader by a full 'g_max_kernel_size' rows between
+  -- pending-window pulses). The re-derivation this rework needed is the
+  -- other direction: given (b), is (a) needed at all? It is not, and it
+  -- had to go, because (a) caps input acceptance at roughly one beat per
+  -- window beat *turnaround* -- with the walk itself now able to retire
+  -- one window per cycle, (a) would simply starve the row banks instead.
+  --
+  -- Why (b) alone is sufficient. Within one physical input row the write
+  -- side only ever moves forward (one cell per accepted beat, restarting
+  -- at cell 0 on a row boundary -- see 'control'), so it never rewrites a
+  -- cell of a row it is already inside. The ONLY way a cell that some
+  -- window still needs can be rewritten is therefore for the write side
+  -- to advance into a *later* physical row that lands in the same bank,
+  -- i.e. one exactly 'g_max_kernel_size' rows on from a row still in use.
+  -- Let 'R = max(row_top, 0)' be the earliest real row that window needs
+  -- ('row_top' clamped up because a negative 'row_top' is top padding,
+  -- which reserves no bank). Rows 'R .. R + g_max_kernel_size - 1'
+  -- occupy 'g_max_kernel_size' distinct banks, and 'kernel_h <=
+  -- g_max_kernel_size' (asserted at 'start') puts every row that window
+  -- reads inside that span. So no bank the window reads is aliased until
+  -- the writer reaches row 'R + g_max_kernel_size' = 'anchor_limit', and
+  -- (b) stops it there. Separately, 'row_ready_i' already guarantees that
+  -- every cell the window reads was written *before* its walk started, so
+  -- the walk never races an in-progress write to the same cell either.
+  --
+  -- What changes with N windows in flight. 'anchor_limit_q' tracks the
+  -- output position 'control' is about to LAUNCH, which since this rework
+  -- runs ahead of the position being presented. Applied to that position
+  -- the rule is wrong: the halo case makes it concrete. 3x3, stride 1,
+  -- two windows in flight, the older from output row 'r' (needing input
+  -- rows 'r-1 .. r+1') and the newer from output row 'r+1' (needing
+  -- 'r .. r+2') -- consecutive windows share two of their three rows, and
+  -- the newer one's anchor, 'r + 1 + K', would let the writer into row
+  -- 'r + K', whose bank is that of row 'r'... which is fine, but it would
+  -- equally let it into row 'r + K - 1', whose bank is that of row
+  -- 'r - 1' -- a row the OLDER window is still assembling from. The
+  -- correct anchor is therefore the oldest in-flight window's, not the
+  -- launching one's, which is what 'anchor_res_q' (see its declaration)
+  -- keeps and 'anchor_head_c' selects. Because 'row_top' is
+  -- non-decreasing in the output row, the oldest entry is also the
+  -- smallest, so the head alone is the binding constraint and no minimum
+  -- has to be computed.
+  --
+  -- Two smaller points, both deliberate:
+  --   * a window is popped from 'anchor_res_q' at *acceptance*, not at
+  --     the end of its walk. That is conservative (its banks are free one
+  --     or two cycles earlier) and costs nothing: the writer is bank-
+  --     limited, not cycle-limited.
+  --   * 'write_freeze_i' no longer carries the predecessor's
+  --     'has_real_row_q = 1' qualifier. That qualifier disabled the
+  --     interlock entirely for a window with no real row at all, which is
+  --     harmless for bottom padding (there 'anchor_limit' is already past
+  --     the end of the frame and never binds) but NOT for a window lying
+  --     entirely in top padding ('kernel_h <= pad_top'), where it let the
+  --     writer run unbounded ahead of rows later windows do need.
+  --     Dropping it is strictly tighter and cannot deadlock: whenever the
+  --     freeze bites, 'cur_row_q >= anchor_limit > real_row_bot', so
+  --     'row_ready_i' is already '1' and the reader can always make
+  --     progress and move the anchor on.
+  --
+  -- No combinational loop: every term is a register except
+  -- 'm_window_s2m.ready', which appears nowhere in this expression.
+  ------------------------------------------------------------------------
+  s_stream_s2m.ready <= active_q and not write_freeze_i;
 
   ------------------------------------------------------------------------
   -- Configuration latch, position counters, write-side address counters,
@@ -688,6 +891,8 @@ begin
     if rising_edge(clk) then
       if reset = '1' then
         active_q <= '0';
+        launch_active_q <= '0';
+        n_res_q <= 0;
         cur_row_q <= (others => '0');
         cur_col_q <= (others => '0');
         wr_tile_q <= (others => '0');
@@ -745,6 +950,8 @@ begin
         out_col_q <= (others => '0');
         rd_tile_q <= (others => '0');
         active_q <= '1';
+        launch_active_q <= '1';
+        n_res_q <= 0;
 
         wr_bank_q <= 0;
         wr_addr_q <= 0;
@@ -875,7 +1082,59 @@ begin
           end if;
         end if;
 
-        if consume = '1' then
+        -- Reservation queue of row-bank anchors, one entry per window in
+        -- flight (see 'anchor_res_q' / the 's_stream_s2m.ready' comment).
+        -- Pushed with the LAUNCHING window's anchor, popped on
+        -- acceptance; 'walk_start' can never fire when the queue is full
+        -- unless 'consume' frees a slot the same cycle ('buffer_free'),
+        -- so 'n_res_q' stays in range by construction.
+        if walk_start = '1' and consume = '1' then
+          if n_res_q = g_assembly_buffers then
+            for i in 0 to g_assembly_buffers - 2 loop
+              anchor_res_q(i) <= anchor_res_q(i + 1);
+            end loop;
+            anchor_res_q(g_assembly_buffers - 1) <= anchor_limit_q;
+          else
+            for i in 0 to g_assembly_buffers - 1 loop
+              if i = n_res_q - 1 then
+                anchor_res_q(i) <= anchor_limit_q;
+              elsif i < g_assembly_buffers - 1 then
+                anchor_res_q(i) <= anchor_res_q(i + 1);
+              end if;
+            end loop;
+          end if;
+        elsif walk_start = '1' then
+          for i in 0 to g_assembly_buffers - 1 loop
+            if i = n_res_q then
+              anchor_res_q(i) <= anchor_limit_q;
+            end if;
+          end loop;
+          n_res_q <= n_res_q + 1;
+        elsif consume = '1' then
+          for i in 0 to g_assembly_buffers - 2 loop
+            anchor_res_q(i) <= anchor_res_q(i + 1);
+          end loop;
+          n_res_q <= n_res_q - 1;
+        end if;
+
+        -- The frame is over, for input-acceptance purposes, once its
+        -- final window has been ACCEPTED (unchanged from the predecessor
+        -- design, where the same test lived in the launch branch below
+        -- because launch and acceptance were the same event).
+        if consume = '1' and meta_last_q(buf_out_q) = '1' then
+          active_q <= '0';
+        end if;
+
+        -- Output-position counters and the whole S7 geometry block now
+        -- advance on walk LAUNCH, not on acceptance: they define the
+        -- addresses the read side is about to issue, and with N windows
+        -- in flight the read side runs ahead of the presentation side.
+        -- Everything that must stay with the *presented* window (the
+        -- stream sidebands) is snapshotted into 'meta_*_q' by
+        -- 'walk_control' in this same cycle; everything the walk itself
+        -- consumes ('kr_base_q'/'row_ok_q') into 'kr_base_walk_q'/
+        -- 'row_ok_walk_q'.
+        if walk_start = '1' then
           if rd_tile_q = n_tiles_q - 1 then
             rd_tile_q <= (others => '0');
 
@@ -955,8 +1214,8 @@ begin
               rd_base_q <= rd_base_q + col_step_words_q;
             end if;
 
-            if last_pixel = '1' then
-              active_q <= '0';
+            if launch_last_pixel = '1' then
+              launch_active_q <= '0';
             end if;
           else
             rd_tile_q <= rd_tile_q + 1;
@@ -968,16 +1227,70 @@ begin
   end process;
 
   ------------------------------------------------------------------------
-  last_pixel <= '1' when (out_row_q = out_height_q - 1 and out_col_q = out_width_q - 1) else '0';
-  first_tile_flag <= '1' when rd_tile_q = 0 else '0';
-  last_tile_flag <= '1' when rd_tile_q = n_tiles_q - 1 else '0';
-  done <= consume and last_pixel and last_tile_flag;
+  -- Sidebands of the window being LAUNCHED this cycle; 'walk_control'
+  -- latches them into that window's buffer, and the presentation side
+  -- below reads them back out of 'meta_*_q'.
+  launch_last_pixel <= '1'
+    when (out_row_q = out_height_q - 1 and out_col_q = out_width_q - 1
+          and rd_tile_q = n_tiles_q - 1)
+    else '0';
+  launch_first_tile <= '1' when rd_tile_q = 0 else '0';
+  launch_last_tile <= '1' when rd_tile_q = n_tiles_q - 1 else '0';
+
+  ------------------------------------------------------------------------
+  -- Presentation side: an N:1 mux of registers, selected by the
+  -- oldest-buffer pointer. Nothing here is a function of any handshake
+  -- input, so 'm_window_m2s.valid' still depends only on registered
+  -- state -- which is what lets 'cnn_accel_conv_core' wire this straight
+  -- to 'cnn_accel_pe_array' with no skid register (see that entity's
+  -- header comment).
+  --
+  -- NOTE: explicit sensitivity list, not 'process(all)' -- GHDL
+  -- 7.0.0-dev's 'all' inference does not reliably track signals read only
+  -- through nested loops/array indexing.
+  ------------------------------------------------------------------------
+  present : process(buf_out_q, full_q, assembly_q, meta_first_tile_q, meta_last_tile_q, meta_last_q)
+  begin
+    window_valid <= '0';
+    m_window_m2s.data <= (others => (others => '0'));
+    m_window_m2s.last <= '0';
+    m_window_m2s.first_tile <= '0';
+    m_window_m2s.last_tile <= '0';
+    for buf in 0 to g_assembly_buffers - 1 loop
+      if buf_out_q = buf then
+        window_valid <= full_q(buf);
+        m_window_m2s.data <= assembly_q(buf);
+        m_window_m2s.last <= meta_last_q(buf);
+        m_window_m2s.first_tile <= meta_first_tile_q(buf);
+        m_window_m2s.last_tile <= meta_last_tile_q(buf);
+      end if;
+    end loop;
+  end process;
 
   m_window_m2s.valid <= window_valid;
-  m_window_m2s.last <= last_pixel and last_tile_flag;
-  m_window_m2s.first_tile <= first_tile_flag;
-  m_window_m2s.last_tile <= last_tile_flag;
-  m_window_m2s.data <= assembly_q;
+  done <= consume and m_window_m2s.last;
+
+  ------------------------------------------------------------------------
+  -- Walk-launch arbitration (combinational, over registers plus
+  -- 'm_window_s2m.ready'). A walk may start when
+  --   * the read side is free ('issue_free': no walk, or the walk in
+  --     progress is issuing its final column, so the next walk's first
+  --     address can be loaded this very cycle -- this is where the
+  --     predecessor's idle re-arm cycle went),
+  --   * a buffer is free or is being freed this cycle ('buffer_free'),
+  --     and
+  --   * this window's inputs are all written ('row_ready_i'), and there
+  --     are windows left to launch ('launch_active_q').
+  -- 'buffer_free' is what keeps the row-bank/backpressure argument
+  -- intact: a buffer is reserved from launch to acceptance, so a stalled
+  -- consumer stops launches after at most 'g_assembly_buffers' windows
+  -- and nothing in flight is ever overwritten or reordered.
+  ------------------------------------------------------------------------
+  issue_free <= '1' when issue_q = '0' or kc_q = kernel_w_q - 1 else '0';
+  buffer_free <= '1' when n_res_q < g_assembly_buffers or consume = '1' else '0';
+  walk_start <= launch_active_q and row_ready_i and issue_free and buffer_free;
+
+  buf_next_c <= next_buf(buf_issue_q);
 
   ------------------------------------------------------------------------
   -- Read-side qualification (combinational). S7: this is all that is left
@@ -1028,13 +1341,14 @@ begin
   -- 'all' inference does not reliably track signals read only through
   -- nested loops/array indexing.
   ------------------------------------------------------------------------
+  anchor_head_c <= anchor_limit_q when n_res_q = 0 else anchor_res_q(0);
+
   read_qualify : process(
-    kernel_w_q, cur_row_q, cur_col_q, kc_q, reading_q, rd_col_ok_q,
+    cur_row_q, cur_col_q, issue_q, rd_col_ok_q,
     has_real_row_q, real_row_bot_q, has_real_col_q, real_col_right_q,
-    anchor_limit_q, row_ok_q
+    anchor_head_c, row_ok_walk_q
   )
     variable v_cur_row : coord_t;
-    variable v_kc_real : std_ulogic;
   begin
     v_cur_row := to_integer(cur_row_q);
 
@@ -1050,63 +1364,90 @@ begin
       row_ready_i <= '0';
     end if;
 
-    if has_real_row_q = '1' and v_cur_row >= anchor_limit_q then
+    if v_cur_row >= anchor_head_c then
       write_freeze_i <= '1';
     else
       write_freeze_i <= '0';
     end if;
 
-    v_kc_real := to_sl(kc_q < kernel_w_q);
-
     for b in 0 to g_max_kernel_size - 1 loop
-      in_frame_now(b) <= reading_q and v_kc_real and row_ok_q(b) and rd_col_ok_q;
+      in_frame_now(b) <= issue_q and row_ok_walk_q(b) and rd_col_ok_q;
     end loop;
   end process;
 
   ------------------------------------------------------------------------
-  -- Column walk (read side) + tap-assembly capture. Every cycle:
+  -- Column walk (read side), tap-assembly capture, and the N-deep
+  -- assembly-buffer pipeline. Four independent stages, all of which
+  -- advance every cycle -- there is no longer a walk "state machine" with
+  -- an idle state at all:
   --
-  -- 1. Capture stage: if 'capture_valid_q' (last cycle issued a real
-  --    read address), pack 'bank_rd_data' -- now valid, one cycle after
-  --    that address -- into 'assembly_q' at tap slot
-  --    'kr_base_capture_q(b) + kc_capture_q' (= 'kr * kernel_w + kc',
-  --    with the multiply hoisted onto the output-row boundary path -- see
-  --    'kr_base_q's declaration for the measured timing reason), for
-  --    whichever banks
-  --    were actually in-frame. 'tap_idx' depends on the runtime 'kw', so
-  --    it cannot index 'assembly_q' directly here without becoming a
-  --    decoder anyway; the destination slot is selected with a
-  --    constant-bound loop, identical in simulation, a mux in hardware --
-  --    the same technique the predecessor combinational process used
-  --    for the same reason (runtime tap index into a fixed-size
-  --    aggregate).
-  -- 2. Walk/valid state machine: 'window_valid' (idle) -> 'reading_q'
-  --    (kc = 0 .. kernel_w_q, one column issued per cycle) ->
-  --    'window_valid' again once the last column's registered read has
-  --    landed (kc_q = kernel_w_q is one extra "drain" cycle: the
-  --    address for column 'kernel_w_q - 1' was issued the cycle before,
-  --    its data is captured this cycle). 'window_valid' only asserts
-  --    from 'idle' when 'row_ready_i' is true, i.e. every input pixel
-  --    the window needs has already been written -- unchanged invariant
-  --    from the predecessor design, just no longer same-cycle (proposal
-  --    doc section 7.1 item 4 / section 8 risk 3).
-  -- 3. S7: the read-address accumulators. 'rd_word_q'/'rd_col_q' are
-  --    loaded -- from registers 'control' keeps coherent with
-  --    'out_col_q'/'rd_tile_q' -- in the *same* cycle the walk is armed,
-  --    i.e. the cycle that already set 'reading_q'/'kc_q', so the
-  --    'kc = 0' address is presented on exactly the cycle the
-  --    predecessor's combinational 'addr_gen' presented it. The read
-  --    latency is therefore still one cycle and items 1 and 2 above are
-  --    untouched: the delay pipeline stays one deep and the drain stays
-  --    one cycle. Each subsequent 'kc' step is '+ n_tiles_words_q' (one
-  --    input column = 'n_tiles_q' consecutive channel-tile cells),
-  --    replacing the predecessor's 'input_col * n_tiles_q + rd_tile_q'
-  --    multiply. 'rd_addr_q' is that accumulator clamped to a legal
-  --    address, so the BRAM address port is driven by a flip-flop and
-  --    nothing else; the clamp condition is the same
-  --    '[0, in_width_q - 1]' test that gates 'in_frame_now', so an
-  --    out-of-frame cycle reads cell 0 exactly as the predecessor's
-  --    'rd_addr(b) <= 0' branch did.
+  -- 1. Issue: while 'issue_q', 'rd_addr_q' presents one column address
+  --    per cycle for 'kc = 0 .. kernel_w - 1'. Unlike the predecessor
+  --    there is no 'kc = kernel_w' drain step and no idle re-arm cycle:
+  --    a new walk is armed in the same cycle the previous one issues its
+  --    last column, so back-to-back windows issue addresses with no gap
+  --    and the issue side alone is the throughput bound at 'kernel_w'
+  --    cycles per window.
+  -- 2. Capture (one cycle later, the row banks' registered read
+  --    latency): pack 'bank_rd_data' into 'assembly_q(buf_capture_q)' at
+  --    tap slot 'kr_base_capture_q(b) + kc_capture_q' (= 'kr * kernel_w
+  --    + kc', with the multiply hoisted onto the output-row boundary
+  --    path -- see 'kr_base_q's declaration for the measured timing
+  --    reason), for whichever banks were in-frame. 'tap_idx' depends on
+  --    the runtime 'kw', so it cannot index 'assembly_q' directly
+  --    without becoming a decoder anyway; the destination slot is
+  --    selected with a constant-bound loop, identical in simulation, a
+  --    mux in hardware -- the same technique the predecessor's
+  --    combinational process used for the same reason.
+  -- 3. Completion: the capture of a window's last column ('capture_last_q')
+  --    marks its buffer 'full_q'. That IS the old drain cycle, now doing
+  --    useful work for the *next* window instead of stalling this one.
+  -- 4. Presentation: the 'present' process above muxes the oldest full
+  --    buffer onto 'm_window_m2s'; acceptance clears its 'full_q' and
+  --    advances 'buf_out_q'.
+  --
+  -- End to end a window takes 'kernel_w + 2' cycles from launch to
+  -- acceptance (arm, 'kernel_w' issue cycles, one capture-latency cycle,
+  -- with the last capture and the first present overlapping), and a
+  -- buffer is reserved for exactly that span. With 'g_assembly_buffers'
+  -- of them the sustained rate is therefore
+  -- 'max(kernel_w, ceil((kernel_w + 2) / N))' cycles per window --
+  -- 'kernel_w'-bound (i.e. optimal) for every 'kernel_w >= 2' at N = 2,
+  -- and 1 cycle per window at 'kernel_w = 1' only from N = 3 up, which is
+  -- why the CONV instance uses 3.
+  --
+  -- Ordering and backpressure. Buffers are allocated strictly in launch
+  -- order ('buf_issue_q' advancing mod N) and released strictly in that
+  -- same order ('buf_out_q'), so windows can neither be reordered nor
+  -- merged. A stalled consumer stops 'consume', which stops 'buf_out_q'
+  -- and 'n_res_q' from draining, which clears 'buffer_free' and therefore
+  -- 'walk_start' -- launches halt after at most N windows are in flight
+  -- and every one of them is held intact in its own buffer until the
+  -- consumer returns. Nothing is dropped, because a walk is never started
+  -- for a buffer that is not free, and nothing is overwritten, because a
+  -- buffer's 'assembly_q' is only ever written by the walk that reserved
+  -- it.
+  --
+  -- 'row_ready_i' still gates every launch, i.e. a walk only starts once
+  -- every input pixel that window needs has been written -- unchanged
+  -- invariant from the predecessor design (proposal doc section 7.1
+  -- item 4 / section 8 risk 3). The row banks those pixels live in are
+  -- protected for the whole time the window is in flight by
+  -- 'write_freeze_i' against 'anchor_head_c'; see the 's_stream_s2m.ready'
+  -- comment for that derivation.
+  --
+  -- S7 read-address accumulators (unchanged): 'rd_word_q'/'rd_col_q' are
+  -- loaded -- from registers 'control' keeps coherent with
+  -- 'out_col_q'/'rd_tile_q' -- in the *same* cycle the walk is armed, so
+  -- the 'kc = 0' address is presented the very next cycle. Each
+  -- subsequent 'kc' step is '+ n_tiles_words_q' (one input column =
+  -- 'n_tiles_q' consecutive channel-tile cells), replacing the
+  -- predecessor's 'input_col * n_tiles_q + rd_tile_q' multiply.
+  -- 'rd_addr_q' is that accumulator clamped to a legal address, so the
+  -- BRAM address port is driven by a flip-flop and nothing else; the
+  -- clamp condition is the same '[0, in_width_q - 1]' test that gates
+  -- 'in_frame_now', so an out-of-frame cycle reads cell 0 exactly as the
+  -- predecessor's 'rd_addr(b) <= 0' branch did.
   ------------------------------------------------------------------------
   walk_control : process(clk)
     variable v_next_word : word_t;
@@ -1114,50 +1455,67 @@ begin
     variable v_next_ok : boolean;
   begin
     if rising_edge(clk) then
-      if reset = '1' then
-        reading_q <= '0';
-        window_valid <= '0';
+      if reset = '1' or start = '1' then
+        issue_q <= '0';
         kc_q <= (others => '0');
         capture_valid_q <= '0';
+        capture_last_q <= '0';
         kc_capture_q <= (others => '0');
         in_frame_capture_q <= (others => '0');
         kr_base_capture_q <= (others => 0);
-        assembly_q <= (others => (others => '0'));
-        rd_addr_q <= 0;
-        rd_word_q <= (others => '0');
-        rd_col_q <= 0;
-        rd_col_ok_q <= '0';
-
-      elsif start = '1' then
-        reading_q <= '0';
-        window_valid <= '0';
-        kc_q <= (others => '0');
-        capture_valid_q <= '0';
-        kc_capture_q <= (others => '0');
-        in_frame_capture_q <= (others => '0');
-        kr_base_capture_q <= (others => 0);
-        assembly_q <= (others => (others => '0'));
+        kr_base_walk_q <= (others => 0);
+        row_ok_walk_q <= (others => '0');
+        assembly_q <= (others => (others => (others => '0')));
+        full_q <= (others => '0');
+        meta_first_tile_q <= (others => '0');
+        meta_last_tile_q <= (others => '0');
+        meta_last_q <= (others => '0');
+        -- Seeded one short of 0 so the first walk of a frame lands in
+        -- buffer 0, which is where 'buf_out_q' starts: launch order and
+        -- presentation order have to agree from the first window.
+        buf_issue_q <= g_assembly_buffers - 1;
+        buf_capture_q <= 0;
+        buf_out_q <= 0;
         rd_addr_q <= 0;
         rd_word_q <= (others => '0');
         rd_col_q <= 0;
         rd_col_ok_q <= '0';
 
       else
-        -- Delay pipeline: always shifts by one cycle, so the capture
-        -- stage below sees last cycle's issued column/in-frame/bank
-        -- mapping alongside this cycle's now-valid 'bank_rd_data'.
-        capture_valid_q <= reading_q;
+        --------------------------------------------------------------
+        -- 1. Delay pipeline: always shifts by one cycle, so the capture
+        --    stage below sees last cycle's issued column/in-frame/bank
+        --    mapping (and its destination buffer) alongside this cycle's
+        --    now-valid 'bank_rd_data'.
+        --------------------------------------------------------------
+        capture_valid_q <= issue_q;
+        capture_last_q <= issue_q and to_sl(kc_q = kernel_w_q - 1);
         kc_capture_q <= kc_q;
-        kr_base_capture_q <= kr_base_q;
+        kr_base_capture_q <= kr_base_walk_q;
         in_frame_capture_q <= in_frame_now;
+        buf_capture_q <= buf_issue_q;
 
+        --------------------------------------------------------------
+        -- 2. Capture stage. Same tap decode as before ('kr * kernel_w +
+        --    kc', with the multiply hoisted onto the output-row boundary
+        --    path -- see 'kr_base_q'), now with the destination buffer
+        --    selected by an equality against a one-hot-decoded
+        --    'buf_capture_q' rather than a direct runtime index, for the
+        --    same reason every other runtime-indexed write in this file
+        --    is written that way.
+        --------------------------------------------------------------
         if capture_valid_q = '1' then
-          for b in 0 to g_max_kernel_size - 1 loop
-            if in_frame_capture_q(b) = '1' then
-              for t in 0 to g_max_kernel_size * g_max_kernel_size - 1 loop
-                if t = kr_base_capture_q(b) + to_integer(kc_capture_q) then
-                  for c in 0 to g_tile_channels - 1 loop
-                    assembly_q(t * g_tile_channels + c) <= bank_rd_data(b)(8 * (c + 1) - 1 downto 8 * c);
+          for buf in 0 to g_assembly_buffers - 1 loop
+            if buf_capture_q = buf then
+              for b in 0 to g_max_kernel_size - 1 loop
+                if in_frame_capture_q(b) = '1' then
+                  for t in 0 to g_max_kernel_size * g_max_kernel_size - 1 loop
+                    if t = kr_base_capture_q(b) + to_integer(kc_capture_q) then
+                      for c in 0 to g_tile_channels - 1 loop
+                        assembly_q(buf)(t * g_tile_channels + c) <=
+                          bank_rd_data(b)(8 * (c + 1) - 1 downto 8 * c);
+                      end loop;
+                    end if;
                   end loop;
                 end if;
               end loop;
@@ -1165,15 +1523,89 @@ begin
           end loop;
         end if;
 
-        if window_valid = '1' then
-          if consume = '1' then
-            window_valid <= '0';
+        --------------------------------------------------------------
+        -- 3. Presentation side. A buffer is freed by acceptance and
+        --    filled by its window's final capture; those can never be
+        --    the same buffer on the same cycle (a buffer being written
+        --    is by definition not full, and only a full buffer can be
+        --    accepted), so the order of these two branches is immaterial
+        --    -- but the fill is written second anyway, so that a future
+        --    change which does make them collide fails safe (full wins)
+        --    rather than silently dropping a window.
+        --------------------------------------------------------------
+        if consume = '1' then
+          for buf in 0 to g_assembly_buffers - 1 loop
+            if buf_out_q = buf then
+              full_q(buf) <= '0';
+            end if;
+          end loop;
+          buf_out_q <= next_buf(buf_out_q);
+        end if;
+
+        if capture_last_q = '1' then
+          for buf in 0 to g_assembly_buffers - 1 loop
+            if buf_capture_q = buf then
+              full_q(buf) <= '1';
+            end if;
+          end loop;
+        end if;
+
+        --------------------------------------------------------------
+        -- 4. Issue side. One column address per cycle, 'kc = 0 ..
+        --    kernel_w - 1'; a new walk is armed in the same cycle the
+        --    previous one issues its last column, so back-to-back
+        --    windows leave no bubble at all. 'walk_start' (see its
+        --    combinational definition above) is exactly "the read side
+        --    is free AND a buffer is free AND this window's inputs are
+        --    written", so the two branches below are mutually exclusive
+        --    by construction: 'walk_start' can only be '1' when
+        --    'issue_free' is, i.e. when the 'elsif' would have been
+        --    taking the 'kc_q = kernel_w_q - 1' exit anyway.
+        --
+        --    'rd_word_q'/'rd_col_q' are loaded from registers 'control'
+        --    keeps coherent with 'out_col_q'/'rd_tile_q' in the same
+        --    cycle 'control' advances them, so the 'kc = 0' address is
+        --    presented on the very next cycle. 'kr_base_walk_q'/
+        --    'row_ok_walk_q' are snapshotted here for the same reason
+        --    (see their declaration): 'control' has already moved on.
+        --------------------------------------------------------------
+        if walk_start = '1' then
+          issue_q <= '1';
+          kc_q <= (others => '0');
+          buf_issue_q <= buf_next_c;
+          kr_base_walk_q <= kr_base_q;
+          row_ok_walk_q <= row_ok_q;
+
+          for buf in 0 to g_assembly_buffers - 1 loop
+            if buf_next_c = buf then
+              -- Cleared to all-'cfg_pad_value' (ISA v2.1) at the start
+              -- of every walk, so a tap left out-of-frame this window
+              -- (padding, or beyond the runtime 'kh'/'kw') reads back as
+              -- padding without being written. Safe against the window
+              -- this buffer may still be presenting on THIS cycle: the
+              -- clear only takes effect next cycle, and 'buffer_free'
+              -- guarantees that window is either already gone or being
+              -- accepted right now.
+              assembly_q(buf) <= (others => pad_value_q);
+              meta_first_tile_q(buf) <= launch_first_tile;
+              meta_last_tile_q(buf) <= launch_last_tile;
+              meta_last_q(buf) <= launch_last_pixel;
+            end if;
+          end loop;
+
+          v_next_ok := col_left_q >= 0 and col_left_q <= in_width_m1_q;
+          rd_word_q <= rd_base_q;
+          rd_col_q <= col_left_q;
+          rd_col_ok_q <= to_sl(v_next_ok);
+          if v_next_ok then
+            rd_addr_q <= to_integer(rd_base_q);
+          else
+            rd_addr_q <= 0;
           end if;
 
-        elsif reading_q = '1' then
-          if kc_q = kernel_w_q then
-            reading_q <= '0';
-            window_valid <= '1';
+        elsif issue_q = '1' then
+          if kc_q = kernel_w_q - 1 then
+            issue_q <= '0';
           else
             kc_q <= kc_q + 1;
 
@@ -1189,29 +1621,6 @@ begin
             rd_col_ok_q <= to_sl(v_next_ok);
             if v_next_ok then
               rd_addr_q <= to_integer(v_next_word);
-            else
-              rd_addr_q <= 0;
-            end if;
-          end if;
-
-        else
-          -- Idle: start a new walk once this window's inputs are fully
-          -- written. 'assembly_q' is cleared here (not just relying on
-          -- its reset value) so a tap left out-of-frame this window
-          -- (fewer real rows/columns than 'g_max_kernel_size', or
-          -- padding) reads back '0' rather than a previous window's
-          -- stale value.
-          if active_q = '1' and row_ready_i = '1' then
-            reading_q <= '1';
-            kc_q <= (others => '0');
-            assembly_q <= (others => pad_value_q);
-
-            v_next_ok := col_left_q >= 0 and col_left_q <= in_width_m1_q;
-            rd_word_q <= rd_base_q;
-            rd_col_q <= col_left_q;
-            rd_col_ok_q <= to_sl(v_next_ok);
-            if v_next_ok then
-              rd_addr_q <= to_integer(rd_base_q);
             else
               rd_addr_q <= 0;
             end if;
