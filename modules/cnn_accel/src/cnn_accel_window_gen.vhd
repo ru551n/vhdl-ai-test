@@ -683,6 +683,54 @@ architecture a of cnn_accel_window_gen is
   signal rd_col_q : coord_t := 0;
   signal rd_col_ok_q : std_ulogic := '0';
 
+  ------------------------------------------------------------------------
+  -- Registered pad-clear of the reserved assembly buffer.
+  --
+  -- This is a pure timing rework of the clear that used to sit inside the
+  -- 'walk_start' branch of 'walk_control'; the values written are
+  -- identical, only the cycle they are written in moves by one.
+  --
+  -- Why it had to move (shared/TimingAndResources.md, "Fan-out is a
+  -- timing path", plus "Handshake stages"). 'walk_start' is
+  -- combinational: 'launch_active_q and row_ready_i and issue_free and
+  -- buffer_free', and 'buffer_free' contains 'consume', which contains
+  -- 'm_window_s2m.ready' -- the CONSUMER's ready. Driving the clear from
+  -- it therefore put the consumer's ready, and everything upstream of it,
+  -- on the clock-enable pin of all 'g_assembly_buffers x
+  -- g_max_kernel_size**2 x g_tile_channels' assembly flip-flops (1600 per
+  -- buffer at the conv geometry, 1600 at the pool one). In the routed
+  -- top-level build that single cone owned 278 of the 400 worst paths:
+  --
+  --   'elementwise/state_q_reg[4] -> cmd_proc -> pe_array ->
+  --    window_gen/consume -> conv window_gen assembly_q_reg[*][*][*]/CE'
+  --   -1.883 ns, 12 logic levels, 6.6 ns of it route
+  --
+  -- and the pool instance had the same shape from its lanes' 'cfg_match'
+  -- ('pool_inst/cfg_kernel_w_q -> pool_window_gen/assembly_q_reg/CE',
+  -- -1.900 ns, 10 levels).
+  --
+  -- Delaying the clear by one cycle makes the enable of those ~5000
+  -- flip-flops a plain register output. It is free, because the clear has
+  -- a cycle of slack by construction: a walk armed in cycle t issues its
+  -- 'kc = 0' address in t+1 and its first capture lands at the end of
+  -- t+2, so a clear taking effect at the end of t+1 is still strictly
+  -- before anything is written into the buffer.
+  --
+  -- It cannot collide with the PREVIOUS walk's final capture either, at
+  -- any 'g_assembly_buffers':
+  --   * N >= 2: the capture at t+1 belongs to 'buf_issue_q' as it was at
+  --     t, and 'buf_next_c = next_buf(buf_issue_q)' is a different buffer.
+  --   * N = 1: 'buffer_free' is 'n_res_q < 1 or consume', so a walk can
+  --     only be armed in a cycle where the previous window is being
+  --     accepted -- which cannot happen before that window is 'full_q',
+  --     i.e. before its last capture has already completed. The
+  --     'issue_free' fast path ("arm while the previous walk issues its
+  --     last column") is therefore unreachable at N = 1, and no capture
+  --     is in flight at t+1 at all.
+  ------------------------------------------------------------------------
+  signal clear_q : std_ulogic := '0';
+  signal clear_buf_q : natural range 0 to g_assembly_buffers - 1 := 0;
+
   function imin(a, b : integer) return integer is
   begin
     if a < b then
@@ -1590,6 +1638,8 @@ begin
         rd_word_q <= (others => '0');
         rd_col_q <= 0;
         rd_col_ok_q <= '0';
+        clear_q <= '0';
+        clear_buf_q <= 0;
 
       else
         --------------------------------------------------------------
@@ -1600,10 +1650,27 @@ begin
         --------------------------------------------------------------
         capture_valid_q <= issue_q;
         capture_last_q <= issue_q and to_sl(kc_q = kernel_w_q - 1);
+        -- Registered pad-clear request, see the 'clear_q' declaration.
+        clear_q <= walk_start;
+        clear_buf_q <= buf_next_c;
         kc_capture_q <= kc_q;
         kr_base_capture_q <= kr_base_walk_q;
         in_frame_capture_q <= in_frame_now;
         buf_capture_q <= buf_issue_q;
+
+        --------------------------------------------------------------
+        -- 1b. Registered pad-clear of the buffer reserved one cycle ago.
+        --     Written BEFORE the capture stage below so that, if a future
+        --     change ever did make the two collide on one buffer, the
+        --     capture would win and a real tap could not be erased.
+        --------------------------------------------------------------
+        if clear_q = '1' then
+          for buf in 0 to g_assembly_buffers - 1 loop
+            if clear_buf_q = buf then
+              assembly_q(buf) <= (others => pad_value_q);
+            end if;
+          end loop;
+        end if;
 
         --------------------------------------------------------------
         -- 2. Capture stage. Same tap decode as before ('kr * kernel_w +
@@ -1688,15 +1755,14 @@ begin
 
           for buf in 0 to g_assembly_buffers - 1 loop
             if buf_next_c = buf then
-              -- Cleared to all-'cfg_pad_value' (ISA v2.1) at the start
-              -- of every walk, so a tap left out-of-frame this window
-              -- (padding, or beyond the runtime 'kh'/'kw') reads back as
-              -- padding without being written. Safe against the window
-              -- this buffer may still be presenting on THIS cycle: the
-              -- clear only takes effect next cycle, and 'buffer_free'
-              -- guarantees that window is either already gone or being
-              -- accepted right now.
-              assembly_q(buf) <= (others => pad_value_q);
+              -- Only the (three-bit, low-fanout) per-window metadata is
+              -- written here. The buffer's all-'cfg_pad_value' clear --
+              -- which is what makes a tap left out-of-frame this window
+              -- (padding, or beyond the runtime 'kh'/'kw') read back as
+              -- padding without being written -- is issued one cycle
+              -- later from the registered 'clear_q'/'clear_buf_q'; see
+              -- their declaration for why, and for why the delay is
+              -- safe at every 'g_assembly_buffers'.
               meta_first_tile_q(buf) <= launch_first_tile;
               meta_last_tile_q(buf) <= launch_last_tile;
               meta_last_q(buf) <= launch_last_pixel;

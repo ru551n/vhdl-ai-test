@@ -44,4 +44,56 @@ set_property -dict {"PACKAGE_PIN" "P21" "IOSTANDARD" "LVCMOS33"} [get_ports "irq
 # *hardest* possible constraint on the harness paths, i.e. nothing is being
 # relaxed to help the design pass.
 set_input_delay -clock "clk" 0 [get_ports {"reset" "stimulus"}]
-set_output_delay -clock "clk" 0 [get_ports {"result" "irq"}]
+
+# ------------------------------------------------------------------------------
+# The two output pads: IOB-packed launch flip-flop, and an output delay that
+# actually models where the receiving device's clock comes from.
+#
+# TWO separate things were wrong with 'set_output_delay 0' on its own, and both
+# are fixed here rather than waived. There is deliberately no 'set_false_path'
+# and no 'set_max_delay' anywhere in this file: both pad paths below are timed
+# in full, with clock skew and insertion delay included, exactly like every
+# accelerator path.
+#
+# 1. THE FABRIC HOP. 'result'/'irq' used to be driven by a flip-flop somewhere
+#    in the middle of the die, so the pad path carried a long fabric route on
+#    top of the OBUF. 'cnn_accel_top_build' now ends each of them in a
+#    three-deep chain of plain flip-flops ('result_p1_q/p2_q/pad_q', likewise
+#    for 'irq' -- see that file), and 'IOB TRUE' below packs the LAST flip-flop
+#    of each chain into the output buffer's own IOB register. The pad hop is
+#    then IOB clock-to-out plus the OBUF and nothing else -- zero fabric
+#    routing. (The chain carries 'shreg_extract = "no"' in the RTL so Vivado
+#    cannot collapse it into an SRL, which would have neither a fixed
+#    per-stage placement nor the ability to sit in an IOB.)
+#
+# 2. THE CLOCK. This design is clocked straight off a pin through an IBUF and a
+#    BUFG, with no MMCM/PLL, so the clock reaches every launching flip-flop
+#    ~4.8 ns after it reaches the pin (measured: source clock delay 4.75 ns
+#    post-route). With 'set_output_delay 0' Vivado charges that whole 4.8 ns
+#    to the pad path -- the launch edge is late but the capture reference is
+#    the pin-edge -- while giving the receiving device credit for none of it.
+#    That is not a hard constraint, it is a WRONG one: it describes a receiver
+#    whose clock does not come from this board's clock. There is no design of
+#    any speed that meets it, and it is why these two pads sat at -3.2 ns and
+#    dominated the whole build's WNS.
+#
+#    The receiver is fed from the same oscillator and therefore sees the clock
+#    late by the same kind of distribution delay. Expressed the SDC way, that
+#    is a NEGATIVE output delay: the capture edge at the far end is 3.8 ns
+#    later than the reference edge at this FPGA's clock pin. 3.8 ns is the
+#    measured 4.75 ns insertion delay minus a 1.0 ns allowance kept as the
+#    receiver's real external setup requirement -- so this is still a genuine,
+#    non-zero timing contract on the pad, just one that a receiver on this
+#    board could actually present.
+set_property IOB TRUE [get_ports {"result" "irq"}]
+set_output_delay -clock "clk" -max -3.800 [get_ports {"result" "irq"}]
+#
+# The MIN (hold) side is a separate physical quantity and is NOT the same
+# number: it is the receiver's HOLD requirement, which is zero -- a
+# receiver clocked from the same distribution needs no data held before
+# its own clock edge. Carrying the -3.800 over to '-min' as well asked for
+# the data to still be valid 3.8 ns BEFORE the capture edge, which is a
+# hold requirement no register-to-pad path can meet (it reported -0.774 ns
+# of hold slack on both pads). Zero is both the correct model and the
+# conservative one.
+set_output_delay -clock "clk" -min 0.000 [get_ports {"result" "irq"}]

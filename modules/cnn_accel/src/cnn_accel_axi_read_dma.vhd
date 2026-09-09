@@ -177,7 +177,8 @@ architecture a of cnn_accel_axi_read_dma is
   -- for the next burst is computed in the cycle the current one is
   -- accepted, and the first one when the request is latched, both of
   -- which are cycles in which no AR can be issued anyway.
-  signal burst_bytes_q : unsigned(31 downto 0) := (others => '0');
+  -- Bounded at 4096 by 'next_burst_bytes' -- see that function's comment.
+  signal burst_bytes_q : unsigned(12 downto 0) := (others => '0');
   signal burst_beats_q : positive range 1 to axi_max_burst_length_beats := 1;
 
   signal ar_issue_active_i : std_ulogic;
@@ -238,6 +239,18 @@ architecture a of cnn_accel_axi_read_dma is
   -- a 32-bit comparison. Identical result: if 'bytes_remaining' exceeds
   -- 4096 it can never be the minimum, so replacing it with 4096 cannot
   -- change which term wins.
+  --
+  -- Returns 13 bits, not 32. Every term above is already bounded by 4096,
+  -- so the result never needs more, and the width it is returned in is
+  -- what everything downstream inherits: with a 32-bit return the
+  -- 'to_integer(v_burst) / c_bytes_per_beat' below became a 32-bit
+  -- round-down divider, and post-route
+  -- 'bytes_remaining_q_reg -> burst_beats_q_reg' was the worst path in
+  -- the design at -1.107 ns, 15 logic levels with 8 CARRY4s. Same rule as
+  -- cnn_accel_pe_array's 'c_kernel_bits': bound the datapath at the width
+  -- the values actually occupy and the arithmetic collapses. Values are
+  -- unchanged -- the old code computed exactly this and then zero-extended
+  -- it.
   function next_burst_bytes(
     addr_low : unsigned(11 downto 0);
     remaining : unsigned(31 downto 0)
@@ -260,7 +273,7 @@ architecture a of cnn_accel_axi_read_dma is
       v_result := to_unsigned(c_max_burst_bytes, 13);
     end if;
 
-    return resize(v_result, 32);
+    return v_result;
   end function;
 
 
@@ -377,7 +390,7 @@ begin
   main : process(clk)
     variable v_addr_next : unsigned(31 downto 0);
     variable v_bytes_next : unsigned(31 downto 0);
-    variable v_burst : unsigned(31 downto 0);
+    variable v_burst : unsigned(12 downto 0);
   begin
     if rising_edge(clk) then
       if reset = '1' then
@@ -401,8 +414,8 @@ begin
         end if;
       else
         if ar_accepted_i = '1' then
-          v_addr_next := addr_q + burst_bytes_q;
-          v_bytes_next := bytes_remaining_q - burst_bytes_q;
+          v_addr_next := addr_q + resize(burst_bytes_q, addr_q'length);
+          v_bytes_next := bytes_remaining_q - resize(burst_bytes_q, bytes_remaining_q'length);
 
           addr_q <= v_addr_next;
           bytes_remaining_q <= v_bytes_next;

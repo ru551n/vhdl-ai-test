@@ -5,6 +5,8 @@ use ieee.numeric_std.all;
 library axi_stream;
 use axi_stream.axi_stream_pkg.all;
 
+library common;
+
 library math;
 use math.math_pkg.all;
 
@@ -255,6 +257,7 @@ architecture a of cnn_accel_conv_core is
   signal window_s2m : window_s2m_t;
 
   signal weight_rd_addr : std_ulogic_vector(c_addr_width - 1 downto 0);
+  signal weight_rd_en : std_ulogic;
   signal weight_rd_data : std_ulogic_vector(8 * c_weight_lanes - 1 downto 0);
   signal bias_rd_addr : std_ulogic_vector(c_bias_addr_width - 1 downto 0);
   signal bias_rd_data : std_ulogic_vector(g_accum_width * g_pe_rows - 1 downto 0);
@@ -263,7 +266,113 @@ architecture a of cnn_accel_conv_core is
   signal accum_m2s : accum_m2s_t(data(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0));
   signal accum_s2m : accum_s2m_t;
 
+  ------------------------------------------------------------------------
+  -- Boundary skid buffers (shared/TimingAndResources.md, "Handshake
+  -- stages": every inter-stage link is registered-ready or a skid buffer;
+  -- a combinational 'ready' chain across stages is a path that grows with
+  -- the pipeline length -- and UG949's "register every hierarchical
+  -- boundary, both directions").
+  --
+  -- This entity used to pass 's_stream' straight into 'window_gen' and
+  -- 'm_out' straight out of 'bias_requant'. Both are ready/valid links,
+  -- and a ready/valid link with no buffer joins the two sides' timing:
+  -- the *consumer's* 'ready' becomes a combinational input to the
+  -- *producer's* logic and keeps going upstream. In the routed top-level
+  -- build that produced two of the four worst paths in the whole design,
+  -- and they were long:
+  --
+  --   * 'window_gen/n_res_q_reg[1] -> load_read_dma/.../read_valid_ram_pre'
+  --     at -2.064 ns, 12 logic levels: window_gen's OWN reservation
+  --     counter -> 's_stream_s2m.ready' -> cmd_proc -> the load DMA's
+  --     stream FIFO, i.e. this entity's input ready reaching all the way
+  --     back into the DMA that feeds it.
+  --   * 'elementwise/state_q_reg[4] -> window_gen/assembly_q_reg[*]/CE'
+  --     at -1.883 ns, 12 logic levels -- 278 of the 400 worst paths in
+  --     the build. That one runs the other way: the top-level result
+  --     sink's ready -> 'm_out_s2m.ready' -> bias_requant -> pe_array ->
+  --     'window_gen/consume' -> 1600+ assembly-register clock enables.
+  --     Both ends of a die-wide combinational chain, 6.6 ns of it pure
+  --     route.
+  --
+  -- A full skid buffer at each port ('full_throughput' with both control
+  -- and data pipelined) breaks both chains at this entity's boundary:
+  -- every 'ready' is now a register output, and neither the DMA upstream
+  -- nor the result sink downstream can reach into this entity's datapath
+  -- combinationally. It is the structural fix, not a constraint or a
+  -- placement one -- it survives any later netlist change.
+  --
+  -- Throughput is unchanged, which is the whole point of a SKID buffer as
+  -- opposed to a plain register: 'full_throughput => true' sustains one
+  -- beat per cycle in both directions. The cost is one cycle of latency
+  -- per port and ~2 x (data + control) flip-flops each.
+  ------------------------------------------------------------------------
+  signal stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal stream_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+
+  signal out_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal out_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+
+  signal m_out_m2s_int : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal m_out_s2m_int : axi_stream_s2m_t := axi_stream_s2m_init;
+
 begin
+
+  ------------------------------------------------------------------------
+  -- Input-side skid buffer: 's_stream' -> 'stream' -> window_gen.
+  -- See the declaration comment above.
+  ------------------------------------------------------------------------
+  s_stream_pipeline_inst : entity common.handshake_pipeline
+    generic map (
+      data_width => axi_stream_data_sz,
+      full_throughput => true,
+      pipeline_control_signals => true,
+      pipeline_data_signals => true
+    )
+    port map (
+      clk => clk,
+      --
+      input_ready => s_stream_s2m.ready,
+      input_valid => s_stream_m2s.valid,
+      input_last => s_stream_m2s.last,
+      input_data => s_stream_m2s.data,
+      --
+      output_ready => stream_s2m.ready,
+      output_valid => stream_m2s.valid,
+      output_last => stream_m2s.last,
+      output_data => stream_m2s.data
+    );
+
+  -- 'user' is unused on this link (bias_requant/cmd_proc/tensor_mem all
+  -- drive it to zero and nobody reads it), so it is not carried through
+  -- the buffer.
+  stream_m2s.user <= (others => '0');
+
+  ------------------------------------------------------------------------
+  -- Output-side skid buffer: bias_requant -> 'out' -> 'm_out'.
+  ------------------------------------------------------------------------
+  m_out_pipeline_inst : entity common.handshake_pipeline
+    generic map (
+      data_width => axi_stream_data_sz,
+      full_throughput => true,
+      pipeline_control_signals => true,
+      pipeline_data_signals => true
+    )
+    port map (
+      clk => clk,
+      --
+      input_ready => out_s2m.ready,
+      input_valid => out_m2s.valid,
+      input_last => out_m2s.last,
+      input_data => out_m2s.data,
+      --
+      output_ready => m_out_s2m.ready,
+      output_valid => m_out_m2s_int.valid,
+      output_last => m_out_m2s_int.last,
+      output_data => m_out_m2s_int.data
+    );
+
+  m_out_m2s_int.user <= (others => '0');
+  m_out_m2s <= m_out_m2s_int;
 
   ------------------------------------------------------------------------
   -- Cross-module generic contract that is NOT structurally forced (see
@@ -337,8 +446,10 @@ begin
       -- Not this entity's 'done' -- see the port comment above.
       done => open,
 
-      s_stream_m2s => s_stream_m2s,
-      s_stream_s2m => s_stream_s2m,
+      -- Behind this entity's input skid buffer, not the port itself --
+      -- see the 'stream_m2s' declaration comment.
+      s_stream_m2s => stream_m2s,
+      s_stream_s2m => stream_s2m,
 
       m_window_m2s => window_m2s,
       m_window_s2m => window_s2m
@@ -369,6 +480,7 @@ begin
       s_window_s2m => window_s2m,
 
       weight_rd_addr => weight_rd_addr,
+      weight_rd_en => weight_rd_en,
       weight_rd_data => weight_rd_data,
 
       m_accum_m2s => accum_m2s,
@@ -402,6 +514,7 @@ begin
       fill_is_scale => fill_is_scale,
 
       weight_rd_addr => weight_rd_addr,
+      weight_rd_en => weight_rd_en,
       weight_rd_data => weight_rd_data,
 
       bias_rd_addr => bias_rd_addr,
@@ -444,8 +557,10 @@ begin
       s_accum_m2s => accum_m2s,
       s_accum_s2m => accum_s2m,
 
-      m_out_m2s => m_out_m2s,
-      m_out_s2m => m_out_s2m
+      -- Into this entity's output skid buffer, not straight to the port
+      -- -- see the 'out_m2s' declaration comment.
+      m_out_m2s => out_m2s,
+      m_out_s2m => out_s2m
     );
 
   ------------------------------------------------------------------------
@@ -455,6 +570,9 @@ begin
   -- combinational loop since it only fans out (nothing feeds back from it).
   ------------------------------------------------------------------------
 
-  done <= m_out_m2s.valid and m_out_m2s.last and m_out_s2m.ready;
+  -- Evaluated at THIS entity's port, i.e. after the output skid buffer, so
+  -- the contract ("the final output beat has left this entity") is exactly
+  -- what it was before the buffer was inserted.
+  done <= m_out_m2s_int.valid and m_out_m2s_int.last and m_out_s2m.ready;
 
 end architecture a;

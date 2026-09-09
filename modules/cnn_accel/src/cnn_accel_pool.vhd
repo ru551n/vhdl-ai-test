@@ -159,6 +159,20 @@ architecture a of cnn_accel_pool is
   -- carry-chain length.
   constant c_sum_width : positive := c_levels + 8;
 
+  -- Second tree split point: one level below the root, but never below
+  -- the first split. Written as a function rather than
+  -- 'max(c_split1, c_levels - 1)' because 'c_levels - 1' would be -1 (a
+  -- 'natural' range error at elaboration) for the degenerate
+  -- single-tap geometry, which no instantiation uses but which the
+  -- expression must still be legal for.
+  function split2_of(levels, split1 : natural) return natural is
+  begin
+    if levels >= 1 and levels - 1 > split1 then
+      return levels - 1;
+    end if;
+    return split1;
+  end function;
+
   -- Number of live nodes at tree level 'level' (level 0 = the taps).
   function level_count(level : natural) return positive is
     variable v_n : positive := c_max_taps;
@@ -169,14 +183,33 @@ architecture a of cnn_accel_pool is
     return v_n;
   end function;
 
-  -- The tree is cut in half by a register stage: levels 1 .. c_split are
-  -- evaluated in the cycle a window beat is accepted, levels c_split+1 ..
-  -- c_levels in the next. At 5x5 that is two compare/add levels then
-  -- three, instead of five in one cycle -- which, together with the
-  -- registered mask, is what takes 'out_max_q' off the design's critical
-  -- path. Purely a re-timing of the same tree: no operand, no operator and
-  -- no association order changes, so the result is bit-identical.
-  constant c_split : natural := c_levels / 2;
+  -- The tree is cut by TWO register stages: levels 1 .. c_split1 are
+  -- evaluated in the cycle a window beat is accepted, levels c_split1+1 ..
+  -- c_split2 in the next, and c_split2+1 .. c_levels in the one after
+  -- that. At 5x5 that is two compare/add levels, then two, then one --
+  -- instead of five in one cycle, or the two-then-three of the previous
+  -- single split. Purely a re-timing of the same tree: no operand, no
+  -- operator and no association order changes, so the result is
+  -- bit-identical at every split.
+  --
+  -- Why the second split. With one split the back half carried three
+  -- compare levels ('v_max(2) -> v_max(3) -> v_max(4) -> v_max(5)'), and
+  -- post-route that was 9 logic levels and 8.49 ns from 'p1_max_q' to
+  -- 'out_max_q' -- -1.964 ns at 150 MHz, and the worst path in the whole
+  -- accelerator once the ready chains were broken. Splitting the back
+  -- half again is the structural fix (shared/TimingAndResources.md,
+  -- "Budget logic depth per stage"); rebalancing the single split instead
+  -- ('c_split = 3') was measured to be no good, because the FRONT half
+  -- starts at the tap mux off 'assembly_q' and already ran at -0.882 ns
+  -- with only two levels -- moving a third into it just swaps which half
+  -- fails.
+  --
+  -- Cost: one cycle of latency, no throughput (the elastic control below
+  -- still moves one beat per cycle through every stage), and
+  -- 'level_count(c_split2)' nodes of extra register -- two of them at
+  -- 5x5, i.e. 2 x 8 bits of max plus 2 x 'c_sum_width' bits of sum.
+  constant c_split1 : natural := c_levels / 2;
+  constant c_split2 : natural := split2_of(c_levels, c_split1);
 
   type sum_level_t is array (0 to c_max_taps - 1) of signed(c_sum_width - 1 downto 0);
   type sum_tree_t is array (0 to c_levels) of sum_level_t;
@@ -234,6 +267,17 @@ architecture a of cnn_accel_pool is
   signal p1_max_q : max_level_t := (others => (others => '0'));
   signal p1_sum_q : sum_level_t := (others => (others => '0'));
 
+  -- Pipeline stage 2: the tree after levels 'c_split1+1 .. c_split2', with
+  -- the same sidebands travelling alongside. See 'c_split2'.
+  signal mid_max : max_level_t;
+  signal mid_sum : sum_level_t;
+
+  signal p2_valid_q : std_ulogic := '0';
+  signal p2_is_avg_q : std_ulogic := '0';
+  signal p2_last_q : std_ulogic := '0';
+  signal p2_max_q : max_level_t := (others => (others => '0'));
+  signal p2_sum_q : sum_level_t := (others => (others => '0'));
+
   ------------------------------------------------------------------------
   -- Two-entry tagged output buffer, shared by both output streams.
   --
@@ -274,6 +318,9 @@ architecture a of cnn_accel_pool is
   signal selected_output_ready : std_ulogic;
   signal out_valid : std_ulogic;
   signal pop : std_ulogic;
+  -- 'push1' moves stage 1 into stage 2, 'push' moves stage 2 into the
+  -- output buffer. Both are functions of registered state only.
+  signal push1 : std_ulogic;
   signal push : std_ulogic;
   signal accepted : std_ulogic;
 
@@ -353,7 +400,7 @@ begin
       end if;
     end loop;
 
-    for level in 1 to c_split loop
+    for level in 1 to c_split1 loop
       for i in 0 to level_count(level) - 1 loop
         if 2 * i + 1 < level_count(level - 1) then
           v_sum(level)(i) := v_sum(level - 1)(2 * i) + v_sum(level - 1)(2 * i + 1);
@@ -369,19 +416,47 @@ begin
       end loop;
     end loop;
 
-    front_max <= v_max(c_split);
-    front_sum <= v_sum(c_split);
+    front_max <= v_max(c_split1);
+    front_sum <= v_sum(c_split1);
   end process;
 
-  -- Levels c_split+1 .. c_levels, combinational off stage 1's registers.
+  -- Levels c_split1+1 .. c_split2, combinational off stage 1's registers.
+  reduce_mid : process(all)
+    variable v_sum : sum_tree_t;
+    variable v_max : max_tree_t;
+  begin
+    v_sum(c_split1) := p1_sum_q;
+    v_max(c_split1) := p1_max_q;
+
+    for level in c_split1 + 1 to c_split2 loop
+      for i in 0 to level_count(level) - 1 loop
+        if 2 * i + 1 < level_count(level - 1) then
+          v_sum(level)(i) := v_sum(level - 1)(2 * i) + v_sum(level - 1)(2 * i + 1);
+          if v_max(level - 1)(2 * i) > v_max(level - 1)(2 * i + 1) then
+            v_max(level)(i) := v_max(level - 1)(2 * i);
+          else
+            v_max(level)(i) := v_max(level - 1)(2 * i + 1);
+          end if;
+        else
+          v_sum(level)(i) := v_sum(level - 1)(2 * i);
+          v_max(level)(i) := v_max(level - 1)(2 * i);
+        end if;
+      end loop;
+    end loop;
+
+    mid_max <= v_max(c_split2);
+    mid_sum <= v_sum(c_split2);
+  end process;
+
+  -- Levels c_split2+1 .. c_levels, combinational off stage 2's registers.
   reduce_back : process(all)
     variable v_sum : sum_tree_t;
     variable v_max : max_tree_t;
   begin
-    v_sum(c_split) := p1_sum_q;
-    v_max(c_split) := p1_max_q;
+    v_sum(c_split2) := p2_sum_q;
+    v_max(c_split2) := p2_max_q;
 
-    for level in c_split + 1 to c_levels loop
+    for level in c_split2 + 1 to c_levels loop
       for i in 0 to level_count(level) - 1 loop
         if 2 * i + 1 < level_count(level - 1) then
           v_sum(level)(i) := v_sum(level - 1)(2 * i) + v_sum(level - 1)(2 * i + 1);
@@ -418,10 +493,14 @@ begin
   selected_output_ready <= m_avgsum_s2m.ready when out_is_avg_q(0) = '1' else m_max_s2m.ready;
 
   pop <= out_valid and selected_output_ready;
-  push <= p1_valid_q when buf_count_q < c_buf_depth else '0';
+  -- Stage 2 -> output buffer, and stage 1 -> stage 2. Both deliberately
+  -- ignore the fact that a pop may free a buffer slot in the same cycle,
+  -- for the same reason the single-stage version did: taking credit for
+  -- it would put the downstream 'ready' back into 's_window_s2m.ready'.
+  push <= p2_valid_q when buf_count_q < c_buf_depth else '0';
+  push1 <= p1_valid_q when (p2_valid_q = '0' or push = '1') else '0';
 
-  s_window_s2m.ready <=
-    cfg_match and ((not p1_valid_q) or to_sl_local(buf_count_q < c_buf_depth));
+  s_window_s2m.ready <= cfg_match and ((not p1_valid_q) or push1);
   accepted <= s_window_m2s.valid and s_window_s2m.ready;
 
   pipeline : process(clk)
@@ -429,16 +508,28 @@ begin
     if rising_edge(clk) then
       if reset = '1' then
         p1_valid_q <= '0';
+        p2_valid_q <= '0';
         buf_count_q <= 0;
       else
         -- Stage 1. Held (not overwritten) whenever it cannot move on.
-        if p1_valid_q = '0' or push = '1' then
+        if p1_valid_q = '0' or push1 = '1' then
           p1_valid_q <= accepted;
           if accepted = '1' then
             p1_is_avg_q <= is_avg_sel;
             p1_last_q <= s_window_m2s.last;
             p1_max_q <= front_max;
             p1_sum_q <= front_sum;
+          end if;
+        end if;
+
+        -- Stage 2, same shape: held whenever it cannot move on.
+        if p2_valid_q = '0' or push = '1' then
+          p2_valid_q <= push1;
+          if push1 = '1' then
+            p2_is_avg_q <= p1_is_avg_q;
+            p2_last_q <= p1_last_q;
+            p2_max_q <= mid_max;
+            p2_sum_q <= mid_sum;
           end if;
         end if;
 
@@ -457,8 +548,8 @@ begin
             -- The slot the pushed beat lands in: the tail, one lower if a
             -- pop is shifting the queue down in this same cycle.
             if e = buf_count_q - to_integer_sl(pop) then
-              out_is_avg_q(e) <= p1_is_avg_q;
-              out_last_q(e) <= p1_last_q;
+              out_is_avg_q(e) <= p2_is_avg_q;
+              out_last_q(e) <= p2_last_q;
               out_max_q(e) <= max_result;
               out_avgsum_q(e) <= avgsum_result;
             end if;

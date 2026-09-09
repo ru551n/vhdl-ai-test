@@ -204,9 +204,13 @@ begin
       end loop;
     end procedure;
 
+    -- The weight region reads through the block RAM's output register, so
+    -- data is valid TWO cycles after the address (see the DUT's read
+    -- process). The bias/scale regions are still one.
     procedure check_weight_row(row : natural; expected : std_ulogic_vector; msg : string) is
     begin
       weight_rd_addr <= std_ulogic_vector(to_unsigned(row, c_addr_width));
+      wait until rising_edge(clk);
       wait until rising_edge(clk);
       wait for c_settle;
       check_equal(weight_rd_data, expected, msg);
@@ -285,17 +289,34 @@ begin
       check_weight_row(0, weight_row_expected(0, 11), "weight region holds weight-routed data");
       check_bias_row(0, bias_row_expected(0, 11), "bias region holds bias-routed data");
 
-    elsif run("test_read_latency_one_cycle") then
-      -- Preload a known pattern, then confirm data is *not* valid the
-      -- same cycle the address is presented, and *is* valid exactly one
-      -- cycle later.
+    elsif run("test_read_latency") then
+      -- Preload a known pattern, then pin down BOTH regions' read
+      -- latency exactly: the weight region reads through the block RAM's
+      -- output register and is valid two cycles after the address (never
+      -- one, which is checked explicitly below), the bias region is
+      -- valid after one. Renamed from 'test_read_latency_one_cycle' when
+      -- the weight region gained that output register -- see the DUT's
+      -- read process for why it did.
       fill_whole_buffer(3);
 
+      -- 'weight_rd_addr' has been 0 since reset, so row 0 is what both
+      -- read stages hold going in; that is what makes the "not yet"
+      -- check below a real check and not a check against 'X'.
       weight_rd_addr <= std_ulogic_vector(to_unsigned(2, c_addr_width));
       wait until rising_edge(clk);
       wait for c_settle;
-      -- One cycle after presenting the address: data must already match.
-      check_equal(weight_rd_data, weight_row_expected(2, 3), "weight read data valid exactly 1 cycle after address");
+      -- One cycle after presenting the address: row 2 has only reached
+      -- the RAM's DO stage, so the output register still presents row 0.
+      check_equal(
+        weight_rd_data, weight_row_expected(0, 3),
+        "weight read data is NOT valid 1 cycle after the address"
+      );
+      wait until rising_edge(clk);
+      wait for c_settle;
+      check_equal(
+        weight_rd_data, weight_row_expected(2, 3),
+        "weight read data valid exactly 2 cycles after address"
+      );
 
       -- Change the address; on this same next cycle (before the next
       -- edge sees it), the *previous* row's data must still be held.
@@ -304,8 +325,12 @@ begin
       wait for c_clk_period / 2 - 2 * c_settle;
       check_equal(weight_rd_data, weight_row_expected(2, 3), "weight read data holds until the next clock edge");
       wait until rising_edge(clk);
+      wait until rising_edge(clk);
       wait for c_settle;
-      check_equal(weight_rd_data, weight_row_expected(1, 3), "weight read data updates 1 cycle after the new address");
+      check_equal(
+        weight_rd_data, weight_row_expected(1, 3),
+        "weight read data updates 2 cycles after the new address"
+      );
 
       bias_rd_addr <= std_ulogic_vector(to_unsigned(c_bias_depth - 1, c_bias_addr_width));
       wait until rising_edge(clk);

@@ -96,6 +96,11 @@ architecture tb of tb_cnn_accel_pe_array is
   signal s_window_s2m : window_s2m_t;
 
   signal weight_rd_addr : std_ulogic_vector(c_addr_width - 1 downto 0);
+  signal weight_rd_en : std_ulogic;
+  -- The model's block-RAM DO stage; 'weight_rd_data' is its output
+  -- register (2-cycle read latency, see 'weight_mem_model').
+  signal weight_rd_data_p : std_ulogic_vector(8 * c_weight_lanes - 1 downto 0) :=
+    (others => '0');
   signal weight_rd_data : std_ulogic_vector(8 * c_weight_lanes - 1 downto 0) := (others => '0');
 
   signal m_accum_m2s : accum_m2s_t(data(0 to c_pe_rows - 1)(c_accum_width - 1 downto 0));
@@ -253,6 +258,7 @@ begin
       s_window_s2m => s_window_s2m,
 
       weight_rd_addr => weight_rd_addr,
+      weight_rd_en => weight_rd_en,
       weight_rd_data => weight_rd_data,
 
       m_accum_m2s => m_accum_m2s,
@@ -260,20 +266,25 @@ begin
     );
 
   ------------------------------------------------------------------------
-  -- Weight "memory" model: registered, 1-cycle read latency, exactly
-  -- cnn_accel_weight_buffer.vhd's own read port contract (see this file's
-  -- header comment). Always responds, regardless of 'reset' (matches the
-  -- real component: the read port is a plain synchronous read, not part
-  -- of any reset-cleared handshake state).
+  -- Weight "memory" model: registered, **2-cycle** read latency, gated by
+  -- 'weight_rd_en' -- exactly cnn_accel_weight_buffer.vhd's own read port
+  -- contract (see this file's header comment and that entity's read
+  -- process, where the second stage is the block RAM's own output
+  -- register). Always responds, regardless of 'reset' (matches the real
+  -- component: the read port is a plain synchronous read, not part of any
+  -- reset-cleared handshake state).
   ------------------------------------------------------------------------
 
   weight_mem_model : process(clk)
     variable addr_int : natural;
   begin
     if rising_edge(clk) then
-      addr_int := to_integer(unsigned(weight_rd_addr));
-      if addr_int <= c_weight_buffer_depth - 1 then
-        weight_rd_data <= pack_weight_row(weight_mem_s(addr_int));
+      if weight_rd_en = '1' then
+        addr_int := to_integer(unsigned(weight_rd_addr));
+        if addr_int <= c_weight_buffer_depth - 1 then
+          weight_rd_data_p <= pack_weight_row(weight_mem_s(addr_int));
+        end if;
+        weight_rd_data <= weight_rd_data_p;
       end if;
     end if;
   end process;

@@ -152,6 +152,49 @@ architecture a of cnn_accel_top_build is
   signal out_q : std_ulogic_vector(c_padded_width - 1 downto 0) := (others => '0');
   signal chunk_q : std_ulogic_vector(c_num_chunks - 1 downto 0) := (others => '0');
 
+  ------------------------------------------------------------------------
+  -- Pad-facing register chains.
+  --
+  -- No accelerator port -- and no harness signal either -- reaches a pin
+  -- directly: 'result' and 'irq' each pass through three further plain
+  -- flip-flops after the reduction/'irq_int', and the LAST one of each
+  -- chain is packed into the output buffer's own IOB flip-flop (the
+  -- 'IOB TRUE' property in 'tcl/cnn_accel_top_build_pinning.xdc'). A
+  -- register-to-pad hop is then IOB-flop clock-to-out plus the OBUF, with
+  -- no fabric routing at all, which is what takes the two pad paths off
+  -- the design's worst-path list where they used to sit at -3.2 ns.
+  --
+  -- 'shreg_extract' is "no" on every stage of both chains, and it has to
+  -- be. Two or more flip-flops in a row on the same clock, with no reset,
+  -- no clock enable and no logic between them, is exactly the pattern
+  -- Vivado's 'shreg_extract' collapses into an SRL16/SRL32 -- and an SRL
+  -- has neither the fixed per-stage placement this chain exists to
+  -- provide nor the ability to be packed into an IOB at all, so the
+  -- collapse would silently undo the whole fix. 'shreg_extract' (not
+  -- 'srl_style') is the right control here: UG901 gives it precedence, and
+  -- it prevents the inference rather than steering it. Verified after the
+  -- build by checking that the design contains zero SRL primitives.
+  --
+  -- Three stages, not one, so that the placer has two freely-placeable
+  -- hops between the (widely spread) reduction logic and the fixed IOB
+  -- site in bank 14. They cost latency only, and this build has no
+  -- latency contract -- it is a static-timing and resource vehicle.
+  ------------------------------------------------------------------------
+  signal result_p1_q : std_ulogic := '0';
+  signal result_p2_q : std_ulogic := '0';
+  signal result_pad_q : std_ulogic := '0';
+  signal irq_p1_q : std_ulogic := '0';
+  signal irq_p2_q : std_ulogic := '0';
+  signal irq_pad_q : std_ulogic := '0';
+
+  attribute shreg_extract : string;
+  attribute shreg_extract of result_p1_q : signal is "no";
+  attribute shreg_extract of result_p2_q : signal is "no";
+  attribute shreg_extract of result_pad_q : signal is "no";
+  attribute shreg_extract of irq_p1_q : signal is "no";
+  attribute shreg_extract of irq_p2_q : signal is "no";
+  attribute shreg_extract of irq_pad_q : signal is "no";
+
   function xor_reduce(value : std_ulogic_vector) return std_ulogic is
     variable result : std_ulogic := '0';
   begin
@@ -216,9 +259,22 @@ begin
       );
     end loop;
 
-    result <= xor_reduce(chunk_q);
-    irq <= irq_int;
+    -- Pad chains: reduction/'irq_int' -> p1 -> p2 -> pad flop -> OBUF.
+    -- See the declaration comment for why there are three of them and why
+    -- every one carries 'shreg_extract = "no"'.
+    result_p1_q <= xor_reduce(chunk_q);
+    result_p2_q <= result_p1_q;
+    result_pad_q <= result_p2_q;
+
+    irq_p1_q <= irq_int;
+    irq_p2_q <= irq_p1_q;
+    irq_pad_q <= irq_p2_q;
   end process;
+
+  -- The only two pad drivers in the design, each a plain flip-flop that
+  -- drives nothing but its own OBUF -- the precondition for IOB packing.
+  result <= result_pad_q;
+  irq <= irq_pad_q;
 
   ------------------------------------------------------------------------
   cnn_accel_top_inst : entity cnn_accel.cnn_accel_top

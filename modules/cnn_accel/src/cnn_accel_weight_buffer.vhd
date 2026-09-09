@@ -107,8 +107,17 @@ entity cnn_accel_weight_buffer is
     --# {{}}
     -- Row (tile) address into the weight region.
     weight_rd_addr : in std_ulogic_vector(num_bits_needed(g_weight_buffer_depth - 1) - 1 downto 0);
+    -- Clock enable for the WEIGHT region's two-stage read pipeline (and
+    -- only that -- the bias/scale reads are unaffected). '0' freezes both
+    -- stages, so 'weight_rd_data' is bit-identical on a frozen cycle and
+    -- the reader's own frozen pipeline stays paired with it. Defaults to
+    -- '1', i.e. the always-on read this port used to be.
+    weight_rd_en : in std_ulogic := '1';
     -- One int8 weight per active PE ('g_pe_rows*g_pe_cols' lanes),
-    -- registered, 1 cycle read latency.
+    -- registered, **2 cycle** read latency (see the block-RAM output
+    -- register note on the read process below), advanced only on cycles
+    -- where 'weight_rd_en' is '1'. The bias and scale ports below still
+    -- have 1 cycle of latency and no enable.
     weight_rd_data : out std_ulogic_vector(8 * g_pe_rows * g_pe_cols - 1 downto 0);
     --# {{}}
     -- Row (tile) address into the bias region.
@@ -220,6 +229,11 @@ architecture a of cnn_accel_weight_buffer is
 
   signal ready_i : std_ulogic;
 
+  -- The weight region's block-RAM DO stage; 'weight_rd_data' is its
+  -- output register. See the read process below.
+  signal weight_rd_data_p : std_ulogic_vector(8 * g_pe_rows * g_pe_cols - 1 downto 0) :=
+    (others => '0');
+
   ------------------------------------------------------------------------
   -- Internal (post-FIFO, or straight-through when 'g_fill_fifo_depth=0')
   -- fill-accept signals: a beat's data and the 'fill_is_bias' value it was
@@ -283,7 +297,40 @@ begin
     fill_fifo_inst : entity fifo.fifo
       generic map (
         width => c_fifo_width,
-        depth => g_fill_fifo_depth
+        -- '+ 1' because of 'enable_output_register' below: 'fifo.fifo'
+        -- takes one word of 'depth' for the output register itself
+        -- ('memory_depth := depth - 1') and then asserts that what is left
+        -- is a power of two. Passing 'g_fill_fifo_depth' unchanged makes
+        -- the RAM 31 deep and trips that assert. With the '+ 1' the RAM is
+        -- exactly the 'g_fill_fifo_depth' words it always was, and the
+        -- FIFO's usable capacity is one word MORE than before (the word
+        -- sitting in the output register), never less -- so no fill
+        -- sequence that fitted before can fail to fit now.
+        depth => g_fill_fifo_depth + 1,
+        -- Block-RAM OUTPUT REGISTER on the prefetch FIFO (shared/
+        -- TimingAndResources.md, "Memories and lookup": use the block
+        -- RAM's output register; never put logic between a RAM's data
+        -- output and the first register).
+        --
+        -- Without it 'fifo_read_data' is the FIFO memory's raw DO port,
+        -- and 'data_i' -- the lane word taken straight off it -- runs
+        -- combinationally through the row-assembly lane mux into
+        -- 'bias_mem'/'weight_mem'/'scale_mem''s DI pins. Post-route that
+        -- was 'fill_fifo/mem_reg/CLKARDCLK -> bias_mem_reg_0/DIADI[1]' at
+        -- -1.273 ns with ZERO logic levels of margin to recover: ~2.1 ns
+        -- of RAMB36 clock-to-out plus the route to another block RAM's
+        -- data-input pins, which is precisely the case the rule names.
+        -- With the output register the FIFO's read data leaves a
+        -- flip-flop instead, at a fraction of the clock-to-out.
+        --
+        -- Free here: the FIFO is a handshake ('fifo.fifo' keeps
+        -- 'read_valid'/'read_ready' coherent with the extra stage itself,
+        -- and reserves one word of the same 'depth' for it), so this
+        -- costs one cycle of fill LATENCY and no throughput at all -- the
+        -- fill stream still accepts one lane per cycle. Nothing outside
+        -- this entity can observe the difference: the fill port is a
+        -- ready/valid stream with no cycle contract.
+        enable_output_register => true
       )
       port map (
         clk => clk,
@@ -406,14 +453,52 @@ begin
   end process;
 
   ------------------------------------------------------------------------
-  -- Read path: registered, 1 cycle latency. No reset -- read-data content
-  -- has no completeness contract of its own (see proposal doc section 4).
+  -- Read path. No reset -- read-data content has no completeness contract
+  -- of its own (see proposal doc section 4).
+  --
+  -- BLOCK-RAM OUTPUT REGISTER on the weight region (shared/
+  -- TimingAndResources.md, "Memories and lookup": use the block RAM's
+  -- output register; it costs one cycle and removes the RAM's clock-to-out
+  -- plus routing from the following stage).
+  --
+  -- 'weight_rd_data' feeds cnn_accel_pe_array's DSP48 A/B ports directly,
+  -- with no logic in between, and post-route that single-register read was
+  -- the largest group of failing endpoints in the whole accelerator:
+  --
+  --   'weight_buffer/weight_mem_reg_1/CLKARDCLK ->
+  --    pe_array/dsp_q_reg[1][0]/D[16]'   -0.985 ns, ZERO logic levels,
+  --    3.444 ns of data path of which 2.125 ns is RAMB36 clock-to-out
+  --
+  -- 388 of the 400 worst paths in the build had exactly that shape. With
+  -- nothing in the path to restructure, the clock-to-out itself is the
+  -- only term left, and the primitive's own output register is what
+  -- removes it: 'weight_rd_data_p' below is the RAM's DO port and
+  -- 'weight_rd_data' the DOREG stage, so Vivado maps the pair onto one
+  -- RAMB36E1 with 'DO*_REG = 1' rather than a RAMB plus fabric
+  -- flip-flops.
+  --
+  -- The extra cycle is absorbed by cnn_accel_pe_array's tap pipeline
+  -- ('tap2_q' there), so weights and activations still meet in the same
+  -- multiply and the array's throughput is unchanged. 'weight_rd_en'
+  -- exists for the other half of that contract: pe_array freezes whole
+  -- when its output register is full, and a two-stage read with no enable
+  -- would keep advancing and hand the frozen multiply the NEXT group's
+  -- weights. (With the old single-stage read, re-presenting the same
+  -- address was enough; with two stages it no longer is, because the
+  -- pipeline would still be draining the row behind it.)
+  --
+  -- Bias and scale are deliberately left at one cycle: they feed
+  -- cnn_accel_bias_requant, whose own pipeline expects that, and they were
+  -- nowhere near the critical path.
   ------------------------------------------------------------------------
 
   read_ports : process(clk)
   begin
     if rising_edge(clk) then
-      weight_rd_data <= weight_mem(to_integer(unsigned(weight_rd_addr)));
+      if weight_rd_en = '1' then
+        weight_rd_data_p <= weight_mem(to_integer(unsigned(weight_rd_addr)));
+        weight_rd_data <= weight_rd_data_p;
+      end if;
       bias_rd_data <= bias_mem(to_integer(unsigned(bias_rd_addr)));
       scale_rd_data <= scale_mem(to_integer(unsigned(bias_rd_addr)));
     end if;

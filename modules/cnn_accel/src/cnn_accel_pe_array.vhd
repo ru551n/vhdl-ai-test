@@ -218,6 +218,11 @@ entity cnn_accel_pe_array is
     -- unconditionally by this module's own sequencing counters (not
     -- AXI4-Stream: a simple, always-ready, 1-cycle-latency read port).
     weight_rd_addr : out std_ulogic_vector(num_bits_needed(g_weight_buffer_depth - 1) - 1 downto 0);
+    -- Clock enable for cnn_accel_weight_buffer's two-stage weight read.
+    -- Driven with this entity's own 'pipe_en', so the buffer's read
+    -- pipeline freezes exactly when this one does and a group's weights
+    -- can never overtake its activations. See 'tap2_q'.
+    weight_rd_en : out std_ulogic;
     -- One int8 weight per PE lane ('g_pe_rows*g_pe_cols' lanes), lane
     -- 'l = r*g_pe_cols + c' (row-major) at bits '8*(l+1)-1 downto 8*l'.
     -- Registered, 1 cycle read latency (cnn_accel_weight_buffer's own
@@ -344,18 +349,56 @@ architecture a of cnn_accel_pe_array is
   constant c_max_abs_product : positive := 2 ** 7 * 2 ** 7;
   constant c_low_field_capacity : positive := 2 ** (c_dsp_shift - 1);
 
+  ------------------------------------------------------------------------
+  -- Bounded width for the per-beat geometry arithmetic.
+  --
+  -- 'cfg_kernel_h'/'cfg_kernel_w' are 8-bit ports, and this entity samples
+  -- them combinationally at 's_window' accept time (see their port
+  -- comment) to form 'mac_taps = kh * kw * g_tile_channels' and
+  -- 'num_groups = ceil(mac_taps / g_pe_cols)'. Those two expressions used
+  -- to be evaluated in unconstrained 'natural' variables -- 32-bit
+  -- integers -- so synthesis built a full 8x8 multiplier feeding a 32-bit
+  -- round-up divider, and post-route the result was the WORST path in the
+  -- whole accelerator:
+  --
+  --   'cmd_proc/desc_q_reg[kernel_h][1] -> pe_array/num_groups_q_reg[3]'
+  --   -1.558 ns, 15 logic levels, 8 of them CARRY4 (3.9 ns of pure logic)
+  --
+  -- The values themselves are tiny: 'cfg_kernel_h/w <= g_max_kernel_size'
+  -- is a hard contract of this entity, asserted at every accept, so only
+  -- 'c_kernel_bits' bits of each port can ever be significant -- three at
+  -- the 5x5 geometry. Taking that many bits bounds the product at
+  -- 'c_kernel_max**2 * g_tile_channels' instead of '2**32', which is what
+  -- collapses the multiplier and the divider. Nothing about the RESULT
+  -- changes for any legal descriptor; an illegal one still fails the
+  -- assert, which reads the full-width ports precisely so that it can.
+  --
+  -- This is the "decode early / bound the datapath" half of
+  -- shared/TimingAndResources.md section 2. The other half -- not doing
+  -- this per beat at all -- would mean 'cnn_accel_cmd_proc' handing over a
+  -- pre-computed group count, which is a wider ISA/port change than this
+  -- pass; it is also why the arithmetic stays combinational here, so the
+  -- documented "sampled at accept time" contract (which
+  -- tb_cnn_accel_pe_array's 'test_varying_kernels' exercises beat by
+  -- beat) is untouched.
+  ------------------------------------------------------------------------
+  constant c_kernel_bits : positive := num_bits_needed(g_max_kernel_size);
+  constant c_kernel_max : positive := 2 ** c_kernel_bits - 1;
+
   -- Index of the last reduction stage (the one whose entry 0 is a
   -- complete per-group partial sum).
   constant c_last_reduce : natural := c_tree_levels - 1;
 
   -- Cycles from a group's 'weight_rd_addr' issue to its contribution
-  -- landing in 'accum_q': 1 weight-buffer read latency + 1 multiply
+  -- landing in 'accum_q': 2 weight-buffer read latency (the buffer's
+  -- block-RAM output register, see that entity's read process) + 1 tap
+  -- alignment stage ('tap2_q') + 1 multiply
   -- stage + 'c_tree_levels' reduction stages + 1 accumulate stage, minus
   -- the issue cycle itself. Documentation only, and now a pure LATENCY
   -- number: no state waits it out any more (entity-level comment's
   -- "cross-position pipelining"), so it costs cycles only once at the end
   -- of a window stream, not once per output pixel.
-  constant c_mac_latency : positive := 2 + c_tree_levels;
+  constant c_mac_latency : positive := 3 + c_tree_levels;
 
   -- Two states only. 'run' issues one group per cycle and rolls straight
   -- into the next accepted beat; 'idle' is entered solely because no beat
@@ -379,6 +422,7 @@ architecture a of cnn_accel_pe_array is
   signal first_tile_q : std_ulogic := '0';
   signal mac_taps_q : natural range 0 to c_window_len := 0;
   signal num_groups_q : natural range 0 to c_max_groups_per_tile := 0;
+
 
   -- Group-sequencing counter: runs 0 .. num_groups_q - 1, one weight-row
   -- address issued per cycle ('num_groups_q' cycles in 'run' per beat).
@@ -439,6 +483,29 @@ architecture a of cnn_accel_pe_array is
   -- can still emit it after 'window_last_q' has been overwritten by a
   -- later beat.
   signal tap_lastout_q : std_ulogic := '0';
+
+  ------------------------------------------------------------------------
+  -- Tap alignment stage.
+  --
+  -- cnn_accel_weight_buffer's weight region now reads through its block
+  -- RAM's own output register (2 cycles instead of 1 -- see that entity's
+  -- read process for the timing reason). The activation taps therefore
+  -- have to wait one more cycle before meeting their weights: group 'g's
+  -- address is issued in cycle t, its 'weight_rd_data' arrives in t+2, and
+  -- 'tap2_q' is what carries that group's taps and sidebands from t+1 to
+  -- t+2 so the multiply below still pairs the two by construction.
+  --
+  -- Pure latency: one more register stage in an already-pipelined path,
+  -- inside the same 'pipe_en', so the array still issues one group per
+  -- cycle and retires one output position per 'num_groups' cycles.
+  -- Re-measured from the conv_core waveform afterwards: 1x1 still 1.000
+  -- cycle/position, 3x3 still 9.000.
+  ------------------------------------------------------------------------
+  signal tap2_q : tap_array_t(0 to g_pe_cols - 1) := (others => (others => '0'));
+  signal tap2_valid_q : std_ulogic := '0';
+  signal tap2_final_q : std_ulogic := '0';
+  signal tap2_first_q : std_ulogic := '0';
+  signal tap2_lastout_q : std_ulogic := '0';
 
   -- Stage 1 output: one PACKED DSP48E1 product per row *pair* per column
   -- (see the DSP48 packing block above). Row 'r' still reads weight lane
@@ -623,6 +690,7 @@ begin
     (others => '0');
 
   weight_rd_addr <= issue_addr when pipe_en = '1' else held_addr_q;
+  weight_rd_en <= pipe_en;
 
   m_accum_m2s.valid <= out_valid_q;
   m_accum_m2s.data <= out_data_q;
@@ -642,10 +710,17 @@ begin
   ------------------------------------------------------------------------
 
   main : process(clk)
-    variable kernel_h_v : natural;
-    variable kernel_w_v : natural;
-    variable mac_taps_v : natural;
-    variable num_groups_v : natural;
+    -- Full-width reads of the two configuration ports, used ONLY by the
+    -- range assert in the accept branch (which synthesis drops, taking
+    -- this 8x8 arithmetic with it).
+    variable kernel_h_full_v : natural range 0 to 2 ** 8 - 1;
+    variable kernel_w_full_v : natural range 0 to 2 ** 8 - 1;
+    -- The bounded copies the datapath uses -- see 'c_kernel_bits'.
+    variable kernel_h_v : natural range 0 to c_kernel_max;
+    variable kernel_w_v : natural range 0 to c_kernel_max;
+    variable mac_taps_v : natural range 0 to c_kernel_max * c_kernel_max * g_tile_channels;
+    variable num_groups_v : natural range
+      0 to (c_kernel_max * c_kernel_max * g_tile_channels + g_pe_cols - 1) / g_pe_cols;
     variable effective_base_v : natural;
     variable idx_v : natural;
     variable weight_lane_v : natural;
@@ -691,6 +766,7 @@ begin
         weight_base_q <= (others => '0');
         out_valid_q <= '0';
         tap_valid_q <= '0';
+        tap2_valid_q <= '0';
         prod_valid_q <= '0';
         reduce_valid_q <= (others => '0');
         held_addr_q <= (others => '0');
@@ -801,13 +877,22 @@ begin
               -- bit-exact.
               w_lo_v := (others => '0');
             end if;
-            dsp_q(p)(c) <= pack_weights(w_hi_v, w_lo_v) * signed(tap_q(c));
+            dsp_q(p)(c) <= pack_weights(w_hi_v, w_lo_v) * signed(tap2_q(c));
           end loop;
         end loop;
-        prod_valid_q <= tap_valid_q;
-        prod_final_q <= tap_final_q;
-        prod_first_q <= tap_first_q;
-        prod_lastout_q <= tap_lastout_q;
+        prod_valid_q <= tap2_valid_q;
+        prod_final_q <= tap2_final_q;
+        prod_first_q <= tap2_first_q;
+        prod_lastout_q <= tap2_lastout_q;
+
+        -- Tap alignment stage (see 'tap2_q'): stage 0's taps and
+        -- sidebands, one cycle on, so they meet the weights the buffer's
+        -- output register delivers in the same cycle.
+        tap2_q <= tap_q;
+        tap2_valid_q <= tap_valid_q;
+        tap2_final_q <= tap_final_q;
+        tap2_first_q <= tap_first_q;
+        tap2_lastout_q <= tap_lastout_q;
 
         -- Stage 0 default: no group issued this cycle (overridden in
         -- 'run' below).
@@ -891,12 +976,22 @@ begin
         --------------------------------------------------------------
 
         if accept_v then
-          kernel_h_v := to_integer(unsigned(cfg_kernel_h));
-          kernel_w_v := to_integer(unsigned(cfg_kernel_w));
+          kernel_h_full_v := to_integer(unsigned(cfg_kernel_h));
+          kernel_w_full_v := to_integer(unsigned(cfg_kernel_w));
 
-          assert kernel_h_v <= g_max_kernel_size and kernel_w_v <= g_max_kernel_size
+          assert kernel_h_full_v <= g_max_kernel_size
+            and kernel_w_full_v <= g_max_kernel_size
             report "cnn_accel_pe_array: cfg_kernel_h/cfg_kernel_w must be <= g_max_kernel_size"
             severity failure;
+
+          -- The BOUNDED copies, and the only ones the datapath below uses.
+          -- See 'c_kernel_bits' for why this narrowing is what makes the
+          -- geometry arithmetic cheap; the assert just above is what makes
+          -- it lossless (for any legal descriptor the two are equal, and
+          -- an illegal one fails the simulation here rather than silently
+          -- wrapping).
+          kernel_h_v := to_integer(unsigned(cfg_kernel_h(c_kernel_bits - 1 downto 0)));
+          kernel_w_v := to_integer(unsigned(cfg_kernel_w(c_kernel_bits - 1 downto 0)));
 
           mac_taps_v := kernel_h_v * kernel_w_v * g_tile_channels;
 

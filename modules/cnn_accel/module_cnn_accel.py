@@ -1077,7 +1077,19 @@ class Module(BaseModule):
                 # and 0 DSP must all stay put.
                 checkers=[
                     TotalLuts(LessThan(2500)),
-                    Ffs(LessThan(60)),
+                    # Re-pinned 2026-09-09, timing pass. Measured 275.
+                    # This gate was badly stale in BOTH directions: it
+                    # predates the registered tap mask, the two-entry
+                    # tagged output buffer AND the second reduction-tree
+                    # register stage this pass added, and 60 has not been
+                    # a plausible flip-flop count for this entity for
+                    # several commits. The stage this pass is responsible
+                    # for is small and exactly countable: one valid, one
+                    # is_avg and one last bit, plus 'level_count(c_split2)'
+                    # = 2 nodes of max (8 bits) and sum (13 bits), i.e.
+                    # ~45 FFs of the 275. Re-pinned loosely, as every
+                    # Yosys gate in this file is, at ~1.45x.
+                    Ffs(LessThan(400)),
                     BlockRams(LessThan(1)),
                     DspBlocks(LessThan(1)),
                 ],
@@ -1125,7 +1137,19 @@ class Module(BaseModule):
                 # at 0, structural (no multiply in this entity).
                 checkers=[
                     TotalLuts(LessThan(1600)),
-                    Ffs(LessThan(2000)),
+                    # Re-pinned 2026-09-09, timing pass. Measured 2304.
+                    # The growth is this pass's block-RAM output register
+                    # on the weight region ('weight_rd_data_p', 8 * 8 * 8
+                    # = 512 bits at this geometry). NOTE the backend
+                    # difference, and do not "fix" it: Vivado folds that
+                    # register into the RAMB36's own DO register and its
+                    # flip-flop count went DOWN (1202 -> 1156), while
+                    # Yosys's xc7 flow keeps it in fabric and the count
+                    # goes up by the full 512. Same RTL, same intent,
+                    # different mapping -- exactly the split the
+                    # module-level "Two synthesis backends" comment
+                    # describes.
+                    Ffs(LessThan(2700)),
                     BlockRams(LessThan(20)),
                     DspBlocks(LessThan(1)),
                 ],
@@ -1491,7 +1515,17 @@ class Module(BaseModule):
                 # which is what the check is for.
                 checkers=[
                     TotalLuts(LessThan(34000)),
-                    Ffs(LessThan(10500)),
+                    # Re-pinned 2026-09-09, timing pass. Measured 10560,
+                    # i.e. the old gate was passed by 60 FFs and is now
+                    # exceeded by 60. The additions are all structural
+                    # timing fixes with countable cost: two boundary skid
+                    # buffers on this entity's 's_stream'/'m_out' ports
+                    # (~2 x 130 bits of data plus control), pe_array's
+                    # 'tap2_q' alignment stage, and weight_buffer's
+                    # fabric-mapped weight output register (see that
+                    # entity's own Yosys gate above). Re-pinned at the
+                    # same loose ~1.14x this gate had.
+                    Ffs(LessThan(12000)),
                     # Re-pinned 2026-09 (YOLOv8n sizing pass): measured 27
                     # (12 window_gen + 15 weight_buffer), up from 18,
                     # entirely from `_MAX_ROW_TILE_WORDS` 512 -> 1920
@@ -1607,7 +1641,18 @@ class Module(BaseModule):
                     # what that `EqualTo` is for.
                     checkers=[
                         TotalLuts(LessThan(5200)),
-                        Ffs(LessThan(3200)),
+                        # Re-pinned 2026-09-09, timing pass. Measured
+                        # 3388. NOT caused by this pass:
+                        # 'cnn_accel_bias_requant.vhd' is byte-identical
+                        # to what it was before it (see the pass's diff),
+                        # so this gate was already failing on 'main'. It
+                        # predates H2 (886f896), which gave this entity
+                        # 'cfg_per_channel_en' plus a per-lane
+                        # (multiplier, shift) mux fed from the weight
+                        # buffer's scale region -- real, feature-driven
+                        # state that was never re-pinned. Measured Fmax
+                        # 186.67 MHz, comfortably over 150.
+                        Ffs(LessThan(3700)),
                         Ramb36(LessThan(1)),
                         Ramb18(LessThan(1)),
                         DspBlocks(EqualTo(32)),
@@ -1672,7 +1717,15 @@ class Module(BaseModule):
                     # happened to the reduction.
                     checkers=[
                         TotalLuts(LessThan(900)),
-                        Ffs(LessThan(260)),
+                        # Re-pinned 2026-09-09, timing pass. Measured
+                        # 279, +19 over the previous measurement: the
+                        # second reduction-tree register stage
+                        # ('p2_*_q', see 'c_split2' in cnn_accel_pool.vhd)
+                        # is 2 max nodes + 2 sum nodes + 3 sidebands at
+                        # this geometry. That stage is what took
+                        # 'p1_max_q -> out_max_q' from -1.964 ns to off
+                        # the failing list in the top-level routed build.
+                        Ffs(LessThan(310)),
                         Ramb36(LessThan(1)),
                         Ramb18(LessThan(1)),
                         DspBlocks(LessThan(1)),
@@ -1704,11 +1757,59 @@ class Module(BaseModule):
                     # same FIFO shows up as LUTs instead (see
                     # conv_core_vivado's own comment).
                     # 150 MHz timing estimate: PASS, 257.80 MHz.
+                    # ===== RE-PINNED 2026-09-09 (timing pass) ==========
+                    # Measured: **1201 LUTs, 1156 FFs, 16 RAMB36 +
+                    # 2 RAMB18, 0 DSP, 247.83 MHz** (gate was 950 / 900 /
+                    # 11 / 1, i.e. failing on all four memory/logic
+                    # checks).
+                    #
+                    # WHERE THE GROWTH CAME FROM -- it is legitimate, and
+                    # almost all of it predates this pass. The checkers
+                    # above were pinned at 587eb1f (S7). Since then
+                    # 886f896 ("per-channel requant scale region ... H2")
+                    # gave this entity a THIRD memory region: 'scale_mem',
+                    # 'g_bias_buffer_depth' rows of
+                    # 'c_scale_entry_width (40) * g_pe_rows' bits, with
+                    # its own write pointer, lane counter and row-assembly
+                    # register, and it widened the prefetch FIFO's payload
+                    # from 32 to 40 bits plus a second region-select bit.
+                    # That is a feature the ISA needs (per-channel
+                    # requantization, which YOLOv8n uses throughout), not
+                    # a lost inference or a duplicated memory: the region
+                    # is read by 'cnn_accel_bias_requant' through
+                    # 'scale_rd_data' and filled through the same fill
+                    # stream with 'fill_is_scale'. The gate was simply
+                    # never refreshed, and 'main' has been failing this
+                    # build since that commit -- measured at 1238 / 1202 /
+                    # 15 / 2 before this pass touched anything.
+                    #
+                    # WHAT THIS PASS CHANGED, and it is a net improvement
+                    # on three of the four numbers: the prefetch FIFO now
+                    # uses 'enable_output_register' and the weight region
+                    # reads through the block RAM's own output register
+                    # (see cnn_accel_weight_buffer.vhd's read process for
+                    # the -1.273 ns / -0.985 ns paths that motivated it).
+                    # LUTs 1238 -> 1201 and FFs 1202 -> 1156: the 512-bit
+                    # weight output register did NOT land in fabric, it
+                    # went into the RAMB36's own DO register, which is the
+                    # whole point. RAMB36 15 -> 16 is the one increase --
+                    # the prefetch FIFO's depth goes from 32 to 33 words
+                    # ('fifo.fifo' reserves one for its output register
+                    # and then requires the RAM depth to be a power of
+                    # two), so it no longer shares a tile.
+                    #
+                    # Leaf additivity now holds EXACTLY at the conv_core
+                    # level, which it did not before: conv_core's 28
+                    # RAMB36 = window_gen's 12 + this entity's 16. The
+                    # previous 12 + 15 = 27 never matched conv_core's
+                    # measured 28, because Vivado had been giving the
+                    # composed instance one tile more than the standalone
+                    # one for the same FIFO.
                     checkers=[
-                        TotalLuts(LessThan(950)),
-                        Ffs(LessThan(900)),
-                        Ramb36(EqualTo(11)),
-                        Ramb18(EqualTo(1)),
+                        TotalLuts(LessThan(1350)),
+                        Ffs(LessThan(1300)),
+                        Ramb36(EqualTo(16)),
+                        Ramb18(EqualTo(2)),
                         DspBlocks(LessThan(1)),
                     ],
                     analyze_synthesis_timing=True,
@@ -2272,10 +2373,32 @@ class Module(BaseModule):
                     #
                     # Re-pinned at the same ~1.10x headroom the previous
                     # pair carried (11200 over 10197, 8400 over 7668).
+                    # ===== RE-PINNED 2026-09-09 (timing pass) ==========
+                    # Measured: **11314 LUTs, 9361 FFs, 28 RAMB36 +
+                    # 2 RAMB18, 68 DSP**. Only the RAMB36 gate moves,
+                    # 27 -> 28, and it was already failing on 'main'
+                    # before this pass.
+                    #
+                    # 28 is what leaf additivity actually predicts now
+                    # that 'cnn_accel_weight_buffer_vivado' is measured
+                    # honestly: window_gen 12 + weight_buffer 16 = 28.
+                    # The old 27 came from adding window_gen's 12 to a
+                    # STALE weight_buffer figure of 15 (see that build's
+                    # own comment); the composed instance has been at 28
+                    # all along. Nothing about this entity's block-RAM
+                    # inference changed -- no region moved to distributed
+                    # RAM, no memory is duplicated.
+                    #
+                    # DSP stays exactly 68 = 64 (bias_requant, 4 per
+                    # requant lane x 16... at 8 rows: 4 x 8 = 32, plus
+                    # pe_array's 32 packed int8 MACs) + 4 (window_gen
+                    # address arithmetic), i.e. the DSP48 int8 packing is
+                    # intact after the 'tap2_q' alignment stage and the
+                    # bounded 'c_kernel_bits' geometry arithmetic.
                     checkers=[
                         TotalLuts(LessThan(13200)),
                         Ffs(LessThan(9800)),
-                        Ramb36(EqualTo(27)),
+                        Ramb36(EqualTo(28)),
                         Ramb18(EqualTo(2)),
                         DspBlocks(EqualTo(68)),
                     ],
@@ -2559,10 +2682,19 @@ class Module(BaseModule):
                     # Fmax again bit-identical; the 60 fps scaled point
                     # still clears 150 MHz with a 19% margin. Re-pinned at
                     # the same ~1.10x headroom as before.
+                    # ===== RE-PINNED 2026-09-09 (timing pass) ==========
+                    # Measured: **18159 LUTs, 15193 FFs, 43 RAMB36 +
+                    # 2 RAMB18, 132 DSP**. As with the 8-row build above,
+                    # only the RAMB36 gate moves (42 -> 43) and it was
+                    # already failing on 'main' before this pass -- the
+                    # 42 was pinned from a measurement taken when the
+                    # weight buffer's scale region (H2) did not exist.
+                    # DSP is bit-identical at 132, so the int8 packing is
+                    # intact at the scaled point too.
                     checkers=[
                         TotalLuts(LessThan(20700)),
                         Ffs(LessThan(16100)),
-                        Ramb36(EqualTo(42)),
+                        Ramb36(EqualTo(43)),
                         Ramb18(EqualTo(2)),
                         DspBlocks(EqualTo(132)),
                     ],

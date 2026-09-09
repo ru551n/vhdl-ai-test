@@ -440,6 +440,41 @@ architecture a of cnn_accel_cmd_proc is
   ------------------------------------------------------------------------
 
   signal pass_q : unsigned(15 downto 0) := (others => '0');
+
+  ------------------------------------------------------------------------
+  -- Per-pass DDR byte offsets, kept as ACCUMULATORS rather than as
+  -- 'pass_q * <stride>' products.
+  --
+  -- Each of the four DDR base addresses this FSM issues (weight tile,
+  -- bias row, scale row, output plane, input plane) used to be formed as
+  -- 'base + resize(pass_q * stride(15 downto 0), 32)' in the state that
+  -- issues the request. 'pass_q' advances by exactly one per pass and
+  -- every stride is a per-command constant, so the product is an
+  -- accumulator by construction -- and building it as a product cost a
+  -- whole DSP48 plus a 32-bit carry chain in the FSM's own critical
+  -- cycle. Post-route that was the worst path in the accelerator:
+  --
+  --   'cmd_proc/wgt_tile_bytes_q1/CLK (DSP48E1)
+  --    -> cmd_proc/side_req_q_reg[req][addr][31]/D'
+  --   -1.040 ns, 10 logic levels (DSP48E1 + 8 CARRY4), 4.87 ns of logic
+  --
+  -- As accumulators the same addresses are one 32-bit add off a register,
+  -- and the DSP and its clock-to-out disappear. Values are identical by
+  -- induction: each offset starts at 0 exactly where 'pass_q' is cleared
+  -- and gains its stride exactly where 'pass_q' is incremented, and the
+  -- strides are the same '(15 downto 0)' truncations the products used,
+  -- so every partial sum equals the product it replaces.
+  --
+  -- This is shared/TimingAndResources.md section 2 ("per-command
+  -- configuration must never be computed per cycle") applied to address
+  -- generation, and the same technique cnn_accel_window_gen already uses
+  -- for its row-bank read address ('rd_base_q').
+  ------------------------------------------------------------------------
+  signal wgt_pass_off_q : unsigned(31 downto 0) := (others => '0');
+  signal bias_pass_off_q : unsigned(31 downto 0) := (others => '0');
+  signal scale_pass_off_q : unsigned(31 downto 0) := (others => '0');
+  signal out_pass_off_q : unsigned(31 downto 0) := (others => '0');
+  signal in_pass_off_q : unsigned(31 downto 0) := (others => '0');
   signal pass_last_q : std_ulogic := '0';
 
   ------------------------------------------------------------------------
@@ -1130,12 +1165,26 @@ begin
               wgt_tile_bytes_q'length
             );
             pass_q <= (others => '0');
+            -- Pass-offset accumulators start with 'pass_q' -- see their
+            -- declaration.
+            wgt_pass_off_q <= (others => '0');
+            bias_pass_off_q <= (others => '0');
+            scale_pass_off_q <= (others => '0');
+            out_pass_off_q <= (others => '0');
+            in_pass_off_q <= (others => '0');
           else
             out_total_bytes_q <= shift_left(
               resize(v_prod * n_tiles_q, 32), c_word_shift
             );
             n_planes_out_q <= n_tiles_q;
             pass_q <= (others => '0');
+            -- Pass-offset accumulators start with 'pass_q' -- see their
+            -- declaration.
+            wgt_pass_off_q <= (others => '0');
+            bias_pass_off_q <= (others => '0');
+            scale_pass_off_q <= (others => '0');
+            out_pass_off_q <= (others => '0');
+            in_pass_off_q <= (others => '0');
           end if;
 
           in_total_bytes_q <= shift_left(
@@ -1271,8 +1320,7 @@ begin
             case wgt_stage_q is
               when 0 =>
                 wgt_region_q <= rg_weight;
-                side_req_q.req.addr <= desc_q.weight_addr
-                  + resize(pass_q * wgt_tile_bytes_q(15 downto 0), 32);
+                side_req_q.req.addr <= desc_q.weight_addr + wgt_pass_off_q;
                 side_req_q.req.length <= wgt_tile_bytes_q;
                 side_req_q.valid <= '1';
                 wgt_fill_active_q <= '1';
@@ -1280,8 +1328,7 @@ begin
               when 1 =>
                 if desc_q.flags(c_flag_bias_en) = '1' then
                   wgt_region_q <= rg_bias;
-                  side_req_q.req.addr <= desc_q.bias_addr
-                    + resize(pass_q * to_unsigned(g_pe_rows * c_bias_entry_bytes, 16), 32);
+                  side_req_q.req.addr <= desc_q.bias_addr + bias_pass_off_q;
                   side_req_q.req.length <=
                     to_unsigned(g_pe_rows * c_bias_entry_bytes, 32);
                   side_req_q.valid <= '1';
@@ -1294,8 +1341,7 @@ begin
               when others =>
                 if desc_q.flags(c_flag_per_channel_en) = '1' then
                   wgt_region_q <= rg_scale;
-                  side_req_q.req.addr <= desc_q.scale_addr
-                    + resize(pass_q * to_unsigned(g_pe_rows * c_scale_entry_bytes, 16), 32);
+                  side_req_q.req.addr <= desc_q.scale_addr + scale_pass_off_q;
                   side_req_q.req.length <=
                     to_unsigned(g_pe_rows * c_scale_entry_bytes, 32);
                   side_req_q.valid <= '1';
@@ -1337,8 +1383,7 @@ begin
             pass_last_q <= '0';
           end if;
 
-          dst_req_q.req.addr <= desc_q.out_addr
-            + resize(pass_q * out_plane_bytes_q(15 downto 0), 32);
+          dst_req_q.req.addr <= desc_q.out_addr + out_pass_off_q;
           dst_req_q.req.length <= out_plane_bytes_q;
           dst_req_q.valid <= '1';
           state <= st_pass_req_dst;
@@ -1377,6 +1422,19 @@ begin
               state <= st_retire;
             else
               pass_q <= pass_q + 1;
+              -- ... and advance with it, by one stride each. See their
+              -- declaration for why this is exactly the product it
+              -- replaces.
+              wgt_pass_off_q <= wgt_pass_off_q
+                + resize(wgt_tile_bytes_q(15 downto 0), 32);
+              bias_pass_off_q <= bias_pass_off_q
+                + to_unsigned(g_pe_rows * c_bias_entry_bytes, 32);
+              scale_pass_off_q <= scale_pass_off_q
+                + to_unsigned(g_pe_rows * c_scale_entry_bytes, 32);
+              out_pass_off_q <= out_pass_off_q
+                + resize(out_plane_bytes_q(15 downto 0), 32);
+              in_pass_off_q <= in_pass_off_q
+                + resize(in_plane_bytes_q(15 downto 0), 32);
               if engine_conv_q = '1' then
                 state <= st_wgt_setup;
               else
@@ -1568,8 +1626,7 @@ begin
                 + resize(feed_row_q * in_row_bytes_q(15 downto 0), 32);
               feed_req_q.req.length <= in_row_bytes_q;
             elsif engine_pool_q = '1' then
-              feed_req_q.req.addr <= desc_q.in_addr
-                + resize(pass_q * in_plane_bytes_q(15 downto 0), 32);
+              feed_req_q.req.addr <= desc_q.in_addr + in_pass_off_q;
               feed_req_q.req.length <= in_plane_bytes_q;
             else
               feed_req_q.req.addr <= desc_q.in_addr;

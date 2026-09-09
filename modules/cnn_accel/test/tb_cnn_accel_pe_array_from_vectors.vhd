@@ -96,6 +96,9 @@ architecture tb of tb_cnn_accel_pe_array_from_vectors is
   signal s_window_s2m : window_s2m_t;
 
   signal weight_rd_addr : std_ulogic_vector(c_addr_width - 1 downto 0);
+  signal weight_rd_en : std_ulogic;
+  signal weight_rd_data_p : std_ulogic_vector(8 * c_weight_lanes - 1 downto 0) :=
+    (others => '0');
   signal weight_rd_data : std_ulogic_vector(8 * c_weight_lanes - 1 downto 0) := (others => '0');
 
   signal m_accum_m2s : accum_m2s_t(data(0 to c_pe_rows - 1)(c_accum_width - 1 downto 0));
@@ -220,6 +223,7 @@ begin
       s_window_s2m => s_window_s2m,
 
       weight_rd_addr => weight_rd_addr,
+      weight_rd_en => weight_rd_en,
       weight_rd_data => weight_rd_data,
 
       m_accum_m2s => m_accum_m2s,
@@ -227,17 +231,22 @@ begin
     );
 
   ------------------------------------------------------------------------
-  -- Weight "memory" model: registered, 1-cycle read latency -- same
-  -- contract/idiom as tb_cnn_accel_pe_array.vhd's identical process.
+  -- Weight "memory" model: registered, 2-cycle read latency gated by
+  -- 'weight_rd_en' -- same contract/idiom as tb_cnn_accel_pe_array.vhd's
+  -- identical process, and as cnn_accel_weight_buffer's own read port
+  -- (whose second stage is the block RAM's output register).
   ------------------------------------------------------------------------
 
   weight_mem_model : process(clk)
     variable addr_int : natural;
   begin
     if rising_edge(clk) then
-      addr_int := to_integer(unsigned(weight_rd_addr));
-      if addr_int <= c_weight_buffer_depth - 1 then
-        weight_rd_data <= pack_weight_row(weight_mem_s(addr_int));
+      if weight_rd_en = '1' then
+        addr_int := to_integer(unsigned(weight_rd_addr));
+        if addr_int <= c_weight_buffer_depth - 1 then
+          weight_rd_data_p <= pack_weight_row(weight_mem_s(addr_int));
+        end if;
+        weight_rd_data <= weight_rd_data_p;
       end if;
     end if;
   end process;
