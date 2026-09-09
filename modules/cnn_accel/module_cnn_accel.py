@@ -1280,6 +1280,19 @@ class Module(BaseModule):
                 #    the way Vivado does (Vivado's FF count goes *down*,
                 #    3212 -> 2124; see the Vivado twin below). LUT/FF keep
                 #    the module-level ~1.75x structural headroom.
+                #
+                # ========= CROSS-POSITION PIPELINING (2026-09) =======
+                # Re-measured after cnn_accel_pe_array.vhd removed the
+                # per-output-position 'drain'/accept overhead (see that
+                # file's "Cross-position pipelining" block): **1981 LUTs,
+                # 2134 FFs, 0 BRAM, 33 DSP** (was 2235 / 2124 / 0 / 33).
+                # DSP is unchanged at 33 -- the packing is untouched --
+                # and the +10 FFs are the three new one-bit flag
+                # pipelines ('first'/'lastout', carried per stage), the
+                # 'first_tile_q' latch and the 6-bit 'held_addr_q'. LUTs
+                # fell because two FSM states and the per-pixel
+                # accumulator-clear mux are gone. No checker moves: every
+                # number is well inside the limits below.
                 checkers=[
                     TotalLuts(LessThan(4000)),
                     Ffs(LessThan(3800)),
@@ -1450,6 +1463,11 @@ class Module(BaseModule):
                     # would put back, which is what this gate is for.
                     DspBlocks(LessThan(80)),
                 ],
+                # ========= CROSS-POSITION PIPELINING (2026-09) =======
+                # Re-measured after the pe_array change above: **12045
+                # LUTs, 8627 FFs, 12 RAMB36 + 15 RAMB18 (27 total), 69
+                # DSP**. DSP and block RAM are bit-for-bit unchanged; the
+                # LUT/FF deltas are pe_array's own, unchanged limits.
             ),
         ]
 
@@ -1884,6 +1902,45 @@ class Module(BaseModule):
                     #    `reduce_q` carries `use_dsp = "no"` -- see its
                     #    declaration in cnn_accel_pe_array.vhd. The 492
                     #    LUTs that costs buy back 28 DSPs.
+                    #
+                    # ===== CROSS-POSITION PIPELINING (2026-09) =======
+                    # Re-measured after cnn_accel_pe_array.vhd removed the
+                    # per-output-position pipeline overhead (its
+                    # "Cross-position pipelining" block): the array now
+                    # sustains one group per cycle across output-pixel
+                    # boundaries instead of paying 'T + c_mac_latency'
+                    # extra cycles per pixel -- 3x3 conv went 15 -> 9
+                    # cycles per output position, the exact
+                    # 'T*num_groups' ideal.
+                    #
+                    # **1860 LUTs, 2142 FFs, 0 BRAM, 32 DSP,
+                    # 205.97 MHz** (was 1852 / 2124 / 0 / 32 / 205.97,
+                    # re-measured on this machine in the same session, not
+                    # quoted from the comment above).
+                    #
+                    #  * DSP **exactly unchanged at 32**, which is the
+                    #    point of the `EqualTo` below: the throughput
+                    #    rework had to leave the int8 packing alone, and
+                    #    it did -- `tap_q`/`dsp_q` are still absorbed as
+                    #    the DSP48E1's own input/M registers even though
+                    #    they now carry a clock enable (`pipe_en` maps to
+                    #    the DSP's CE, not to fabric).
+                    #  * FF +18: the 'first'/'lastout' flag pipelines
+                    #    (2 bits per MAC stage), 'first_tile_q' and the
+                    #    6-bit 'held_addr_q'. LUT +8, i.e. the two
+                    #    removed FSM states very nearly pay for the
+                    #    global clock enable.
+                    #  * **Fmax bit-identical at 205.97 MHz** -- the
+                    #    enable fan-out and the late-select address mux
+                    #    cost nothing measurable, and the entity stays
+                    #    37% above the 150 MHz target.
+                    #  * Every simulation expected value is unchanged
+                    #    (141/141 `cnn_accel.*`): this is a scheduling
+                    #    change, so any shift would be a bug.
+                    #
+                    # Checkers below are NOT moved: 1860 < 2050 and
+                    # 2142 < 2350 still, so the existing ~10% margins
+                    # absorb this change without being re-slackened.
                     checkers=[
                         TotalLuts(LessThan(2050)),
                         Ffs(LessThan(2350)),
@@ -2024,6 +2081,25 @@ class Module(BaseModule):
                     # `cnn_accel.*` VUnit tests unchanged) -- the packing
                     # is a mapping change, so an expected-value shift here
                     # would be a bug, never a new baseline.
+                    #
+                    # ===== CROSS-POSITION PIPELINING (2026-09) =======
+                    # Re-measured after the pe_array throughput rework
+                    # (see the pe_array Vivado entry above): **10197
+                    # LUTs, 7668 FFs, 27 RAMB36 + 2 RAMB18, 68 DSP,
+                    # 178.57 MHz** (was 10179 / 7647 / 27 + 2 / 68 /
+                    # 178.57). +18 LUTs and +21 FFs -- pe_array's own
+                    # delta and nothing else -- with DSP, block RAM and
+                    # **Fmax all bit-identical**. What it buys, measured
+                    # from a VCD of `test_bitexact_full_throughput` at
+                    # zero stall (accumulator output beats per output
+                    # position): 3x3 conv 15.0 -> **9.0** cycles/position
+                    # (the `T*num_groups` ideal, PE array 100% busy),
+                    # 3-tile 3x3 35.0 -> **27.25**, 1x1 conv 7.0 ->
+                    # **4.0** -- and 1x1 is no longer pe_array-bound at
+                    # all (it needs only 1 cycle/position now; the 4 is
+                    # cnn_accel_window_gen's per-window column walk, the
+                    # next bottleneck to attack).
+                    # Checkers unchanged: 10197 < 11200, 7668 < 8400.
                     checkers=[
                         TotalLuts(LessThan(11200)),
                         Ffs(LessThan(8400)),
@@ -2187,6 +2263,18 @@ class Module(BaseModule):
                     # 64 DSP of the XC7A200T's 740 -- the 128-MAC array now
                     # costs 8.6% of the DSPs and 2.5% of the LUTs, where
                     # before it cost 0% and 9.2%.
+                    #
+                    # ===== CROSS-POSITION PIPELINING (2026-09) =======
+                    # Re-measured after the same change as the 8-row
+                    # entry above: **3374 LUTs, 3662 FFs, 0 BRAM,
+                    # 64 DSP, 205.97 MHz** (was 3359 / 3638 / 0 / 64 /
+                    # 205.97). DSP is exactly `g_pe_rows/2 * g_pe_cols`
+                    # still, i.e. the packing survives at the scaled
+                    # point too; LUT +15 / FF +24 is the same fixed
+                    # control-side cost as at 8 rows (the flag pipelines
+                    # are per-stage, not per-row, so it does not double),
+                    # and Fmax is bit-identical. Checkers unchanged:
+                    # 3374 < 3700, 3662 < 4000.
                     checkers=[
                         TotalLuts(LessThan(3700)),
                         Ffs(LessThan(4000)),
@@ -2274,6 +2362,17 @@ class Module(BaseModule):
                     #  * Fmax 170.33 -> 178.57 MHz, matching the 8-row
                     #    build exactly, so the critical path still does not
                     #    scale with `g_pe_rows`.
+                    #
+                    # ===== CROSS-POSITION PIPELINING (2026-09) =======
+                    # Re-measured after the pe_array throughput rework
+                    # (see the 8-row conv_core entry above for what it
+                    # buys in cycles/position): **17033 LUTs, 13379 FFs,
+                    # 42 RAMB36 + 2 RAMB18, 132 DSP, 178.57 MHz** (was
+                    # 16989 / 13348 / 42 + 2 / 132 / 178.57). +44 LUTs,
+                    # +31 FFs, everything else bit-identical including
+                    # Fmax, so the 60 fps scaled point still clears
+                    # 150 MHz with the same 19% margin. Checkers
+                    # unchanged: 17033 < 18700, 13379 < 14700.
                     checkers=[
                         TotalLuts(LessThan(18700)),
                         Ffs(LessThan(14700)),

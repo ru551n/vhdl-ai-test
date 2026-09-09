@@ -29,9 +29,10 @@ use cnn_accel.cnn_accel_pkg.all;
 -- 'T = ceil(in_channels / g_tile_channels)' input-channel tiles arrives as
 -- 'T' consecutive 's_window_m2s' beats, 'first_tile'/'last_tile' marking
 -- the first/last of that run (both '1' when 'T = 1', per
--- 'cnn_accel_pkg.window_m2s_t's own contract). 'first_tile = '1'' clears
--- all 'g_pe_rows' accumulators; every beat's group sequence accumulates
--- into them (never cleared between tiles of one pixel); 'last_tile = '1''
+-- 'cnn_accel_pkg.window_m2s_t's own contract). 'first_tile = '1'' restarts
+-- all 'g_pe_rows' accumulators (its group 0 LOADS rather than adds -- see
+-- "cross-position pipelining" below); every later group of the pixel
+-- accumulates into them (never restarted between tiles); 'last_tile = '1''
 -- commits the final int32 sums, once its own group sequence completes, to
 -- a one-entry output register and emits 'm_accum_m2s' ('last' mirrors the
 -- accepted window's 'last'). The accumulators are 'g_pe_rows' flip-flops
@@ -44,11 +45,14 @@ use cnn_accel.cnn_accel_pkg.all;
 -- across every tile beat of that pixel before wrapping again at the next
 -- pixel's 'first_tile' (doc/cnn_accel_tiled_dataflow_proposal.md section 4).
 --
--- Only one window (one tile beat) is ever "in flight" through the compute
--- engine; the completed-but-undrained pixel result is held in a separate
--- one-entry output register (proposal doc section 3.6) so the compute
--- engine can already start the next tile beat's (or next pixel's) group
--- sequence while the previous pixel's result waits on 'm_accum_s2m.ready'.
+-- One window (one tile beat) is latched at a time in 'window_q' for the
+-- tap mux, but the MAC pipeline behind it holds up to 'c_mac_latency'
+-- further groups -- belonging to later tile beats and later OUTPUT PIXELS
+-- (see "cross-position pipelining" below). The completed pixel result is
+-- held in a separate one-entry output register (proposal doc section 3.6)
+-- so the compute engine can already start the next tile beat's (or next
+-- pixel's) group sequence while the previous pixel's result waits on
+-- 'm_accum_s2m.ready'.
 --
 -- MAC pipeline (S7 timing fix, flow_status.md): the multiply-then-
 -- accumulate for one group is split over a register pipeline instead of
@@ -72,23 +76,61 @@ use cnn_accel.cnn_accel_pkg.all;
 --
 -- Total 'c_mac_latency = 2 + c_tree_levels' cycles from a group's address
 -- issue to its contribution landing in 'accum_q' (5 at the project's
--- 'g_pe_cols = 8'). Throughput is unchanged at one group per cycle.
+-- 'g_pe_cols = 8'). Throughput is one group per cycle, and (see next
+-- paragraph) that rate is now sustained across output-pixel boundaries
+-- too, so 'c_mac_latency' is a pure LATENCY number: it is paid once at the
+-- end of a whole window stream, never per pixel.
 --
--- Because the pipeline is self-timed off its own valid flags rather than
--- off 'state_q', a *non*-last tile beat returns to 'idle' as soon as its
--- last address is issued and its tail drains into 'accum_q' while the next
--- tile beat of the same pixel is already issuing (both only ever add into
--- the same running sum, one entry per cycle, so the overlap is safe). Only
--- a 'last_tile' beat has to wait, in the new 'drain' state, for its own
--- last group to reach the accumulate stage before the pixel's sum can be
--- committed -- 'c_mac_latency' cycles once per output pixel, against one
--- cycle per *beat* saved by the earlier 'idle' return. Net per-pixel cost
--- is 'T*(num_groups + 1) + c_mac_latency' cycles versus the previous
--- 'T*(num_groups + 2)': cheaper for every pixel with more than
--- 'c_mac_latency' input-channel tiles (which is most of the target
--- backbone -- T runs 1, 2, 4, 4, 8, 8, 16, 16, 32), and
+-- Cross-position pipelining ("the drain removal"). Two structures used to
+-- force the array empty between consecutive output pixels, costing
+-- 'T + c_mac_latency' cycles on top of every pixel's 'T*num_groups' cycles
+-- of real work (measured: 7 cycles per 1x1 output position of which 1 does
+-- work, 15 per 3x3 of which 9 do):
+--
+--   1. 'accum_q' was cleared at 's_window' ACCEPT time on a 'first_tile'
+--      beat. Because the clear raced the tail of the previous pixel still
+--      in flight, a 'last_tile' beat had to sit in a 'drain' state with
+--      's_window_s2m.ready' low for 'c_mac_latency' cycles, until its own
+--      last group had reached the accumulate stage. That is the
+--      '+ c_mac_latency' per pixel.
+--   2. 's_window_s2m.ready' was '1' only in 'idle', so accepting a beat
+--      cost a cycle of its own on top of that beat's 'num_groups' issue
+--      cycles. That is the '+ T' per pixel (one per tile beat).
+--
+-- Both are gone. (1) 'accum_q' is no longer cleared out of band: a
+-- 'first' flag travels with the group through the pipeline (like 'valid'
+-- and 'final' already did) and the accumulate stage LOADS instead of adds
+-- when it is set. Since that stage sees groups in strict issue order, the
+-- boundary between pixel N and pixel N+1 is just the cycle the 'first'
+-- flag arrives -- no emptying required, and pixel N+1's groups can be
+-- issued while pixel N's tail is still in the multiply/reduce stages.
+-- The commit ('final' flag) reads the very same 'final_accum_v' the load/
+-- add produces, so it is bit-identical to the old 'drain'-state commit;
+-- 'last' rides the pipeline as 'reduce_lastout_q' rather than being read
+-- from the (by then already overwritten) per-beat 'window_last_q'.
+-- (2) 's_window_s2m.ready' is additionally '1' on the LAST issue cycle of
+-- a beat ('cycle_q + 1 = num_groups_q'), so the next beat is latched into
+-- 'window_q' in the same cycle the current beat issues its last group and
+-- 'run' continues straight into it with no 'idle' cycle in between.
+--
+-- Net per-pixel cost is therefore 'T*num_groups' cycles in steady state
+-- (down from 'T*(num_groups + 1) + c_mac_latency'), plus a one-off
+-- 'c_mac_latency + 1' cycles of pipeline latency at the end of a stream.
 -- 'doc/cnn_accel_sizing_proposal.md' section 3's frame model (which counts
--- only the 'T*num_groups' group-issue cycles) is unaffected either way.
+-- only the 'T*num_groups' group-issue cycles) is now exactly achieved
+-- rather than merely bounded.
+--
+-- Backpressure. With pixels overlapping there is no longer a state in
+-- which the array is guaranteed empty, so a stalled 'm_accum' is absorbed
+-- by freezing the WHOLE module for a cycle instead: 'pipe_en' (low exactly
+-- when the output register is full and the sink is not ready) gates every
+-- register in this file -- FSM, counters, 'window_q', the MAC pipeline
+-- stages and 'accum_q' -- and forces 's_window_s2m.ready' low. Nothing is
+-- dropped and nothing is reordered; this is the same single-clock-enable
+-- idiom cnn_accel_bias_requant.vhd already uses for its own 7-stage
+-- pipeline ('pipe_en' there too). It also removes the old 'done' state,
+-- whose only job was to park a completed pixel until the output register
+-- freed up.
 --
 -- v1 scope deviation from the pre-tiling requirement/proposal docs
 -- (recorded prominently per this round's instructions, not silently
@@ -141,10 +183,12 @@ entity cnn_accel_pe_array is
     -- Synchronous active-high reset ('reset_internal' at the IP top
     -- level): clears the FSM to 'idle' and drops any in-flight/pending
     -- accumulation and any pending-but-undrained output beat. The
-    -- accumulator registers' content does not need explicit reset (only
-    -- ever read while the, already-reset, state machine guarantees a
-    -- fresh 'first_tile' beat clears them before any post-reset
-    -- accumulate) -- see the entity-level comment.
+    -- accumulator registers' content does not need explicit reset: the
+    -- first post-reset group to reach the accumulate stage necessarily
+    -- carries the pipelined 'first' flag (it is group 0 of a 'first_tile'
+    -- beat), and that flag LOADS 'accum_q' rather than adding into it, so
+    -- no pre-reset value can survive into a result -- see the entity-level
+    -- comment's "cross-position pipelining".
     reset : in std_ulogic := '0';
     --# {{}}
     -- Kernel height/width for the in-flight layer. Added by vhdesign (not
@@ -307,18 +351,19 @@ architecture a of cnn_accel_pe_array is
   -- Cycles from a group's 'weight_rd_addr' issue to its contribution
   -- landing in 'accum_q': 1 weight-buffer read latency + 1 multiply
   -- stage + 'c_tree_levels' reduction stages + 1 accumulate stage, minus
-  -- the issue cycle itself. Documentation only -- the 'drain' state below
-  -- is self-timed off 'reduce_final_q', not off this number.
+  -- the issue cycle itself. Documentation only, and now a pure LATENCY
+  -- number: no state waits it out any more (entity-level comment's
+  -- "cross-position pipelining"), so it costs cycles only once at the end
+  -- of a window stream, not once per output pixel.
   constant c_mac_latency : positive := 2 + c_tree_levels;
 
-  -- 'drain' (new with the MAC pipeline, entity-level comment): a
-  -- 'last_tile' beat has issued its last group's address but that group is
-  -- still in flight through the multiply/reduce/accumulate stages, so the
-  -- pixel's sum is not complete yet. Blocks 's_window_s2m.ready' for
-  -- exactly 'c_mac_latency' cycles, which is also what keeps the next
-  -- pixel's 'first_tile' accumulator clear from ever racing an in-flight
-  -- partial sum.
-  type state_t is (idle, run, drain, done);
+  -- Two states only. 'run' issues one group per cycle and rolls straight
+  -- into the next accepted beat; 'idle' is entered solely because no beat
+  -- was offered on the last issue cycle. The old 'drain' (wait out
+  -- 'c_mac_latency' before the next pixel could start) and 'done' (park a
+  -- completed pixel until the output register frees up) states are gone --
+  -- see the entity-level comment.
+  type state_t is (idle, run);
   signal state_q : state_t := idle;
 
   -- Per-beat latched configuration/data, captured at 's_window' accept
@@ -327,6 +372,11 @@ architecture a of cnn_accel_pe_array is
   signal window_q : tap_array_t(0 to c_window_len - 1) := (others => (others => '0'));
   signal window_last_q : std_ulogic := '0';
   signal last_tile_q : std_ulogic := '0';
+  -- 'first_tile' of the beat currently in 'window_q'. Latched (it was
+  -- previously only read combinationally at accept time, to clear
+  -- 'accum_q') because the accumulator clear is now a pipelined 'first'
+  -- flag raised on this beat's group 0 -- entity-level comment.
+  signal first_tile_q : std_ulogic := '0';
   signal mac_taps_q : natural range 0 to c_window_len := 0;
   signal num_groups_q : natural range 0 to c_max_groups_per_tile := 0;
 
@@ -342,9 +392,13 @@ architecture a of cnn_accel_pe_array is
   -- beat's first row (doc/cnn_accel_tiled_dataflow_proposal.md section 4).
   signal weight_base_q : unsigned(c_ptr_width - 1 downto 0) := (others => '0');
 
-  -- Partial-sum accumulators: 'g_pe_rows' flip-flops, cleared on
-  -- 'first_tile', carried across every tile beat of one pixel, holding
-  -- only the one in-flight pixel's sums (entity-level comment).
+  -- Partial-sum accumulators: 'g_pe_rows' flip-flops, LOADED (rather than
+  -- added into) by the group carrying the pipelined 'first' flag, then
+  -- added into by every following group of that pixel, holding only the
+  -- one pixel whose groups are currently at the accumulate stage
+  -- (entity-level comment). Later pixels' groups may already be in the
+  -- earlier stages; they reach this register strictly in issue order, so
+  -- one bank still suffices.
   signal accum_q : accum_array_t(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0) :=
     (others => (others => '0'));
 
@@ -375,6 +429,16 @@ architecture a of cnn_accel_pe_array is
   -- 'this is the last group of a last_tile beat', i.e. the group whose
   -- stage-3 accumulate completes the output pixel.
   signal tap_final_q : std_ulogic := '0';
+  -- 'this is the FIRST group of a first_tile beat', i.e. the group whose
+  -- stage-3 accumulate must LOAD 'accum_q' instead of adding into it. This
+  -- flag is what replaces the old accumulator clear at 's_window' accept
+  -- time, and is the whole reason consecutive output pixels can overlap in
+  -- the pipeline (entity-level comment).
+  signal tap_first_q : std_ulogic := '0';
+  -- The accepted window's 'last', carried alongside 'final' so the commit
+  -- can still emit it after 'window_last_q' has been overwritten by a
+  -- later beat.
+  signal tap_lastout_q : std_ulogic := '0';
 
   -- Stage 1 output: one PACKED DSP48E1 product per row *pair* per column
   -- (see the DSP48 packing block above). Row 'r' still reads weight lane
@@ -394,6 +458,8 @@ architecture a of cnn_accel_pe_array is
   signal dsp_q : dsp_array_t := (others => (others => (others => '0')));
   signal prod_valid_q : std_ulogic := '0';
   signal prod_final_q : std_ulogic := '0';
+  signal prod_first_q : std_ulogic := '0';
+  signal prod_lastout_q : std_ulogic := '0';
 
   -- Vivado mapping hint: force the packed multiply into a DSP48E1 rather
   -- than leaving it to the size heuristic that put the *unpacked* 8x8
@@ -432,6 +498,31 @@ architecture a of cnn_accel_pe_array is
   attribute use_dsp of reduce_q : signal is "no";
   signal reduce_valid_q : std_ulogic_vector(0 to c_last_reduce) := (others => '0');
   signal reduce_final_q : std_ulogic_vector(0 to c_last_reduce) := (others => '0');
+  signal reduce_first_q : std_ulogic_vector(0 to c_last_reduce) := (others => '0');
+  signal reduce_lastout_q : std_ulogic_vector(0 to c_last_reduce) := (others => '0');
+
+  -- Single clock enable for every register in this file (entity-level
+  -- comment, "Backpressure"): low exactly when the one-entry output
+  -- register is full and 'm_accum_s2m' is not accepting, which is the only
+  -- reason this module ever has to hold. Pure function of registered state
+  -- plus the sink's own 'ready' input -- no combinational loop (the same
+  -- shape cnn_accel_bias_requant.vhd's 'pipe_en' has).
+  signal pipe_en : std_ulogic;
+
+  -- The 'weight_rd_addr' value presented last cycle, re-presented while
+  -- 'pipe_en' is low. cnn_accel_weight_buffer's read port is a plain
+  -- always-on registered read with NO clock enable of its own (its own
+  -- contract), so it advances even on a cycle this module is frozen: if
+  -- the address were allowed to move on, its 'weight_rd_data' would run
+  -- one group ahead of the frozen 'tap_q' and the multiply would pair the
+  -- wrong weight row with the held activation taps (a real, measured
+  -- mis-compare, not a theoretical one). Re-presenting the same address
+  -- makes the buffer re-read the same row, so 'weight_rd_data' is
+  -- bit-identical on every frozen cycle and the pairing survives the
+  -- stall. Only the mux SELECT is late ('pipe_en'); both data inputs are
+  -- registered.
+  signal held_addr_q : std_ulogic_vector(c_addr_width - 1 downto 0) := (others => '0');
+  signal issue_addr : std_ulogic_vector(c_addr_width - 1 downto 0);
 
   -- Zero-padded, width-extended read of PE row product 'i', for the
   -- tree's power-of-two padding entries (only reachable when 'g_pe_cols'
@@ -502,32 +593,52 @@ begin
 
   ------------------------------------------------------------------------
   -- Handshake: 's_window_s2m.ready' is a pure function of registered
-  -- state ('state_q = idle'), never of 's_window_m2s.valid' itself -- no
-  -- combinational loop (shared/Axi4.md). 'weight_rd_addr' is likewise a
-  -- pure function of registered state, driven unconditionally while a
-  -- group remains to be issued this beat (proposal doc section 10).
+  -- state ('state_q'/'cycle_q'/'num_groups_q'/'out_valid_q') and of the
+  -- SINK's 'ready' input, never of 's_window_m2s.valid' itself -- no
+  -- combinational loop (shared/Axi4.md; the same shape
+  -- cnn_accel_bias_requant.vhd's 's_accum_s2m.ready <= pipe_en' has).
+  --
+  -- Ready in 'idle' (nothing in the tap register) OR on the last issue
+  -- cycle of the beat currently in it: latching the next beat then costs
+  -- no cycle of its own, because 'window_q'/'mac_taps_q'/'num_groups_q'
+  -- are read by this cycle's tap mux before the new values take effect
+  -- (entity-level comment item 2). 'cycle_q + 1 = num_groups_q' rather
+  -- than 'cycle_q = num_groups_q - 1' so the expression is also safe for
+  -- the power-on 'num_groups_q = 0'.
+  --
+  -- 'weight_rd_addr' is likewise a pure function of registered state,
+  -- driven unconditionally while a group remains to be issued this beat
+  -- (proposal doc section 10).
   ------------------------------------------------------------------------
 
-  s_window_s2m.ready <= '1' when state_q = idle else '0';
+  pipe_en <= '1' when (out_valid_q = '0') or (m_accum_s2m.ready = '1') else '0';
 
-  weight_rd_addr <=
+  s_window_s2m.ready <=
+    pipe_en when (state_q = idle) or (cycle_q + 1 = num_groups_q) else '0';
+
+  issue_addr <=
     std_ulogic_vector(
       resize(weight_base_q + to_unsigned(cycle_q, c_ptr_width), c_addr_width)
     ) when state_q = run else
     (others => '0');
+
+  weight_rd_addr <= issue_addr when pipe_en = '1' else held_addr_q;
 
   m_accum_m2s.valid <= out_valid_q;
   m_accum_m2s.data <= out_data_q;
   m_accum_m2s.last <= out_last_q;
 
   ------------------------------------------------------------------------
-  -- Compute engine: window-tile accept (idle) -> address issue (run) ->
-  -- pipeline drain (drain, 'last_tile' beats only) -> output-register
-  -- wait (done, only entered when a 'last_tile' beat's commit found the
-  -- output register still full) -- proposal doc section 5, extended with
-  -- the multi-tile partial-sum carry (doc/cnn_accel_tiled_dataflow_
-  -- proposal.md section 3) and the three-stage MAC pipeline (this file's
-  -- entity-level comment).
+  -- Compute engine: window-tile accept ('idle', or the last issue cycle of
+  -- the beat already in 'run') -> address issue ('run', one group per
+  -- cycle) -- proposal doc section 5, extended with the multi-tile
+  -- partial-sum carry (doc/cnn_accel_tiled_dataflow_proposal.md section 3),
+  -- the MAC pipeline and the cross-position pipelining that removed the
+  -- old 'drain'/'done' states (this file's entity-level comment).
+  --
+  -- Every register below is inside 'if pipe_en = '1'', i.e. the module is
+  -- frozen whole for any cycle the output register is full and the sink is
+  -- not accepting. That is the only stall this module has.
   ------------------------------------------------------------------------
 
   main : process(clk)
@@ -539,7 +650,14 @@ begin
     variable idx_v : natural;
     variable weight_lane_v : natural;
     variable final_accum_v : accum_array_t(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0);
-    variable can_commit_v : boolean;
+    -- Set by the 'case' below when a new 's_window' beat is being accepted
+    -- this cycle, together with the weight-row base the CURRENT beat
+    -- leaves behind ('weight_base_q' in 'idle', where the finishing beat
+    -- already advanced it; 'weight_base_q + num_groups_q' when accepting
+    -- on the finishing beat's own last issue cycle, where it has not yet).
+    -- Shared so the accept body exists exactly once.
+    variable accept_v : boolean;
+    variable base_after_v : unsigned(c_ptr_width - 1 downto 0);
     -- The two int8 x int8 products recovered from each packed DSP result,
     -- laid out exactly like the pre-packing 'prod_q' register so the
     -- adder tree below is byte-for-byte the code it always was.
@@ -548,13 +666,23 @@ begin
     variable w_lo_v : signed(7 downto 0);
   begin
     if rising_edge(clk) then
-      -- Stage 3 (the only place 'accum_q' is ever added into): one
-      -- 'g_accum_width'-bit add per PE row. Computed here as a variable so
-      -- the 'drain' commit below can use the same value in the same cycle
-      -- it is written back (no extra commit cycle).
+      -- Stage 3 (the only place 'accum_q' is ever written): one
+      -- 'g_accum_width'-bit add per PE row -- or a plain LOAD of the
+      -- reduced per-group sum when this group carries the pipelined
+      -- 'first' flag, which is what starts a new output pixel without the
+      -- array ever having to be emptied (entity-level comment). Loading is
+      -- bit-identical to the old "clear 'accum_q' to zero at accept time,
+      -- then add group 0 into it": '0 + x = x' at 'g_accum_width' bits.
+      -- Computed here as a variable so the commit below can use the same
+      -- value in the same cycle it is written back (no extra commit
+      -- cycle).
       for r in 0 to g_pe_rows - 1 loop
-        final_accum_v(r) :=
-          accum_q(r) + resize(reduce_q(c_last_reduce)(r)(0), g_accum_width);
+        if reduce_first_q(c_last_reduce) = '1' then
+          final_accum_v(r) := resize(reduce_q(c_last_reduce)(r)(0), g_accum_width);
+        else
+          final_accum_v(r) :=
+            accum_q(r) + resize(reduce_q(c_last_reduce)(r)(0), g_accum_width);
+        end if;
       end loop;
 
       if reset = '1' then
@@ -565,31 +693,46 @@ begin
         tap_valid_q <= '0';
         prod_valid_q <= '0';
         reduce_valid_q <= (others => '0');
-      else
-        can_commit_v := (out_valid_q = '0') or (m_accum_s2m.ready = '1');
+        held_addr_q <= (others => '0');
+      elsif pipe_en = '1' then
+        accept_v := false;
+        -- Remember the address actually presented this cycle, so a freeze
+        -- starting next cycle can re-present it (see 'held_addr_q').
+        held_addr_q <= issue_addr;
+        base_after_v := weight_base_q;
 
         -- Default output-register drain, overridden below by a same-
         -- cycle commit (no bubble on back-to-back commit+drain) -- same
         -- idiom as cnn_accel_pool.vhd/cnn_accel_bias_requant.vhd's own
-        -- one-entry output registers.
+        -- one-entry output registers. 'pipe_en = '1'' already means the
+        -- register is either empty or being drained this cycle.
         if out_valid_q = '1' and m_accum_s2m.ready = '1' then
           out_valid_q <= '0';
         end if;
 
         --------------------------------------------------------------
         -- MAC pipeline stages 3, 2 and 1. Driven purely by their own
-        -- valid pipeline, never by 'state_q', so a non-'last_tile'
-        -- beat's tail keeps draining into 'accum_q' after the FSM has
-        -- already returned to 'idle' and accepted the next tile beat of
-        -- the same pixel (entity-level comment). Written before the
-        -- 'case' so the 'first_tile' accumulator clear below overrides
-        -- the stage-3 write-back -- which is safe precisely because a
-        -- 'first_tile' beat can only be accepted with the pipeline
-        -- empty (the previous pixel's 'drain' state guarantees it).
+        -- valid pipeline, never by 'state_q', so the tail of one beat
+        -- (or of one whole output pixel) keeps flowing into 'accum_q'
+        -- while the FSM is already issuing the next beat's -- or the
+        -- next PIXEL's -- groups (entity-level comment). The accumulate
+        -- stage sees groups in strict issue order, so the pixel boundary
+        -- is simply the cycle 'reduce_first_q' arrives, and the commit
+        -- ('reduce_final_q') publishes exactly the value written back.
         --------------------------------------------------------------
 
         if reduce_valid_q(c_last_reduce) = '1' then
           accum_q <= final_accum_v;
+
+          if reduce_final_q(c_last_reduce) = '1' then
+            -- This group completed an output pixel. 'pipe_en' guarantees
+            -- the one-entry output register is free (or freeing) this
+            -- cycle, so the commit can never be blocked and no 'done'
+            -- state is needed.
+            out_valid_q <= '1';
+            out_data_q <= final_accum_v;
+            out_last_q <= reduce_lastout_q(c_last_reduce);
+          end if;
         end if;
 
         -- Unpack every DSP48E1 result into the two PE-row products it
@@ -619,6 +762,8 @@ begin
         end loop;
         reduce_valid_q(0) <= prod_valid_q;
         reduce_final_q(0) <= prod_final_q;
+        reduce_first_q(0) <= prod_first_q;
+        reduce_lastout_q(0) <= prod_lastout_q;
 
         -- Reduction stages 1 .. c_last_reduce: one balanced tree level
         -- each. Null range when 'g_pe_cols' <= 2.
@@ -633,6 +778,8 @@ begin
           end loop;
           reduce_valid_q(level) <= reduce_valid_q(level - 1);
           reduce_final_q(level) <= reduce_final_q(level - 1);
+          reduce_first_q(level) <= reduce_first_q(level - 1);
+          reduce_lastout_q(level) <= reduce_lastout_q(level - 1);
         end loop;
 
         -- Stage 1, the packed multiply: one DSP48E1 per row pair per
@@ -659,68 +806,22 @@ begin
         end loop;
         prod_valid_q <= tap_valid_q;
         prod_final_q <= tap_final_q;
+        prod_first_q <= tap_first_q;
+        prod_lastout_q <= tap_lastout_q;
 
         -- Stage 0 default: no group issued this cycle (overridden in
         -- 'run' below).
         tap_valid_q <= '0';
         tap_final_q <= '0';
+        tap_first_q <= '0';
 
         case state_q is
 
           when idle =>
+            -- Nothing in 'window_q'. 's_window_s2m.ready' is 'pipe_en'
+            -- here, so a valid beat is being accepted this cycle.
             if s_window_m2s.valid = '1' then
-              kernel_h_v := to_integer(unsigned(cfg_kernel_h));
-              kernel_w_v := to_integer(unsigned(cfg_kernel_w));
-
-              assert kernel_h_v <= g_max_kernel_size and kernel_w_v <= g_max_kernel_size
-                report "cnn_accel_pe_array: cfg_kernel_h/cfg_kernel_w must be <= g_max_kernel_size"
-                severity failure;
-
-              mac_taps_v := kernel_h_v * kernel_w_v * g_tile_channels;
-
-              assert mac_taps_v >= 1
-                report "cnn_accel_pe_array: cfg_kernel_h/cfg_kernel_w must both be >= 1"
-                severity failure;
-
-              assert mac_taps_v <= c_window_len
-                report "cnn_accel_pe_array: kernel_h*kernel_w*g_tile_channels (" &
-                  natural'image(mac_taps_v) & ") exceeds s_window_m2s.data's element count (" &
-                  natural'image(c_window_len) & ")"
-                severity failure;
-
-              num_groups_v := (mac_taps_v + g_pe_cols - 1) / g_pe_cols;
-
-              if s_window_m2s.first_tile = '1' then
-                effective_base_v := 0;
-              else
-                effective_base_v := to_integer(weight_base_q);
-              end if;
-
-              assert effective_base_v + num_groups_v <= g_weight_buffer_depth
-                report "cnn_accel_pe_array: weight_rd_addr sequence (base " &
-                  natural'image(effective_base_v) & " + " & natural'image(num_groups_v) &
-                  " groups) exceeds g_weight_buffer_depth (" &
-                  natural'image(g_weight_buffer_depth) & ")"
-                severity failure;
-
-              if s_window_m2s.first_tile = '1' then
-                weight_base_q <= (others => '0');
-                -- Partial-sum carry: a first-tile beat starts a fresh
-                -- pixel, so the accumulators from any previous pixel are
-                -- cleared here rather than after this beat's own group
-                -- sequence -- the same cycle-1 group's partial sum is
-                -- added into an all-zero accumulator (see the 'run'
-                -- state below, which always adds into 'accum_q').
-                accum_q <= (others => (others => '0'));
-              end if;
-
-              window_q <= s_window_m2s.data;
-              window_last_q <= s_window_m2s.last;
-              last_tile_q <= s_window_m2s.last_tile;
-              mac_taps_q <= mac_taps_v;
-              num_groups_q <= num_groups_v;
-              cycle_q <= 0;
-              state_q <= run;
+              accept_v := true;
             end if;
 
           when run =>
@@ -746,6 +847,14 @@ begin
             end loop;
             tap_valid_q <= '1';
 
+            -- Group 0 of a 'first_tile' beat is the group that starts a
+            -- new output pixel: its accumulate stage LOADS 'accum_q'
+            -- rather than adding into it. This replaces the old
+            -- accept-time accumulator clear (entity-level comment).
+            if cycle_q = 0 then
+              tap_first_q <= first_tile_q;
+            end if;
+
             if cycle_q = num_groups_q - 1 then
               -- Last address of this beat. 'weight_base_q' advances by
               -- this beat's own 'num_groups_q' so the next tile beat of
@@ -753,52 +862,84 @@ begin
               -- sequence -- doc/cnn_accel_tiled_dataflow_proposal.md
               -- section 4, unchanged by the pipeline.
               tap_final_q <= last_tile_q;
-              weight_base_q <= weight_base_q + to_unsigned(num_groups_q, c_ptr_width);
+              tap_lastout_q <= window_last_q;
+              base_after_v := weight_base_q + to_unsigned(num_groups_q, c_ptr_width);
+              weight_base_q <= base_after_v;
               cycle_q <= 0;
 
-              if last_tile_q = '1' then
-                -- The pixel's sum is not complete until this group
-                -- reaches stage 3, three cycles from now.
-                state_q <= drain;
+              -- 's_window_s2m.ready' is also '1' on this cycle, so the
+              -- next beat -- of this pixel OR of the next one -- can be
+              -- latched right now and 'run' continues into it without an
+              -- 'idle' cycle. Its groups simply queue behind this beat's
+              -- tail in the MAC pipeline.
+              if s_window_m2s.valid = '1' then
+                accept_v := true;
               else
-                -- Nothing left to wait for: the next tile beat of this
-                -- pixel can be accepted immediately and its own groups
-                -- will simply queue up behind this beat's tail, adding
-                -- into the same running 'accum_q'.
                 state_q <= idle;
               end if;
             else
               cycle_q <= cycle_q + 1;
             end if;
 
-          when drain =>
-            -- 'reduce_final_q(c_last_reduce)' marks the 'last_tile' beat's
-            -- last group arriving at the accumulate stage, so
-            -- 'final_accum_v' *is* this output pixel's completed sum this
-            -- cycle (and is written back into 'accum_q' by the accumulate
-            -- block above, which is what the 'done' path below then
-            -- commits).
-            if reduce_valid_q(c_last_reduce) = '1'
-              and reduce_final_q(c_last_reduce) = '1' then
-              if can_commit_v then
-                out_valid_q <= '1';
-                out_data_q <= final_accum_v;
-                out_last_q <= window_last_q;
-                state_q <= idle;
-              else
-                state_q <= done;
-              end if;
-            end if;
-
-          when done =>
-            if can_commit_v then
-              out_valid_q <= '1';
-              out_data_q <= accum_q;
-              out_last_q <= window_last_q;
-              state_q <= idle;
-            end if;
-
         end case;
+
+        --------------------------------------------------------------
+        -- Window accept. One body for both accept points ('idle' and
+        -- the last issue cycle of 'run'); they differ only in the
+        -- weight-row base the finishing beat leaves behind, which the
+        -- 'case' above put in 'base_after_v'.
+        --------------------------------------------------------------
+
+        if accept_v then
+          kernel_h_v := to_integer(unsigned(cfg_kernel_h));
+          kernel_w_v := to_integer(unsigned(cfg_kernel_w));
+
+          assert kernel_h_v <= g_max_kernel_size and kernel_w_v <= g_max_kernel_size
+            report "cnn_accel_pe_array: cfg_kernel_h/cfg_kernel_w must be <= g_max_kernel_size"
+            severity failure;
+
+          mac_taps_v := kernel_h_v * kernel_w_v * g_tile_channels;
+
+          assert mac_taps_v >= 1
+            report "cnn_accel_pe_array: cfg_kernel_h/cfg_kernel_w must both be >= 1"
+            severity failure;
+
+          assert mac_taps_v <= c_window_len
+            report "cnn_accel_pe_array: kernel_h*kernel_w*g_tile_channels (" &
+              natural'image(mac_taps_v) & ") exceeds s_window_m2s.data's element count (" &
+              natural'image(c_window_len) & ")"
+            severity failure;
+
+          num_groups_v := (mac_taps_v + g_pe_cols - 1) / g_pe_cols;
+
+          if s_window_m2s.first_tile = '1' then
+            effective_base_v := 0;
+          else
+            effective_base_v := to_integer(base_after_v);
+          end if;
+
+          assert effective_base_v + num_groups_v <= g_weight_buffer_depth
+            report "cnn_accel_pe_array: weight_rd_addr sequence (base " &
+              natural'image(effective_base_v) & " + " & natural'image(num_groups_v) &
+              " groups) exceeds g_weight_buffer_depth (" &
+              natural'image(g_weight_buffer_depth) & ")"
+            severity failure;
+
+          -- Overrides the 'weight_base_q <= base_after_v' the 'run'
+          -- branch above may already have made this cycle (last
+          -- assignment wins): the accepted beat's own base is what the
+          -- next 'run' cycle must issue from.
+          weight_base_q <= to_unsigned(effective_base_v, c_ptr_width);
+
+          window_q <= s_window_m2s.data;
+          window_last_q <= s_window_m2s.last;
+          last_tile_q <= s_window_m2s.last_tile;
+          first_tile_q <= s_window_m2s.first_tile;
+          mac_taps_q <= mac_taps_v;
+          num_groups_q <= num_groups_v;
+          cycle_q <= 0;
+          state_q <= run;
+        end if;
       end if;
     end if;
   end process;

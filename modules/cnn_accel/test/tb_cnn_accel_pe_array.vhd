@@ -483,16 +483,21 @@ begin
       -- Zero stall on both links (generic-driven, per
       -- module_cnn_accel.py's per-test config): must sustain the ideal
       -- per-pixel cycle count back-to-back, with no extra bubble beyond
-      -- that. With the S7 pipelined MAC that is
-      -- 'T*(num_groups + 1) + c_mac_latency' cycles per pixel (1 idle
-      -- accept cycle + num_groups address-issue cycles per tile beat, plus
-      -- one 'drain' of the last beat's pipeline tail per pixel). For this
-      -- fixed T=1/3x3/c_tile_channels=6/c_pe_cols=4 shape: num_groups =
-      -- ceil(54/4) = 14 and c_mac_latency = 2 + ceil(log2(4)) = 4, so
-      -- 1*(14 + 1) + 4 = 19 cycles per pixel (was 16 with the
-      -- single-cycle combinational MAC, which capped the entity at
-      -- ~56 MHz -- see cnn_accel_pe_array.vhd's entity comment). 40
-      -- pixels * 19 = 760 cycles, still inside the 800-cycle bound below.
+      -- that. Since the cross-position pipelining (cnn_accel_pe_array.vhd's
+      -- own entity comment) removed the per-pixel 'drain' and the
+      -- per-beat accept cycle, the ideal is now exactly the
+      -- 'T*num_groups' group-issue cycles -- the array issues one group
+      -- EVERY cycle, for ever, with 'c_mac_latency' paid once at the end
+      -- of the whole stream rather than once per pixel.
+      --
+      -- For this fixed T=1/3x3/c_tile_channels=6/c_pe_cols=4 shape:
+      -- num_groups = ceil(54/4) = 14, so 14 cycles per pixel (was
+      -- 'T*(num_groups + 1) + c_mac_latency' = 19, and 16 before the S7
+      -- pipelined MAC). 40 pixels * 14 = 560 cycles plus the one-off
+      -- c_mac_latency = 2 + ceil(log2(4)) = 4 cycle tail and a couple of
+      -- cycles of testbench start-up, well inside the 600-cycle bound
+      -- below -- which is deliberately tighter than 40*15, so a
+      -- regression that put back even ONE bubble per pixel fails here.
       start_time := now;
       for p in 0 to 39 loop
         run_pixel(3, 3, 1, p = 39);
@@ -500,7 +505,7 @@ begin
       drain_and_check(200);
 
       check_relation(
-        (now - start_time) < 800 * c_clk_period,
+        (now - start_time) < 600 * c_clk_period,
         "cnn_accel_pe_array did not sustain full throughput at zero stall"
       );
 
@@ -513,6 +518,47 @@ begin
         run_pixel(3, 3, 1 + (p mod 3), p = 7);
       end loop;
       drain_and_check(3000);
+
+    elsif run("test_pipelined_positions_backpressure") then
+      -- Guards the cross-position pipelining (cnn_accel_pe_array.vhd's
+      -- "cross-position pipelining"/"Backpressure" paragraphs) at its
+      -- worst point: SEVERAL OUTPUT POSITIONS IN FLIGHT AT ONCE while
+      -- 'm_accum' stalls hard.
+      --
+      -- 1x1 kernels are the shape that packs positions tightest here:
+      -- mac_taps = 1*1*c_tile_channels = 6, so num_groups = ceil(6/4) = 2
+      -- and a new pixel is issued every 2 cycles, against a MAC pipeline
+      -- that is c_mac_latency = 2 + ceil(log2(4)) = 4 cycles deep. Up to
+      -- three different output positions are therefore between the tap
+      -- register and the accumulator at any moment -- a situation the old
+      -- 'drain'-per-pixel design could not produce at all, which is why
+      -- 'test_backpressure' above (3x3, num_groups = 14 >> 4) does not
+      -- cover it.
+      --
+      -- Zero stall on the INPUT link (so the positions really do pack
+      -- back-to-back; a stalled input would space them out and hide the
+      -- overlap) and heavy stall on the OUTPUT link, which is what forces
+      -- 'pipe_en' low with several positions mid-pipeline. Every result
+      -- must still come out, in order, bit-identical -- nothing dropped,
+      -- nothing reordered, no weight row paired with the wrong taps
+      -- across the freeze.
+      stall_pct_in <= 0;
+      stall_pct_out <= 70;
+      wait until rising_edge(clk);
+
+      for p in 0 to 39 loop
+        run_pixel(1, 1, 1, false);
+      end loop;
+      -- Then the same thing with multi-tile pixels, so a freeze can also
+      -- land in the middle of one pixel's tile run (partial sums held in
+      -- 'accum_q') while a LATER pixel's groups are already issued.
+      for p in 0 to 19 loop
+        run_pixel(1, 1, 1 + (p mod 3), p = 19);
+      end loop;
+      drain_and_check(6000);
+
+      stall_pct_in <= stall_probability_percent_in;
+      stall_pct_out <= stall_probability_percent_out;
 
     elsif run("test_backpressure") then
       -- Forces a non-zero stall locally on both links regardless of the
