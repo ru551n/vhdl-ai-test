@@ -50,7 +50,13 @@ from accel_v2 import isa
 from accel_v2.ddrmap import DdrMap
 from accel_v2.memimage import MemoryImage
 from accel_v2.model import ActOp, AddOp, Conv2dOp, CopyOp, PoolOp, UpsampleOp
-from accel_v2.planner import ComputeStep, MoveStep, PlannedProgram
+from accel_v2.planner import (
+    ComputeStep,
+    MoveStep,
+    PlannedProgram,
+    RowCopyStep,
+    descriptor_count,
+)
 
 #: `MoveStep.kind -> DescV2 opcode` (section 5.2: `LOAD`/`STORE` are one
 #: DMA family differing only in operand space tags).
@@ -153,6 +159,43 @@ def _lut_addrs(planned: PlannedProgram, ddr_map: DdrMap, image: MemoryImage) -> 
     return addrs
 
 
+def _row_copy_opcode(src_space: int, dst_space: int) -> int:
+    """`LOAD`, `STORE` or `COPY` for one plane of a `RowCopyOp`, chosen
+    from the two resolved operand spaces and nothing else.
+
+    Section 5.2: `LOAD`/`STORE` are one DMA family differing only in
+    which end is `LOCAL_TENSOR`, and `COPY` is the elementwise engine's
+    opaque byte move that is legal between any two spaces. A row copy
+    therefore needs no opcode of its own -- which is the whole reason the
+    tiling design fits inside ISA v2.1 unchanged. Where a row copy sits
+    (group-input load, join window, strip store) is a fact about the
+    graph, never about the descriptor."""
+    if src_space == isa.SPACE_DDR and dst_space == isa.SPACE_LOCAL_TENSOR:
+        return isa.OPCODE_LOAD
+    if src_space == isa.SPACE_LOCAL_TENSOR and dst_space == isa.SPACE_DDR:
+        return isa.OPCODE_STORE
+    return isa.OPCODE_COPY
+
+
+def _row_copy_descs(step: RowCopyStep, next_addrs: list[int]) -> list[isa.DescV2]:
+    """One descriptor per activation plane. `next_addrs` is parallel to
+    `step.transfers`: each plane chains to the following plane, and the
+    last to whatever follows the whole step."""
+    opcode = _row_copy_opcode(step.src_space, step.dst_space)
+    return [
+        isa.DescV2(
+            opcode=opcode,
+            space_src0=step.src_space,
+            space_dst=step.dst_space,
+            in_addr=src_addr,
+            out_addr=dst_addr,
+            xfer_bytes=nbytes,
+            next_instr_addr=next_addr,
+        )
+        for (src_addr, dst_addr, nbytes), next_addr in zip(step.transfers, next_addrs)
+    ]
+
+
 def _move_desc(step: MoveStep, next_addr: int) -> isa.DescV2:
     return isa.DescV2(
         opcode=_MOVE_OPCODE[step.kind],
@@ -175,6 +218,27 @@ def _compute_desc(
 
     if isinstance(op, Conv2dOp):
         x = op.inputs[0]
+        # R8. `WEIGHT_REUSE` does not mean "these weights are already in
+        # the weight buffer, skip the fetch for pass 0"; `cmd_proc.vhd`
+        # (:1177-1179) skips the weight refill for EVERY output-channel
+        # pass, so with more than one pass every pass but the last-loaded
+        # one would run on the wrong tile. It is correct only when the op
+        # has a single pass, i.e. `out_channels <= PE_ROWS`. Nothing in
+        # the catalogue has ever violated that, and the tiler never sets
+        # the flag at all (a strip clone reuses the weight *object*, not
+        # the descriptor bit) -- but the failure mode is silent numeric
+        # corruption on the DUT only, so it is refused here, at the one
+        # place that can see both the flag and the channel count.
+        n_ot = -(-op.output.channels // golden.PE_ROWS)
+        if op.weight_reuse and n_ot > 1:
+            raise ValueError(
+                f"program: conv '{op.name}' sets WEIGHT_REUSE with {op.output.channels} "
+                f"output channels, which is {n_ot} output-channel passes. The hardware "
+                "skips the weight refill for every pass, not just the first, so passes "
+                "2.. would compute on whichever tile happened to be resident. "
+                f"WEIGHT_REUSE is only correct for out_channels <= {golden.PE_ROWS}; drop "
+                "`weight_reuse_from` and let this conv fetch its own weights."
+            )
         alloc = weight_allocations[id(op)]
         clamp_min, clamp_max = op.clamp if op.clamp is not None else (0, 0)
         pad_top, pad_bottom, pad_left, pad_right = op.padding
@@ -335,18 +399,29 @@ def emit_program(planned: PlannedProgram) -> ProgramImage:
     # step, plus the closing HALT) so each step's next_instr_addr can
     # point at the following one already known, per section 6's chained-
     # descriptor program region.
-    n_descs = len(planned.steps) + 1
+    # One descriptor per step, except a `RowCopyStep`, which is one per
+    # activation plane -- `planner.descriptor_count` is the single place
+    # that rule is stated, and the planner charges the program fetch from
+    # the same function.
+    counts = [descriptor_count(step) for step in planned.steps]
+    n_descs = sum(counts) + 1
     addrs = [ddr_map.alloc(DdrMap.PROGRAM, isa.INSTR_WORD_BYTES) for _ in range(n_descs)]
     program_addr = addrs[0]
 
     descs: list[isa.DescV2] = []
-    for i, step in enumerate(planned.steps):
-        next_addr = addrs[i + 1]
-        if isinstance(step, MoveStep):
-            descs.append(_move_desc(step, next_addr))
+    cursor = 0
+    for step, count in zip(planned.steps, counts):
+        # Each descriptor chains to the one after it, which for a
+        # multi-plane row copy means to the next plane of the same step.
+        next_addrs = addrs[cursor + 1 : cursor + count + 1]
+        if isinstance(step, RowCopyStep):
+            descs.extend(_row_copy_descs(step, next_addrs))
+        elif isinstance(step, MoveStep):
+            descs.append(_move_desc(step, next_addrs[0]))
         else:
             assert isinstance(step, ComputeStep)
-            descs.append(_compute_desc(step, next_addr, weight_allocations, lut_addrs))
+            descs.append(_compute_desc(step, next_addrs[0], weight_allocations, lut_addrs))
+        cursor += count
     descs.append(isa.DescV2(opcode=isa.OPCODE_HALT))
 
     for addr, desc in zip(addrs, descs):

@@ -72,11 +72,21 @@ from accel_v2.model import (
     Model,
     Op,
     PLANE_CHANNELS,
+    alias_byte_offset,
+    alias_root,
     PoolOp,
+    RowCopyOp,
     Tensor,
     UpsampleOp,
 )
-from accel_v2.planner import ComputeStep, DdrTraffic, MoveStep, PlannedProgram
+from accel_v2.planner import (
+    ComputeStep,
+    DdrTraffic,
+    MoveStep,
+    PlannedProgram,
+    RowCopyStep,
+    descriptor_count,
+)
 
 
 @dataclass
@@ -277,6 +287,43 @@ def _materialize_alias_values(model: Model, tensor_data: dict[str, list[int]]) -
                 pass
 
 
+def _read_back_row_copy_targets(
+    planned: PlannedProgram,
+    image: MemoryImage,
+    local: bytearray,
+    targets: dict[str, Tensor],
+    tensor_data: dict[str, list[int]],
+) -> None:
+    """Recover the logical value of every tensor that was assembled by
+    `RowCopyOp`s, by reading its buffer back once the program has run.
+
+    A tiled group output is written `S` windows at a time and is the
+    `output` of `S` different steps, none of which knows the whole
+    tensor; the only place its value exists is the buffer itself. That is
+    also the honest way to report it -- the oracle compares a tiled
+    program's outputs against an untiled program's, and reading the bytes
+    the strips actually wrote is precisely the claim under test.
+
+    Charges no traffic: this is the test harness looking at memory, not
+    an instruction the hardware would execute (`program.py` emits nothing
+    for it), exactly as `_materialize_alias_values` charges nothing for
+    composing a concat result."""
+    for name, tensor in targets.items():
+        root = alias_root(tensor)
+        addr = planned.tensor_ddr_addr.get(root.name)
+        if addr is None:
+            # Not in DDR: an extract window into the scratchpad. Its
+            # value is only interesting if some later op read it, and
+            # such an op recorded it itself; skip rather than guess at a
+            # local address the plan may since have reused.
+            continue
+        offset = alias_byte_offset(tensor)
+        raw = image.read_bytes(addr + offset, tensor.size_bytes)
+        tensor_data[name] = golden.unpack_activation_planes(
+            _to_signed_bytes(raw), tensor.width, tensor.height, tensor.channels
+        )
+
+
 def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResult:
     """Execute `planned` against `image` (mutated in place, exactly like
     the real DDR memory model would be) plus a fresh local scratchpad
@@ -311,9 +358,16 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
     # had anyway" and "traffic the overflow fallback cost", so that
     # `planned.traffic == result.traffic` still compares every field.
     resident_ranges = [(addr, addr + size) for _, addr, size in planned.ddr_placements]
+    # ...and, separately, the tensors that live in DDR *by design* (a
+    # fusion group's boundaries). Same mechanism, different question --
+    # see `DdrTraffic.pinned_read_bytes`.
+    pinned_ranges = [(addr, addr + size) for _, addr, size in planned.pinned_placements]
+
+    def in_ranges(ranges, addr: int) -> bool:
+        return any(lo <= addr < hi for lo, hi in ranges)
 
     def is_resident(addr: int) -> bool:
-        return any(lo <= addr < hi for lo, hi in resident_ranges)
+        return in_ranges(resident_ranges, addr)
 
     def count(space: int, addr: int, nbytes: int, *, is_read: bool) -> None:
         if space == isa.SPACE_DDR:
@@ -321,10 +375,14 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
                 traffic.read_bytes += nbytes
                 if is_resident(addr):
                     traffic.ddr_resident_read_bytes += nbytes
+                if in_ranges(pinned_ranges, addr):
+                    traffic.pinned_read_bytes += nbytes
             else:
                 traffic.write_bytes += nbytes
                 if is_resident(addr):
                     traffic.ddr_resident_write_bytes += nbytes
+                if in_ranges(pinned_ranges, addr):
+                    traffic.pinned_write_bytes += nbytes
         else:
             if is_read:
                 traffic.local_read_bytes += nbytes
@@ -337,7 +395,40 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
     def pack(t: Tensor, values: list[int]) -> bytes:
         return bytes(v & 0xFF for v in golden.pack_activation_planes(values, t.width, t.height, t.channels))
 
+    #: Every tensor a `RowCopyOp` wrote into, so its logical value can
+    #: be recovered from memory after the run. A strip *store*'s
+    #: destination is written a window at a time by several steps and is
+    #: never the output of any single one, so nothing in the loop below
+    #: can name its value -- but a group output (and every graph output
+    #: of a tiled program) is exactly such a tensor.
+    row_copy_targets: dict[str, Tensor] = {}
+
     for step in planned.steps:
+        if isinstance(step, RowCopyStep):
+            moved = []
+            for src_addr, dst_addr, nbytes in step.transfers:
+                raw = read_from(step.src_space, src_addr, nbytes)
+                write_to(step.dst_space, dst_addr, raw)
+                count(step.src_space, src_addr, nbytes, is_read=True)
+                count(step.dst_space, dst_addr, nbytes, is_read=False)
+                moved.append(raw)
+            planes = len(step.transfers)
+            destination = step.op.output
+            if step.op.dst_rows.r0 == 0 and step.op.dst_rows.r1 == destination.height:
+                # The copy filled the destination completely, so the
+                # bytes just moved ARE its packed image, plane by plane
+                # in order -- no need to read anything back. This is the
+                # *extract* form: a group input's strip, or a join
+                # window. (The store form writes a row window of a taller
+                # buffer and is recovered from memory after the run.)
+                tensor_data[destination.name] = unpack(destination, b"".join(moved))
+            if step.src_space == isa.SPACE_DDR and step.dst_space == isa.SPACE_LOCAL_TENSOR:
+                traffic.tensor_load_count += planes
+            elif step.src_space == isa.SPACE_LOCAL_TENSOR and step.dst_space == isa.SPACE_DDR:
+                traffic.tensor_store_count += planes
+            row_copy_targets[step.op.output.name] = step.op.output
+            continue
+
         if isinstance(step, MoveStep):
             raw = read_from(step.src_space, step.src_addr, step.nbytes)
             write_to(step.dst_space, step.dst_addr, raw)
@@ -396,8 +487,11 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
         count(step.output_space, step.output_addr, len(out_bytes), is_read=False)
         tensor_data[op.output.name] = values
 
-    traffic.read_bytes += (len(planned.steps) + 1) * isa.INSTR_WORD_BYTES
+    traffic.read_bytes += (
+        sum(descriptor_count(step) for step in planned.steps) + 1
+    ) * isa.INSTR_WORD_BYTES
 
+    _read_back_row_copy_targets(planned, image, local, row_copy_targets, tensor_data)
     _materialize_alias_values(planned.model, tensor_data)
 
     return ExecutionResult(traffic=traffic, tensor_data=tensor_data)

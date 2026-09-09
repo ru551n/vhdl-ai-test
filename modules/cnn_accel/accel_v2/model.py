@@ -106,6 +106,68 @@ class QuantParams:
             raise ValueError(f"quant scale must be positive, got {self.scale}")
 
 
+@dataclass(frozen=True)
+class RowRange:
+    """A half-open range of rows `[r0, r1)` in ONE tensor's own row
+    coordinate system.
+
+    Spatial tiling (`tiler.py`) is entirely a statement about row ranges:
+    which rows of which full-resolution tensor a compact strip buffer
+    holds, and which rows of an input a strip's output rows were computed
+    from. Frozen (and therefore hashable) because a `RowRange` is a value,
+    never a mutable cursor -- the tiler unions and translates them and
+    must never alias one by accident."""
+
+    r0: int  # inclusive
+    r1: int  # exclusive
+
+    def __post_init__(self) -> None:
+        if self.r1 < self.r0:
+            raise ValueError(f"RowRange: r1={self.r1} is below r0={self.r0}")
+
+    @property
+    def rows(self) -> int:
+        return self.r1 - self.r0
+
+    def clip(self, height: int) -> "RowRange":
+        """This range intersected with `[0, height)` -- the receptive-field
+        recurrence routinely produces a range that runs off the top or
+        bottom of a tensor (that is exactly what padding is), and the
+        strip buffer only ever holds rows that really exist."""
+        return RowRange(max(0, self.r0), min(height, self.r1))
+
+    def hull(self, other: "RowRange") -> "RowRange":
+        """Smallest range containing both. Used to union the requirements
+        of several consumers of one tensor: two consumers may ask for
+        ranges that do not touch, and materializing the hull costs a few
+        recomputed rows but keeps every strip buffer one contiguous,
+        compact tensor (the only thing `in_plane_bytes` can describe --
+        see `tiler.py`'s module docstring, hardware fact F2)."""
+        return RowRange(min(self.r0, other.r0), max(self.r1, other.r1))
+
+    def shift(self, delta: int) -> "RowRange":
+        return RowRange(self.r0 + delta, self.r1 + delta)
+
+
+@dataclass(frozen=True)
+class StripOrigin:
+    """Provenance of a strip tensor: which full-resolution tensor it is a
+    piece of, and which of that tensor's rows this compact buffer holds.
+
+    Never consulted by `planner.py`, `program.py` or `reference.py` -- it
+    exists so the tiler's own geometry assertions, the tests and a
+    program dump can say *what a buffer is* without re-deriving it from
+    the addresses. The project's standing blind spot is that the DUT and
+    `reference.py` both take their addresses from the planner, so a
+    placement bug is self-consistently wrong on both sides; an
+    independent record of the intended geometry is what a test checks the
+    plan against."""
+
+    full: "Tensor"
+    rows: RowRange
+    strip: int
+
+
 @dataclass
 class Tensor:
     """One node in the dataflow graph. `height/width/channels` is the
@@ -163,6 +225,42 @@ class Tensor:
     #: CONCAT result that owns a buffer.
     alias_parts: list["Tensor"] = field(default_factory=list)
 
+    # -- spatial tiling (see `tiler.py`) ------------------------------------
+
+    #: Set by `tiler.py` on a strip buffer: which rows of which
+    #: full-resolution tensor these bytes are. `None` for every tensor of
+    #: an untiled graph.
+    origin: "StripOrigin | None" = None
+    #: Keep this tensor in DDR for its whole lifetime, unconditionally.
+    #:
+    #: A full-resolution tensor on a fusion-group boundary is written by
+    #: `S` separate strip `RowCopyOp`s and read by the next group's, so it
+    #: has no single producer, several writers, and a lifetime spanning
+    #: groups -- it is backing storage by design, not a scratchpad
+    #: resident. `planner.py` takes its existing `place_in_ddr` path for
+    #: such a tensor immediately and unconditionally, and reports the
+    #: bytes separately (`DdrTraffic.pinned_*_bytes`) from the bytes an
+    #: overflow *fallback* cost, so a test can still assert "this program
+    #: paid nothing for overflow" while the group boundaries cost exactly
+    #: what the tiling says they should.
+    pin_ddr: bool = False
+    #: The granularity at which this tensor's buffer must stay inside one
+    #: `cnn_accel_tensor_mem` bank (see `planner._LocalAllocator`), or
+    #: `None` for "the whole buffer" -- which is what every untiled
+    #: tensor wants and what this planner has always enforced.
+    #:
+    #: The hardware requirement is not "a buffer lies in one bank" but
+    #: "no single *request* straddles a bank": `cnn_accel_tensor_mem`
+    #: serves each request from the bank its address decodes to and
+    #: silently clamps the overrun. For a strip activation buffer every
+    #: request is at most one channel plane (`cmd_proc.vhd`'s ifmap
+    #: feeder fetches one `(row, tile)` strip per request, output passes
+    #: write one plane), so confining *planes* rather than the whole
+    #: buffer is what lets a multi-plane strip be larger than a bank at
+    #: all. Left `None` everywhere outside `tiler.py`, so no existing
+    #: placement moves.
+    confine_unit_bytes: int | None = None
+
     @property
     def size_bytes(self) -> int:
         """DDR/LOCAL_TENSOR byte footprint of this tensor in the
@@ -177,6 +275,13 @@ class Tensor:
     @property
     def plane_count(self) -> int:
         return golden.activation_plane_count(self.channels)
+
+    @property
+    def row_bytes(self) -> int:
+        """Bytes in one row of ONE `T`-channel activation plane. The unit
+        a `RowCopyOp` moves: `plane_bytes` is `height * row_bytes`, and
+        row `y` of plane `p` starts at `p * plane_bytes + y * row_bytes`."""
+        return PLANE_CHANNELS * self.width
 
 
 PLANE_CHANNELS = golden.ACTIVATION_PLANE_CHANNELS
@@ -392,6 +497,49 @@ class ActOp(Op):
     lut: list[int]
 
 
+@dataclass
+class RowCopyOp(Op):
+    """Move rows `src_rows` of `inputs[0]` into rows `dst_rows` of
+    `output`, **plane by plane**.
+
+    This is the one new operation spatial tiling needs, and it needs no
+    new opcode: the planner lowers it to `plane_count` ordinary
+    `LOAD`/`STORE`/`COPY` descriptors (one opcode family, chosen purely
+    from the two resolved operand spaces, exactly as `MoveStep` already
+    is), each moving `rows * width * T` bytes
+
+        src + p*src.plane_bytes + src_rows.r0*src.row_bytes
+     -> dst + p*dst.plane_bytes + dst_rows.r0*dst.row_bytes
+
+    One descriptor per plane rather than one for the lot, because the
+    activation layout is channel-plane-major: a row window of a
+    multi-plane tensor is `plane_count` separate byte ranges, `plane_bytes`
+    apart, and the two ends have *different* plane strides whenever the
+    strip and the full tensor differ in height (which is the normal case
+    -- see hardware fact F2 in `tiler.py`'s docstring). A single-plane
+    tensor's row window is contiguous and the lowering degenerates to one
+    descriptor.
+
+    `output` is one of three things, and the planner does not need to
+    know which:
+
+    * a fresh compact tensor of `src_rows.rows` rows -- the *extract*
+      form, used to align a join operand's rows with the join's, and to
+      pull a strip out of a pinned group input;
+    * a `concat` part -- then this op is that part's producer and writes
+      straight into the concat slot, which is the existing
+      "producer-directed placement" rule with a `RowCopyOp` as producer;
+    * a pinned full-resolution tensor, written at a row offset -- the
+      *store* form that assembles a group output from `S` strips.
+
+    Widths and plane counts must match at the two ends (a row copy never
+    reshapes channels and never splits a plane); heights need not.
+    """
+
+    src_rows: RowRange
+    dst_rows: RowRange
+
+
 # ---------------------------------------------------------------------------
 # Model: the graph builder.
 # ---------------------------------------------------------------------------
@@ -404,9 +552,24 @@ class Model:
     are byte-identical; a different `seed` (almost certainly) is not --
     exercised directly by `tests/test_model.py`'s determinism test."""
 
-    def __init__(self, seed: int, name: str = "model") -> None:
+    def __init__(self, seed: int, name: str = "model", *, shapes_only: bool = False) -> None:
+        """`shapes_only` builds a graph for **planning only**: weights,
+        biases, scale tables and input data are left empty instead of
+        drawn from the RNG.
+
+        It exists for one purpose: reasoning about a network at its real
+        size. YOLOv8n's weights are 3.2 million int8 values, and the
+        tiling selection rule (`tiling_select.py`) plans a few thousand
+        candidate strip sub-programs over them -- drawing and copying
+        those lists would dominate the run by orders of magnitude while
+        changing nothing, since `planner.py` only ever asks a conv for
+        its *shape* (`Conv2dOp.weight_layer_desc`, whose byte counts come
+        from the channel and kernel counts alone). A `shapes_only` model
+        must never be handed to `reference.py` or `program.py`, which do
+        read the values."""
         self.seed = seed
         self.name = name
+        self.shapes_only = shapes_only
         self._rng = _Rng(seed)
         self.ops: list[Op] = []
         self.tensors: list[Tensor] = []
@@ -443,7 +606,7 @@ class Model:
             quant=QuantParams(scale),
             is_input=True,
         )
-        t.data = self._rng.int8_list(height * width * channels)
+        t.data = [] if self.shapes_only else self._rng.int8_list(height * width * channels)
         self.inputs.append(t)
         self.tensors.append(t)
         return t
@@ -536,6 +699,11 @@ class Model:
                     f"this conv wants out_channels={out_channels}"
                 )
             weight, bias_values, per_channel_scale = reused.weight, reused.bias, reused.per_channel_scale
+        elif self.shapes_only:
+            reused = None
+            weight = []
+            bias_values = [0] * out_channels if bias else None
+            per_channel_scale = [(1, 0)] * out_channels if per_channel else None
         else:
             reused = None
             weight = self._rng.int8_list(out_channels * kh * kw * x.channels, low=-127, high=127)
@@ -952,6 +1120,162 @@ class Model:
             alias_role="slice",
         )
 
+    # -- spatial tiling helpers (see `tiler.py`) ---------------------------
+
+    def register_prebuilt_op(self, op: Op) -> Op:
+        """Attach an `Op` this module did not build, wiring up the same
+        `consumers`/`tensors` bookkeeping every builder method does.
+
+        `tiler.py` constructs its clones directly rather than calling
+        `conv2d`/`pool_max`/..., for one reason: those methods draw
+        weights, biases and scale tables from the model's RNG, and a
+        strip clone must reuse the *original* op's constants byte for
+        byte or the tiled program computes a different (if equally valid)
+        network and the tiled-vs-untiled oracle has nothing to compare.
+        Op construction is a dataclass call; only the graph bookkeeping
+        is worth sharing, and this is it."""
+        self._register_op(op)
+        return op
+
+    def copy_rows(
+        self,
+        src: Tensor,
+        rows: RowRange,
+        *,
+        into: Tensor | None = None,
+        at: RowRange | None = None,
+        name: str | None = None,
+    ) -> Tensor:
+        """Move rows `rows` of `src` into `into`'s rows `at` (or into a
+        fresh compact tensor of `rows.rows` rows when `into` is `None`).
+
+        The two forms are the two halves of tiling. `into=None` *extracts*
+        a window -- the group-input LOAD of a strip, and the row
+        alignment a join needs when one operand's strip is taller than
+        the join's output. `into=<tensor>` *stores* a strip back into a
+        full-resolution buffer at a row offset, which is how `S` strips
+        assemble one group output.
+
+        `at` defaults to `rows` (same rows at both ends), which is what
+        the store form of a strip whose destination shares the source's
+        coordinate system wants; the extract form always lands at row 0
+        of its fresh buffer.
+
+        No opcode is chosen here: `planner.py` resolves the two operand
+        spaces and `program.py` picks `LOAD`/`STORE`/`COPY` from them,
+        the same way it already does for a spill or a reload."""
+        if rows.rows <= 0:
+            raise ValueError(
+                f"copy_rows of '{src.name}': {rows} is empty -- a row copy must move at "
+                "least one row (an empty strip is a tiler bug, not a legal program)"
+            )
+        if rows.r0 < 0 or rows.r1 > src.height:
+            raise ValueError(
+                f"copy_rows of '{src.name}': {rows} is outside the tensor's "
+                f"{src.height} rows"
+            )
+
+        if into is None:
+            dst = Tensor(
+                name=name or self._auto_name("rowcopy"),
+                height=rows.rows,
+                width=src.width,
+                channels=src.channels,
+                quant=src.quant,
+            )
+            dst_rows = RowRange(0, rows.rows)
+        else:
+            dst = into
+            dst_rows = at if at is not None else rows
+            if dst_rows.rows != rows.rows:
+                raise ValueError(
+                    f"copy_rows into '{into.name}': source {rows} is {rows.rows} rows but "
+                    f"destination {dst_rows} is {dst_rows.rows} -- a row copy moves rows, "
+                    "it does not resample them"
+                )
+            if dst_rows.r0 < 0 or dst_rows.r1 > into.height:
+                raise ValueError(
+                    f"copy_rows into '{into.name}': {dst_rows} is outside the tensor's "
+                    f"{into.height} rows"
+                )
+
+        if src.width != dst.width or src.plane_count != dst.plane_count:
+            raise ValueError(
+                f"copy_rows '{src.name}' -> '{dst.name}': the two ends must agree on width "
+                f"and plane count (got {src.width}x{src.plane_count} planes vs "
+                f"{dst.width}x{dst.plane_count}). A row copy moves whole plane-rows; it "
+                "never reshapes channels and never splits a plane."
+            )
+
+        op = RowCopyOp(name=dst.name, inputs=[src], output=dst, src_rows=rows, dst_rows=dst_rows)
+        if into is None:
+            # Only the extract form owns its output. A store form's
+            # destination has several writers (one per strip) and
+            # therefore no single `producer` -- `planner.py` counts
+            # writers by walking `Model.ops`, exactly so this works.
+            dst.producer = op
+        self._register_op(op)
+        return dst
+
+    def add_planewise(
+        self,
+        a: Tensor,
+        b: Tensor,
+        *,
+        requant_scale: int | None = None,
+        requant_shift: int | None = None,
+        output_scale: float | None = None,
+        name: str | None = None,
+    ) -> Tensor:
+        """`add(a, b)`, but emitted as one `ADD` **per activation plane**
+        and re-concatenated -- arithmetically identical, and the only
+        form a tiled program may use.
+
+        `cnn_accel_elementwise.vhd` issues an `ADD` as a single request
+        per operand covering the whole tensor (`in_w*in_h*T*8` bytes),
+        while `cnn_accel_tensor_mem` serves any one request from the
+        single bank its address decodes to. A multi-plane strip buffer is
+        deliberately allowed to span banks at plane granularity
+        (`Tensor.confine_unit_bytes`), so a whole-tensor `ADD` request
+        over one would be silently clamped. Splitting the add along
+        planes -- which is free, `split`/`concat` are pure aliasing --
+        keeps every request inside one plane and therefore inside one
+        bank.
+
+        Degenerates to a plain `add` for a single-plane tensor, so the
+        untiled catalogue is unaffected."""
+        if (a.height, a.width, a.channels) != (b.height, b.width, b.channels):
+            raise ValueError(
+                f"add_planewise: shape mismatch {a.height, a.width, a.channels} vs "
+                f"{b.height, b.width, b.channels}"
+            )
+        out_name = name or self._auto_name("add")
+        if a.plane_count == 1:
+            return self.add(
+                a,
+                b,
+                requant_scale=requant_scale,
+                requant_shift=requant_shift,
+                output_scale=output_scale,
+                name=out_name,
+            )
+
+        sizes = _plane_sizes(a.channels)
+        a_planes = self.split(a, sizes, names=[f"{out_name}_a{i}" for i in range(len(sizes))])
+        b_planes = self.split(b, sizes, names=[f"{out_name}_b{i}" for i in range(len(sizes))])
+        sums = [
+            self.add(
+                ap,
+                bp,
+                requant_scale=requant_scale,
+                requant_shift=requant_shift,
+                output_scale=output_scale,
+                name=f"{out_name}_p{i}",
+            )
+            for i, (ap, bp) in enumerate(zip(a_planes, b_planes))
+        ]
+        return self.concat(sums, name=out_name)
+
     def act(self, x: Tensor, lut: list[int] | None = None, *, name: str | None = None) -> Tensor:
         """`OPCODE_ACT`. `lut[raw_byte] -> int8` for `raw_byte` in
         `0..255` (i.e. indexed by the *unsigned* byte representation of
@@ -968,6 +1292,17 @@ class Model:
         out_t.producer = op
         self._register_op(op)
         return out_t
+
+
+def _plane_sizes(channels: int) -> list[int]:
+    """`channels` cut into one entry per activation plane: `T` channels
+    each, with a short last entry when `channels` is not a multiple of
+    `T`. The channel counts a `split` needs to name every plane of a
+    tensor individually (`Model.add_planewise`)."""
+    sizes = [PLANE_CHANNELS] * (channels // PLANE_CHANNELS)
+    if channels % PLANE_CHANNELS:
+        sizes.append(channels % PLANE_CHANNELS)
+    return sizes
 
 
 class _Rng:
@@ -993,6 +1328,8 @@ class _Rng:
 
 __all__ = [
     "PLANE_CHANNELS",
+    "RowRange",
+    "StripOrigin",
     "alias_root",
     "alias_plane_offset_total",
     "alias_byte_offset",
@@ -1006,6 +1343,7 @@ __all__ = [
     "UpsampleOp",
     "CopyOp",
     "ActOp",
+    "RowCopyOp",
     "Model",
     "quantize_scale",
 ]

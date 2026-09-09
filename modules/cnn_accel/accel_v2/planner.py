@@ -67,7 +67,15 @@ import cnn_accel_model as golden
 
 from accel_v2 import isa
 from accel_v2.ddrmap import DdrMap
-from accel_v2.model import Conv2dOp, Model, Op, Tensor, alias_byte_offset, alias_root
+from accel_v2.model import (
+    Conv2dOp,
+    Model,
+    Op,
+    RowCopyOp,
+    Tensor,
+    alias_byte_offset,
+    alias_root,
+)
 
 #: Section 4 default: `g_num_banks=2 * g_bank_words=1024 * 8 bytes`.
 DEFAULT_TENSOR_MEM_BYTES = 2 * 1024 * 8
@@ -129,6 +137,16 @@ class DdrTraffic:
     #: N bytes".
     ddr_resident_read_bytes: int = 0
     ddr_resident_write_bytes: int = 0
+    #: Subtotals of `read_bytes`/`write_bytes` (not additional to them)
+    #: attributable to tensors that live in DDR *by design* --
+    #: `Tensor.pin_ddr`, the full-resolution buffers on a fusion group's
+    #: boundary (`tiler.py`). Split out from `ddr_resident_*_bytes` so the
+    #: two questions stay separate: "did the overflow fallback cost
+    #: anything?" (`ddr_resident_*`, still expected to be zero for a
+    #: healthy plan) and "what did the group boundaries cost?"
+    #: (`pinned_*`, expected to be exactly the tiling's own prediction).
+    pinned_read_bytes: int = 0
+    pinned_write_bytes: int = 0
 
 
 @dataclass
@@ -160,7 +178,50 @@ class MoveStep:
     kind: str  # "reload" | "spill"
 
 
-Step = ComputeStep | MoveStep
+@dataclass
+class RowCopyStep:
+    """One `model.RowCopyOp`, resolved into its `plane_count` per-plane
+    sub-transfers.
+
+    One planner step, several descriptors: the activation layout is
+    channel-plane-major, so a row window of a multi-plane tensor is
+    `plane_count` separate byte ranges (`plane_bytes` apart at the source,
+    a *different* `plane_bytes` apart at the destination whenever the two
+    tensors differ in height). Keeping them one step is what lets the
+    planner's liveness, eviction and family bookkeeping treat the whole
+    move as the single operation it logically is -- in particular a
+    half-copied destination is never an eviction victim, because the
+    planner never sees a moment between two of its planes.
+
+    `program.py` emits one `LOAD`/`STORE`/`COPY` descriptor per entry of
+    `transfers`, choosing the opcode from `src_space`/`dst_space` exactly
+    as it does for a `MoveStep`."""
+
+    op: RowCopyOp
+    src_space: int
+    dst_space: int
+    #: `(src_addr, dst_addr, nbytes)` per activation plane, in plane order.
+    transfers: list[tuple[int, int, int]] = field(default_factory=list)
+
+    @property
+    def nbytes(self) -> int:
+        """Total bytes moved -- `rows * width * T` per plane."""
+        return sum(n for _, _, n in self.transfers)
+
+
+Step = ComputeStep | MoveStep | RowCopyStep
+
+
+def descriptor_count(step: "Step") -> int:
+    """How many 64-byte descriptors `program.py` will emit for `step`.
+
+    One for every step except a `RowCopyStep`, which is one per plane.
+    The single place this is stated: `planner.py` charges the program
+    fetch, `reference.py` charges it again independently, and
+    `program.py` actually emits them, and all three must agree or a
+    traffic assertion fails for a reason that has nothing to do with
+    the tensors."""
+    return len(step.transfers) if isinstance(step, RowCopyStep) else 1
 
 
 @dataclass
@@ -197,6 +258,13 @@ class PlannedProgram:
     #: rather than inferring it from values, which the DUT and
     #: `reference.py` would agree on even if it were wrong.
     ddr_placements: list[tuple[str, int, int]] = field(default_factory=list)
+    #: Every `Tensor.pin_ddr` buffer this plan gave a DDR home, as
+    #: `(alias-root tensor name, DDR byte address, byte size)`. Kept out
+    #: of `ddr_placements` on purpose: a pinned buffer is not a failure to
+    #: place anything, it is the fusion-group boundary the tiler asked
+    #: for, and a test that asserts "nothing overflowed" must still be
+    #: able to say that about a tiled program.
+    pinned_placements: list[tuple[str, int, int]] = field(default_factory=list)
 
 
 class _LocalAllocator:
@@ -214,7 +282,15 @@ class _LocalAllocator:
     end of that bank is clamped by the hardware (see `DEFAULT_BANK_BYTES`),
     silently truncating the transfer. Every allocation here is therefore
     required to satisfy `addr // bank_bytes == (addr + size - 1) //
-    bank_bytes`.
+    bank_bytes` -- **per `unit`**, where `unit` is the largest single
+    request that will ever be made against the buffer (`try_alloc`'s
+    argument, from `Tensor.confine_unit_bytes`). For every untiled
+    tensor the unit is the whole buffer, which is the strict rule this
+    planner has always applied and which every existing placement still
+    gets; a tiled activation strip passes its plane size instead,
+    because no request against an activation is larger than one channel
+    plane, and that is what lets a multi-plane strip be bigger than a
+    bank at all.
 
     The strategy is **"skip to the next bank boundary on straddle"**,
     not "align every buffer to a bank":
@@ -252,34 +328,96 @@ class _LocalAllocator:
         self.bank_bytes = bank_bytes
         self._free: list[tuple[int, int]] = [(0, capacity)] if capacity > 0 else []
 
-    def try_alloc(self, size: int, align: int = 8) -> int | None:
+    def try_alloc(self, size: int, align: int = 8, unit: int | None = None) -> int | None:
+        """Place `size` bytes so that **every `unit`-byte sub-range lies
+        in one bank**, and return the address (or `None`).
+
+        `unit` is the largest transfer the hardware will ever issue
+        against this buffer -- `None` means "the whole buffer", which is
+        the strict rule this planner has always enforced and what every
+        untiled tensor uses. A tiled activation strip passes its
+        `plane_bytes` instead (`Tensor.confine_unit_bytes`), because the
+        hardware requirement is per *request*, and no request against an
+        activation is bigger than one plane.
+
+        With `unit == size` the loop below reduces, provably, to the
+        original single "bump to the next bank boundary on straddle"
+        step: `k` can only be 0, the boundary it straddles is the first
+        one after `addr`, and the bumped address `beta - 0*unit == beta`
+        cannot straddle again because `size <= bank_bytes`. That
+        equivalence is what keeps every existing placement byte-identical
+        (`tests/test_tiling_guard.py`).
+        """
         if size <= 0:
             raise ValueError(f"allocation size must be positive, got {size}")
-        if size > self.bank_bytes:
+        if unit is None:
+            unit = size
+        if unit <= 0:
+            raise ValueError(f"confinement unit must be positive, got {unit}")
+        if unit > self.bank_bytes:
             # Caller (`Planner.alloc_local`) is expected to have rejected
             # this already with a much more actionable message; belt and
             # braces, since silently returning an illegal address is the
             # exact failure mode this class exists to prevent.
             return None
         for i, (start, length) in enumerate(self._free):
-            aligned_start = start + (-start) % align
+            addr = start + (-start) % align
             # Bank boundaries are whole multiples of `align` (a bank is a
-            # whole number of 8-byte words), so bumping to one keeps the
-            # alignment guarantee.
-            bank_end = (aligned_start // self.bank_bytes + 1) * self.bank_bytes
-            if aligned_start + size > bank_end:
-                aligned_start = bank_end
-            pad = aligned_start - start
-            if length - pad < size:
+            # whole number of 8-byte words) and so is `unit`, so every
+            # bump below keeps the alignment guarantee.
+            # Slide until nothing straddles. Which unit straddles first,
+            # and how far the buffer then moves, depend ONLY on
+            # `addr % bank_bytes` -- so a repeated residue means the
+            # slide has entered a cycle and NO confined address exists
+            # for this many units, which is what happens whenever `unit`
+            # does not divide `bank_bytes` and there are enough units to
+            # wrap around one. Detecting that is what keeps the search
+            # from walking a large free block eight bytes at a time; a
+            # buffer with no confined address falls back to DDR exactly
+            # as one that is simply too big does.
+            seen_residues: set[int] = set()
+            while addr + size <= start + length:
+                straddle = self._first_straddle(addr, size, unit)
+                if straddle is None:
+                    break
+                residue = addr % self.bank_bytes
+                if residue in seen_residues:
+                    break
+                seen_residues.add(residue)
+                # Slide the buffer up so unit `k` *starts* on the boundary
+                # it was straddling. `boundary` is strictly above unit
+                # `k`'s own start, so this strictly increases `addr`.
+                k, boundary = straddle
+                addr = boundary - k * unit
+            pad = addr - start
+            if (
+                pad < 0
+                or length - pad < size
+                or self._first_straddle(addr, size, unit) is not None
+            ):
                 continue
-            end = aligned_start + size
+            end = addr + size
             replacement = []
             if pad > 0:
                 replacement.append((start, pad))
             if length - pad - size > 0:
                 replacement.append((end, length - pad - size))
             self._free[i : i + 1] = replacement
-            return aligned_start
+            return addr
+        return None
+
+    def _first_straddle(self, addr: int, size: int, unit: int) -> tuple[int, int] | None:
+        """`(k, boundary)` for the first `unit`-sized sub-range of
+        `[addr, addr+size)` that crosses a bank boundary, or `None` when
+        none does. The final sub-range may be short (`size` need not be a
+        whole number of units); a short one straddles by the same rule."""
+        k = 0
+        while k * unit < size:
+            lo = addr + k * unit
+            hi = min(lo + unit, addr + size)
+            if lo // self.bank_bytes != (hi - 1) // self.bank_bytes:
+                return k, (lo // self.bank_bytes + 1) * self.bank_bytes
+            k += 1
         return None
 
     def clone(self) -> "_LocalAllocator":
@@ -300,6 +438,65 @@ class _LocalAllocator:
             else:
                 merged.append((start, length))
         self._free = merged
+
+
+def _plan_row_copy(
+    op: RowCopyOp,
+    exclude: set[str],
+    resolve_input,
+    resolve_output,
+    traffic: DdrTraffic,
+) -> RowCopyStep:
+    """Resolve one `RowCopyOp` into a `RowCopyStep` of `plane_count`
+    per-plane sub-transfers.
+
+    Three things make this different from an ordinary op, and all three
+    are consequences of the channel-plane-major layout (arch doc section
+    3) plus the fact that a strip and the full tensor it came from have
+    *different heights*:
+
+    * the bytes moved are `planes * rows * width * T`, not either
+      tensor's `size_bytes` -- so both operand resolutions are told the
+      real figure rather than being allowed to charge a whole tensor;
+    * the source is read **in place**. A row copy exists precisely so
+      that a full-resolution group boundary never enters the scratchpad;
+      letting `resolve_input`'s ordinary "more than one consumer left, so
+      hoist it local" rule fire here would reintroduce the traffic
+      tiling was built to remove (and, for a real group boundary, would
+      simply not fit);
+    * the plane stride differs at the two ends (`src.plane_bytes` vs
+      `dst.plane_bytes`), which is why this cannot be one transfer even
+      when the row ranges happen to line up.
+
+    `LOAD`/`STORE` counting follows the descriptors: a DDR->local copy
+    retires `plane_count` `LOAD`s and a local->DDR copy `plane_count`
+    `STORE`s, exactly what `TENSOR_LOAD_COUNT`/`TENSOR_STORE_COUNT` will
+    show. Neither is a spill or a reload -- no value is being evicted --
+    so `spill_count`/`reload_count` stay untouched."""
+    src, dst = op.inputs[0], op.output
+    planes = src.plane_count
+    rows = op.src_rows.rows
+    per_plane = rows * src.row_bytes
+    moved = planes * per_plane
+
+    src_space, src_base = resolve_input(src, exclude, read_bytes=moved, in_place=True)
+    dst_space, dst_base = resolve_output(dst, exclude, write_bytes=moved)
+
+    transfers = [
+        (
+            src_base + plane * src.plane_bytes + op.src_rows.r0 * src.row_bytes,
+            dst_base + plane * dst.plane_bytes + op.dst_rows.r0 * dst.row_bytes,
+            per_plane,
+        )
+        for plane in range(planes)
+    ]
+
+    if src_space == isa.SPACE_DDR and dst_space == isa.SPACE_LOCAL_TENSOR:
+        traffic.tensor_load_count += planes
+    elif src_space == isa.SPACE_LOCAL_TENSOR and dst_space == isa.SPACE_DDR:
+        traffic.tensor_store_count += planes
+
+    return RowCopyStep(op=op, src_space=src_space, dst_space=dst_space, transfers=transfers)
 
 
 class Planner:
@@ -333,6 +530,7 @@ class Planner:
         alloc = _LocalAllocator(self.tensor_mem_bytes, self.bank_bytes)
         local_placements: list[tuple[str, int, int]] = []
         ddr_placements: list[tuple[str, int, int]] = []
+        pinned_placements: list[tuple[str, int, int]] = []
         traffic = DdrTraffic()
         steps: list[Step] = []
         tensor_ddr_addr: dict[str, int] = {}
@@ -375,10 +573,26 @@ class Planner:
         for name, members in family.items():
             pending_consumers[name] = sum(len(t.consumers) for t in members)
             total_consumers[name] = pending_consumers[name]
-            pending_producers[name] = sum(1 for t in members if t.producer is not None)
+            pending_producers[name] = 0
+        # Counted by walking the ops rather than by counting members with
+        # a `producer`, because those two stopped being the same number
+        # when `RowCopyOp` arrived: `S` strip stores all write into one
+        # pinned tensor, which therefore has several writers and no single
+        # `producer` at all. For every graph without row copies the two
+        # counts are identical (each op sets its output's `producer`), so
+        # no existing plan moves.
+        for op in model.ops:
+            pending_producers[root_of[op.output.name].name] += 1
 
         def nbytes(t: Tensor) -> int:
             return t.size_bytes
+
+        def confine_unit(t: Tensor) -> int:
+            """The largest single hardware request that will ever be made
+            against `t`'s buffer, which is what must stay inside one bank
+            (`_LocalAllocator.try_alloc`). `None` means the whole buffer:
+            the strict rule, and the only one an untiled tensor uses."""
+            return t.confine_unit_bytes if t.confine_unit_bytes is not None else nbytes(t)
 
         def next_use(root_name: str, from_idx: int) -> int | None:
             """First op index >= `from_idx` that reads any member of
@@ -453,7 +667,7 @@ class Planner:
             tensor_ddr_addr[best_name] = ddr_addr
             return True
 
-        def can_ever_fit(size: int, exclude: set[str]) -> bool:
+        def can_ever_fit(size: int, exclude: set[str], unit: int) -> bool:
             """Would `size` bytes fit locally if every buffer `evict_one`
             is *allowed* to evict were evicted?
 
@@ -475,9 +689,9 @@ class Planner:
                 if name in exclude or pending_producers[name]:
                     continue
                 probe.free(addr, nbytes(root_by_name[name]))
-            return probe.try_alloc(size) is not None
+            return probe.try_alloc(size, unit=unit) is not None
 
-        def alloc_local(root_name: str, size: int, exclude: set[str]) -> int | None:
+        def alloc_local(root_name: str, size: int, exclude: set[str], unit: int) -> int | None:
             """Place `root_name`'s `size`-byte buffer in the scratchpad,
             spilling other buffers if that is what it takes, and return
             its byte address -- or `None` when it cannot be placed
@@ -487,10 +701,14 @@ class Planner:
             The two ways a buffer is unplaceable are both permanent
             properties of this moment, not transient pressure:
 
-            * it is larger than one `cnn_accel_tensor_mem` bank, so no
-              legal address exists for it at any occupancy (the hardware
-              serves every transfer from the single bank the address
-              decodes to and clamps anything past that bank's end);
+            * its confinement `unit` -- the largest single transfer the
+              hardware will make against it -- is larger than one
+              `cnn_accel_tensor_mem` bank, so no legal address exists for
+              it at any occupancy (the hardware serves every transfer from
+              the single bank the address decodes to and clamps anything
+              past that bank's end). For an untiled tensor the unit is the
+              whole buffer, which is the rule this planner has always
+              applied;
             * even with every evictable buffer evicted there is no
               bank-confined hole big enough -- the free list is
               fragmented and this planner has no defragmenter, or the
@@ -502,11 +720,11 @@ class Planner:
             that cannot be lowered *at all*; "does not fit on chip" has a
             correct, if slower, lowering, and taking it is what makes the
             planner degrade instead of falling over."""
-            if size > self.bank_bytes:
+            if unit > self.bank_bytes:
                 return None
-            addr = alloc.try_alloc(size)
+            addr = alloc.try_alloc(size, unit=unit)
             if addr is None:
-                if not can_ever_fit(size, exclude):
+                if not can_ever_fit(size, exclude, unit):
                     return None
                 while addr is None:
                     if not evict_one(exclude):  # pragma: no cover - can_ever_fit said yes
@@ -517,11 +735,11 @@ class Planner:
                             f"{self.bank_bytes}-byte banks, and a buffer may not cross a "
                             "bank boundary) even after evicting every evictable buffer"
                         )
-                    addr = alloc.try_alloc(size)
+                    addr = alloc.try_alloc(size, unit=unit)
             local_placements.append((root_name, addr, size))
             return addr
 
-        def place_in_ddr(root_name: str, size: int) -> int:
+        def place_in_ddr(root_name: str, size: int, *, pinned: bool = False) -> int:
             """Give `root_name`'s buffer a permanent DDR home and return
             its address, allocating one on first call.
 
@@ -546,13 +764,37 @@ class Planner:
             # a DDR home; reuse it rather than allocating a second copy.
             addr = tensor_ddr_addr.get(root_name)
             if addr is None:
-                addr = self.ddr_map.alloc(DdrMap.SPILL, size)
+                region = DdrMap.OUTPUTS if root_by_name[root_name].is_output else DdrMap.SPILL
+                addr = self.ddr_map.alloc(region, size)
                 tensor_ddr_addr[root_name] = addr
             ddr_resident[root_name] = addr
-            ddr_placements.append((root_name, addr, size))
+            (pinned_placements if pinned else ddr_placements).append((root_name, addr, size))
             return addr
 
-        def resolve_input(t: Tensor, exclude: set[str]) -> tuple[int, int]:
+        def pin_if_needed(root: Tensor) -> bool:
+            """Give a `Tensor.pin_ddr` buffer its permanent DDR home the
+            first time anything touches it, and say whether it has one.
+
+            Unconditional and immediate, unlike `place_in_ddr`'s other
+            caller: a pinned buffer is not a scratchpad candidate that
+            failed to fit, it is a fusion-group boundary that is *defined*
+            to be backing storage -- written by one strip's store, read by
+            another strip's load, many commands apart, and larger than the
+            scratchpad in every case that matters. Trying to place it
+            locally first would be a guaranteed-wasted eviction sweep."""
+            if not root.pin_ddr:
+                return False
+            if root.name not in ddr_resident:
+                place_in_ddr(root.name, nbytes(root), pinned=True)
+            return True
+
+        def resolve_input(
+            t: Tensor,
+            exclude: set[str],
+            *,
+            read_bytes: int | None = None,
+            in_place: bool = False,
+        ) -> tuple[int, int]:
             """Return `(space, addr)` for consuming `t` as an operand of
             the op currently being planned (`op_index`), doing whatever
             spill-bookkeeping / reload / local allocation that requires.
@@ -578,21 +820,38 @@ class Planner:
             history, so its single-remaining-consumer case is left as an
             ordinary direct `DDR` operand read (identical AXI bytes, one
             fewer instruction, and exactly the "DDR round trip for
-            initial inputs" the policy already allows)."""
+            initial inputs" the policy already allows).
+
+            `read_bytes` overrides how many bytes this operand fetch
+            costs: a `RowCopyOp` reads a row *window*, not the whole
+            tensor, and charging it the tensor's size would make the
+            tiling look as expensive as the thing it replaces.
+            `in_place` says never to hoist the buffer into the scratchpad
+            for this read -- also a `RowCopyOp` property, and the whole
+            point of tiling: loading a full-resolution group boundary
+            into the scratchpad just to copy 20 rows out of it is exactly
+            the traffic the strips exist to avoid."""
             root = root_of[t.name]
             offset = alias_byte_offset(t)
+            operand_bytes = nbytes(t) if read_bytes is None else read_bytes
 
             if root.name in local_addr:
-                traffic.local_read_bytes += nbytes(t)
+                traffic.local_read_bytes += operand_bytes
                 return isa.SPACE_LOCAL_TENSOR, local_addr[root.name] + offset
+
+            pinned = pin_if_needed(root)
 
             if root.name in ddr_resident:
                 # Never reloaded: a buffer only lives in DDR because it
-                # provably has no local home, so there is nowhere to
+                # provably has no local home (or, pinned, because it is
+                # backing storage by design), so there is nowhere to
                 # reload it to, and a later producer of another slice of
                 # it would have to find it in DDR anyway.
-                traffic.read_bytes += nbytes(t)
-                traffic.ddr_resident_read_bytes += nbytes(t)
+                traffic.read_bytes += operand_bytes
+                if pinned:
+                    traffic.pinned_read_bytes += operand_bytes
+                else:
+                    traffic.ddr_resident_read_bytes += operand_bytes
                 return isa.SPACE_DDR, ddr_resident[root.name] + offset
 
             if root.is_input and root.name not in tensor_ddr_addr:
@@ -606,9 +865,9 @@ class Planner:
             ddr_addr = tensor_ddr_addr[root.name]
 
             was_spilled = root.name in spilled
-            if was_spilled or remaining_uses(root.name, op_index) > 1:
+            if not in_place and (was_spilled or remaining_uses(root.name, op_index) > 1):
                 size = nbytes(root)
-                addr = alloc_local(root.name, size, exclude)
+                addr = alloc_local(root.name, size, exclude, confine_unit(root))
                 # `addr is None`: the buffer has no local home. Reading it
                 # straight out of DDR moves the same bytes as the reload
                 # would have, one instruction fewer, and is the only
@@ -639,10 +898,10 @@ class Planner:
                     # second, separate local-memory transaction (mirrors
                     # reference.py, which always counts a ComputeStep's
                     # operand fetch regardless of how the operand got local).
-                    traffic.local_read_bytes += nbytes(t)
+                    traffic.local_read_bytes += operand_bytes
                     return isa.SPACE_LOCAL_TENSOR, addr + offset
 
-            traffic.read_bytes += nbytes(t)
+            traffic.read_bytes += operand_bytes
             return isa.SPACE_DDR, ddr_addr + offset
 
         def release(root_name: str) -> None:
@@ -660,58 +919,76 @@ class Planner:
                 freed_addr = local_addr.pop(root_name)
                 alloc.free(freed_addr, nbytes(root_by_name[root_name]))
 
-        for op_index, op in enumerate(model.ops):
-            exclude_this_op = {root_of[t.name].name for t in op.inputs}
-            input_spaces: list[int] = []
-            input_addrs: list[int] = []
-            for t in op.inputs:
-                space, addr = resolve_input(t, exclude_this_op)
-                input_spaces.append(space)
-                input_addrs.append(addr)
+        def resolve_output(
+            out_t: Tensor, exclude: set[str], *, write_bytes: int | None = None
+        ) -> tuple[int, int]:
+            """Return `(space, addr)` for the tensor an op writes, doing
+            whatever allocation / DDR fallback that requires.
 
-            out_t = op.output
+            `write_bytes` overrides the byte charge for the same reason
+            `resolve_input`'s `read_bytes` does: a `RowCopyOp` writes a row
+            window, not a whole tensor."""
             out_root = root_of[out_t.name]
             out_offset = alias_byte_offset(out_t)
+            written = nbytes(out_t) if write_bytes is None else write_bytes
+
+            if pin_if_needed(out_root):
+                traffic.write_bytes += written
+                traffic.pinned_write_bytes += written
+                return isa.SPACE_DDR, ddr_resident[out_root.name] + out_offset
+
             if out_root.is_output:
                 if out_root.name not in tensor_ddr_addr:
                     tensor_ddr_addr[out_root.name] = self.ddr_map.alloc(
                         DdrMap.OUTPUTS, nbytes(out_root)
                     )
-                out_addr = tensor_ddr_addr[out_root.name] + out_offset
-                output_space = isa.SPACE_DDR
-                traffic.write_bytes += nbytes(out_t)
-            else:
-                if out_root.name in spilled:  # pragma: no cover - see evict_one
-                    raise ValueError(
-                        f"planner: op {op_index} writes '{out_t.name}' into the buffer of "
-                        f"'{out_root.name}', which is currently spilled to DDR -- a "
-                        "half-written concat buffer must never be evicted (see evict_one)"
-                    )
-                if out_root.name not in local_addr and out_root.name not in ddr_resident:
-                    addr = alloc_local(out_root.name, nbytes(out_root), exclude_this_op)
-                    if addr is None:
-                        place_in_ddr(out_root.name, nbytes(out_root))
-                    else:
-                        local_addr[out_root.name] = addr
-                if out_root.name in ddr_resident:
-                    out_addr = ddr_resident[out_root.name] + out_offset
-                    output_space = isa.SPACE_DDR
-                    traffic.write_bytes += nbytes(out_t)
-                    traffic.ddr_resident_write_bytes += nbytes(out_t)
-                else:
-                    out_addr = local_addr[out_root.name] + out_offset
-                    output_space = isa.SPACE_LOCAL_TENSOR
-                    traffic.local_write_bytes += nbytes(out_t)
+                traffic.write_bytes += written
+                return isa.SPACE_DDR, tensor_ddr_addr[out_root.name] + out_offset
 
-            steps.append(
-                ComputeStep(
-                    op=op,
-                    input_spaces=input_spaces,
-                    input_addrs=input_addrs,
-                    output_space=output_space,
-                    output_addr=out_addr,
+            if out_root.name in spilled:  # pragma: no cover - see evict_one
+                raise ValueError(
+                    f"planner: op {op_index} writes '{out_t.name}' into the buffer of "
+                    f"'{out_root.name}', which is currently spilled to DDR -- a "
+                    "half-written concat buffer must never be evicted (see evict_one)"
                 )
-            )
+            if out_root.name not in local_addr and out_root.name not in ddr_resident:
+                addr = alloc_local(
+                    out_root.name, nbytes(out_root), exclude, confine_unit(out_root)
+                )
+                if addr is None:
+                    place_in_ddr(out_root.name, nbytes(out_root))
+                else:
+                    local_addr[out_root.name] = addr
+            if out_root.name in ddr_resident:
+                traffic.write_bytes += written
+                traffic.ddr_resident_write_bytes += written
+                return isa.SPACE_DDR, ddr_resident[out_root.name] + out_offset
+            traffic.local_write_bytes += written
+            return isa.SPACE_LOCAL_TENSOR, local_addr[out_root.name] + out_offset
+
+        for op_index, op in enumerate(model.ops):
+            exclude_this_op = {root_of[t.name].name for t in op.inputs}
+
+            if isinstance(op, RowCopyOp):
+                steps.append(_plan_row_copy(op, exclude_this_op, resolve_input, resolve_output, traffic))
+            else:
+                input_spaces: list[int] = []
+                input_addrs: list[int] = []
+                for t in op.inputs:
+                    space, addr = resolve_input(t, exclude_this_op)
+                    input_spaces.append(space)
+                    input_addrs.append(addr)
+
+                output_space, out_addr = resolve_output(op.output, exclude_this_op)
+                steps.append(
+                    ComputeStep(
+                        op=op,
+                        input_spaces=input_spaces,
+                        input_addrs=input_addrs,
+                        output_space=output_space,
+                        output_addr=out_addr,
+                    )
+                )
 
             if isinstance(op, Conv2dOp) and not op.weight_reuse:
                 desc = op.weight_layer_desc()
@@ -727,16 +1004,20 @@ class Planner:
                     traffic.read_bytes += scale_bytes
                     traffic.weight_bytes += scale_bytes
 
-            pending_producers[out_root.name] -= 1
+            out_root_name = root_of[op.output.name].name
+            pending_producers[out_root_name] -= 1
             for t in op.inputs:
                 pending_consumers[root_of[t.name].name] -= 1
-            release(out_root.name)
+            release(out_root_name)
             for t in op.inputs:
                 release(root_of[t.name].name)
 
-        # +1 for the closing HALT: every step corresponds to exactly one
-        # fetched 64-byte descriptor (section 6/CSR "incl. descriptors").
-        traffic.read_bytes += (len(steps) + 1) * isa.INSTR_WORD_BYTES
+        # +1 for the closing HALT. Every step is one fetched 64-byte
+        # descriptor (section 6/CSR "incl. descriptors") except a
+        # `RowCopyStep`, which is one per plane -- see `descriptor_count`.
+        traffic.read_bytes += (
+            sum(descriptor_count(step) for step in steps) + 1
+        ) * isa.INSTR_WORD_BYTES
 
         return PlannedProgram(
             model=model,
@@ -748,6 +1029,7 @@ class Planner:
             bank_bytes=self.bank_bytes,
             local_placements=local_placements,
             ddr_placements=ddr_placements,
+            pinned_placements=pinned_placements,
         )
 
 
@@ -757,7 +1039,9 @@ __all__ = [
     "DdrTraffic",
     "ComputeStep",
     "MoveStep",
+    "RowCopyStep",
     "Step",
+    "descriptor_count",
     "PlannedProgram",
     "Planner",
 ]
