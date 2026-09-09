@@ -220,6 +220,86 @@ architecture a of cnn_accel_pe_array is
   constant c_tree_width : positive := 2 ** c_tree_levels;
   constant c_psum_width : positive := c_product_width + c_tree_levels;
 
+  ------------------------------------------------------------------------
+  -- DSP48 int8 PACKING ("two MACs per DSP"). This is a MAPPING change
+  -- only: every product below is bit-identical to the plain
+  -- 'signed(tap) * signed(weight)' it replaces (proof in the overflow
+  -- bound further down), and nothing about the dataflow, the adder tree,
+  -- the accumulator or the pipeline depth changes.
+  --
+  -- Motivation: at 'g_pe_rows = 8' this array is 64 int8 x int8
+  -- multipliers, and Vivado's default inference put *all* of them in LUT
+  -- fabric (measured: 6297 LUTs, 0 DSP standalone) because an 8x8
+  -- multiply is far below its DSP-inference size threshold, while the
+  -- XC7A200T's 740 DSP48E1s sat idle. Since a DSP48E1 multiplier is
+  -- 25 x 18, one 8-bit operand only uses a third of it.
+  --
+  -- The packing exploits the *broadcast activation* shape of this array
+  -- (entity-level comment): for a given column 'c' every PE row
+  -- multiplies the SAME activation 'tap_q(c)' by its own weight. So two
+  -- rows sharing a column can share one DSP:
+  --
+  --   A = w_hi * 2**c_dsp_shift + w_lo        (25-bit signed, in fabric)
+  --   B = tap_q(c)                            ( 8-bit signed)
+  --   P = A * B = (w_hi*B) * 2**c_dsp_shift + (w_lo*B)
+  --
+  -- so ONE DSP48E1 yields BOTH row products. 'g_pe_rows * g_pe_cols'
+  -- MACs therefore need 'ceil(g_pe_rows/2) * g_pe_cols' DSPs -- 32 for
+  -- the 64-MAC default -- i.e. 2 MACs per DSP.
+  --
+  -- 'c_dsp_shift = 16', not 18 as the usual UltraScale (DSP48E2, 27x18)
+  -- recipe uses, and that is forced by DSP48E1's narrower 25-bit A port:
+  -- the packed operand's range is
+  --   [-2**7 * 2**c_dsp_shift - 2**7, (2**7-1) * 2**c_dsp_shift + 2**7-1]
+  -- so 'c_dsp_shift = 16' needs 25 bits (checked below) while 17 would
+  -- need 26 and would no longer be a single DSP48E1 multiply.
+  --
+  -- OVERFLOW BOUND (the whole correctness argument). Unpacking
+  -- 'P' recovers the two products only while the low field's value
+  -- 'L' satisfies '-2**(c_dsp_shift-1) <= L <= 2**(c_dsp_shift-1) - 1',
+  -- because the unpack reads 'L' as a 'c_dsp_shift'-bit two's-complement
+  -- field and compensates the high field with the borrow 'L < 0' implies
+  -- (function 'dsp_hi' below). This design UNPACKS EVERY CYCLE, in the
+  -- very next pipeline stage, *before* anything is summed: nothing is
+  -- ever accumulated in packed form. The low field therefore only ever
+  -- holds ONE int8 x int8 product, so the bound to prove is
+  --
+  --     max |w_lo * tap| = 2**7 * 2**7 = 16384 <= 2**15 - 1 = 32767
+  --
+  -- which holds with better than 2x margin and -- crucially -- is
+  -- INDEPENDENT of 'g_max_kernel_size', 'g_tile_channels', 'g_pe_rows',
+  -- 'g_pe_cols', the window generator's 'MAX_ROW_TILE_WORDS' and the
+  -- number of channel tiles 'T' per pixel, because none of those can
+  -- lengthen a sum that is never taken in packed form. All the
+  -- multi-cycle, multi-tile accumulation still happens exactly where it
+  -- did before: in the 'c_psum_width' adder tree and the
+  -- 'g_accum_width' accumulator, both untouched by this change.
+  -- The two bounds are checked as concurrent assertions after 'begin'
+  -- rather than left as a comment.
+  ------------------------------------------------------------------------
+
+  -- Bit position of the high lane's product inside the packed DSP result.
+  constant c_dsp_shift : positive := c_product_width;
+
+  -- Number of packed row pairs (one DSP48E1 per pair per column). An odd
+  -- 'g_pe_rows' leaves the last pair's low lane unused (weight forced to
+  -- zero), which costs one half-used DSP and nothing else.
+  constant c_pe_pairs : positive := (g_pe_rows + 1) / 2;
+
+  -- Packed A-operand width: 8-bit high weight shifted up by
+  -- 'c_dsp_shift', plus one bit so the '-128 * 2**c_dsp_shift - 128'
+  -- corner still fits. Must be <= 25 to stay one DSP48E1 multiply.
+  constant c_pack_a_width : positive := 8 + c_dsp_shift + 1;
+
+  -- Packed product width (25 x 8 signed).
+  constant c_dsp_p_width : positive := c_pack_a_width + 8;
+
+  -- The largest magnitude a single int8 x int8 product can reach, and the
+  -- largest magnitude the packed low field can represent. See the
+  -- OVERFLOW BOUND paragraph above; asserted after 'begin'.
+  constant c_max_abs_product : positive := 2 ** 7 * 2 ** 7;
+  constant c_low_field_capacity : positive := 2 ** (c_dsp_shift - 1);
+
   -- Index of the last reduction stage (the one whose entry 0 is a
   -- complete per-group partial sum).
   constant c_last_reduce : natural := c_tree_levels - 1;
@@ -296,13 +376,32 @@ architecture a of cnn_accel_pe_array is
   -- stage-3 accumulate completes the output pixel.
   signal tap_final_q : std_ulogic := '0';
 
-  -- Stage 1 output: one int8 x int8 product per PE cell (row 'r' reads
-  -- weight lane 'r*g_pe_cols + c' -- per-lane weight, unchanged indexing).
+  -- Stage 1 output: one PACKED DSP48E1 product per row *pair* per column
+  -- (see the DSP48 packing block above). Row 'r' still reads weight lane
+  -- 'r*g_pe_cols + c' -- per-lane weight, unchanged indexing -- but rows
+  -- '2*p' (high lane) and '2*p+1' (low lane) share 'dsp_q(p)(c)'. The two
+  -- 16-bit products are recovered combinationally by 'dsp_hi'/'dsp_lo' at
+  -- the head of the next stage, so the pipeline depth ('c_mac_latency')
+  -- is exactly what it was before packing.
+  --
+  -- Kept free of reset and of any enable so Vivado can absorb it into the
+  -- DSP48E1's own M/P register, which is what makes the hard multiplier
+  -- meet timing without an extra fabric stage.
   type prod_row_t is array (0 to g_pe_cols - 1) of signed(c_product_width - 1 downto 0);
   type prod_array_t is array (0 to g_pe_rows - 1) of prod_row_t;
-  signal prod_q : prod_array_t := (others => (others => (others => '0')));
+  type dsp_row_t is array (0 to g_pe_cols - 1) of signed(c_dsp_p_width - 1 downto 0);
+  type dsp_array_t is array (0 to c_pe_pairs - 1) of dsp_row_t;
+  signal dsp_q : dsp_array_t := (others => (others => (others => '0')));
   signal prod_valid_q : std_ulogic := '0';
   signal prod_final_q : std_ulogic := '0';
+
+  -- Vivado mapping hint: force the packed multiply into a DSP48E1 rather
+  -- than leaving it to the size heuristic that put the *unpacked* 8x8
+  -- version in fabric. A locally declared user attribute, so it is inert
+  -- (and legal) for GHDL and for the Yosys netlist build -- no vendor
+  -- primitive is instantiated anywhere in this file.
+  attribute use_dsp : string;
+  attribute use_dsp of dsp_q : signal is "yes";
 
   -- Stages 2 .. 2+c_last_reduce: the balanced adder-tree reduction of one
   -- PE row's products, *one tree level per register stage*. The original
@@ -324,6 +423,13 @@ architecture a of cnn_accel_pe_array is
   type tree_rows_t is array (0 to g_pe_rows - 1) of tree_level_t;
   type tree_pipe_t is array (0 to c_last_reduce) of tree_rows_t;
   signal reduce_q : tree_pipe_t := (others => (others => (others => (others => '0'))));
+  -- Keep the reduction tree in LUT fabric. Once the multiply above became
+  -- a DSP48E1, Vivado also started absorbing these adders into the DSPs'
+  -- post-adder/PCIN cascade (28 extra DSP48E1s at 'g_pe_rows = 8'), which
+  -- is a *correct* mapping but spends the resource this change exists to
+  -- free for a wider array. Pinned here so the entity's DSP count is
+  -- exactly its MAC count / 2 and the checker below can assert it.
+  attribute use_dsp of reduce_q : signal is "no";
   signal reduce_valid_q : std_ulogic_vector(0 to c_last_reduce) := (others => '0');
   signal reduce_final_q : std_ulogic_vector(0 to c_last_reduce) := (others => '0');
 
@@ -331,6 +437,41 @@ architecture a of cnn_accel_pe_array is
   -- tree's power-of-two padding entries (only reachable when 'g_pe_cols'
   -- is not itself a power of two). 'i' is a loop constant at every
   -- unrolled call site, so the branch resolves at elaboration time.
+  -- One int8 weight lane out of the flat 'weight_rd_data' vector.
+  function weight_lane(data : std_ulogic_vector; lane : natural) return signed is
+  begin
+    return signed(data(8 * (lane + 1) - 1 downto 8 * lane));
+  end function;
+
+  -- Build the packed DSP A operand 'w_hi * 2**c_dsp_shift + w_lo'.
+  function pack_weights(w_hi : signed; w_lo : signed) return signed is
+  begin
+    return shift_left(resize(w_hi, c_pack_a_width), c_dsp_shift)
+      + resize(w_lo, c_pack_a_width);
+  end function;
+
+  -- Unpack the low lane: the bottom 'c_dsp_shift' bits of the packed
+  -- product are exactly 'w_lo * tap' in two's complement, because that
+  -- product's magnitude is within the field (OVERFLOW BOUND above).
+  function dsp_lo(p : signed) return signed is
+  begin
+    return resize(signed(p(c_dsp_shift - 1 downto 0)), c_product_width);
+  end function;
+
+  -- Unpack the high lane. 'p = hi*2**c_dsp_shift + lo' as integers, so
+  -- 'floor(p / 2**c_dsp_shift) = hi - 1' exactly when 'lo < 0' and 'hi'
+  -- otherwise; bit 'c_dsp_shift-1' of 'p' IS that low field's sign bit,
+  -- so adding it back recovers 'hi' bit-exactly, with no other case.
+  function dsp_hi(p : signed) return signed is
+    variable result_v : signed(c_product_width - 1 downto 0);
+  begin
+    result_v := signed(p(c_dsp_shift + c_product_width - 1 downto c_dsp_shift));
+    if p(c_dsp_shift - 1) = '1' then
+      result_v := result_v + 1;
+    end if;
+    return result_v;
+  end function;
+
   function padded_product(row : prod_row_t; i : natural) return signed is
   begin
     if i < g_pe_cols then
@@ -340,6 +481,24 @@ architecture a of cnn_accel_pe_array is
   end function;
 
 begin
+
+  ------------------------------------------------------------------------
+  -- The DSP48 packing's two elaboration-time preconditions, asserted
+  -- rather than commented (see the OVERFLOW BOUND block above).
+  ------------------------------------------------------------------------
+
+  assert c_max_abs_product <= c_low_field_capacity - 1
+    report "cnn_accel_pe_array: packed DSP low field (" &
+      natural'image(c_dsp_shift) & " bits, capacity +/-" &
+      natural'image(c_low_field_capacity) & ") cannot hold one int8 x int8 product (" &
+      natural'image(c_max_abs_product) & ") -- the two packed lanes would corrupt each other"
+    severity failure;
+
+  assert c_pack_a_width <= 25
+    report "cnn_accel_pe_array: packed DSP A operand is " &
+      natural'image(c_pack_a_width) &
+      " bits, wider than a DSP48E1's 25-bit multiplier port"
+    severity failure;
 
   ------------------------------------------------------------------------
   -- Handshake: 's_window_s2m.ready' is a pure function of registered
@@ -381,6 +540,12 @@ begin
     variable weight_lane_v : natural;
     variable final_accum_v : accum_array_t(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0);
     variable can_commit_v : boolean;
+    -- The two int8 x int8 products recovered from each packed DSP result,
+    -- laid out exactly like the pre-packing 'prod_q' register so the
+    -- adder tree below is byte-for-byte the code it always was.
+    variable prod_v : prod_array_t;
+    variable w_hi_v : signed(7 downto 0);
+    variable w_lo_v : signed(7 downto 0);
   begin
     if rising_edge(clk) then
       -- Stage 3 (the only place 'accum_q' is ever added into): one
@@ -427,6 +592,19 @@ begin
           accum_q <= final_accum_v;
         end if;
 
+        -- Unpack every DSP48E1 result into the two PE-row products it
+        -- carries. Purely combinational, in front of reduction stage 0's
+        -- register -- this is what replaces the old per-cell 'prod_q'
+        -- register, so no pipeline stage is added or removed.
+        for p in 0 to c_pe_pairs - 1 loop
+          for c in 0 to g_pe_cols - 1 loop
+            prod_v(2 * p)(c) := dsp_hi(dsp_q(p)(c));
+            if 2 * p + 1 <= g_pe_rows - 1 then
+              prod_v(2 * p + 1)(c) := dsp_lo(dsp_q(p)(c));
+            end if;
+          end loop;
+        end loop;
+
         -- Reduction stage 0: pair up this row's products. Only the
         -- even-indexed entries are written (and read at the next level);
         -- 'padded_product' supplies a constant zero for the power-of-two
@@ -435,7 +613,7 @@ begin
           for i in 0 to c_tree_width - 1 loop
             if i mod 2 = 0 then
               reduce_q(0)(r)(i) <=
-                padded_product(prod_q(r), i) + padded_product(prod_q(r), i + 1);
+                padded_product(prod_v(r), i) + padded_product(prod_v(r), i + 1);
             end if;
           end loop;
         end loop;
@@ -457,12 +635,26 @@ begin
           reduce_final_q(level) <= reduce_final_q(level - 1);
         end loop;
 
-        for r in 0 to g_pe_rows - 1 loop
+        -- Stage 1, the packed multiply: one DSP48E1 per row pair per
+        -- column, carrying BOTH rows' int8 x int8 products (see the DSP48
+        -- packing block at the top of this architecture). Weight lane
+        -- indexing ('r*g_pe_cols + c', row-major) is unchanged; only the
+        -- arithmetic's physical mapping is.
+        for p in 0 to c_pe_pairs - 1 loop
           for c in 0 to g_pe_cols - 1 loop
-            weight_lane_v := r * g_pe_cols + c;
-            prod_q(r)(c) <=
-              signed(tap_q(c))
-              * signed(weight_rd_data(8 * (weight_lane_v + 1) - 1 downto 8 * weight_lane_v));
+            weight_lane_v := (2 * p) * g_pe_cols + c;
+            w_hi_v := weight_lane(weight_rd_data, weight_lane_v);
+            if 2 * p + 1 <= g_pe_rows - 1 then
+              weight_lane_v := (2 * p + 1) * g_pe_cols + c;
+              w_lo_v := weight_lane(weight_rd_data, weight_lane_v);
+            else
+              -- Odd 'g_pe_rows': this pair has no low row. A zero weight
+              -- keeps the low field at zero, hence its sign bit at '0',
+              -- hence 'dsp_hi' correction-free -- the high lane is still
+              -- bit-exact.
+              w_lo_v := (others => '0');
+            end if;
+            dsp_q(p)(c) <= pack_weights(w_hi_v, w_lo_v) * signed(tap_q(c));
           end loop;
         end loop;
         prod_valid_q <= tap_valid_q;

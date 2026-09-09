@@ -1253,11 +1253,38 @@ class Module(BaseModule):
                 # flip-flops, and DSP because 65 is the exact expected
                 # multiply-lane count and a big drop there would mean DSP
                 # packing/MAC inference broke.
+                #
+                # Re-pinned 2026-09 (DSP48 int8 PACKING pass, see
+                # cnn_accel_pe_array.vhd's "DSP48 int8 PACKING" block):
+                # measured locally 2235 LUTs, 2124 FFs, 0 BRAM, **33 DSP**
+                # (was 2891/1118/0/65 locally, 3474/1119/0/65 in CI).
+                #
+                #  * DSP 65 -> 33 is the whole point of the change and the
+                #    only checker here that is meant to be tight-ish. The
+                #    MAC array is now `ceil(g_pe_rows/2) * g_pe_cols = 32`
+                #    packed multiplies (two int8 MACs per multiply) instead
+                #    of `g_pe_rows * g_pe_cols = 64` plain ones, plus the
+                #    same 1 address adder Yosys has always folded into a
+                #    DSP48E1: 32 + 1 = 33, measured exactly. Yosys maps
+                #    every `*` to its own DSP48E1 unconditionally, so this
+                #    number counts *multiply operators*, which is precisely
+                #    what the packing halves. `LessThan(40)` is therefore
+                #    the regression gate that matters now: losing the
+                #    packing puts it straight back at 65.
+                #  * LUT 2891 -> 2235 and FF 1118 -> 2124. The FF rise is
+                #    not new registers in the dataflow -- no pipeline stage
+                #    was added, `c_mac_latency` is unchanged -- it is the
+                #    packed product register being 33 bits wide per row
+                #    *pair* where the old one was 16 bits per row, plus
+                #    Yosys not having a DSP M/P register to absorb it into
+                #    the way Vivado does (Vivado's FF count goes *down*,
+                #    3212 -> 2124; see the Vivado twin below). LUT/FF keep
+                #    the module-level ~1.75x structural headroom.
                 checkers=[
-                    TotalLuts(LessThan(6100)),
-                    Ffs(LessThan(2000)),
+                    TotalLuts(LessThan(4000)),
+                    Ffs(LessThan(3800)),
                     BlockRams(LessThan(1)),
-                    DspBlocks(LessThan(70)),
+                    DspBlocks(LessThan(40)),
                 ],
             ),
             build(
@@ -1321,6 +1348,21 @@ class Module(BaseModule):
                 # 36 DSP, 0 LUTRAM. The BRAM story agrees closely (16 vs
                 # Yosys's 18, both far below the old 72), which is what
                 # mattered here.
+                #
+                # SUPERSEDED 2026-09 by the DSP48 int8 PACKING pass: the
+                # long paragraph below is kept because its reasoning is
+                # still instructive, but its conclusion no longer holds.
+                # `cnn_accel_pe_array` no longer synthesizes to 0 DSP under
+                # Vivado -- it now synthesizes to exactly 32 (8 rows) / 64
+                # (16 rows), two int8 MACs per DSP48E1. The real reason
+                # Vivado had put the array in fabric was NOT the
+                # `is_valid`-gated accumulate guessed at below (that gate
+                # was already gone with S7's pipeline, and the count stayed
+                # 0): an 8x8 multiply is simply below Vivado's DSP
+                # inference size threshold. Packing two weights into one
+                # 25-bit operand makes it a 25x8 multiply, comfortably
+                # above it. See cnn_accel_pe_array.vhd's "DSP48 int8
+                # PACKING" block and the re-pinned Vivado entries below.
                 #
                 # DSP 36 vs 106 differs STRUCTURALLY, and -- once this
                 # session added a standalone Vivado build per leaf (see
@@ -1400,7 +1442,13 @@ class Module(BaseModule):
                     # quadrupling each window_gen row bank -- see that
                     # entity's own BlockRams checker above.
                     BlockRams(LessThan(40)),
-                    DspBlocks(LessThan(115)),
+                    # Re-pinned 2026-09 (DSP48 int8 packing pass): measured
+                    # 69 (was 101). pe_array's multiply count went 65 -> 33
+                    # (see its own entry above); bias_requant's 32 and
+                    # window_gen's ~2-4 are untouched. `LessThan(80)` still
+                    # passes at 69 but fails the ~101 an unpacked MAC array
+                    # would put back, which is what this gate is for.
+                    DspBlocks(LessThan(80)),
                 ],
             ),
         ]
@@ -1736,6 +1784,10 @@ class Module(BaseModule):
                     # 1136 FFs (were 6778/1126 unconstrained -- both still
                     # comfortably inside the `LessThan` margins below, so no
                     # checker change needed here), 0 BRAM, *0* DSP. This is
+                    # SUPERSEDED 2026-09 (DSP48 int8 packing) -- the
+                    # paragraph below records why this entity USED to
+                    # synthesize to 0 DSP and why that guess was wrong; the
+                    # current numbers are in the block after it.
                     # the one genuinely surprising number in this whole set:
                     # constraint/prior assumption said
                     # Vivado would pack the 64 int8 x int8 MAC lanes two per
@@ -1781,12 +1833,63 @@ class Module(BaseModule):
                     # single balanced adder tree with no internal registers
                     # only reached 110 MHz. Both the rebalance *and* the
                     # per-level register were needed.
+                    #
+                    # ================= DSP48 int8 PACKING (2026-09) ======
+                    # Re-measured after `cnn_accel_pe_array.vhd` started
+                    # packing TWO int8 MACs into one DSP48E1 -- see that
+                    # file's "DSP48 int8 PACKING" block for the design and
+                    # the (exhaustively checked) overflow bound. This is a
+                    # pure MAPPING change: no pipeline stage was added or
+                    # removed, `c_mac_latency` is unchanged, and every
+                    # simulation expected value is bit-identical.
+                    #
+                    # **1852 LUTs, 2124 FFs, 0 BRAM, 32 DSP, 205.97 MHz**
+                    # (was 6297 / 3212 / 0 / **0** / 232.67 MHz).
+                    #
+                    #  * DSP 0 -> 32, EXACTLY `g_pe_rows/2 * g_pe_cols`.
+                    #    The comment above used to say Vivado would not
+                    #    put this MAC array in DSPs; the reason was simply
+                    #    that an 8x8 multiply is below Vivado's DSP
+                    #    inference size threshold. The packed operand is
+                    #    25x8, well above it, and the Vivado synthesis log
+                    #    reports mode `((D+A)*B2)` per cell -- so the
+                    #    pack's own adder is absorbed into the DSP48E1
+                    #    PRE-ADDER and costs no fabric at all, and
+                    #    `tap_q`/`dsp_q` are absorbed as the DSP's own
+                    #    input/M registers. 2 MACs per DSP, as intended.
+                    #    Pinned with `EqualTo`: this number IS the
+                    #    packing's structural signature -- 64 would mean
+                    #    the packing was lost and every MAC got its own
+                    #    DSP, 0 would mean it fell back to fabric.
+                    #  * LUT 6297 -> 1852 (-71%), which is the entire
+                    #    point: LUTs, not DSPs, are what limits how wide
+                    #    this array can grow on an XC7A200T (134600 LUT /
+                    #    740 DSP).
+                    #  * FF 3212 -> 2124 (-34%), because the product
+                    #    register moved inside the DSP.
+                    #  * Fmax 232.67 -> 205.97 MHz, an 11% drop and still
+                    #    37% above the 150 MHz target, so no extra
+                    #    pipeline stage was added to buy it back (the
+                    #    DSP48E1's combinational A/B -> MREG path is
+                    #    simply longer than a fabric 8x8 multiply's, and
+                    #    the entity is no longer anywhere near critical --
+                    #    conv_core, the figure that actually decides, went
+                    #    *up*, 170.33 -> 178.57 MHz).
+                    #  * A deliberate non-result: with the multiply in a
+                    #    DSP, Vivado also wanted to absorb the reduction
+                    #    tree into the DSPs' post-adder/PCIN cascade (60
+                    #    DSPs, 1360 LUTs, same 205.97 MHz). That mapping
+                    #    is correct but spends 28 extra DSP48E1s of the
+                    #    budget this change exists to protect, so
+                    #    `reduce_q` carries `use_dsp = "no"` -- see its
+                    #    declaration in cnn_accel_pe_array.vhd. The 492
+                    #    LUTs that costs buy back 28 DSPs.
                     checkers=[
-                        TotalLuts(LessThan(7200)),
-                        Ffs(LessThan(3600)),
+                        TotalLuts(LessThan(2050)),
+                        Ffs(LessThan(2350)),
                         Ramb36(LessThan(1)),
                         Ramb18(LessThan(1)),
-                        DspBlocks(LessThan(1)),
+                        DspBlocks(EqualTo(32)),
                     ],
                     analyze_synthesis_timing=True,
                 ),
@@ -1889,12 +1992,44 @@ class Module(BaseModule):
                     # `window_gen`'s own netlist build is byte-identical
                     # (its RTL was not touched at all: it already had the
                     # port).
+                    #
+                    # ================= DSP48 int8 PACKING (2026-09) ======
+                    # Re-measured after `cnn_accel_pe_array.vhd` started
+                    # packing two int8 MACs per DSP48E1 (see that file and
+                    # the pe_array Vivado entry above):
+                    # **10179 LUTs, 7647 FFs, 27 RAMB36 + 2 RAMB18,
+                    # 68 DSP, 178.57 MHz** (was 14487 / 8735 / 27 + 2 /
+                    # 36 / 170.33 MHz). This entity is where the change is
+                    # actually paid for and collected, so these are the
+                    # numbers that count:
+                    #
+                    #  * LUT 14487 -> 10179, **-29.7%**. The saving is
+                    #    exactly pe_array's own (6297 -> 1852) plus a
+                    #    little cross-boundary noise, and it is a saving of
+                    #    the resource that limits array width.
+                    #  * DSP 36 -> 68, still exact leaf additivity:
+                    #    32 (pe_array, NEW -- 64 MACs at 2 per DSP)
+                    #    + 32 (bias_requant, unchanged)
+                    #    + 4 (window_gen address arithmetic, unchanged)
+                    #    = 68. 9.2% of the XC7A200T's 740.
+                    #  * FF 8735 -> 7647: the MAC product registers moved
+                    #    inside the DSP48E1s.
+                    #  * BRAM unchanged at 27 + 2, as it must be -- this
+                    #    change touches nothing but the multiply's mapping.
+                    #  * Fmax 170.33 -> **178.57 MHz**, i.e. timing did not
+                    #    just hold, it improved, and no extra pipeline
+                    #    stage was spent to get there.
+                    #
+                    # Every conv testbench value is bit-identical (141/141
+                    # `cnn_accel.*` VUnit tests unchanged) -- the packing
+                    # is a mapping change, so an expected-value shift here
+                    # would be a bug, never a new baseline.
                     checkers=[
-                        TotalLuts(LessThan(16300)),
-                        Ffs(LessThan(9500)),
+                        TotalLuts(LessThan(11200)),
+                        Ffs(LessThan(8400)),
                         Ramb36(EqualTo(27)),
                         Ramb18(EqualTo(2)),
-                        DspBlocks(EqualTo(36)),
+                        DspBlocks(EqualTo(68)),
                     ],
                     analyze_synthesis_timing=True,
                 ),
@@ -2026,12 +2161,38 @@ class Module(BaseModule):
                     # the critical path does not scale with `g_pe_rows` (it
                     # is inside one PE lane's MAC chain, not across rows).
                     # See flow_status.md S7.
+                    #
+                    # ================= DSP48 int8 PACKING (2026-09) ======
+                    # Re-measured after `cnn_accel_pe_array.vhd` started
+                    # packing TWO int8 MACs into one DSP48E1 -- see that
+                    # file's "DSP48 int8 PACKING" block for the design and
+                    # the (exhaustively checked) overflow bound. This is a
+                    # pure MAPPING change: no pipeline stage was added or
+                    # removed, `c_mac_latency` is unchanged, and every
+                    # simulation expected value is bit-identical.
+                    #
+                    # **3359 LUTs, 3638 FFs, 0 BRAM, 64 DSP, 205.97 MHz**
+                    # (was 12345 / 5846 / 0 / 0 / 232.67 MHz -- note the
+                    # FF checker below was already stale and FAILING at
+                    # 5846 against its 1750 limit before this change; it is
+                    # re-pinned here against a real measurement rather than
+                    # left broken).
+                    #
+                    # DSP is exactly `g_pe_rows/2 * g_pe_cols = 64`, i.e.
+                    # 2 MACs per DSP at the scaled point too, and LUTs
+                    # scale linearly with rows (3359 ~= 2 x 1852) as they
+                    # must. Fmax is identical to the 8-row build, so the
+                    # critical path still does not scale with `g_pe_rows`.
+                    # Headroom check the scaled point exists to answer:
+                    # 64 DSP of the XC7A200T's 740 -- the 128-MAC array now
+                    # costs 8.6% of the DSPs and 2.5% of the LUTs, where
+                    # before it cost 0% and 9.2%.
                     checkers=[
-                        TotalLuts(LessThan(13800)),
-                        Ffs(LessThan(1750)),
+                        TotalLuts(LessThan(3700)),
+                        Ffs(LessThan(4000)),
                         Ramb36(LessThan(1)),
                         Ramb18(LessThan(1)),
-                        DspBlocks(LessThan(1)),
+                        DspBlocks(EqualTo(64)),
                     ],
                     analyze_synthesis_timing=True,
                 ),
@@ -2088,12 +2249,37 @@ class Module(BaseModule):
                     # 8727, and FFs scale with `g_pe_rows`), and RAMB36 was
                     # 17 against a real 43. Of that 43, the increase this
                     # change is responsible for is window_gen's 3 -> 12.
+                    #
+                    # ================= DSP48 int8 PACKING (2026-09) ======
+                    # Re-measured after the pe_array DSP48 int8 packing
+                    # (see the 8-row conv_core entry above for the full
+                    # rationale): **16989 LUTs, 13348 FFs, 42 RAMB36 +
+                    # 2 RAMB18, 132 DSP, 178.57 MHz** (was 25705 / 15507 /
+                    # 43 + 2 / 68 / 170.33 MHz).
+                    #
+                    #  * LUT 25705 -> 16989, **-33.9%**: the 60 fps
+                    #    system-footprint number, and the answer to "does
+                    #    16 rows fit the XC7A200T" is now a much easier
+                    #    yes -- 12.6% of its LUTs and 17.8% of its DSPs.
+                    #  * DSP 68 -> 132, exact leaf additivity again:
+                    #    64 (pe_array, 128 MACs at 2 per DSP) + 64
+                    #    (bias_requant, 4 per requant lane x 16 lanes) + 4
+                    #    (window_gen) = 132.
+                    #  * RAMB36 43 -> 42 with LUTRAMs 0 -> 28: Vivado moved
+                    #    one small weight_buffer prefetch FIFO out of block
+                    #    RAM into LUTRAM now that there are LUTs going
+                    #    spare next to it. A mapping side effect of the LUT
+                    #    pressure dropping, not a storage change -- pinned
+                    #    at the measured 42 rather than assumed back to 43.
+                    #  * Fmax 170.33 -> 178.57 MHz, matching the 8-row
+                    #    build exactly, so the critical path still does not
+                    #    scale with `g_pe_rows`.
                     checkers=[
-                        TotalLuts(LessThan(29300)),
-                        Ffs(LessThan(16500)),
-                        Ramb36(EqualTo(43)),
+                        TotalLuts(LessThan(18700)),
+                        Ffs(LessThan(14700)),
+                        Ramb36(EqualTo(42)),
                         Ramb18(EqualTo(2)),
-                        DspBlocks(EqualTo(68)),
+                        DspBlocks(EqualTo(132)),
                     ],
                     analyze_synthesis_timing=True,
                 ),
