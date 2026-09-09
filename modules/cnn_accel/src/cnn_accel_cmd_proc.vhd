@@ -1002,9 +1002,36 @@ begin
             end if;
           end if;
 
-          if cls_q = cls_xfer or cls_q = cls_elem then
-            -- Neither class needs an output-dimension divide.
+          if cls_q = cls_xfer then
+            -- A pure move is described entirely by 'xfer_bytes': no
+            -- shape, no divide, and nothing in 'st_geom_out'/'out2' that
+            -- its validation reads.
             state <= st_range;
+          elsif cls_q = cls_elem then
+            -- No output-dimension divide either -- an elementwise
+            -- command's output is the same shape as its input -- but it
+            -- must NOT skip 'st_geom_out'/'st_geom_out2': those are
+            -- where 'in_plane_words' and 'in_total_bytes' are computed,
+            -- and 'st_range'/'st_range_dst' validate ADD and UPSAMPLE
+            -- against 'in_total_bytes'. Jumping straight to 'st_range'
+            -- left that register holding the PREVIOUS command's ifmap
+            -- size, so an ADD following a larger convolution was
+            -- range-checked against a length that had nothing to do with
+            -- it -- and raised 'ERR_LOCAL_RANGE' on a perfectly legal
+            -- descriptor. Invisible in the untiled catalogue, where every
+            -- tensor in a program is the same shape; the first tiled case
+            -- with a per-plane ADD after a taller conv strip hit it
+            -- immediately.
+            --
+            -- 'out_w_q'/'out_h_q' are stale on this path and the products
+            -- 'st_geom_out'/'out2' derive from them ('out_plane_bytes',
+            -- 'out_total_bytes', 'n_planes_out') are meaningless -- and
+            -- unread: the elementwise engine sequences its own transfers
+            -- and never enters the pass loop, and the 'out_w = 0'
+            -- geometry check is gated on conv/pool. Only the two input
+            -- products matter here, and they are computed from the
+            -- descriptor's own fields.
+            state <= st_geom_out;
           end if;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
 

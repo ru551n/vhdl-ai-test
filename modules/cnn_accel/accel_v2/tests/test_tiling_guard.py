@@ -41,17 +41,41 @@ from accel_v2.planner import ComputeStep, MoveStep, RowCopyStep
 
 _CATALOGUES = (cases, cases_concat_split, cases_conv_pad, cases_error, cases_pool_pad, cases_yolo)
 
-#: sha256 of `catalogue_dump()`, ratified while landing spatial tiling on
-#: top of `main` at d695c21.
+#: sha256 of `catalogue_dump()`, re-ratified while landing the
+#: output-channel-tile read accounting (`planner.ifmap_passes`) on top of
+#: 7256b14.
 #:
-#: How it was established, since a digest taken *after* a change proves
-#: nothing on its own: the same dump was taken on unmodified d695c21 and
-#: again after each tiling step, and diffed field by field across all 64
-#: cases. The two are identical except for the two new
-#: `DdrTraffic.pinned_*_bytes` counters, which appear as `0` in every
-#: untiled case because nothing is pinned. No placement, no step, no
-#: descriptor byte and no other counter moved.
-_RATIFIED_DIGEST = "51fae7817e02d5aa8d9e5f20b27afb311c2e144bb432c5fa52684c490201176c"
+#: How each ratification was established, since a digest taken *after* a
+#: change proves nothing on its own: the dump is taken on the previous
+#: commit and on the change under test and diffed field by field across
+#: all 64 cases.
+#:
+#: * 51fae78... (spatial tiling core, on top of d695c21): identical to
+#:   d695c21 except for the two new `DdrTraffic.pinned_*_bytes` counters,
+#:   which are `0` in every untiled case because nothing is pinned.
+#: * this digest (the simulator half of spatial tiling, on top of
+#:   7256b14): identical to 7256b14 in every `local_placements`,
+#:   `ddr_placements`, `pinned_placements`, `tensor_ddr_addr`, `steps`,
+#:   `descs`, `program_addr` and geometry entry of all 64 cases, and
+#:   different in exactly two counters:
+#:
+#:   - `traffic.read_bytes` (9 cases) -- the convolutions whose ifmap the
+#:     hardware streams once per output-channel tile
+#:     (`planner.ifmap_passes`) and the `ACT`s whose 256-byte LUT is
+#:     refetched per command (`isa.ACT_LUT_BYTES`). Both were real DDR
+#:     reads the prediction did not charge, which is why `read_bytes`
+#:     could only ever be a lower bound; with them charged it is exact
+#:     for every case in the catalogue and `TrafficPolicy.
+#:     read_bytes_exact` defaults to `True`.
+#:   - `traffic.local_read_bytes` (9 cases) -- the same ifmap
+#:     re-streaming, for the convolutions whose input is resident.
+#:
+#:   Nothing else moved, across resident weight images, per-plane
+#:   spill lowering and the sharing of one DDR weight image between
+#:   convolutions with the same weights: none of those three is reachable
+#:   from an untiled graph, which is what the structural test above
+#:   independently guarantees.
+_RATIFIED_DIGEST = "541f43044a53abcab01839f2e7df80c11bced396f5052d5f4c68ba537a217695"
 
 #: The number of cases the digest covers, asserted separately so that
 #: *deleting* a case cannot silently keep the digest meaningful.

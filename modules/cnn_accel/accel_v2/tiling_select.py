@@ -35,15 +35,21 @@ Weight residency
 `weights_resident` means the group's packed weight images are LOADed
 into the scratchpad once and every strip's convolutions fetch their tiles
 from `space_wgt = LOCAL_TENSOR` rather than re-reading them from DDR per
-strip. The hardware supports it (`cmd_proc.vhd:896-898`) but `program.py`
-has never emitted it, so **the emission half of that path is not built
-yet** (implementation plan step 2, which needs the simulator to ratify).
+strip. The whole path is built and simulated: `Conv2dOp.weights_resident`
+carries the request, `planner.py` places the images and emits the
+`ConstLoadStep`, `program.py` emits the `LOAD`s and the
+`space_wgt = LOCAL_TENSOR` descriptor, and `cases_tiling.py` runs it on
+the DUT. `allow_resident_weights` therefore defaults to **True**, and
+`Selection.resident_groups` is the set `tiler.tile` should be handed
+alongside `strips` and `groups`.
 
-This module therefore reports residency as a *prediction*: `weights` in
-`GroupChoice` says which option the rule picks and what it would save,
-and `allow_resident_weights` (default `False`) controls whether the rule
-is allowed to pick it. Leave it off until step 2 lands, or the chosen
-plan will be cheaper on paper than the program that actually runs.
+The one thing residency is still modelled rather than planned is the fit
+test: `_probe` shrinks the probe's scratchpad by the image bytes instead
+of allocating them, because a probe builds *one* strip while a real
+image is live across all `S` of them. If the final plan then cannot place
+an image after all, `planner.py` falls back to DDR weights for it -- the
+program stays correct and its predicted traffic stays honest (the charge
+follows the decision actually made), it is merely the slower plan.
 """
 
 from __future__ import annotations
@@ -171,9 +177,24 @@ def evaluate(
     read = 0
     write = 0
     recomputed_rows: dict[str, int] = {}
+    #: The strip with the largest working set, which is the one whose fit
+    #: decides the candidate. It is NOT the first: strip 0's halo is
+    #: clipped by the top of the tensor and the last strip's by the
+    #: bottom, so an *interior* strip materializes more rows of every
+    #: tensor than either -- at `S = 3` on a 16-row C2f, 80 rows against
+    #: strip 0's 73, which is the difference between two 8-plane buffers
+    #: fitting a 16 KiB scratchpad and not. Probing strip 0 and calling
+    #: the answer "the tallest strip" was wrong about `R` being the whole
+    #: story, and the DUT found it: the plan fell back to DDR for two
+    #: buffers the rule had already declared feasible.
+    worst_rows: int = -1
+    worst_bound = bounds[0]
 
     for out_rows in bounds:
         need = propagate_rows(group, out_rows, outs)
+        total_rows = sum(rows.rows for rows in need.values())
+        if total_rows > worst_rows:
+            worst_rows, worst_bound = total_rows, out_rows
         for tensor in inputs:
             read += _window_bytes(tensor, need[tensor.name].rows)
         for tensor in outs:
@@ -196,7 +217,7 @@ def evaluate(
         model,
         groups,
         group,
-        bounds,
+        worst_bound,
         planner,
         planewise_add=planewise_add,
         # Resident weight images occupy the scratchpad for the whole
@@ -230,7 +251,7 @@ def _probe(
     model: Model,
     groups: list[Group],
     group: Group,
-    bounds: list[RowRange],
+    out_rows: RowRange,
     planner: Planner,
     *,
     planewise_add: bool,
@@ -238,11 +259,18 @@ def _probe(
 ) -> tuple[bool, str, int]:
     """Plan one strip for real. Returns `(fits, reason, descriptors)`.
 
-    The tallest strip is the one probed -- the first, since `R` is a
-    ceiling division and the last strip is the short one. "Fits" means
-    the plan put nothing but pinned group boundaries in DDR: a
-    group-internal buffer that fell back (section 7 level 2) is exactly
-    the strip height not being viable."""
+    `out_rows` is the strip with the largest working set, chosen by the
+    caller from the row-range recurrence itself (see `evaluate`) rather
+    than assumed to be the first. "Fits" means the plan put nothing but
+    pinned group boundaries in DDR: a group-internal buffer that fell
+    back (section 7 level 2) is exactly the strip height not being
+    viable.
+
+    One strip is still enough. Every strip is the same sub-program, only
+    the row counts differ, and the buffers of one strip are all dead
+    before the next begins -- so the strip that needs the most rows is
+    the one that decides, and planning the other `S-1` would ask the same
+    question with more slack."""
     from accel_v2.planner import descriptor_count
 
     capacity = planner.tensor_mem_bytes - reserved
@@ -251,7 +279,7 @@ def _probe(
     capacity -= capacity % planner.bank_bytes
     try:
         probe = probe_strip(
-            model, group, bounds[0], planewise_add=planewise_add, groups=groups
+            model, group, out_rows, planewise_add=planewise_add, groups=groups
         )
         # A fresh `DdrMap` per probe, at the caller's scale. `DdrMap`'s
         # per-region bump allocators are stateful and never reset, and a
@@ -271,6 +299,19 @@ def _probe(
     if planned.ddr_placements:
         names = [name for name, _, _ in planned.ddr_placements]
         return False, f"buffer(s) {names} did not fit in the scratchpad", descriptors
+    if planned.traffic.spill_count:
+        # A spilled buffer is the same verdict reached one step later:
+        # the strip's live set does not fit, and the planner paid a
+        # STORE + LOAD round trip to DDR for a group-internal buffer.
+        # Section 7 calls that level 2, the thing the chosen `S` is
+        # supposed to make unnecessary -- and unlike a DDR *placement* it
+        # is invisible in `ddr_placements`, so it has to be asked for
+        # separately or a "fallback-free" case quietly writes DDR.
+        return (
+            False,
+            f"{planned.traffic.spill_count} buffer(s) had to be spilled mid-strip",
+            descriptors,
+        )
     return True, "", descriptors
 
 
@@ -326,7 +367,7 @@ def choose_group(
     *,
     planner: Planner,
     recompute_cap: float = DEFAULT_RECOMPUTE_CAP,
-    allow_resident_weights: bool = False,
+    allow_resident_weights: bool = True,
     planewise_add: bool = True,
 ) -> GroupChoice:
     """Section 4.2, for one group."""
@@ -389,6 +430,9 @@ class Selection:
     #: Groups no `(S, residency)` satisfied, which are dissolved into
     #: single-op groups (section 7 level 3).
     fallbacks: list[int] = field(default_factory=list)
+    #: Group indices whose weights the rule chose to keep resident in the
+    #: scratchpad -- hand it to `tiler.tile(..., resident_groups=...)`.
+    resident_groups: set[int] = field(default_factory=set)
 
     @property
     def ddr_read(self) -> int:
@@ -406,7 +450,7 @@ def select(
     tensor_mem_bytes: int | None = None,
     bank_bytes: int | None = None,
     recompute_cap: float = DEFAULT_RECOMPUTE_CAP,
-    allow_resident_weights: bool = False,
+    allow_resident_weights: bool = True,
     planewise_add: bool = True,
     ddr_scale: int = 1,
     strict_fallback: bool = False,
@@ -487,8 +531,17 @@ def select(
                 if all(c.cost is not None for c in trial)
                 else None
             )
+            # `choice.cost is None` means the group does not fit at ANY
+            # strip height as one group, so dissolving is not a
+            # cost comparison but the only lowering left. (Before the
+            # probe learned to plan the *widest* strip rather than the
+            # first, no group ever reached this state, and asking the
+            # comparison anyway raised `AttributeError` instead of
+            # falling back.)
             take_it = dissolved_cost is not None and (
-                strict_fallback or dissolved_cost < choice.cost.ddr_total
+                strict_fallback
+                or choice.cost is None
+                or dissolved_cost < choice.cost.ddr_total
             )
             if take_it:
                 groups = trial_groups
@@ -497,6 +550,8 @@ def select(
                     if sub_choice.fell_back:
                         selection.fallbacks.append(sub_choice.group)
                     selection.strips[sub_choice.group] = sub_choice.cost.strips
+                    if sub_choice.cost.weights_resident:
+                        selection.resident_groups.add(sub_choice.group)
                 index += len(group.ops)
                 continue
         selection.choices.append(choice)
@@ -511,6 +566,8 @@ def select(
                 "be split, or its buffers left in DDR by the planner's own fallback."
             )
         selection.strips[group.index] = choice.cost.strips
+        if choice.cost.weights_resident:
+            selection.resident_groups.add(group.index)
         index += 1
     selection.groups = groups
     return selection

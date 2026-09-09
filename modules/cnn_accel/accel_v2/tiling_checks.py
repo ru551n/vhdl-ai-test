@@ -140,6 +140,10 @@ def check_units_confined(planned: PlannedProgram) -> None:
         for t in planned.model.tensors
         if t.confine_unit_bytes is not None
     }
+    # A resident weight image is not a graph tensor at all -- it is a
+    # planner-owned buffer of packed constants -- so its request size
+    # comes from the plan's own side table rather than from a `Tensor`.
+    units.update(planned.local_confine_units)
     bank = planned.bank_bytes
     for name, addr, size in planned.local_placements:
         unit = units.get(name, size)

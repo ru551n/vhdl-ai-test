@@ -510,6 +510,7 @@ def tile(
     planewise_add: bool = True,
     name: str | None = None,
     groups: list[Group] | None = None,
+    resident_groups: set[int] | None = None,
 ) -> TiledModel:
     """Rewrite `model` into an equivalent strip-tiled model.
 
@@ -527,8 +528,25 @@ def tile(
 
     `groups` overrides the grouping `form_groups` would derive -- pass
     the list `tiling_select.select` settled on, which may have dissolved
-    a group that did not fit (design section 7 level 3)."""
-    return _Tiler(model, strips, planewise_add=planewise_add, name=name, groups=groups).run()
+    a group that did not fit (design section 7 level 3).
+
+    `resident_groups` is the set of group indices whose convolutions
+    should serve their packed weight/bias/scale images out of the
+    scratchpad (`Conv2dOp.weights_resident`). Every strip's clone of one
+    conv shares that conv's `weight` list, which is what lets
+    `planner.py` give the `S` clones ONE image and load it once instead
+    of once per strip -- the whole of the saving. Pass
+    `tiling_select.Selection.resident_groups`; an unplaceable image
+    silently falls back to DDR weights in the planner, so this is a
+    request rather than a promise."""
+    return _Tiler(
+        model,
+        strips,
+        planewise_add=planewise_add,
+        name=name,
+        groups=groups,
+        resident_groups=resident_groups,
+    ).run()
 
 
 def probe_strip(
@@ -572,8 +590,14 @@ class _Tiler:
         planewise_add: bool,
         name: str | None,
         groups: list[Group] | None = None,
+        resident_groups: set[int] | None = None,
     ) -> None:
         self.source = source
+        self.resident_groups = set(resident_groups or ())
+        #: Whether the group currently being tiled wants resident
+        #: weights, read by `_clone_shaped` (which is four calls deep and
+        #: has no other way to know which group it is in).
+        self._resident = False
         self.planewise_add = planewise_add
         self.out = Model(seed=source.seed, name=name or f"{source.name}_tiled")
         self.groups = form_groups(source) if groups is None else groups
@@ -669,9 +693,58 @@ class _Tiler:
         self.out.tensors.append(view)
         return view
 
+    #: Ops whose hardware requests are NOT bounded by one activation
+    #: plane, and whose operands therefore cannot be confined at plane
+    #: granularity (design section 2.4's own proviso, "as long as the
+    #: planner never emits a `T = 1`-style whole-tensor request or an
+    #: `ADD`/`COPY` bigger than a plane").
+    #:
+    #: * `COPY` and `ACT` issue **one** request of `xfer_bytes` -- the
+    #:   whole tensor (`cnn_accel_elementwise.vhd`, `cur_len_q <=
+    #:   xfer_len_q`).
+    #: * `UPSAMPLE` issues 8-byte reads and 16-byte writes, walking the
+    #:   buffer sequentially, so a request straddles a plane boundary
+    #:   whenever the plane size is not a multiple of the beat pair.
+    #:
+    #: Found by the DUT, not by inspection: `cnn_accel_tensor_mem`
+    #: asserts on a straddling request, and the first tiled case with an
+    #: `UPSAMPLE` in it stopped the simulation on that assertion. A
+    #: buffer these ops touch is therefore left with the strict rule
+    #: (whole buffer in one bank), which is what every untiled tensor
+    #: uses; if it then does not fit, the planner's ordinary DDR fallback
+    #: takes it.
+    _UNPLANNED_REQUEST_OPS = (CopyOp, ActOp, UpsampleOp)
+
+    def _relax_unconfinable(self) -> None:
+        """Undo `tag`'s plane confinement wherever an op would issue a
+        request bigger than one plane against the buffer."""
+        family: dict[int, list[Tensor]] = {}
+        for tensor in self.out.tensors:
+            family.setdefault(id(alias_root(tensor)), []).append(tensor)
+
+        def unconfine(tensor: Tensor) -> None:
+            root = alias_root(tensor)
+            for member in family.get(id(root), [root]):
+                member.confine_unit_bytes = None
+            root.confine_unit_bytes = None
+
+        for op in self.out.ops:
+            unbounded = isinstance(op, self._UNPLANNED_REQUEST_OPS) or (
+                # A multi-plane ADD is one request per operand over the
+                # whole tensor; `Model.add_planewise` is what normally
+                # keeps it to a plane, and this catches the case where it
+                # was turned off.
+                isinstance(op, AddOp) and op.inputs[0].plane_count > 1
+            )
+            if not unbounded:
+                continue
+            for tensor in list(op.inputs) + [op.output]:
+                unconfine(tensor)
+
     def run(self) -> TiledModel:
         for group in self.groups:
             self._tile_group(group)
+        self._relax_unconfinable()
         return TiledModel(
             model=self.out,
             source=self.source,
@@ -709,6 +782,7 @@ class _Tiler:
             group.height, min(self.strips_of.get(group.index, 1), group.height)
         )
         self.strip_counts[group.index] = len(bounds)
+        self._resident = group.index in self.resident_groups
         for strip_index, out_rows in enumerate(bounds):
             self._tile_strip(group, strip_index, out_rows, outs, produced)
 
@@ -1042,6 +1116,11 @@ class _Tiler:
                 output_offset=op.output_offset,
                 per_channel_scale=op.per_channel_scale,
                 pad_value=op.pad_value,
+                # Every strip's clone shares `op.weight`, so `planner.py`
+                # gives all `S` of them one scratchpad image and loads it
+                # once -- which is the point of the flag. See `tile`'s
+                # `resident_groups`.
+                weights_resident=self._resident,
             )
         else:
             assert isinstance(op, PoolOp)

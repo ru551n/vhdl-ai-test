@@ -28,6 +28,16 @@ import cnn_accel_constants as _const
 ISA_VERSION = _const.ISA_VERSION
 INSTR_WORD_BYTES = _const.INSTR_WORD_BYTES
 
+#: Bytes an `ACT` descriptor's standalone activation LUT occupies, and
+#: therefore the DDR read one `ACT` costs beyond its operands: the table
+#: is one int8 per raw input byte, fetched in full from `weight_addr`
+#: every time the opcode runs (`cnn_accel_elementwise.vhd`'s
+#: `c_lut_entries`, whose fill is armed per command -- there is no
+#: caching across descriptors). Stated once here because `program.py`
+#: allocates and writes exactly this many bytes, `planner.py` predicts
+#: the read and `reference.py` charges it independently.
+ACT_LUT_BYTES = 256
+
 # ---------------------------------------------------------------------------
 # Space tags (section 3): 2-bit tag per operand, packed into W0 bits
 # [23:16] (see `_SPACE_SHIFT` below).
@@ -307,6 +317,7 @@ def decode_desc(data: bytes) -> DescV2:
 
 __all__ = [
     "ISA_VERSION",
+    "ACT_LUT_BYTES",
     "INSTR_WORD_BYTES",
     "SPACE_DDR",
     "SPACE_LOCAL_TENSOR",

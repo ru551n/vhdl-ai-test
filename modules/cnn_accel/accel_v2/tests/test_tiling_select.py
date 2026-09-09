@@ -174,18 +174,58 @@ def test_the_chosen_tiling_actually_plans_fallback_free() -> None:
     assert planned.ddr_placements == []
 
 
-def test_resident_weights_are_off_unless_asked_for() -> None:
-    """`space_wgt = LOCAL_TENSOR` is not emitted yet (implementation plan
-    step 2), so the rule must not choose a plan whose cost assumes it."""
+def test_resident_weights_are_searched_by_default_and_can_be_turned_off() -> None:
+    """Residency is on by default now that `space_wgt = LOCAL_TENSOR` is
+    actually emitted and simulated (implementation plan step 2); the flag
+    survives so a test can isolate the DDR-weight plan.
+
+    The default must also *choose* residency here, not merely consider
+    it: with more than one strip a resident image is read once instead of
+    once per strip, so it is strictly cheaper in DDR bytes and the rule's
+    own objective has to prefer it."""
     model = _chain(height=16)
     groups = form_groups(model)
     default = choose_group(model, groups, groups[0], planner=_planner())
-    assert all(not c.weights_resident for c in default.considered)
+    assert any(c.weights_resident for c in default.considered)
+    assert default.cost.strips == 1 or default.cost.weights_resident
 
-    opted_in = choose_group(
-        model, groups, groups[0], planner=_planner(), allow_resident_weights=True
+    opted_out = choose_group(
+        model, groups, groups[0], planner=_planner(), allow_resident_weights=False
     )
-    assert any(c.weights_resident for c in opted_in.considered)
+    assert all(not c.weights_resident for c in opted_out.considered)
+
+
+def test_a_selected_resident_group_is_reported_for_the_tiler() -> None:
+    """`Selection.resident_groups` is the argument `tiler.tile` needs.
+    Every conv the rule kept resident must come back with the flag set on
+    its clones, and every conv it did not must come back without --
+    otherwise the plan is cheaper on paper than the program that runs."""
+    from accel_v2.model import Conv2dOp
+
+    model = _chain(height=16)
+    selection = select(model, tensor_mem_bytes=32 * 1024, bank_bytes=8 * 1024, ddr_scale=4)
+    assert selection.resident_groups, "this shape should be worth keeping resident"
+
+    tiled = tile(
+        model,
+        selection.strips,
+        groups=selection.groups,
+        resident_groups=selection.resident_groups,
+    )
+    group_of_clone = {}
+    for group in selection.groups:
+        for op in group.ops:
+            group_of_clone[op.name] = group.index
+    seen = set()
+    for op in tiled.model.ops:
+        if not isinstance(op, Conv2dOp):
+            continue
+        # A strip clone is named "<original>_g<group>s<strip>".
+        origin = op.name.split("_g")[0]
+        want = group_of_clone[origin] in selection.resident_groups
+        assert op.weights_resident is want, (op.name, origin, want)
+        seen.add(origin)
+    assert seen, "no convolution survived tiling"
 
 
 def test_weight_bytes_agree_with_what_the_planner_charges() -> None:

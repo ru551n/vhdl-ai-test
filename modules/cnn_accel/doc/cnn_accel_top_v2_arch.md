@@ -163,6 +163,82 @@ residency policy:
 This is the mechanism the compiler's future lifetime analysis /
 allocation / spill passes need, and nothing more.
 
+### 3.2 Strips and pinned tensors
+
+A real network's activations do not fit. Every YOLOv8n intermediate at
+640x640 is 12x to 200x one scratchpad bank, so §3.1's residency is inert
+at that scale unless the compiler stops trying to place whole tensors.
+It does: `accel_v2/tiler.py` rewrites the graph into **row strips**
+before the planner ever sees it. Nothing below is an ISA or hardware
+feature — it is entirely a statement about what the compiler emits — but
+it is what makes §3 and §10 true of a program bigger than a test case.
+
+**A strip is an ordinary tensor.** `cmd_proc` derives a plane stride from
+the descriptor's own `in_height`/`out_h` (`in_plane_bytes = in_width *
+in_height * 8`), so there is no way to say "this buffer is really taller
+than the part I am addressing". A strip therefore cannot be the full
+tensor at an offset once it has more than one channel plane; it is a
+*compact* tensor of its own height, and the tiler builds it as one. Every
+op in a strip is an ordinary op on ordinary tensors, and the planner,
+`reference.py` and `program.py` see nothing new.
+
+**Halo rows are recomputed, not carried.** A strip covering group-output
+rows `[o0, o1)` materializes, for every tensor of the group, exactly the
+rows the receptive-field recurrence says those outputs need — `[a*s - p,
+(b-1)*s + k - p)` through a `k x k` stride-`s` convolution or pool,
+`[a, b)` through anything pointwise, `[a//2, ceil(b/2))` through
+`UPSAMPLE` — clipped to the tensor. Whatever the clip removed is exactly
+what that strip's `pad_top`/`pad_bottom` supply, so an interior strip
+pads on neither side and a frame-edge strip pads on one. Strips are
+consequently independent: no state crosses a command boundary, and the
+"scratchpad contents survive" contract of §3.1 is used only *within* a
+strip.
+
+**Group boundaries are pinned to DDR.** Fusion groups are cut at every
+stride > 1. A tensor at a group boundary is written by `S` different
+strip stores and read by the next group's `S'` strip loads, so it has no
+single producer and a lifetime spanning groups: it is backing storage by
+definition, and `Tensor.pin_ddr` makes the planner give it a DDR home
+immediately rather than trying and failing to place it. Those bytes are
+counted separately (`DdrTraffic.pinned_read_bytes`/`pinned_write_bytes`)
+from the bytes an overflow *fallback* costs (`ddr_resident_*`), so "did
+anything overflow?" stays a different question from "what did the group
+boundaries cost?".
+
+**Row windows move plane by plane.** The layout is channel-plane-major,
+so a row window of a multi-plane tensor is `plane_count` separate byte
+ranges. A `RowCopyOp` is lowered to one `LOAD`, `STORE` or `COPY`
+descriptor per plane — the opcode chosen from the two resolved operand
+spaces and nothing else — which is why strip loads, join alignment and
+strip stores need no opcode of their own and ISA v2.1 is unchanged.
+
+**Confinement is per request, not per buffer.** §4's rule is that a
+buffer never straddles a bank. The hardware requirement is weaker: no
+single *request* may straddle one, because `cnn_accel_tensor_mem` serves
+each request from the bank its address decodes to and clamps the
+overrun. A strip activation is therefore confined at **plane**
+granularity (`Tensor.confine_unit_bytes`), which is what lets a
+multi-plane strip be larger than a bank at all, and a resident weight
+image at **weight-tile** granularity. That relaxation is only sound for
+operands whose every request is plane-bounded: the convolution ifmap
+feeder (one `(row, tile)` strip per request), the conv/pool output pass
+(one plane), pooling's input pass (one plane), and `RowCopyOp` itself.
+`COPY`, `ACT`, a multi-plane `ADD` and `UPSAMPLE` all issue requests that
+walk a buffer without regard to plane boundaries, and a buffer they touch
+keeps the strict whole-buffer rule; so does the `LOAD`/`STORE` of a
+spill, unless it is split one plane per descriptor. `cnn_accel_tensor_mem`
+asserts on a straddling request, which is how each of those was found.
+
+**Weights can be resident.** `space_wgt = LOCAL_TENSOR` (§3's table, and
+`st_wgt_req`'s operand mux) lets a convolution's packed weight, bias and
+scale images be `LOAD`ed into the scratchpad once and fetched from there
+once per output-channel pass. Every strip clone of one convolution shares
+one image, so a group's weights cross the AXI bus once instead of once per
+strip. `WEIGHT_LOAD_BYTES` is unchanged by this — `cnt_wgt_bytes_q`
+counts the weight-buffer refill before the operand-space mux, so it
+measures how much the buffer was filled, not how much DDR was read. What
+changes is `DDR_RD_BYTES`.
+
 ---
 
 ## 4 `cnn_accel_tensor_mem` — local tensor memory
@@ -566,6 +642,15 @@ construction.
 | R4 | A residual tensor written at command `i` and consumed at command `i+k` is never stored to DDR in between. |
 | R5 | A forced spill (`STORE` to spill arena, later `LOAD` back) is bit-exact, and `TENSOR_STORE_COUNT` / `TENSOR_LOAD_COUNT` equal the program's explicit counts — no hidden traffic. |
 | R6 | `weight_reuse=1` on a repeated conv adds **zero** to `WEIGHT_LOAD_BYTES`. |
+| R7 | A **fused group's** DDR traffic equals its pinned boundary bytes plus one weight `LOAD` — nothing else. `DDR_WR_BYTES` equals exactly the group outputs' `pinned_write_bytes`, `ddr_resident_read_bytes`/`ddr_resident_write_bytes` are zero (no buffer fell back), and `DDR_RD_BYTES` matches the plan to the byte, which is only meaningful because the prediction now charges the §5.4 output-channel loop's ifmap re-streaming. Proved by `accel_v2/cases_tiling.py`, whose cases run the tiler's own output on the DUT and are checked bit-exact against the reference of the **untiled** graph. |
+
+`DDR_RD_BYTES` is exact for every non-error case in the catalogue, not a
+lower bound. That took two corrections to the prediction, both of them
+about traffic nobody was counting: a convolution's ifmap is streamed once
+per output-channel tile (§5.4, `planner.ifmap_passes`), and every `ACT`
+refetches its whole 256-byte LUT. Until both were charged, R2's "AXI reads
+only for descriptors + weights" could only be asserted as an inequality,
+and R7 could not be asserted at all.
 
 ---
 
@@ -621,7 +706,29 @@ adding a test adds a Python function, never VHDL.
 6. ~~`g_max_row_tile_words` stays at its current value in this phase; the
    H2 bump is a separate, independent change.~~ **Done (2026-09):** raised
    512 -> 1920, see §12a.
-7. `dma_store` shares read channel `r0` with `engine_in_a` (§4), so a
+7. **No `plane_stride_rows`.** A descriptor derives its plane stride from
+   its own `in_height`/`out_h`, so a strip (§3.2) has to be a compact
+   tensor of its own and every strip load, join window and strip store is
+   a per-plane `LOAD`/`STORE`/`COPY`. A v2.2 field `plane_stride_rows`
+   (16 bits, fitting the `reserved, must be 0` half of W10, with `0`
+   meaning "= `in_height`", i.e. today's behaviour, so every v2.1 program
+   keeps running unchanged) would let those geometries be computed from a
+   *taller* buffer. A strip would then be an in-place row window of the
+   full tensor in either space, and every row copy in a tiled program
+   would disappear — network-wide that is 2 000-3 000 descriptors and
+   roughly 6-8 MB of local copy traffic per frame, about 1 % of frame
+   time. It also makes carrying halo rows between strips cheap, instead
+   of recomputing them (4.9-6.5 % of MACs on YOLOv8n).
+
+   It is documented rather than proposed because it is not needed for
+   correctness or for the traffic win, and it is not free: `cmd_proc`'s
+   geometry (`in_plane_bytes`/`out_plane_bytes`, the ifmap feeder, the
+   pool pass), `cnn_accel_elementwise`'s per-operand request loops,
+   `st_range`'s extent arithmetic, `cnn_accel_constants.py` and the ISA
+   generator, the golden model, `reference.py`, `program.py` and every
+   test that reads `reserved_w10` all move. Justify it with a measurement
+   of the copy overhead on the real DUT first.
+8. `dma_store` shares read channel `r0` with `engine_in_a` (§4), so a
    `STORE` cannot overlap a compute command's activation reads even once
    limitation 1 is lifted. Overlapping writeback with compute — the
    natural next optimisation after ping-pong loading — needs a third read

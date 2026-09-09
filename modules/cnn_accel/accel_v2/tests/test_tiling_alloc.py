@@ -22,6 +22,8 @@ import random
 
 import pytest
 
+import cnn_accel_model as golden
+
 from accel_v2 import isa
 from accel_v2.model import Activation, Model
 from accel_v2.planner import _LocalAllocator, DEFAULT_BANK_BYTES, Planner
@@ -222,7 +224,14 @@ def test_pinned_tensors_go_straight_to_ddr_and_are_counted_apart() -> None:
     assert planned.traffic.ddr_resident_read_bytes == 0
     assert planned.traffic.ddr_resident_write_bytes == 0
     assert planned.traffic.pinned_write_bytes == pinned.size_bytes
-    assert planned.traffic.pinned_read_bytes == pinned.size_bytes
+    # Read `n_ot` times, not once: 'y' has 16 output channels, so the
+    # hardware runs two output-channel passes and re-streams the whole
+    # ifmap for each (`planner.ifmap_passes`). Written once -- the output
+    # side of a pass writes one *plane*, so the ofmap is written exactly
+    # once in total.
+    n_ot = -(-16 // golden.PE_ROWS)
+    assert n_ot == 2
+    assert planned.traffic.pinned_read_bytes == n_ot * pinned.size_bytes
 
     steps = [s for s in planned.steps if hasattr(s, "op")]
     produce = next(s for s in steps if s.op.output.name == "h")

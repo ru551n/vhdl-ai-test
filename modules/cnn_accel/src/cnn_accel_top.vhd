@@ -904,13 +904,19 @@ begin
       r0_req_s2m => req_out_s2m(c_req_tm_r0),
       m_r0_m2s => tm_r0_raw_m2s,
       m_r0_s2m => tm_r0_raw_s2m,
-      r0_done => tm_r0_done,
 
       r1_req_m2s => req_out_m2s(c_req_tm_r1),
       r1_req_s2m => req_out_s2m(c_req_tm_r1),
       m_r1_m2s => tm_r1_raw_m2s,
       m_r1_s2m => tm_r1_raw_s2m,
-      r1_done => tm_r1_done
+      -- Both read-channel 'done' pulses are re-derived below, on the far
+      -- side of the skid stage. 'cnn_accel_tensor_mem' raises its own
+      -- when the last beat is accepted by whatever is connected to
+      -- 'm_rN_s2m.ready' -- which, since the skid stage was inserted, is
+      -- the pipeline register and not the consumer. See
+      -- 'tm_read_pipeline_gen'.
+      r0_done => open,
+      r1_done => open
     );
 
   ------------------------------------------------------------------------
@@ -1127,7 +1133,7 @@ begin
 
   tm_read_pipeline_gen : for r in 0 to 1 generate
     signal input_m2s, output_m2s : axi_stream_m2s_t;
-    signal input_ready, output_ready : std_ulogic;
+    signal input_ready, output_ready, output_done : std_ulogic;
   begin
     input_m2s <= tm_r0_raw_m2s when r = 0 else tm_r1_raw_m2s;
     output_ready <= tm_r0_s2m.ready when r = 0 else tm_r1_s2m.ready;
@@ -1155,14 +1161,38 @@ begin
 
     output_m2s.user <= (others => '-');
 
+    -- 'done' for the channel, raised where the last beat is accepted by
+    -- the *consumer* -- here, past the skid register -- and not where
+    -- 'cnn_accel_tensor_mem' sees it accepted, which since this stage was
+    -- inserted is one or two beats earlier.
+    --
+    -- That distinction is invisible on the ifmap channel: 'cmd_proc's
+    -- feeder only uses 'src_done' to decide when to issue the *next*
+    -- '(row, tile)' request, and every beat still arrives, in order, and
+    -- is still consumed. It is fatal on the weight channel. A convolution
+    -- with 'space_wgt = LOCAL_TENSOR' fetches its weight, bias and scale
+    -- images through 'r1' in three back-to-back requests, and 'cmd_proc'
+    -- ends each one on 'side_done' by clearing 'wgt_fill_active_q'. With
+    -- the early pulse, the last beat of a region is still sitting in this
+    -- register when its request is declared finished, the weight
+    -- serializer stops accepting, and that beat is then handed to the
+    -- *next* region as its first word -- so every fill after the first is
+    -- shifted by a word and the convolution runs on rubbish. It has never
+    -- been seen because 'program.py' only ever emitted DDR weights, whose
+    -- read DMA raises 'done' against the real consumer; the first tiled
+    -- case to ask for resident weights failed on it immediately.
+    output_done <= output_m2s.valid and output_m2s.last and output_ready;
+
     r0_gen : if r = 0 generate
       tm_r0_raw_s2m.ready <= input_ready;
       tm_r0_m2s <= output_m2s;
+      tm_r0_done <= output_done;
     end generate;
 
     r1_gen : if r = 1 generate
       tm_r1_raw_s2m.ready <= input_ready;
       tm_r1_m2s <= output_m2s;
+      tm_r1_done <= output_done;
     end generate;
   end generate;
 

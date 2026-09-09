@@ -278,3 +278,64 @@ def test_local_read_bytes_counted_for_every_operand_fetch() -> None:
     # h1 -> h2 and h2 -> h3 are both local reads (each intermediate has
     # exactly one consumer, immediately following, so never spilled).
     assert planned.traffic.local_read_bytes > 0
+
+
+# ---------------------------------------------------------------------------
+# The output-channel-tile loop re-streams the ifmap (hardware fact F4).
+# ---------------------------------------------------------------------------
+
+
+def test_conv_ifmap_is_charged_once_per_output_channel_tile_from_ddr() -> None:
+    """`cmd_proc` runs `n_ot = ceil(Cout/PE_ROWS)` output-channel passes
+    and kicks the ifmap feeder for the whole input tensor on every one of
+    them (`st_pass_req_dst` -> `feed_kick`, feeder `fd_issue` walking all
+    `in_height * n_tiles` strips). A conv reading its input straight out
+    of DDR therefore moves `n_ot` times the ifmap over AXI, which is what
+    made the untiled YOLOv8n baseline 202 MB per frame instead of 22.
+
+    Asserted as a *difference* between two graphs identical except for
+    their output-channel count, so the figure does not depend on
+    descriptor, weight or output bytes at all -- only on `n_ot`."""
+    import cnn_accel_model as golden
+
+    def read_bytes_for(out_channels: int) -> tuple[int, int]:
+        m = Model(seed=11)
+        x = m.input(8, 8, 8, name="x")
+        y = m.conv2d(x, out_channels, kernel=(1, 1), name="y")
+        m.output(y)
+        planned = Planner(tensor_mem_bytes=1 << 16).plan(m)
+        # The input is read straight from DDR: one remaining consumer,
+        # never spilled, so `resolve_input` takes the direct-DDR path.
+        step = planned.steps[0]
+        assert step.input_spaces[0] == isa.SPACE_DDR
+        return planned.traffic.read_bytes, x.size_bytes
+
+    one_pass, ifmap = read_bytes_for(golden.PE_ROWS)
+    four_pass, _ = read_bytes_for(4 * golden.PE_ROWS)
+
+    # Everything else that differs between the two (weights, bias,
+    # output) is accounted for by planning both and subtracting the
+    # *predicted* difference of those alone would be circular -- so
+    # instead compare against `reference.py`, which is an independent
+    # execution, in the test below. Here only the direction and the
+    # multiple are claimed: three extra passes over the ifmap.
+    assert four_pass - one_pass >= 3 * ifmap
+
+
+def test_planner_and_reference_agree_on_the_ot_multiplier() -> None:
+    """The two halves must charge the same multiplier or every
+    `read_bytes_exact` case fails for a reason that has nothing to do
+    with residency. `ifmap_passes` is the single definition; this is the
+    test that both callers use it."""
+    from accel_v2.memimage import MemoryImage
+    from accel_v2.reference import run_reference
+
+    for out_channels in (8, 16, 32):
+        m = Model(seed=12)
+        x = m.input(6, 6, 16, name="x")
+        h = m.conv2d(x, out_channels, kernel=(3, 3), padding=(1, 1, 1, 1), name="h")
+        y = m.conv2d(h, 8, kernel=(1, 1), name="y")
+        m.output(y)
+        planned = Planner(tensor_mem_bytes=1 << 16).plan(m)
+        actual = run_reference(planned, MemoryImage())
+        assert vars(planned.traffic) == vars(actual.traffic), out_channels

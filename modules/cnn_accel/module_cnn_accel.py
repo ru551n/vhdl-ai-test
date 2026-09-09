@@ -2723,12 +2723,13 @@ class Module(BaseModule):
             cases_conv_pad,
             cases_error,
             cases_pool_pad,
+            cases_tiling,
             cases_yolo,
         )
 
         tb = library.test_bench("tb_cnn_accel_top")
 
-        # Six catalogues, one registration loop. `cases_pool_pad.py`
+        # Seven catalogues, one registration loop. `cases_pool_pad.py`
         # holds the ISA v2.1 pooling cases (padding, the zero-point pad
         # value, the 5x5 SPPF kernel); `cases_conv_pad.py` holds the
         # convolution half of that same `pad_value` field (a padded conv
@@ -2740,13 +2741,19 @@ class Module(BaseModule):
         # tests by *topology* rather than by feature -- Bottleneck, C2f,
         # SPPF, backbone stage, FPN/PAN merge, the three-scale head
         # boundary and a small end-to-end YOLOv8n-shaped network;
+        # `cases_tiling.py` holds the spatially tiled cases -- the only
+        # ones whose program the tiler produced, and therefore the only
+        # ones with a pinned tensor, a row copy, a plane-confined buffer
+        # or a `space_wgt = LOCAL_TENSOR` convolution in them (see its
+        # own docstring, and `tests/test_tiling_guard.py` for why the
+        # other six must stay free of all of that);
         # `cases_error.py` holds the ISA v2.1 error-model coverage (each
         # `c_err_*` code that can be provoked deterministically, by
         # mutating one field of an otherwise-well-formed program's first
         # descriptor -- see that file's docstring for which codes it
         # deliberately does not attempt and why). All follow exactly the
         # same contract as `cases.py` and are separate files only so the
-        # six can be edited independently. Case names are unique across
+        # seven can be edited independently. Case names are unique across
         # all of them.
         for case in (
             cases.all_cases()
@@ -2755,6 +2762,7 @@ class Module(BaseModule):
             + cases_concat_split.all_cases()
             + cases_yolo.all_cases()
             + cases_error.all_cases()
+            + cases_tiling.all_cases()
         ):
             # VUnit's own `add_config` rather than tsfpga's
             # `add_vunit_config` helper: the helper always appends every

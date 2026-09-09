@@ -83,11 +83,14 @@ from accel_v2.model import (
 )
 from accel_v2.planner import (
     ComputeStep,
+    ConstLoadStep,
     DdrTraffic,
     MoveStep,
     PlannedProgram,
     RowCopyStep,
+    charge_weight_fill,
     descriptor_count,
+    ifmap_passes,
 )
 
 
@@ -199,28 +202,6 @@ def _exec_upsample(op: UpsampleOp, input_values: list[int]) -> list[int]:
 def _exec_act(op: ActOp, input_values: list[int]) -> list[int]:
     """The standalone 256-entry LUT, via `cnn_accel_model.act_lut`."""
     return golden.act_lut(input_values, op.lut)
-
-
-def _charge_weight_traffic(op: Conv2dOp, traffic: DdrTraffic) -> None:
-    """Identical formulas to `planner.Planner.plan`'s own weight-traffic
-    accounting -- kept as a private helper here (rather than imported
-    from `planner.py`) only because `PoolOp`/`AddOp`/etc. never call it;
-    both call sites build the same `LayerDesc` via
-    `Conv2dOp.weight_layer_desc`, so they cannot drift."""
-    if op.weight_reuse:
-        return
-    desc = op.weight_layer_desc()
-    weight_bytes = golden.packed_weight_count(desc, golden.TILE_CHANNELS, golden.PE_ROWS)
-    traffic.read_bytes += weight_bytes
-    traffic.weight_bytes += weight_bytes
-    if op.bias is not None:
-        bias_bytes = golden.packed_bias_count(desc, golden.PE_ROWS) * 4
-        traffic.read_bytes += bias_bytes
-        traffic.weight_bytes += bias_bytes
-    if op.per_channel_scale is not None:
-        scale_bytes = golden.packed_scale_table_bytes(desc, golden.PE_ROWS)
-        traffic.read_bytes += scale_bytes
-        traffic.weight_bytes += scale_bytes
 
 
 def _materialize_alias_values(model: Model, tensor_data: dict[str, list[int]]) -> None:
@@ -403,6 +384,27 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
     row_copy_targets: dict[str, Tensor] = {}
 
     for step in planned.steps:
+        if isinstance(step, ConstLoadStep):
+            # No bytes move here. This module consumes a convolution's
+            # weights from the `Conv2dOp` in their LOGICAL form and never
+            # builds their packed byte image (see the module docstring),
+            # so there is nothing in `image` to copy and nothing in
+            # `local` that would ever be read back -- only the traffic is
+            # real, and it is charged in full.
+            #
+            # That is not a gap in the check, it is what makes the DUT
+            # comparison sharp: the hardware really does fetch its tiles
+            # from these scratchpad addresses, while the reference's
+            # answer does not depend on them at all. A wrong local weight
+            # address is therefore wrong on the DUT and right in the
+            # reference -- the one direction of disagreement the standing
+            # blind spot normally denies us.
+            moved = step.nbytes
+            traffic.read_bytes += moved
+            traffic.local_write_bytes += moved
+            traffic.tensor_load_count += len(step.images)
+            continue
+
         if isinstance(step, RowCopyStep):
             moved = []
             for src_addr, dst_addr, nbytes in step.transfers:
@@ -433,11 +435,17 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
             write_to(step.dst_space, step.dst_addr, raw)
             count(step.src_space, step.src_addr, step.nbytes, is_read=True)
             count(step.dst_space, step.dst_addr, step.nbytes, is_read=False)
+            # One `LOAD`/`STORE` retires per descriptor, and a
+            # plane-confined buffer is moved one plane per descriptor
+            # (`MoveStep.unit`). `spill_count`/`reload_count` stay per
+            # *buffer*: they answer "how many values left the scratchpad",
+            # not "how many instructions did it take".
+            descs = descriptor_count(step)
             if step.kind == "spill":
-                traffic.tensor_store_count += 1
+                traffic.tensor_store_count += descs
                 traffic.spill_count += 1
             else:
-                traffic.tensor_load_count += 1
+                traffic.tensor_load_count += descs
                 if step.kind == "reload":
                     traffic.reload_count += 1
             continue
@@ -461,15 +469,27 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
             continue
 
         input_values: list[list[int]] = []
-        for t, space, addr in zip(op.inputs, step.input_spaces, step.input_addrs):
+        # A convolution's ifmap is streamed once per output-channel tile
+        # (`planner.ifmap_passes`), so it is *charged* `n_ot` times -- from
+        # DDR or from the scratchpad, whichever it sits in. It is still
+        # *read* once here: the bytes do not change between passes, and
+        # re-reading them would only make this loop slower. The multiplier
+        # is imported rather than re-derived, so this module and the
+        # planner cannot disagree about it.
+        passes = ifmap_passes(op)
+        for index, (t, space, addr) in enumerate(
+            zip(op.inputs, step.input_spaces, step.input_addrs)
+        ):
             nbytes = t.size_bytes
             raw = read_from(space, addr, nbytes)
-            count(space, addr, nbytes, is_read=True)
+            count(space, addr, nbytes * (passes if index == 0 else 1), is_read=True)
             input_values.append(unpack(t, raw))
 
         if isinstance(op, Conv2dOp):
             values = _exec_conv2d(op, input_values[0])
-            _charge_weight_traffic(op, traffic)
+            charge_weight_fill(
+                op, traffic, resident=step.weight_space == isa.SPACE_LOCAL_TENSOR
+            )
         elif isinstance(op, PoolOp):
             values = _exec_pool(op, input_values[0])
         elif isinstance(op, AddOp):
@@ -478,6 +498,11 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
             values = _exec_upsample(op, input_values[0])
         elif isinstance(op, ActOp):
             values = _exec_act(op, input_values[0])
+            # The 256-entry LUT is refetched from DDR for every `ACT`
+            # command (`planner.py` charges the same read). Its *values*
+            # come straight off the op, like a conv's weights -- only the
+            # byte count is modelled here.
+            traffic.read_bytes += isa.ACT_LUT_BYTES
         else:
             raise TypeError(f"reference: unhandled op type {type(op)!r}")
 

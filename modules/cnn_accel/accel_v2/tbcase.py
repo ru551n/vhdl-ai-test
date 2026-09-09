@@ -44,7 +44,15 @@ from accel_v2 import isa
 from accel_v2.ddrmap import DdrMap
 from accel_v2.memimage import MemoryImage
 from accel_v2.model import Model, Tensor
-from accel_v2.planner import ComputeStep, MoveStep, PlannedProgram, Planner
+from accel_v2.planner import (
+    ComputeStep,
+    ConstLoadStep,
+    MoveStep,
+    PlannedProgram,
+    Planner,
+    RowCopyStep,
+    descriptor_count,
+)
 from accel_v2.program import ProgramImage, emit_program
 from accel_v2.reference import ExecutionResult, run_reference
 
@@ -147,19 +155,38 @@ class TrafficPolicy:
     check: for a local chain it must equal exactly the closing `STORE`'s
     size (invariants R1/R2/R4).
 
-    `read_bytes` is a *lower* bound by default. The prediction counts the
-    logical bytes each operand needs, while the hardware fetches whole
-    AXI beats and may re-fetch a weight image per output-channel tile, so
-    an exact equality here would encode burst behaviour that is not part
-    of the residency contract. Tests that do care about an exact read
-    figure set `read_bytes_exact=True` themselves.
+    `read_bytes` is exact by default too, and has been since the
+    prediction learned that the output-channel loop re-streams a
+    convolution's ifmap once per tile (`planner.ifmap_passes`) and that
+    every `ACT` refetches its 256-byte LUT. Those two were the whole of
+    the gap: with them charged, all 56 non-error catalogue cases predict
+    `DDR_RD_BYTES` to the byte, descriptors, weights, bias, scale tables,
+    LUTs and operands included. A lower bound was the honest claim while
+    the prediction was knowingly incomplete; it is not any more, and an
+    exact read figure is what makes "the fused group moved exactly its
+    boundary bytes" assertable at all. A case that genuinely cannot
+    predict its reads sets `read_bytes_exact=False` **with a written
+    reason**.
+
+    `local_bytes_at_most` checks the DUT's `LOCAL_BYTES` CSR against the
+    predicted `local_read_bytes`/`local_write_bytes`, in the KiB
+    granularity the counter reports. One-sided on purpose: the counter
+    increments from two read ports (and two write ports) in two separate
+    `if` statements of one clocked process, so two ports handshaking in
+    the same cycle contribute one word instead of two and the register
+    *undercounts*. Measured over the catalogue that costs at most 1 KiB
+    on the read side and nothing at all on the write side. What the check
+    can still say without qualification is the direction that matters:
+    the DUT must never move MORE local bytes than the program logically
+    needs, which is what unmodelled scratchpad traffic would look like.
     """
 
     write_bytes_exact: bool = True
-    read_bytes_exact: bool = False
+    read_bytes_exact: bool = True
     read_bytes_at_least: bool = True
     counts_exact: bool = True
     weight_bytes_exact: bool = True
+    local_bytes_at_most: bool = True
     #: Cross-check the DUT's `DDR_*_BYTES` against the testbench's own
     #: passive AXI monitor. Only ever disabled with a written reason.
     monitor_cross_check: bool = True
@@ -205,15 +232,23 @@ class TbCase:
     def generics(self) -> dict[str, object]:
         """The generics for `add_vunit_config`. `output_path` is filled in
         by VUnit itself and must not appear here."""
+        # Sized from THIS case's own map, not from the class constant: a
+        # tiled case plans against `DdrMap(scale=N)` (one descriptor per
+        # plane per row copy runs the default 60 KiB PROGRAM region out),
+        # and the testbench's DDR model plus its range validation must
+        # cover the addresses that map actually hands out. Identical to
+        # `DdrMap.LIMIT` for every scale-1 case, which is all of them
+        # outside `cases_tiling.py`.
+        ddr_bytes = self.planned.ddr_map.limit
         generics: dict[str, object] = {
-            "g_ddr_bytes": DdrMap.LIMIT,
+            "g_ddr_bytes": ddr_bytes,
             "g_program_base": self.program.program_addr,
             "g_export_base": self.export_base,
             "g_export_bytes": self.export_bytes,
             "g_expect_error": self.expect_error,
             "g_num_banks": self.num_banks,
             "g_bank_words": self.bank_words,
-            "g_ddr_limit": DdrMap.LIMIT,
+            "g_ddr_limit": ddr_bytes,
             # The catalogue's tensors are deliberately tiny (a passing case
             # finishes in a few thousand cycles), so the entity defaults of
             # 1M/2M cycles only ever cost wall-clock time: a genuinely stuck
@@ -421,12 +456,17 @@ class TbCase:
         if counters["busy"] != 0:
             raise CheckFailure(f"STATUS.BUSY still set after DONE (status=0x{counters['status']:08x})")
 
-        # One descriptor retired per planned step, plus the closing HALT.
-        expected_cmds = len(self.planned.steps) + 1
+        # One descriptor retired per planned step, plus the closing HALT
+        # -- except a `RowCopyStep` (one per activation plane) and a
+        # `ConstLoadStep` (one per packed weight sub-image), which is
+        # what `planner.descriptor_count` is for. Identical to
+        # `len(steps) + 1` for every untiled case.
+        expected_cmds = sum(descriptor_count(step) for step in self.planned.steps) + 1
         if counters["cmd_count"] != expected_cmds:
             raise CheckFailure(
                 f"CMD_COUNT={counters['cmd_count']}, expected {expected_cmds} "
-                f"({len(self.planned.steps)} steps + HALT)\n{self._program_listing()}"
+                f"({len(self.planned.steps)} steps, {expected_cmds - 1} descriptors "
+                f"+ HALT)\n{self._program_listing()}"
             )
 
     def _check_outputs(self, output_path: str) -> None:
@@ -558,6 +598,9 @@ class TbCase:
                 f"{predicted.weight_bytes}\n{self._program_listing()}"
             )
 
+        if policy.local_bytes_at_most:
+            self._check_local_bytes(counters)
+
         ranges = policy.allowed_write_ranges
         if ranges is None:
             ranges = self._expected_write_ranges()
@@ -571,6 +614,24 @@ class TbCase:
                         f"destination {pretty} -- the DUT wrote DDR somewhere the program "
                         f"never told it to\n{self._program_listing()}"
                     )
+
+    def _check_local_bytes(self, counters: dict[str, int]) -> None:
+        """`LOCAL_BYTES` (section 8) packs `rd_kib` in bits [15:0] and
+        `wr_kib` in [31:16], each the whole-KiB part of a byte counter --
+        so the comparison is made in KiB, on the prediction's own floor.
+        See `TrafficPolicy.local_bytes_at_most` for why this is one-sided."""
+        predicted = self.planned.traffic
+        raw = counters["local_bytes"]
+        for measured, want, what in (
+            (raw & 0xFFFF, predicted.local_read_bytes, "read"),
+            ((raw >> 16) & 0xFFFF, predicted.local_write_bytes, "written"),
+        ):
+            if measured > want // 1024:
+                raise CheckFailure(
+                    f"LOCAL_BYTES says {measured} KiB {what} in the scratchpad, but the "
+                    f"program only needs {want} bytes ({want // 1024} KiB) -- the DUT is "
+                    f"moving local data the plan does not account for\n{self._program_listing()}"
+                )
 
     def _check_error_wrote_nothing_unexpected(self, counters: dict[str, int]) -> None:
         ranges = self.traffic.allowed_write_ranges
@@ -593,6 +654,11 @@ class TbCase:
         for step in self.planned.steps:
             if isinstance(step, MoveStep) and step.dst_space == isa.SPACE_DDR:
                 ranges.append((step.dst_addr, step.dst_addr + step.nbytes))
+            elif isinstance(step, RowCopyStep) and step.dst_space == isa.SPACE_DDR:
+                # One range per plane: a strip store writes `plane_count`
+                # separate windows of the destination, and the bytes
+                # between them belong to other strips.
+                ranges.extend((dst, dst + n) for _src, dst, n in step.transfers)
             elif isinstance(step, ComputeStep) and step.output_space == isa.SPACE_DDR:
                 ranges.append((step.output_addr, step.output_addr + step.op.output.size_bytes))
         return ranges
@@ -631,10 +697,34 @@ class TbCase:
     def _program_listing(self) -> str:
         """Disassembly-ish dump of the planned program, printed with every
         failure so a log line is enough to see what ran."""
-        lines = [f"  planned program ({len(self.planned.steps)} steps + HALT):"]
+        total = sum(descriptor_count(step) for step in self.planned.steps)
+        lines = [
+            f"  planned program ({len(self.planned.steps)} steps, {total} descriptors "
+            "+ HALT):"
+        ]
+        cursor = 0
         for index, step in enumerate(self.planned.steps):
-            addr = self.program.program_addr + index * isa.INSTR_WORD_BYTES
-            if isinstance(step, MoveStep):
+            addr = self.program.program_addr + cursor * isa.INSTR_WORD_BYTES
+            cursor += descriptor_count(step)
+            if isinstance(step, RowCopyStep):
+                op = step.op
+                lines.append(
+                    f"    [{index:2d}] pc=0x{addr:08x} {'rowcopy':<10s} "
+                    f"{op.output.name:<12s} <- {op.inputs[0].name} rows {op.src_rows.r0}.."
+                    f"{op.src_rows.r1} @{_space_name(step.src_space)} -> rows "
+                    f"{op.dst_rows.r0}..{op.dst_rows.r1} @{_space_name(step.dst_space)} "
+                    f"({len(step.transfers)} planes, {step.nbytes} bytes)"
+                )
+            elif isinstance(step, ConstLoadStep):
+                images = ", ".join(
+                    f"{kind}@LOCAL 0x{local:08x} ({nbytes} bytes)"
+                    for kind, local, nbytes in step.images
+                )
+                lines.append(
+                    f"    [{index:2d}] pc=0x{addr:08x} {'constload':<10s} "
+                    f"{step.conv.name:<12s} -> {images}"
+                )
+            elif isinstance(step, MoveStep):
                 lines.append(
                     f"    [{index:2d}] pc=0x{addr:08x} {step.kind:<10s} "
                     f"{step.tensor.name:<12s} "
@@ -654,7 +744,7 @@ class TbCase:
                 )
         lines.append(
             f"    [{len(self.planned.steps):2d}] pc="
-            f"0x{self.program.program_addr + len(self.planned.steps) * isa.INSTR_WORD_BYTES:08x} HALT"
+            f"0x{self.program.program_addr + total * isa.INSTR_WORD_BYTES:08x} HALT"
         )
         lines.append(
             f"  predicted traffic: rd={self.planned.traffic.read_bytes} "
@@ -712,6 +802,7 @@ def build_case(
     expect_err_pc: int | None = None,
     traffic: TrafficPolicy | None = None,
     generic_overrides: dict[str, object] | None = None,
+    ddr_scale: int = 1,
 ) -> TbCase:
     """Build one `TbCase`. `build(model)` adds the case's tensors and ops
     to a freshly seeded `Model` (and marks its graph outputs); everything
@@ -721,7 +812,52 @@ def build_case(
     `seed` is explicit and mandatory: every randomized value in the case
     (inputs, weights, biases, per-channel scale tables) comes from it, so
     a failing case is reproducible from its name alone.
+
+    `ddr_scale` grows every `DdrMap` region (and the testbench's modelled
+    DDR with it, see `generics`). It exists for tiled cases: a strip
+    program emits one descriptor per activation plane per row copy, which
+    runs the default 60 KiB `PROGRAM` region out long before anything
+    else. Leave it at 1 for an untiled case -- the DDR model costs real
+    simulator memory.
     """
+    model = Model(seed=seed, name=name)
+    build(model)
+    return case_from_model(
+        name,
+        model,
+        num_banks=num_banks,
+        bank_words=bank_words,
+        expect_error=expect_error,
+        expect_err_code=expect_err_code,
+        expect_err_pc=expect_err_pc,
+        traffic=traffic,
+        generic_overrides=generic_overrides,
+        ddr_scale=ddr_scale,
+    )
+
+
+def case_from_model(
+    name: str,
+    model: Model,
+    *,
+    num_banks: int = 2,
+    bank_words: int = 1024,
+    expect_error: bool = False,
+    expect_err_code: int | None = None,
+    expect_err_pc: int | None = None,
+    traffic: TrafficPolicy | None = None,
+    generic_overrides: dict[str, object] | None = None,
+    ddr_scale: int = 1,
+) -> TbCase:
+    """`build_case` for a `Model` that already exists.
+
+    `build_case` owns the "fresh seeded model, then a builder function"
+    contract every hand-written case uses. A *tiled* case has no such
+    builder: `tiler.tile` produces the model to run as a whole-graph
+    rewrite of another one, and `tiling_select.select` has to see that
+    other one first. Everything downstream -- planning, DDR layout,
+    descriptor emission, the export window -- is identical, so it lives
+    here and `build_case` calls it."""
     # `cnn_accel_tensor_mem` requires a power-of-two `g_bank_words` (it
     # decodes bank/offset as bit slices of the word address) and asserts
     # it at elaboration. Caught here instead, because otherwise a case
@@ -734,9 +870,6 @@ def build_case(
             f"(cnn_accel_tensor_mem asserts it), got {bank_words}"
         )
 
-    model = Model(seed=seed, name=name)
-    build(model)
-
     tensor_mem_bytes = num_banks * bank_words * WORD_BYTES
     # `bank_words` is passed on, not just multiplied in: the scratchpad is
     # `num_banks` INDEPENDENT banks, and `cnn_accel_tensor_mem` clamps any
@@ -745,7 +878,9 @@ def build_case(
     # happily place a buffer across one and have the hardware silently
     # truncate every access to it.
     planned = Planner(
-        tensor_mem_bytes=tensor_mem_bytes, bank_bytes=bank_words * WORD_BYTES
+        tensor_mem_bytes=tensor_mem_bytes,
+        bank_bytes=bank_words * WORD_BYTES,
+        ddr_map=DdrMap(scale=ddr_scale),
     ).plan(model)
     program = emit_program(planned)
 
@@ -789,5 +924,6 @@ __all__ = [
     "TbCase",
     "TrafficPolicy",
     "build_case",
+    "case_from_model",
     "read_counters",
 ]

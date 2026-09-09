@@ -379,6 +379,28 @@ class Conv2dOp(Op):
     #: `reused_weight_op`'s own allocation instead of making a new one.
     weight_reuse: bool = False
     reused_weight_op: "Conv2dOp | None" = None
+    #: Serve this op's packed weight/bias/scale images out of the
+    #: scratchpad (`space_wgt = LOCAL_TENSOR`) instead of DDR.
+    #:
+    #: The hardware refills the weight buffer once per output-channel
+    #: pass either way (`cmd_proc.vhd`'s `st_wgt_req`, which is skipped
+    #: only by `WEIGHT_REUSE` and by `LOCAL_WEIGHT`); what this flag
+    #: changes is where those `n_ot` fetches come *from*. For a tiled
+    #: group that is the difference between reading the group's weights
+    #: from DDR once per strip and reading them once in total: with `S`
+    #: strips the DDR weight traffic goes from `S * W_G` to `W_G`, which
+    #: on YOLOv8n at 256 KiB is several megabytes a frame.
+    #:
+    #: `planner.py` gives the images a local home (all convolutions
+    #: sharing one `weight` list share one image), emits the `LOAD` as a
+    #: `ConstLoadStep`, and silently falls back to DDR for the whole
+    #: image if it cannot be placed -- so the flag is a request, never a
+    #: promise, and a plan that ignores it is still correct.
+    #:
+    #: This is NOT `weight_reuse`: that flag skips the refill outright
+    #: and is only correct for `out_channels <= PE_ROWS` (R8). The two
+    #: are independent, and the tiler sets only this one.
+    weights_resident: bool = False
 
     def flags(self) -> int:
         """W0 `flags` byte (section 5.1) for this op's `CONV2D`

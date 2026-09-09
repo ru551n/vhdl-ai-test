@@ -52,6 +52,7 @@ from accel_v2.memimage import MemoryImage
 from accel_v2.model import ActOp, AddOp, Conv2dOp, CopyOp, PoolOp, UpsampleOp
 from accel_v2.planner import (
     ComputeStep,
+    ConstLoadStep,
     MoveStep,
     PlannedProgram,
     RowCopyStep,
@@ -100,12 +101,25 @@ def _weight_allocations(planned: PlannedProgram, ddr_map: DdrMap) -> dict[int, W
     second time, mirroring `planner.py`'s zero-byte traffic charge for
     the same case (`Conv2dOp.flags`'s `WEIGHT_REUSE` docstring)."""
     allocations: dict[int, WeightAllocation] = {}
+    #: `id(weight list) -> the allocation its first owner got`. Two
+    #: convolutions that share a `weight` object are the same convolution
+    #: -- which is exactly what `tiler.py` produces when it clones one
+    #: conv onto `S` strips -- and writing `S` byte-identical copies of a
+    #: weight image into DDR wastes both the image and the `WEIGHTS`
+    #: region, which a tiled program at real channel counts runs out of.
+    #: No untiled case is affected: `Model.conv2d` draws a fresh list for
+    #: every convolution, so nothing there ever shares one.
+    by_weights: dict[int, WeightAllocation] = {}
     for op in planned.model.ops:
         if not isinstance(op, Conv2dOp):
             continue
         if op.weight_reuse:
             assert op.reused_weight_op is not None, "weight_reuse set without reused_weight_op"
             allocations[id(op)] = allocations[id(op.reused_weight_op)]
+            continue
+        shared = by_weights.get(id(op.weight))
+        if shared is not None:
+            allocations[id(op)] = shared
             continue
 
         desc = op.weight_layer_desc()
@@ -118,7 +132,9 @@ def _weight_allocations(planned: PlannedProgram, ddr_map: DdrMap) -> dict[int, W
         scale_addr = None
         if op.per_channel_scale is not None:
             scale_addr = ddr_map.alloc(DdrMap.SCALE, golden.packed_scale_table_bytes(desc, golden.PE_ROWS))
-        allocations[id(op)] = WeightAllocation(weight_addr, bias_addr, scale_addr)
+        allocations[id(op)] = by_weights[id(op.weight)] = WeightAllocation(
+            weight_addr, bias_addr, scale_addr
+        )
     return allocations
 
 
@@ -129,10 +145,17 @@ def _write_weight_images(
     scale table, using the exact same `cnn_accel_model.pack_*` calls
     `reference.py` charges bytes for (never a second, hand-rolled
     layout)."""
+    written: set[int] = set()
     for op in planned.model.ops:
         if not isinstance(op, Conv2dOp) or op.weight_reuse:
             continue
         alloc = allocations[id(op)]
+        if alloc.weight_addr in written:
+            # A strip clone sharing its original's image (see
+            # `_weight_allocations`): the bytes are already there, and
+            # they are byte-identical by construction.
+            continue
+        written.add(alloc.weight_addr)
         desc = op.weight_layer_desc()
 
         packed_w = golden.pack_weights_for_hw(op.weight, desc, golden.TILE_CHANNELS, golden.PE_ROWS)
@@ -148,12 +171,13 @@ def _write_weight_images(
 
 
 def _lut_addrs(planned: PlannedProgram, ddr_map: DdrMap, image: MemoryImage) -> dict[int, int]:
-    """`id(ActOp) -> DDR address of its 256-byte int8->int8 LUT."""
+    """`id(ActOp) -> DDR address of its `isa.ACT_LUT_BYTES`-byte
+    int8->int8 LUT."""
     addrs: dict[int, int] = {}
     for op in planned.model.ops:
         if not isinstance(op, ActOp):
             continue
-        addr = ddr_map.alloc(DdrMap.LUT, 256)
+        addr = ddr_map.alloc(DdrMap.LUT, isa.ACT_LUT_BYTES)
         image.write_bytes(addr, bytes(v & 0xFF for v in op.lut))
         addrs[id(op)] = addr
     return addrs
@@ -196,16 +220,63 @@ def _row_copy_descs(step: RowCopyStep, next_addrs: list[int]) -> list[isa.DescV2
     ]
 
 
-def _move_desc(step: MoveStep, next_addr: int) -> isa.DescV2:
-    return isa.DescV2(
-        opcode=_MOVE_OPCODE[step.kind],
-        space_src0=step.src_space,
-        space_dst=step.dst_space,
-        in_addr=step.src_addr,
-        out_addr=step.dst_addr,
-        xfer_bytes=step.nbytes,
-        next_instr_addr=next_addr,
-    )
+def _const_load_descs(
+    step: ConstLoadStep,
+    next_addrs: list[int],
+    allocations: dict[int, WeightAllocation],
+) -> list[isa.DescV2]:
+    """One `LOAD` per packed sub-image: DDR (where `_write_weight_images`
+    put the bytes) into the scratchpad address the planner reserved.
+
+    A plain `LOAD` with `space_dst = LOCAL_TENSOR`, not `LOADW`: `LOADW`
+    writes the `LOCAL_WEIGHT` space -- the weight buffer inside the conv
+    core -- which is a different thing entirely, is not addressable per
+    output-channel tile, and is what `WEIGHT_LOAD_BYTES` was named after.
+    What residency wants is the images sitting in the ordinary tensor
+    scratchpad so that `st_wgt_req` can fetch tile `pass` out of them
+    through port `r1`."""
+    alloc = allocations[id(step.conv)]
+    sources = {
+        "weight": alloc.weight_addr,
+        "bias": alloc.bias_addr,
+        "scale": alloc.scale_addr,
+    }
+    descs = []
+    for (kind, local_addr, nbytes), next_addr in zip(step.images, next_addrs):
+        src = sources[kind]
+        assert src is not None, f"program: resident {kind} image with no DDR allocation"
+        descs.append(
+            isa.DescV2(
+                opcode=isa.OPCODE_LOAD,
+                space_src0=isa.SPACE_DDR,
+                space_dst=isa.SPACE_LOCAL_TENSOR,
+                in_addr=src,
+                out_addr=local_addr,
+                xfer_bytes=nbytes,
+                next_instr_addr=next_addr,
+            )
+        )
+    return descs
+
+
+def _move_descs(step: MoveStep, next_addrs: list[int]) -> list[isa.DescV2]:
+    """One `LOAD`/`STORE` per `MoveStep.unit` chunk -- one descriptor for
+    the whole move whenever the buffer is confined the strict way, which
+    is every untiled tensor. See `MoveStep.unit` for why a plane-confined
+    buffer cannot be moved in one request."""
+    opcode = _MOVE_OPCODE[step.kind]
+    return [
+        isa.DescV2(
+            opcode=opcode,
+            space_src0=step.src_space,
+            space_dst=step.dst_space,
+            in_addr=step.src_addr + offset,
+            out_addr=step.dst_addr + offset,
+            xfer_bytes=nbytes,
+            next_instr_addr=next_addr,
+        )
+        for (offset, nbytes), next_addr in zip(step.transfer_offsets, next_addrs)
+    ]
 
 
 def _compute_desc(
@@ -242,17 +313,24 @@ def _compute_desc(
         alloc = weight_allocations[id(op)]
         clamp_min, clamp_max = op.clamp if op.clamp is not None else (0, 0)
         pad_top, pad_bottom, pad_left, pad_right = op.padding
+        # Weight residency (design D6). `space_wgt` is ONE tag covering
+        # all three side tables, so either the whole image group is in
+        # the scratchpad or none of it is -- which is exactly how
+        # `planner.py` places it. The addresses swap with the space; no
+        # other field changes, and the descriptor is otherwise the one
+        # this emitter has always produced.
+        weight_addrs = step.weight_addrs or {}
         return isa.DescV2(
             opcode=isa.OPCODE_CONV2D,
             flags=op.flags(),
             space_src0=step.input_spaces[0],
             space_dst=step.output_space,
-            space_wgt=isa.SPACE_DDR,
+            space_wgt=step.weight_space,
             in_addr=step.input_addrs[0],
             out_addr=step.output_addr,
-            weight_addr=alloc.weight_addr,
-            bias_addr=alloc.bias_addr or 0,
-            scale_addr=alloc.scale_addr or 0,
+            weight_addr=weight_addrs.get("weight", alloc.weight_addr),
+            bias_addr=weight_addrs.get("bias", alloc.bias_addr or 0),
+            scale_addr=weight_addrs.get("scale", alloc.scale_addr or 0),
             in_width=x.width,
             in_height=x.height,
             in_channels=x.channels,
@@ -416,8 +494,10 @@ def emit_program(planned: PlannedProgram) -> ProgramImage:
         next_addrs = addrs[cursor + 1 : cursor + count + 1]
         if isinstance(step, RowCopyStep):
             descs.extend(_row_copy_descs(step, next_addrs))
+        elif isinstance(step, ConstLoadStep):
+            descs.extend(_const_load_descs(step, next_addrs, weight_allocations))
         elif isinstance(step, MoveStep):
-            descs.append(_move_desc(step, next_addrs[0]))
+            descs.extend(_move_descs(step, next_addrs))
         else:
             assert isinstance(step, ComputeStep)
             descs.append(_compute_desc(step, next_addrs[0], weight_allocations, lut_addrs))

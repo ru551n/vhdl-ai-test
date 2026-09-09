@@ -51,6 +51,35 @@ they only say that one tensor's bytes live inside another's buffer (see
   liveness rule that stops a concat buffer being recycled while one of
   its slices is still live.
 
+Spatial tiling (`tiler.py`, arch doc section 3.2) adds three things to
+that, all of them opt-in and none of them reachable from a graph that
+does not ask:
+
+* **`Tensor.pin_ddr`** -- a fusion-group boundary, written by `S` strip
+  stores and read by the next group's `S'` strip loads. It takes the
+  `place_in_ddr` path immediately and unconditionally, and its bytes are
+  reported in `pinned_read_bytes`/`pinned_write_bytes` rather than in
+  `ddr_resident_*`, so "did the overflow fallback cost anything?" stays
+  a separate question from "what did the group boundaries cost?".
+* **`Tensor.confine_unit_bytes`** -- per-*request* bank confinement
+  instead of per-buffer, which is what lets a multi-plane activation
+  strip be larger than one `cnn_accel_tensor_mem` bank. Only sound for a
+  buffer every request against which is one plane or less; see
+  `tiler._UNPLANNED_REQUEST_OPS` for the ops that are not, and
+  `MoveStep.unit` for the spill lowering it forces.
+* **`Conv2dOp.weights_resident`** -- the packed weight/bias/scale images
+  `LOAD`ed into the scratchpad once (`ConstLoadStep`) and fetched per
+  output-channel pass from `space_wgt = LOCAL_TENSOR`. All `S` strip
+  clones of one convolution share one image, so a group's weights cross
+  the bus once instead of once per strip. A request the allocator cannot
+  place falls back to DDR weights silently, and the traffic charge
+  follows the decision actually made.
+
+The traffic prediction is exact, not a bound. Two things it once missed
+are charged here: a convolution's ifmap is streamed once per
+output-channel tile (`ifmap_passes`, arch doc section 5.4) and every
+`ACT` refetches its whole LUT (`isa.ACT_LUT_BYTES`).
+
 The output is a `PlannedProgram`: an ordered list of `ComputeStep`/
 `MoveStep`s with every operand's space and address already resolved,
 plus a `DdrTraffic` prediction that `program.py`'s actual DDR-image
@@ -63,11 +92,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import cnn_accel_constants as _const
 import cnn_accel_model as golden
 
 from accel_v2 import isa
 from accel_v2.ddrmap import DdrMap
 from accel_v2.model import (
+    ActOp,
     Conv2dOp,
     Model,
     Op,
@@ -95,6 +126,14 @@ DEFAULT_TENSOR_MEM_BYTES = 2 * 1024 * 8
 #: comparison can see the difference, because the program and the
 #: reference both take their addresses from the same planner.
 DEFAULT_BANK_BYTES = 1024 * 8
+
+#: Bytes per packed bias entry (one `ACCUM_WIDTH` accumulator) and per
+#: packed per-channel scale-table entry, matching `cmd_proc`'s own
+#: `c_bias_entry_bytes` / `c_scale_entry_bytes`. They set the per-pass
+#: request size of the bias and scale images, and therefore the
+#: granularity at which a resident image must stay inside one bank.
+_BIAS_ENTRY_BYTES = _const.ACCUM_WIDTH // 8
+_SCALE_ENTRY_BYTES = _const.SCALE_TABLE_ENTRY_BYTES
 
 
 @dataclass
@@ -160,6 +199,16 @@ class ComputeStep:
     input_addrs: list[int]
     output_space: int
     output_addr: int
+    #: `space_wgt` for this instruction's compile-time side tables (a
+    #: convolution's weight/bias/scale images). `SPACE_DDR` is the only
+    #: value any untiled program has ever used; `SPACE_LOCAL_TENSOR`
+    #: means the images were LOADed into the scratchpad by an earlier
+    #: `ConstLoadStep` and every output-channel pass fetches its tile
+    #: from there. `ACT`'s LUT is not covered -- it always rides in DDR.
+    weight_space: int = isa.SPACE_DDR
+    #: `kind -> scratchpad byte address` for a `weight_space ==
+    #: SPACE_LOCAL_TENSOR` convolution, `None` otherwise.
+    weight_addrs: dict[str, int] | None = None
 
 
 @dataclass
@@ -176,6 +225,30 @@ class MoveStep:
     dst_addr: int
     nbytes: int
     kind: str  # "reload" | "spill"
+    #: Largest number of bytes one descriptor of this move may transfer,
+    #: or `None` for "all of them in one".
+    #:
+    #: A `LOAD`/`STORE` is a single request of `xfer_bytes`
+    #: (`cmd_proc.vhd`'s `st_xfer_*`), and `cnn_accel_tensor_mem` serves
+    #: it from the one bank its address decodes to -- so moving a
+    #: plane-confined buffer (one that is deliberately allowed to span
+    #: banks, `Tensor.confine_unit_bytes`) in one go would be clamped and
+    #: silently truncated. Spilling one is therefore `ceil(nbytes/unit)`
+    #: descriptors at consecutive offsets, exactly as a `RowCopyStep` is
+    #: one per plane. Found by the DUT: `cnn_accel_tensor_mem` asserts on
+    #: the straddle, and the first tiled case that evicted a multi-plane
+    #: strip stopped the simulation on it.
+    unit: int | None = None
+
+    @property
+    def transfer_offsets(self) -> list[tuple[int, int]]:
+        """`(offset, nbytes)` per emitted descriptor, in address order."""
+        if self.unit is None or self.unit >= self.nbytes:
+            return [(0, self.nbytes)]
+        return [
+            (offset, min(self.unit, self.nbytes - offset))
+            for offset in range(0, self.nbytes, self.unit)
+        ]
 
 
 @dataclass
@@ -209,19 +282,154 @@ class RowCopyStep:
         return sum(n for _, _, n in self.transfers)
 
 
-Step = ComputeStep | MoveStep | RowCopyStep
+@dataclass
+class ConstLoadStep:
+    """The one-time `LOAD` of a convolution's packed weight/bias/scale
+    images into the scratchpad, so that its output-channel passes can
+    fetch their tiles with `space_wgt = LOCAL_TENSOR` instead of
+    re-reading DDR (design D6 / hardware fact F7).
+
+    Three sub-images, three descriptors, because `program.py` allocates
+    them out of three different `DdrMap` regions and they are therefore
+    not contiguous in DDR. Each lands in its **own** local buffer with
+    its own confinement unit -- the request the hardware makes against
+    the weight image is one `wgt_tile_bytes` tile, against the bias image
+    `PE_ROWS * 4` bytes and against the scale image
+    `PE_ROWS * SCALE_TABLE_ENTRY_BYTES`, and only a per-image unit keeps
+    all three inside one bank without padding the weight region out to a
+    whole number of tiles twice over.
+
+    `images` is `(kind, local_addr, nbytes)` with `kind` one of
+    `"weight"`, `"bias"`, `"scale"`; `program.py` looks the DDR source up
+    by the same kind. The step carries no source address of its own
+    because DDR addresses for compile-time constants are `program.py`'s
+    to allocate, exactly as they always have been."""
+
+    conv: Conv2dOp
+    key: str
+    images: list[tuple[str, int, int]] = field(default_factory=list)
+
+    @property
+    def nbytes(self) -> int:
+        return sum(n for _, _, n in self.images)
+
+
+Step = ComputeStep | MoveStep | RowCopyStep | ConstLoadStep
+
+
+def ifmap_passes(op: Op) -> int:
+    """How many times the hardware streams `op`'s `inputs[0]`.
+
+    `cmd_proc` runs a `CONV2D` as `n_ot = ceil(out_channels / PE_ROWS)`
+    output-channel passes (`st_geom_out2`: `n_planes_out_q <= n_ot_q`),
+    and every pass re-kicks the ifmap feeder over the *whole* input
+    tensor -- one `(row, tile)` request per plane row when there is more
+    than one channel tile, one whole-tensor request otherwise, but either
+    way `in_total_bytes` per pass. So a conv whose input sits in DDR
+    reads it `n_ot` times over AXI, and a conv whose input is resident
+    reads it `n_ot` times out of the scratchpad.
+
+    That is hardware fact F4 of the tiling design, and it is where 184 of
+    the 202 MB per frame of the untiled YOLOv8n baseline come from. Until
+    this function existed both `planner.py` and `reference.py` charged a
+    conv's ifmap exactly once, which is why `TrafficPolicy.read_bytes`
+    could only ever be a lower bound.
+
+    Every other opcode streams its inputs once: `POOL_*` also runs one
+    pass per plane, but each pass reads one *plane* (`:1494-1496`), so
+    the tensor is read once in total; the elementwise family issues one
+    request per operand for the whole tensor.
+
+    Stated here, once, and imported by `reference.py` -- the two must
+    charge the same multiplier or every exact read assertion fails for a
+    reason that has nothing to do with residency."""
+    if isinstance(op, Conv2dOp):
+        return -(-op.output.channels // golden.PE_ROWS)
+    return 1
+
+
+#: The three packed side tables a `CONV2D` fetches per output-channel
+#: pass, as `(kind, total-bytes function, per-pass request function)`.
+#: `cmd_proc`'s `st_wgt_req` walks exactly these three, in this order,
+#: at `<base> + pass * <per-pass bytes>`.
+def const_images(op: Conv2dOp) -> list[tuple[str, int, int]]:
+    """`(kind, total bytes, per-pass request bytes)` for every packed
+    side table of `op`, in `st_wgt_req`'s own order.
+
+    The third element is what must stay inside one `cnn_accel_tensor_mem`
+    bank when the image is resident: the hardware fetches one weight
+    *tile*, one `PE_ROWS`-entry bias row and one `PE_ROWS`-entry scale
+    row per pass, never the whole image. Totals come from the same
+    `cnn_accel_model.packed_*` calls `program.py` uses to write the
+    bytes, so an image is exactly as big as what lands in it."""
+    desc = op.weight_layer_desc()
+    n_ot = -(-op.output.channels // golden.PE_ROWS)
+    images = []
+    weight_bytes = golden.packed_weight_count(desc, golden.TILE_CHANNELS, golden.PE_ROWS)
+    images.append(("weight", weight_bytes, weight_bytes // n_ot))
+    if op.bias is not None:
+        bias_bytes = golden.packed_bias_count(desc, golden.PE_ROWS) * _BIAS_ENTRY_BYTES
+        images.append(("bias", bias_bytes, golden.PE_ROWS * _BIAS_ENTRY_BYTES))
+    if op.per_channel_scale is not None:
+        scale_bytes = golden.packed_scale_table_bytes(desc, golden.PE_ROWS)
+        images.append(("scale", scale_bytes, golden.PE_ROWS * _SCALE_ENTRY_BYTES))
+    return images
+
+
+def weight_fill_bytes(op: Conv2dOp) -> int:
+    """Bytes the weight/bias/scale refill moves for `op` over all its
+    output-channel passes -- what the hardware's `WEIGHT_LOAD_BYTES`
+    counter accumulates in `st_wgt_req`, whichever space `space_wgt`
+    names. Zero for a `WEIGHT_REUSE` op, which skips the refill
+    entirely.
+
+    The single definition: `Planner.plan` predicts it and
+    `reference.py` charges it again independently, and the two must
+    agree or `weight_bytes_exact` fails for a reason unrelated to
+    residency."""
+    if op.weight_reuse:
+        return 0
+    return sum(total for _, total, _ in const_images(op))
+
+
+def charge_weight_fill(op: Conv2dOp, traffic: "DdrTraffic", *, resident: bool) -> None:
+    """Charge `op`'s weight/bias/scale refill against `traffic`.
+
+    Called by `Planner.plan` (predicting) and by `reference.py`
+    (executing), so the formula lives once. `WEIGHT_LOAD_BYTES` counts
+    the refill whichever space it reads -- `cmd_proc`'s `cnt_wgt_bytes_q`
+    increments in `st_wgt_req` before the space mux, so it is a measure
+    of how much the weight buffer was filled, not of how much DDR was
+    read. What residency moves is which of `read_bytes` (AXI) and
+    `local_read_bytes` (scratchpad port `r1`) the same bytes land in."""
+    fill = weight_fill_bytes(op)
+    if not fill:
+        return
+    traffic.weight_bytes += fill
+    if resident:
+        traffic.local_read_bytes += fill
+    else:
+        traffic.read_bytes += fill
 
 
 def descriptor_count(step: "Step") -> int:
     """How many 64-byte descriptors `program.py` will emit for `step`.
 
-    One for every step except a `RowCopyStep`, which is one per plane.
+    One for every step except a `RowCopyStep` (one per activation plane),
+    a `ConstLoadStep` (one per packed sub-image) and a `MoveStep` of a
+    plane-confined buffer (one per plane, `MoveStep.unit`).
     The single place this is stated: `planner.py` charges the program
     fetch, `reference.py` charges it again independently, and
     `program.py` actually emits them, and all three must agree or a
     traffic assertion fails for a reason that has nothing to do with
     the tensors."""
-    return len(step.transfers) if isinstance(step, RowCopyStep) else 1
+    if isinstance(step, RowCopyStep):
+        return len(step.transfers)
+    if isinstance(step, ConstLoadStep):
+        return len(step.images)
+    if isinstance(step, MoveStep):
+        return len(step.transfer_offsets)
+    return 1
 
 
 @dataclass
@@ -265,6 +473,15 @@ class PlannedProgram:
     #: for, and a test that asserts "nothing overflowed" must still be
     #: able to say that about a tiled program.
     pinned_placements: list[tuple[str, int, int]] = field(default_factory=list)
+    #: Placement name -> the largest single hardware request that will be
+    #: made against it, for `tiling_checks.check_units_confined` to
+    #: re-derive the bank-confinement property from the plan alone. Only
+    #: buffers whose unit is *not* their whole size appear: a tiled
+    #: activation strip (one plane) and a resident weight image (one
+    #: tile). Deliberately a side table rather than a fourth element of
+    #: `local_placements`, so the placement tuples -- and the digest that
+    #: hashes them -- keep their shape.
+    local_confine_units: dict[str, int] = field(default_factory=dict)
 
 
 class _LocalAllocator:
@@ -531,6 +748,7 @@ class Planner:
         local_placements: list[tuple[str, int, int]] = []
         ddr_placements: list[tuple[str, int, int]] = []
         pinned_placements: list[tuple[str, int, int]] = []
+        local_confine_units: dict[str, int] = {}
         traffic = DdrTraffic()
         steps: list[Step] = []
         tensor_ddr_addr: dict[str, int] = {}
@@ -656,11 +874,14 @@ class Planner:
                     dst_addr=ddr_addr,
                     nbytes=size,
                     kind="spill",
+                    unit=victim.confine_unit_bytes,
                 )
             )
             traffic.local_read_bytes += size
             traffic.write_bytes += size
-            traffic.tensor_store_count += 1
+            # One retired `STORE` per descriptor (see `MoveStep.unit`);
+            # `spill_count` stays one per buffer.
+            traffic.tensor_store_count += descriptor_count(steps[-1])
             traffic.spill_count += 1
             alloc.free(addr, size)
             spilled[best_name] = ddr_addr
@@ -737,6 +958,8 @@ class Planner:
                         )
                     addr = alloc.try_alloc(size, unit=unit)
             local_placements.append((root_name, addr, size))
+            if unit != size:
+                local_confine_units[root_name] = unit
             return addr
 
         def place_in_ddr(root_name: str, size: int, *, pinned: bool = False) -> int:
@@ -794,6 +1017,7 @@ class Planner:
             *,
             read_bytes: int | None = None,
             in_place: bool = False,
+            passes: int = 1,
         ) -> tuple[int, int]:
             """Return `(space, addr)` for consuming `t` as an operand of
             the op currently being planned (`op_index`), doing whatever
@@ -826,6 +1050,14 @@ class Planner:
             costs: a `RowCopyOp` reads a row *window*, not the whole
             tensor, and charging it the tensor's size would make the
             tiling look as expensive as the thing it replaces.
+            `passes` is how many times the hardware will stream this
+            operand -- `ifmap_passes(op)`, i.e. the output-channel-tile
+            count for a convolution's ifmap and 1 for everything else.
+            It multiplies the operand fetch only: a reload is one
+            transfer however many times the value is then read, so the
+            `LOAD` below is charged once and the `n_ot` re-reads land on
+            `local_read_bytes`, which is exactly what the hardware does.
+
             `in_place` says never to hoist the buffer into the scratchpad
             for this read -- also a `RowCopyOp` property, and the whole
             point of tiling: loading a full-resolution group boundary
@@ -833,7 +1065,7 @@ class Planner:
             the traffic the strips exist to avoid."""
             root = root_of[t.name]
             offset = alias_byte_offset(t)
-            operand_bytes = nbytes(t) if read_bytes is None else read_bytes
+            operand_bytes = (nbytes(t) if read_bytes is None else read_bytes) * passes
 
             if root.name in local_addr:
                 traffic.local_read_bytes += operand_bytes
@@ -884,11 +1116,12 @@ class Planner:
                             dst_addr=addr,
                             nbytes=size,
                             kind="reload" if was_spilled else "cold_load",
+                            unit=root.confine_unit_bytes,
                         )
                     )
                     traffic.read_bytes += size
                     traffic.local_write_bytes += size
-                    traffic.tensor_load_count += 1
+                    traffic.tensor_load_count += descriptor_count(steps[-1])
                     if was_spilled:
                         traffic.reload_count += 1
                         del spilled[root.name]
@@ -966,6 +1199,69 @@ class Planner:
             traffic.local_write_bytes += written
             return isa.SPACE_LOCAL_TENSOR, local_addr[out_root.name] + out_offset
 
+        # -- resident weight images (design D6, hardware fact F7) ---------
+        #
+        # Every convolution that shares one `weight` list shares one
+        # image: that is precisely what the tiler produces when it clones
+        # a conv onto `S` strips, and sharing the image is the whole
+        # saving. Keyed by the identity of that list -- the ops keep it
+        # alive for the duration of this call -- and named after the
+        # first conv to ask, so a placement reads as
+        # `'<conv>#const#weight'`.
+        image_of_op: dict[int, str] = {}
+        image_users: dict[str, list[int]] = {}
+        for index, candidate in enumerate(model.ops):
+            if not isinstance(candidate, Conv2dOp) or not candidate.weights_resident:
+                continue
+            if candidate.weight_reuse:
+                # No refill to redirect: `WEIGHT_REUSE` skips `st_wgt_req`
+                # outright, so residency has nothing to say about it.
+                continue
+            key = f"{candidate.name}#const"
+            for seen_key, users in image_users.items():
+                if model.ops[users[0]].weight is candidate.weight:
+                    key = seen_key
+                    break
+            image_of_op[index] = key
+            image_users.setdefault(key, []).append(index)
+
+        #: key -> `{kind: local addr}` once the image is resident, or
+        #: `None` once it has been decided that it cannot be. Sticky
+        #: either way: the decision is made at the image's first use and
+        #: every later user must agree with it, or half the passes would
+        #: read a scratchpad that never got loaded.
+        image_addrs: dict[str, dict[str, int] | None] = {}
+        #: key -> the `(addr, size)` buffers to hand back to the
+        #: allocator after the image's last user.
+        image_buffers: dict[str, list[tuple[int, int]]] = {}
+
+        def load_const_image(key: str, conv: Conv2dOp, exclude: set[str]) -> dict[str, int] | None:
+            """Place `conv`'s packed side tables in the scratchpad and
+            emit the one-time `LOAD`, or return `None` when they do not
+            fit -- in which case the caller leaves `space_wgt` at DDR and
+            the program is merely the slower one it would have been
+            anyway. Each sub-image gets its own buffer with its own
+            confinement unit (see `ConstLoadStep`)."""
+            placed: list[tuple[str, int, int]] = []
+            buffers: list[tuple[int, int]] = []
+            for kind, size, unit in const_images(conv):
+                addr = alloc_local(f"{key}#{kind}", size, exclude, unit)
+                if addr is None:
+                    for freed_addr, freed_size in buffers:
+                        alloc.free(freed_addr, freed_size)
+                        local_placements.pop()
+                        local_confine_units.pop(f"{key}#{placed.pop()[0]}", None)
+                    return None
+                placed.append((kind, addr, size))
+                buffers.append((addr, size))
+            steps.append(ConstLoadStep(conv=conv, key=key, images=placed))
+            moved = sum(size for _, _, size in placed)
+            traffic.read_bytes += moved
+            traffic.local_write_bytes += moved
+            traffic.tensor_load_count += len(placed)
+            image_buffers[key] = buffers
+            return {kind: addr for kind, addr, _ in placed}
+
         for op_index, op in enumerate(model.ops):
             exclude_this_op = {root_of[t.name].name for t in op.inputs}
 
@@ -974,10 +1270,27 @@ class Planner:
             else:
                 input_spaces: list[int] = []
                 input_addrs: list[int] = []
-                for t in op.inputs:
-                    space, addr = resolve_input(t, exclude_this_op)
+                # Only `inputs[0]` is re-streamed by the output-channel
+                # loop; `ADD`'s second operand is read once like every
+                # other elementwise input.
+                passes = ifmap_passes(op)
+                for index, t in enumerate(op.inputs):
+                    space, addr = resolve_input(
+                        t, exclude_this_op, passes=passes if index == 0 else 1
+                    )
                     input_spaces.append(space)
                     input_addrs.append(addr)
+
+                # The weight LOAD is emitted before the operand
+                # resolution's own steps would be, but after the operand
+                # roots are known, so the images can never evict a buffer
+                # this very command is about to read.
+                key = image_of_op.get(op_index)
+                weight_addrs = None
+                if key is not None:
+                    if key not in image_addrs:
+                        image_addrs[key] = load_const_image(key, op, exclude_this_op)
+                    weight_addrs = image_addrs[key]
 
                 output_space, out_addr = resolve_output(op.output, exclude_this_op)
                 steps.append(
@@ -987,22 +1300,38 @@ class Planner:
                         input_addrs=input_addrs,
                         output_space=output_space,
                         output_addr=out_addr,
+                        weight_space=(
+                            isa.SPACE_LOCAL_TENSOR if weight_addrs else isa.SPACE_DDR
+                        ),
+                        weight_addrs=weight_addrs,
                     )
                 )
 
-            if isinstance(op, Conv2dOp) and not op.weight_reuse:
-                desc = op.weight_layer_desc()
-                weight_bytes = golden.packed_weight_count(desc, golden.TILE_CHANNELS, golden.PE_ROWS)
-                traffic.read_bytes += weight_bytes
-                traffic.weight_bytes += weight_bytes
-                if op.bias is not None:
-                    bias_bytes = golden.packed_bias_count(desc, golden.PE_ROWS) * 4
-                    traffic.read_bytes += bias_bytes
-                    traffic.weight_bytes += bias_bytes
-                if op.per_channel_scale is not None:
-                    scale_bytes = golden.packed_scale_table_bytes(desc, golden.PE_ROWS)
-                    traffic.read_bytes += scale_bytes
-                    traffic.weight_bytes += scale_bytes
+            if isinstance(op, ActOp):
+                # The standalone LUT is a compile-time side table in DDR
+                # (`program.py` puts it at `weight_addr`/`space_wgt`), and
+                # `cnn_accel_elementwise` refills all 256 entries for every
+                # `ACT` command -- there is no cache across descriptors. It
+                # is a plain DDR read, not weight-buffer traffic: the
+                # hardware's `WEIGHT_LOAD_BYTES` counter is only touched by
+                # the conv weight refill and by `LOADW`, never by this.
+                traffic.read_bytes += isa.ACT_LUT_BYTES
+
+            if isinstance(op, Conv2dOp):
+                charge_weight_fill(
+                    op,
+                    traffic,
+                    resident=isinstance(steps[-1], ComputeStep)
+                    and steps[-1].weight_space == isa.SPACE_LOCAL_TENSOR,
+                )
+
+            # An image is freed the moment its last user has run, exactly
+            # like any other buffer -- a group's weights must not squat in
+            # the scratchpad for the whole program.
+            key = image_of_op.get(op_index)
+            if key is not None and op_index == image_users[key][-1]:
+                for freed_addr, freed_size in image_buffers.pop(key, []):
+                    alloc.free(freed_addr, freed_size)
 
             out_root_name = root_of[op.output.name].name
             pending_producers[out_root_name] -= 1
@@ -1028,6 +1357,7 @@ class Planner:
             tensor_ddr_addr=tensor_ddr_addr,
             bank_bytes=self.bank_bytes,
             local_placements=local_placements,
+            local_confine_units=local_confine_units,
             ddr_placements=ddr_placements,
             pinned_placements=pinned_placements,
         )
@@ -1038,10 +1368,15 @@ __all__ = [
     "DEFAULT_TENSOR_MEM_BYTES",
     "DdrTraffic",
     "ComputeStep",
+    "ConstLoadStep",
+    "charge_weight_fill",
+    "const_images",
+    "weight_fill_bytes",
     "MoveStep",
     "RowCopyStep",
     "Step",
     "descriptor_count",
+    "ifmap_passes",
     "PlannedProgram",
     "Planner",
 ]
