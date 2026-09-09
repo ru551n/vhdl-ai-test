@@ -126,6 +126,25 @@ entity cnn_accel_window_gen is
     cfg_in_width : in std_ulogic_vector(15 downto 0);
     cfg_in_height : in std_ulogic_vector(15 downto 0);
     cfg_in_channels : in std_ulogic_vector(15 downto 0);
+    -- Output frame dimensions for the command being started, i.e. exactly
+    -- '(in_dim + pad_lo + pad_hi - kernel) / stride + 1' in each axis.
+    --
+    -- This module used to derive them itself, in the single cycle in which
+    -- 'start' latched the configuration. Two runtime divisions by
+    -- 'cfg_stride_w'/'cfg_stride_h' in one combinational cone off
+    -- 'cnn_accel_cmd_proc's descriptor register is what made
+    -- 'out_height_q' a 135-logic-level endpoint and cost the first
+    -- top-level build 47 ns of setup slack at 150 MHz. 'cnn_accel_cmd_proc'
+    -- already computes the identical quantity, once per command, on its
+    -- own 16-step restoring divider ('st_div_w'/'st_div_h', reaching
+    -- 'out_w_q'/'out_h_q' several states before it pulses 'start'), so
+    -- the division is not repeated here -- it is received.
+    --
+    -- Contract: stable and correct for the command's geometry whenever
+    -- 'start' is asserted. Both are '>= 1' for any geometry
+    -- 'cnn_accel_cmd_proc' does not reject.
+    cfg_out_width : in std_ulogic_vector(15 downto 0);
+    cfg_out_height : in std_ulogic_vector(15 downto 0);
     --# {{}}
     -- Pulse, from cnn_accel_layer_ctrl: latches the 'cfg_*' ports above and
     -- resets row/column counters and line-buffer pointers for a new frame.
@@ -468,6 +487,14 @@ architecture a of cnn_accel_window_gen is
   -- '1' once a frame is in progress (between 'start' and the final
   -- window's acceptance); gates 's_stream_s2m.ready' so nothing is
   -- accepted before the first 'start' or after the frame's last beat.
+  -- High for the single cycle between 'start' and 'active_q': frame setup
+  -- stage 2 (see the 'control' process). Nothing outside this process
+  -- observes it -- the world sees only that 'active_q' rises one cycle
+  -- later than it used to.
+  signal setup_q : std_ulogic := '0';
+  -- High for the cycle after 'setup_q': frame setup stage 3.
+  signal setup2_q : std_ulogic := '0';
+
   signal active_q : std_ulogic := '0';
   -- '1' while windows remain to be *launched* (between 'start' and the
   -- launch of the final window). Distinct from 'active_q', which only
@@ -483,7 +510,17 @@ architecture a of cnn_accel_window_gen is
   signal stride_h_q, stride_w_q : unsigned(7 downto 0) := (others => '0');
   signal pad_top_q, pad_left_q : unsigned(7 downto 0) := (others => '0');
   -- ISA v2.1 pad value, latched at 'start' alongside the pad counts.
+  -- The int8 value every padded tap takes. It is written to every byte of
+  -- every tap-assembly buffer at the start of a column walk, so its eight
+  -- bits drive 'g_max_kernel_size**2 * g_tile_channels *
+  -- g_assembly_buffers' flip-flop inputs -- 216 loads per bit for the CONV
+  -- instance. Once the logic depth in this entity was gone, that single
+  -- net was the accelerator's worst path: one LUT level, 0.5 ns of logic
+  -- and 8.5 ns of route. 'max_fanout' makes the synthesiser replicate the
+  -- register instead of driving one net across the whole buffer bank.
   signal pad_value_q : std_ulogic_vector(7 downto 0) := (others => '0');
+  attribute max_fanout : integer;
+  attribute max_fanout of pad_value_q : signal is 24;
   signal in_width_q, in_height_q : unsigned(15 downto 0) := (others => '0');
   signal out_width_q, out_height_q : unsigned(15 downto 0) := (others => '0');
 
@@ -881,10 +918,18 @@ begin
   -- than a cycle behind them).
   ------------------------------------------------------------------------
   control : process(clk)
-    variable v_num_w, v_num_h : integer;
-    variable v_in_channels, v_n_tiles : integer;
-    variable v_kh, v_kw, v_sh, v_sw, v_pt, v_pl, v_inh, v_inw : integer;
+    -- Ranged, not plain 'integer'. Every one of these is a copy of an
+    -- 8- or 16-bit port or register, but as unconstrained integers they
+    -- made every 'mod' and every product below 32 bits wide in the
+    -- netlist: '(-pad_top) mod g_max_kernel_size' alone synthesised to a
+    -- 32-bit signed modulo, 11.9 ns of it, and was the second-worst path
+    -- in the design once the divisions were gone.
+    variable v_in_channels : natural range 0 to 65535;
+    variable v_n_tiles : natural range 0 to 65535;
+    variable v_kh, v_kw, v_sh, v_sw, v_pt, v_pl : natural range 0 to 255;
+    variable v_inh, v_inw : natural range 0 to 65535;
     variable v_row_top, v_col_left : coord_t;
+    variable v_pt_mod : natural range 0 to g_max_kernel_size - 1;
     variable v_mod : natural range 0 to 2 * g_max_kernel_size - 2;
     variable v_kr : natural range 0 to 2 * g_max_kernel_size - 1;
   begin
@@ -892,6 +937,8 @@ begin
       if reset = '1' then
         active_q <= '0';
         launch_active_q <= '0';
+        setup_q <= '0';
+        setup2_q <= '0';
         n_res_q <= 0;
         cur_row_q <= (others => '0');
         cur_col_q <= (others => '0');
@@ -903,6 +950,21 @@ begin
         wr_addr_q <= 0;
 
       elsif start = '1' then
+        -- ------------------------------------------------------------
+        -- Frame setup, stage 1 of 2: latch the configuration and clear
+        -- the position counters. 'active_q' stays low: the seeding of the
+        -- geometry registers below happens in stage 2, off the registers
+        -- latched here rather than off the 'cfg_*' ports.
+        --
+        -- Splitting what used to be one cycle in two is what takes
+        -- 'cnn_accel_cmd_proc's descriptor register out of the seeding
+        -- cone. Every product and modulo in stage 2 now starts at a
+        -- register inside this entity, one command-start cycle later.
+        -- The cost is exactly one cycle per COMMAND (commands run for
+        -- thousands); nothing per position and nothing per beat, since
+        -- 's_stream_s2m.ready' is gated by 'active_q' and simply
+        -- backpressures the feeder for that cycle.
+        -- ------------------------------------------------------------
         assert unsigned(cfg_kernel_h) <= to_unsigned(g_max_kernel_size, 8)
           and unsigned(cfg_kernel_w) <= to_unsigned(g_max_kernel_size, 8)
           report "cnn_accel_window_gen: cfg_kernel_h/w must be <= g_max_kernel_size"
@@ -918,20 +980,15 @@ begin
         in_width_q <= unsigned(cfg_in_width);
         in_height_q <= unsigned(cfg_in_height);
 
-        -- out_dim = (in_dim + pad_lo + pad_hi - kernel) / stride + 1.
-        -- One-shot per 'start' (not a per-cycle datapath), so plain
-        -- integer division here is deliberate -- see
-        -- cnn_accel_window_gen_proposal.md section 5.
-        v_num_w := to_integer(unsigned(cfg_in_width)) + to_integer(unsigned(cfg_pad_left))
-          + to_integer(unsigned(cfg_pad_right)) - to_integer(unsigned(cfg_kernel_w));
-        v_num_h := to_integer(unsigned(cfg_in_height)) + to_integer(unsigned(cfg_pad_top))
-          + to_integer(unsigned(cfg_pad_bottom)) - to_integer(unsigned(cfg_kernel_h));
-
-        out_width_q <= to_unsigned(v_num_w / to_integer(unsigned(cfg_stride_w)) + 1, 16);
-        out_height_q <= to_unsigned(v_num_h / to_integer(unsigned(cfg_stride_h)) + 1, 16);
+        -- 'out_dim = (in_dim + pad_lo + pad_hi - kernel) / stride + 1',
+        -- received pre-divided from 'cnn_accel_cmd_proc' -- see the
+        -- 'cfg_out_width' port comment for why it is not derived here.
+        out_width_q <= unsigned(cfg_out_width);
+        out_height_q <= unsigned(cfg_out_height);
 
         -- T = ceil(in_channels / g_tile_channels); only the last tile of
         -- the frame can be partial (see 'last_tile_channels_q's comment).
+        -- 'g_tile_channels' is a generic, so this is a constant divide.
         v_in_channels := to_integer(unsigned(cfg_in_channels));
         v_n_tiles := (v_in_channels + g_tile_channels - 1) / g_tile_channels;
 
@@ -949,25 +1006,38 @@ begin
         out_row_q <= (others => '0');
         out_col_q <= (others => '0');
         rd_tile_q <= (others => '0');
-        active_q <= '1';
-        launch_active_q <= '1';
+        active_q <= '0';
+        launch_active_q <= '0';
         n_res_q <= 0;
 
         wr_bank_q <= 0;
         wr_addr_q <= 0;
 
-        -- S7: seed every geometry register / address accumulator for
-        -- 'out_row = out_col = rd_tile = 0'. Read from the 'cfg_*' ports
-        -- rather than from 'kernel_h_q' et al, which are only being
-        -- latched this same cycle.
-        v_kh := to_integer(unsigned(cfg_kernel_h));
-        v_kw := to_integer(unsigned(cfg_kernel_w));
-        v_sh := to_integer(unsigned(cfg_stride_h));
-        v_sw := to_integer(unsigned(cfg_stride_w));
-        v_pt := to_integer(unsigned(cfg_pad_top));
-        v_pl := to_integer(unsigned(cfg_pad_left));
-        v_inh := to_integer(unsigned(cfg_in_height));
-        v_inw := to_integer(unsigned(cfg_in_width));
+        setup_q <= '1';
+        setup2_q <= '0';
+
+      elsif setup_q = '1' then
+        -- ------------------------------------------------------------
+        -- Frame setup, stage 2 of 2: seed every geometry register and
+        -- address accumulator for 'out_row = out_col = rd_tile = 0', then
+        -- go active.
+        --
+        -- Every source here is a register latched in stage 1, so the
+        -- deepest cone in this block is one narrow multiply
+        -- register-to-register, instead of the descriptor-register-to-here
+        -- cone it used to be.
+        -- ------------------------------------------------------------
+        setup_q <= '0';
+
+        v_kh := to_integer(kernel_h_q);
+        v_kw := to_integer(kernel_w_q);
+        v_sh := to_integer(stride_h_q);
+        v_sw := to_integer(stride_w_q);
+        v_pt := to_integer(pad_top_q);
+        v_pl := to_integer(pad_left_q);
+        v_inh := to_integer(in_height_q);
+        v_inw := to_integer(in_width_q);
+        v_n_tiles := to_integer(n_tiles_q);
 
         v_row_top := -v_pt;
         v_col_left := -v_pl;
@@ -987,22 +1057,25 @@ begin
         row_bot_next_q <= v_row_top + v_sh + v_kh - 1;
         row_top_k_next_q <= v_row_top + v_sh + g_max_kernel_size;
 
+        -- The two modulo-'g_max_kernel_size' reductions are the deepest
+        -- single operation in the setup, and 'row_top_mod_q' feeds a
+        -- second layer of per-bank selects, multiplies and range tests.
+        -- Both are registered here and consumed in stage 3, so no cone
+        -- runs 'pad_top -> mod -> kr -> row_ok' in one cycle.
         stride_h_mod_q <= v_sh mod g_max_kernel_size;
-        v_mod := (-v_pt) mod g_max_kernel_size;
-        row_top_mod_q <= v_mod;
-        for b in 0 to g_max_kernel_size - 1 loop
-          v_kr := b + g_max_kernel_size - v_mod;
-          if v_kr >= g_max_kernel_size then
-            v_kr := v_kr - g_max_kernel_size;
-          end if;
-          kr_of_q(b) <= v_kr;
-          -- Start-time only: one narrow multiply per bank, off every
-          -- cycle-by-cycle path (see 'kr_base_q's declaration).
-          kr_base_q(b) <= v_kr * v_kw;
-          row_ok_q(b) <= to_sl(
-            v_kr < v_kh and v_row_top + v_kr >= 0 and v_row_top + v_kr <= v_inh - 1
-          );
-        end loop;
+
+        -- '(-pad_top) mod K', written as a reduction of the NON-negative
+        -- 'pad_top mod K'. Identical by definition -- VHDL's 'mod' takes
+        -- the sign of its right operand, so '(-p) mod K' is the unique
+        -- 'r' in '0 .. K-1' congruent to '-p', which is 'K - (p mod K)'
+        -- unless 'p mod K' is zero. The point is that the operand is now
+        -- an 8-bit non-negative value instead of a signed integer.
+        v_pt_mod := v_pt mod g_max_kernel_size;
+        if v_pt_mod = 0 then
+          row_top_mod_q <= 0;
+        else
+          row_top_mod_q <= g_max_kernel_size - v_pt_mod;
+        end if;
 
         -- 'k * kernel_w' for every possible kernel row, so the
         -- per-output-row 'kr_base_q' update below is a mux, not a
@@ -1050,6 +1123,43 @@ begin
           (-v_pl * v_n_tiles) mod 2 ** c_addr_width, c_addr_width
         );
         rd_base_q <= to_unsigned((-v_pl * v_n_tiles) mod 2 ** c_addr_width, c_addr_width);
+
+        setup2_q <= '1';
+
+      elsif setup2_q = '1' then
+        -- ------------------------------------------------------------
+        -- Frame setup, stage 3 of 3: the per-row-bank kernel-row mapping,
+        -- which is everything downstream of 'row_top_mod_q'. Kept out of
+        -- stage 2 because the chain 'pad_top -> mod g_max_kernel_size ->
+        -- kernel row -> (multiply, range tests) -> row_ok_q' was still a
+        -- 9 ns cone at 150 MHz when it ran in one cycle.
+        --
+        -- Reads only registers written in stages 1 and 2. 'active_q'
+        -- rises at the end of this cycle, so the frame is live from here.
+        -- ------------------------------------------------------------
+        setup2_q <= '0';
+        active_q <= '1';
+        launch_active_q <= '1';
+
+        v_kh := to_integer(kernel_h_q);
+        v_kw := to_integer(kernel_w_q);
+        v_pt := to_integer(pad_top_q);
+        v_inh := to_integer(in_height_q);
+        v_row_top := -v_pt;
+
+        for b in 0 to g_max_kernel_size - 1 loop
+          v_kr := b + g_max_kernel_size - row_top_mod_q;
+          if v_kr >= g_max_kernel_size then
+            v_kr := v_kr - g_max_kernel_size;
+          end if;
+          kr_of_q(b) <= v_kr;
+          -- Start-time only: one narrow multiply per bank, off every
+          -- cycle-by-cycle path (see 'kr_base_q's declaration).
+          kr_base_q(b) <= v_kr * v_kw;
+          row_ok_q(b) <= to_sl(
+            v_kr < v_kh and v_row_top + v_kr >= 0 and v_row_top + v_kr <= v_inh - 1
+          );
+        end loop;
 
       else
         if fire = '1' then

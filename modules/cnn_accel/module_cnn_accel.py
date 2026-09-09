@@ -1635,9 +1635,44 @@ class Module(BaseModule):
                     # output register, so anything that moved FFs, BRAM or
                     # DSP would mean the reduction had stopped being
                     # combinational.
+                    #
+                    # Re-measured 2026-09 after the 150 MHz rework: **708
+                    # LUTs**, **227 FFs**, 0 BRAM, 0 DSP.
+                    #
+                    # The FF bound had to move, and by a lot, because the
+                    # premise of the sentence above is exactly what the
+                    # rework deleted. The reduction is no longer one
+                    # combinational stage feeding one output register --
+                    # `desc_q -> pool_lane/out_max_q` was 82 logic levels
+                    # and -49.5 ns of setup slack at 150 MHz, the worst
+                    # path in the whole accelerator. It is now a registered
+                    # tap mask, a balanced tree split across a pipeline
+                    # register, and a two-entry output buffer. The 227
+                    # account for themselves exactly:
+                    #
+                    #   25  tap_mask_q
+                    #   16  cfg_kernel_h_q / cfg_kernel_w_q (the shadow the
+                    #       one-cycle `cfg_match` bubble compares against)
+                    #  147  pipeline stage 1: 7 max nodes x 8 bits +
+                    #       7 sum nodes x 13 bits
+                    #   36  output buffer: 2 entries x (8-bit max +
+                    #       16-bit sum + is_avg + last)
+                    #    3  buf_count_q + p1_valid_q + the stage-1 tag/last
+                    #  ---
+                    #  227
+                    #
+                    # LUTs went DOWN, 899 -> 708, because the balanced tree
+                    # is cheaper than the 25-deep linear reduce it replaces
+                    # and the runtime `kernel_h * kernel_w` multiply is gone
+                    # from the datapath entirely.
+                    #
+                    # BRAM and DSP stay pinned at zero for the original
+                    # reason: this entity is compare-and-add logic, and any
+                    # movement there would mean something unintended
+                    # happened to the reduction.
                     checkers=[
-                        TotalLuts(LessThan(1100)),
-                        Ffs(LessThan(35)),
+                        TotalLuts(LessThan(900)),
+                        Ffs(LessThan(260)),
                         Ramb36(LessThan(1)),
                         Ramb18(LessThan(1)),
                         DspBlocks(LessThan(1)),

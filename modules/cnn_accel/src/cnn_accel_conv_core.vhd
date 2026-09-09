@@ -166,6 +166,11 @@ entity cnn_accel_conv_core is
     cfg_in_width : in std_ulogic_vector(15 downto 0);
     cfg_in_height : in std_ulogic_vector(15 downto 0);
     cfg_in_channels : in std_ulogic_vector(15 downto 0);
+    -- Pre-computed output frame dimensions, straight through to
+    -- 'cnn_accel_window_gen' -- see that entity's port comment for why
+    -- the division that produces them lives in 'cnn_accel_cmd_proc'.
+    cfg_out_width : in std_ulogic_vector(15 downto 0);
+    cfg_out_height : in std_ulogic_vector(15 downto 0);
     --# {{}}
     -- Output-quantization configuration for cnn_accel_bias_requant, sampled
     -- combinationally per accepted beat (not latched at 'start' -- see that
@@ -325,6 +330,8 @@ begin
       cfg_in_width => cfg_in_width,
       cfg_in_height => cfg_in_height,
       cfg_in_channels => cfg_in_channels,
+      cfg_out_width => cfg_out_width,
+      cfg_out_height => cfg_out_height,
 
       start => start,
       -- Not this entity's 'done' -- see the port comment above.

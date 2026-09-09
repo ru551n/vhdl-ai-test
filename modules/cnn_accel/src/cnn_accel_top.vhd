@@ -16,6 +16,8 @@ use axi_lite.axi_lite_pkg.all;
 library axi_stream;
 use axi_stream.axi_stream_pkg.all;
 
+library common;
+
 -- Structural integration of the rev-2 programmable tensor accelerator, per
 -- modules/cnn_accel/doc/cnn_accel_top_v2_arch.md section 2. This entity owns
 -- no command, opcode or neural-network semantics of its own: everything that
@@ -139,7 +141,13 @@ architecture a of cnn_accel_top is
   -- Reset distribution.
   ------------------------------------------------------------------------
 
+  -- Reaches the reset input of essentially every register in the design --
+  -- a 22 674-load net in the first top-level build. Replicated rather than
+  -- routed as one net; the semantics are unchanged (every replica is the
+  -- same function of the same two sources, in the same cycle).
   signal reset_internal : std_ulogic := '0';
+  attribute max_fanout : integer;
+  attribute max_fanout of reset_internal : signal is 200;
   signal soft_reset_pulse : std_ulogic := '0';
 
   ------------------------------------------------------------------------
@@ -232,9 +240,54 @@ architecture a of cnn_accel_top is
   -- Local tensor scratchpad ports.
   ------------------------------------------------------------------------
 
+  ------------------------------------------------------------------------
+  -- Registered request stage.
+  --
+  -- 'cnn_accel_cmd_proc's operand-port binding (its "who owns the source
+  -- port" mux) selects, from a handful of its own state registers, which
+  -- internal requester drives each physical request port. Feeding that mux
+  -- straight into a sink's request-accept logic made one combinational
+  -- path out of the selector register, the mux, the trip across the die,
+  -- and the sink's own address decode or burst sizing -- the accelerator's
+  -- worst remaining paths after the pool and window-generator reworks
+  -- ('src0_is_ddr_q' into the scratchpad's read FSM, 'engine_conv_q' into
+  -- the ifmap DMA's burst calculation).
+  --
+  -- Every request port therefore goes through a one-deep register stage
+  -- below. Both directions are registered, so neither 'valid'/'addr' nor
+  -- 'ready' crosses combinationally. The stage accepts one request every
+  -- two cycles, which is free: a request is issued once per DMA job (a
+  -- plane, a weight tile, a whole transfer), never per beat, and the
+  -- issuing state machine waits for 'ready' anyway.
+  ------------------------------------------------------------------------
+
+  constant c_n_req_ports : positive := 7;
+  type req_m2s_arr_t is array (0 to c_n_req_ports - 1) of dma_req_m2s_t;
+  type req_s2m_arr_t is array (0 to c_n_req_ports - 1) of dma_req_s2m_t;
+
+  -- Index into the two arrays below, one per physical request port.
+  constant c_req_load : natural := 0;
+  constant c_req_wgt : natural := 1;
+  constant c_req_store : natural := 2;
+  constant c_req_tm_w0 : natural := 3;
+  constant c_req_tm_w1 : natural := 4;
+  constant c_req_tm_r0 : natural := 5;
+  constant c_req_tm_r1 : natural := 6;
+
+  -- 'req_in_*': cmd_proc side. 'req_out_*': sink side.
+  signal req_in_m2s : req_m2s_arr_t;
+  signal req_in_s2m : req_s2m_arr_t;
+  constant c_req_init : dma_req_m2s_t :=
+    (valid => '0', req => (addr => (others => '0'), length => (others => '0')));
+  signal req_out_m2s : req_m2s_arr_t := (others => c_req_init);
+  signal req_out_s2m : req_s2m_arr_t;
+
   signal tm_w0_req_m2s, tm_w1_req_m2s : dma_req_m2s_t;
   signal tm_w0_req_s2m, tm_w1_req_s2m : dma_req_s2m_t;
   signal tm_w0_m2s, tm_w1_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  -- Scratchpad write streams after the skid stage below.
+  signal tm_w0_piped_m2s, tm_w1_piped_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal tm_w0_piped_s2m, tm_w1_piped_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
   signal tm_w0_s2m, tm_w1_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
   signal tm_w0_done, tm_w1_done : std_ulogic := '0';
 
@@ -242,6 +295,10 @@ architecture a of cnn_accel_top is
   signal tm_r0_req_s2m, tm_r1_req_s2m : dma_req_s2m_t;
   signal tm_r0_m2s, tm_r1_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
   signal tm_r0_s2m, tm_r1_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+  -- Scratchpad read streams as the scratchpad itself drives them, i.e.
+  -- upstream of the skid stage below.
+  signal tm_r0_raw_m2s, tm_r1_raw_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal tm_r0_raw_s2m, tm_r1_raw_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
   signal tm_r0_done, tm_r1_done : std_ulogic := '0';
 
   ------------------------------------------------------------------------
@@ -263,6 +320,10 @@ architecture a of cnn_accel_top is
   signal conv_cfg_clamp_en : std_ulogic;
   signal conv_cfg_clamp_min, conv_cfg_clamp_max : std_ulogic_vector(7 downto 0);
   signal conv_cfg_per_channel_en : std_ulogic;
+  -- Output frame dimensions, divided once per command by 'cnn_accel_cmd_proc'
+  -- and latched by whichever window generator is started. Shared: only one
+  -- engine runs per descriptor.
+  signal geom_out_width, geom_out_height : std_ulogic_vector(15 downto 0);
 
   signal conv_start : std_ulogic := '0';
   signal conv_done : std_ulogic := '0';
@@ -550,6 +611,8 @@ begin
       conv_cfg_clamp_min => conv_cfg_clamp_min,
       conv_cfg_clamp_max => conv_cfg_clamp_max,
       conv_cfg_per_channel_en => conv_cfg_per_channel_en,
+      geom_out_width => geom_out_width,
+      geom_out_height => geom_out_height,
       conv_start => conv_start,
       conv_done => conv_done,
       m_conv_stream_m2s => conv_stream_m2s,
@@ -695,8 +758,8 @@ begin
       clk => clk,
       reset => reset_internal,
 
-      req_m2s => load_req_m2s,
-      req_s2m => load_req_s2m,
+      req_m2s => req_out_m2s(c_req_load),
+      req_s2m => req_out_s2m(c_req_load),
       dma_done => load_dma_done,
       resp_error => load_resp_error,
 
@@ -719,8 +782,8 @@ begin
       clk => clk,
       reset => reset_internal,
 
-      req_m2s => wgt_req_m2s,
-      req_s2m => wgt_req_s2m,
+      req_m2s => req_out_m2s(c_req_wgt),
+      req_s2m => req_out_s2m(c_req_wgt),
       dma_done => wgt_dma_done,
       resp_error => wgt_resp_error,
 
@@ -746,8 +809,8 @@ begin
       clk => clk,
       reset => reset_internal,
 
-      req_m2s => store_req_m2s,
-      req_s2m => store_req_s2m,
+      req_m2s => req_out_m2s(c_req_store),
+      req_s2m => req_out_s2m(c_req_store),
       dma_done => store_dma_done,
       resp_error => store_resp_error,
 
@@ -825,28 +888,28 @@ begin
       clk => clk,
       reset => reset_internal,
 
-      w0_req_m2s => tm_w0_req_m2s,
-      w0_req_s2m => tm_w0_req_s2m,
-      s_w0_m2s => tm_w0_m2s,
-      s_w0_s2m => tm_w0_s2m,
+      w0_req_m2s => req_out_m2s(c_req_tm_w0),
+      w0_req_s2m => req_out_s2m(c_req_tm_w0),
+      s_w0_m2s => tm_w0_piped_m2s,
+      s_w0_s2m => tm_w0_piped_s2m,
       w0_done => tm_w0_done,
 
-      w1_req_m2s => tm_w1_req_m2s,
-      w1_req_s2m => tm_w1_req_s2m,
-      s_w1_m2s => tm_w1_m2s,
-      s_w1_s2m => tm_w1_s2m,
+      w1_req_m2s => req_out_m2s(c_req_tm_w1),
+      w1_req_s2m => req_out_s2m(c_req_tm_w1),
+      s_w1_m2s => tm_w1_piped_m2s,
+      s_w1_s2m => tm_w1_piped_s2m,
       w1_done => tm_w1_done,
 
-      r0_req_m2s => tm_r0_req_m2s,
-      r0_req_s2m => tm_r0_req_s2m,
-      m_r0_m2s => tm_r0_m2s,
-      m_r0_s2m => tm_r0_s2m,
+      r0_req_m2s => req_out_m2s(c_req_tm_r0),
+      r0_req_s2m => req_out_s2m(c_req_tm_r0),
+      m_r0_m2s => tm_r0_raw_m2s,
+      m_r0_s2m => tm_r0_raw_s2m,
       r0_done => tm_r0_done,
 
-      r1_req_m2s => tm_r1_req_m2s,
-      r1_req_s2m => tm_r1_req_s2m,
-      m_r1_m2s => tm_r1_m2s,
-      m_r1_s2m => tm_r1_s2m,
+      r1_req_m2s => req_out_m2s(c_req_tm_r1),
+      r1_req_s2m => req_out_s2m(c_req_tm_r1),
+      m_r1_m2s => tm_r1_raw_m2s,
+      m_r1_s2m => tm_r1_raw_s2m,
       r1_done => tm_r1_done
     );
 
@@ -904,6 +967,8 @@ begin
       cfg_clamp_min => conv_cfg_clamp_min,
       cfg_clamp_max => conv_cfg_clamp_max,
       cfg_per_channel_en => conv_cfg_per_channel_en,
+      cfg_out_width => geom_out_width,
+      cfg_out_height => geom_out_height,
 
       start => conv_start,
       done => conv_done,
@@ -988,6 +1053,8 @@ begin
       cfg_in_width => pool_cfg_in_width,
       cfg_in_height => pool_cfg_in_height,
       cfg_in_channels => std_ulogic_vector(to_unsigned(g_tile_channels, 16)),
+      cfg_out_width => geom_out_width,
+      cfg_out_height => geom_out_height,
 
       start => pool_start,
       -- The engine's completion is taken from the far end of the pipeline
@@ -1005,6 +1072,161 @@ begin
   -- The lanes are structurally identical and see identical inputs, so their
   -- readys are identical too; ANDing them is a zero-cost statement of that
   -- invariant rather than real arbitration.
+  req_in_m2s(c_req_load) <= load_req_m2s;
+  req_in_m2s(c_req_wgt) <= wgt_req_m2s;
+  req_in_m2s(c_req_store) <= store_req_m2s;
+  req_in_m2s(c_req_tm_w0) <= tm_w0_req_m2s;
+  req_in_m2s(c_req_tm_w1) <= tm_w1_req_m2s;
+  req_in_m2s(c_req_tm_r0) <= tm_r0_req_m2s;
+  req_in_m2s(c_req_tm_r1) <= tm_r1_req_m2s;
+
+  load_req_s2m <= req_in_s2m(c_req_load);
+  wgt_req_s2m <= req_in_s2m(c_req_wgt);
+  store_req_s2m <= req_in_s2m(c_req_store);
+  tm_w0_req_s2m <= req_in_s2m(c_req_tm_w0);
+  tm_w1_req_s2m <= req_in_s2m(c_req_tm_w1);
+  tm_r0_req_s2m <= req_in_s2m(c_req_tm_r0);
+  tm_r1_req_s2m <= req_in_s2m(c_req_tm_r1);
+
+  req_pipeline : process(clk)
+  begin
+    if rising_edge(clk) then
+      for i in 0 to c_n_req_ports - 1 loop
+        if req_out_m2s(i).valid = '0' then
+          if req_in_m2s(i).valid = '1' then
+            req_out_m2s(i) <= req_in_m2s(i);
+          end if;
+        elsif req_out_s2m(i).ready = '1' then
+          req_out_m2s(i).valid <= '0';
+        end if;
+      end loop;
+
+      if reset_internal = '1' then
+        for i in 0 to c_n_req_ports - 1 loop
+          req_out_m2s(i).valid <= '0';
+        end loop;
+      end if;
+    end if;
+  end process;
+
+  -- Registered, so nothing downstream of the stage reaches cmd_proc's mux.
+  req_ready_gen : for i in 0 to c_n_req_ports - 1 generate
+    req_in_s2m(i).ready <= not req_out_m2s(i).valid;
+  end generate;
+
+  ------------------------------------------------------------------------
+  -- Skid stage on each scratchpad read stream.
+  --
+  -- The mirror image of the write-side stage below, and it exists for the
+  -- mirror-image path: the ifmap consumer's 'ready' -- the window
+  -- generator's, ultimately its tap-assembly launch control -- reached
+  -- 'cnn_accel_tensor_mem's block-RAM read ADDRESS through
+  -- 'cnn_accel_cmd_proc's operand mux, one combinational path from a
+  -- window-generator register to a 'ADDRBWRADDR' pin.
+  ------------------------------------------------------------------------
+
+  tm_read_pipeline_gen : for r in 0 to 1 generate
+    signal input_m2s, output_m2s : axi_stream_m2s_t;
+    signal input_ready, output_ready : std_ulogic;
+  begin
+    input_m2s <= tm_r0_raw_m2s when r = 0 else tm_r1_raw_m2s;
+    output_ready <= tm_r0_s2m.ready when r = 0 else tm_r1_s2m.ready;
+
+    pipeline_inst : entity common.handshake_pipeline
+      generic map (
+        data_width => axi_stream_data_sz,
+        full_throughput => true,
+        pipeline_control_signals => true,
+        pipeline_data_signals => true
+      )
+      port map (
+        clk => clk,
+
+        input_ready => input_ready,
+        input_valid => input_m2s.valid,
+        input_last => input_m2s.last,
+        input_data => input_m2s.data,
+
+        output_ready => output_ready,
+        output_valid => output_m2s.valid,
+        output_last => output_m2s.last,
+        output_data => output_m2s.data
+      );
+
+    output_m2s.user <= (others => '-');
+
+    r0_gen : if r = 0 generate
+      tm_r0_raw_s2m.ready <= input_ready;
+      tm_r0_m2s <= output_m2s;
+    end generate;
+
+    r1_gen : if r = 1 generate
+      tm_r1_raw_s2m.ready <= input_ready;
+      tm_r1_m2s <= output_m2s;
+    end generate;
+  end generate;
+
+  ------------------------------------------------------------------------
+  -- Skid stage on each scratchpad write stream.
+  --
+  -- Every producer that can write the scratchpad -- the ifmap read DMA's
+  -- FIFO, the scratchpad's own read port on a local-to-local move, the
+  -- elementwise engine, the conv/pool epilogue -- reaches
+  -- 'cnn_accel_tensor_mem's block-RAM write port through 'cnn_accel_cmd_proc's
+  -- operand-port binding mux. That was one combinational path from a
+  -- producer's output register, across the mux, to a 'DIADI' pin on the
+  -- other side of the die: five separate groups of failing endpoints in
+  -- the first top-level build, all of them mostly route delay.
+  --
+  -- 'full_throughput' with both control and data pipelined is a skid
+  -- buffer: one beat per cycle sustained, no combinational path from
+  -- 'ready' to 'ready' or from 'data' to 'data'. Bit-exact -- a stream
+  -- pipeline neither creates, drops nor reorders beats, and the write
+  -- request that sizes the transfer is issued before the first data beat
+  -- either way, so all that changes is when the beats land.
+  ------------------------------------------------------------------------
+
+  tm_write_pipeline_gen : for w in 0 to 1 generate
+    signal input_m2s, output_m2s : axi_stream_m2s_t;
+    signal input_ready, output_ready : std_ulogic;
+  begin
+    input_m2s <= tm_w0_m2s when w = 0 else tm_w1_m2s;
+    output_ready <= tm_w0_piped_s2m.ready when w = 0 else tm_w1_piped_s2m.ready;
+
+    pipeline_inst : entity common.handshake_pipeline
+      generic map (
+        data_width => axi_stream_data_sz,
+        full_throughput => true,
+        pipeline_control_signals => true,
+        pipeline_data_signals => true
+      )
+      port map (
+        clk => clk,
+
+        input_ready => input_ready,
+        input_valid => input_m2s.valid,
+        input_last => input_m2s.last,
+        input_data => input_m2s.data,
+
+        output_ready => output_ready,
+        output_valid => output_m2s.valid,
+        output_last => output_m2s.last,
+        output_data => output_m2s.data
+      );
+
+    output_m2s.user <= (others => '-');
+
+    w0_gen : if w = 0 generate
+      tm_w0_s2m.ready <= input_ready;
+      tm_w0_piped_m2s <= output_m2s;
+    end generate;
+
+    w1_gen : if w = 1 generate
+      tm_w1_s2m.ready <= input_ready;
+      tm_w1_piped_m2s <= output_m2s;
+    end generate;
+  end generate;
+
   pool_window_s2m.ready <= and pool_lane_ready_vec;
 
   pool_lane_gen : for lane in 0 to g_tile_channels - 1 generate

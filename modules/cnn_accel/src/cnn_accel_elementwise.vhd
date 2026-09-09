@@ -290,8 +290,9 @@ architecture a of cnn_accel_elementwise is
     s_idle,
     s_bad,
     s_lut_req, s_lut_run,
-    s_sd_req_src0, s_sd_req_dst, s_sd_run,
-    s_add_req_src0, s_add_req_src1, s_add_req_dst, s_add_run,
+    s_sd_req_src0, s_sd_req_dst, s_sd_run, s_sd_drain,
+    s_geom_rows, s_geom_total, s_geom_check,
+    s_add_req_src0, s_add_req_src1, s_add_req_dst, s_add_run, s_add_drain,
     s_up_req_src0, s_up_run_src0,
     s_up_req_dst, s_up_run_dst,
     s_up_next,
@@ -345,11 +346,113 @@ architecture a of cnn_accel_elementwise is
   signal lut_beat_count_q : natural range 0 to c_lut_beats - 1 := 0;
 
   -- COPY/ACT streaming data, per lane: passthrough or LUT-mapped byte.
+  ------------------------------------------------------------------------
+  -- Sequential geometry evaluation (ADD / UPSAMPLE).
+  --
+  -- 'total = n_tiles * out_h * out_w * bytes_per_beat' used to be a chain
+  -- of three multiplies evaluated combinationally off 'cmd_proc's
+  -- descriptor register in the single cycle 'start' was seen. That was a
+  -- -8.8 ns endpoint at 150 MHz. It is now spread over two extra states,
+  -- at most one multiply each, all of them register-to-register. Commands
+  -- run for thousands of cycles, so two more at command start is free.
+  --
+  -- Widths are the true bounds, not 64 bits: 'in_width'/'in_height'/
+  -- 'in_channels' are 16-bit ISA fields, so 'n_tiles <= 2**13',
+  -- 'out_h'/'out_w' <= 2*65535 < 2**17 and their product < 2**31. Naming
+  -- them at those widths is what keeps each multiply to a two-DSP cascade.
+  ------------------------------------------------------------------------
+
+  signal geom_rows_q : unsigned(31 downto 0) := (others => '0');
+  signal geom_total_q : unsigned(63 downto 0) := (others => '0');
+  -- Degenerate geometry (a zero dimension) detected at 'start' and carried
+  -- to the state that raises the error, so the check does not have to be
+  -- redone against registers.
+  signal geom_zero_q : std_ulogic := '0';
+
+  ------------------------------------------------------------------------
+  -- UPSAMPLE address accumulators.
+  --
+  -- The source pixel index '(c_tile*in_h + iy)*in_w + ix' advances by
+  -- exactly one per iteration of the (tile, iy, ix) raster loop, so the
+  -- source address is an accumulator, not two chained multiplies.
+  --
+  -- The destination row base '(c_tile*out_h + 2*iy) * out_w' advances by
+  -- exactly '2*out_w' at every ix wrap -- at an iy step because
+  -- '2*(iy+1) - 2*iy = 2', and at a tile step because 'out_h = 2*in_h'
+  -- makes '(c_tile+1)*out_h - (c_tile*out_h + 2*(in_h-1))' also 2. Within
+  -- a row it does not change at all. So it too is an accumulator.
+  --
+  -- Both hold exactly the values the multiply chain produced: the
+  -- geometry check bounds 'out_idx * bytes_per_beat' below 2**32, so
+  -- neither accumulator can wrap for any geometry this entity accepts.
+  ------------------------------------------------------------------------
+
+  signal up_src_addr_q : unsigned(31 downto 0) := (others => '0');
+  signal up_row_base_q : unsigned(31 downto 0) := (others => '0');
+  signal up_two_out_w_q : unsigned(31 downto 0) := (others => '0');
+
+  ------------------------------------------------------------------------
+  -- ADD datapath pipeline (4 stages).
+  --
+  -- 'int8 * int32' (a two-DSP cascade), a runtime-variable rounding shift
+  -- of the 40-bit product, the sum and the saturation used to be one
+  -- combinational path from the source stream register to the destination
+  -- stream register: 17.7 ns of data path, -11.4 ns of slack at 150 MHz,
+  -- and the design's second-worst endpoint after the pool reduction.
+  --
+  -- The stages are: 1 operand registers (which also give the DSP its A/B
+  -- registers), 2 products, 3 rounded/shifted products, 4 sum + saturate.
+  -- One shared enable 'add_pipe_en' stalls all four together when the
+  -- destination stalls -- the same structure 'cnn_accel_bias_requant'
+  -- uses, for the same reason. Throughput is unchanged at one beat per
+  -- cycle; only latency grows, by four cycles per ADD command, absorbed
+  -- by 's_add_drain'.
+  --
+  -- 'requant_scale_q'/'combined_shift_q' are read live rather than
+  -- carried down the pipeline: both are written only in 's_idle', and the
+  -- pipeline is provably empty there ('s_add_drain' does not leave until
+  -- 'add_valid_q' is all zero).
+  ------------------------------------------------------------------------
+
+  signal add_pipe_en : std_ulogic;
+  signal add_accept : std_ulogic;
+  signal add_active : std_ulogic;
+  signal add_valid_q : std_ulogic_vector(1 to 4) := (others => '0');
+  signal add_last_q : std_ulogic_vector(1 to 4) := (others => '0');
+  signal add_data_4 : std_ulogic_vector(g_axi_data_width - 1 downto 0);
+
+  ------------------------------------------------------------------------
+  -- COPY / ACT datapath pipeline (2 stages).
+  --
+  -- ACT is a 256-entry int8->int8 table lookup per lane, i.e. a 256:1 mux
+  -- per lane, and it used to sit combinationally between the source
+  -- stream's register (the ifmap DMA's block-RAM FIFO output, 2.1 ns of
+  -- clock-to-out before this entity even sees it) and the destination
+  -- stream. Once everything above it had been fixed, that made this the
+  -- accelerator's worst path.
+  --
+  -- Stage 1 registers the source beat, so the lookup starts at a register
+  -- inside this entity; stage 2 registers the looked-up result, so the
+  -- destination mux starts at one too. Same shared-enable structure as the
+  -- ADD pipeline above: one beat per cycle sustained, two cycles of extra
+  -- latency per COPY/ACT command, drained by 's_sd_drain'.
+  --
+  -- 'opcode_q' and 'lut_mem_q' are read live: both are written only in
+  -- 's_idle'/'s_lut_run', and the pipeline is provably empty there.
+  ------------------------------------------------------------------------
+
+  signal sd_pipe_en : std_ulogic;
+  signal sd_accept : std_ulogic;
+  signal sd_active : std_ulogic;
+  signal sd_valid_q : std_ulogic_vector(1 to 2) := (others => '0');
+  signal sd_last_q : std_ulogic_vector(1 to 2) := (others => '0');
+  signal sd_in_q : std_ulogic_vector(g_axi_data_width - 1 downto 0) := (others => '0');
+  signal sd_data_2 : std_ulogic_vector(g_axi_data_width - 1 downto 0) := (others => '0');
+
   signal sd_data_next : std_ulogic_vector(g_axi_data_width - 1 downto 0);
 
   -- ADD streaming data, per lane: the two rescaled operands, summed and
   -- saturated to int8 (see entity-level shared-arithmetic comment).
-  signal add_data_next : std_ulogic_vector(g_axi_data_width - 1 downto 0);
 
   -- dst stream payload mux (one of the three producers, or all-zero while
   -- none apply), separated from 'm_dst_stream_m2s.data' itself because a
@@ -432,13 +535,13 @@ begin
 
   -- Stream consumption: ready only in each channel's own run state.
   s_src0_stream_s2m.ready <= '1' when
-    (state_q = s_sd_run and m_dst_stream_s2m.ready = '1') or
-    (state_q = s_add_run and s_src1_stream_m2s.valid = '1' and m_dst_stream_s2m.ready = '1') or
+    (state_q = s_sd_run and sd_pipe_en = '1') or
+    (state_q = s_add_run and s_src1_stream_m2s.valid = '1' and add_pipe_en = '1') or
     state_q = s_up_run_src0
     else '0';
 
   s_src1_stream_s2m.ready <= '1' when
-    state_q = s_add_run and s_src0_stream_m2s.valid = '1' and m_dst_stream_s2m.ready = '1'
+    state_q = s_add_run and s_src0_stream_m2s.valid = '1' and add_pipe_en = '1'
     else '0';
 
   s_lut_stream_s2m.ready <= '1' when state_q = s_lut_run else '0';
@@ -447,12 +550,34 @@ begin
   -- COPY/ACT per-lane mapping: passthrough, or through 'lut_mem_q' (ACT).
   ------------------------------------------------------------------------
 
+  sd_pipe_en <= (not sd_valid_q(2)) or m_dst_stream_s2m.ready;
+
+  sd_accept <= '1' when state_q = s_sd_run
+    and s_src0_stream_m2s.valid = '1' and sd_pipe_en = '1' else '0';
+
+  sd_active <= '1' when state_q = s_sd_run or state_q = s_sd_drain else '0';
+
+  -- Stage 2's input: the table lookup, off stage 1's register.
   sd_lane_gen : for l in 0 to c_bytes_per_beat - 1 generate
     sd_data_next(8 * l + 7 downto 8 * l) <=
-      lut_mem_q(to_integer(unsigned(s_src0_stream_m2s.data(8 * l + 7 downto 8 * l))))
+      lut_mem_q(to_integer(unsigned(sd_in_q(8 * l + 7 downto 8 * l))))
         when opcode_q = c_opcode_act else
-      s_src0_stream_m2s.data(8 * l + 7 downto 8 * l);
+      sd_in_q(8 * l + 7 downto 8 * l);
   end generate sd_lane_gen;
+
+  sd_control : process(clk)
+  begin
+    if rising_edge(clk) then
+      if reset = '1' then
+        sd_valid_q <= (others => '0');
+      elsif sd_pipe_en = '1' then
+        sd_valid_q <= sd_accept & sd_valid_q(1);
+        sd_last_q <= s_src0_stream_m2s.last & sd_last_q(1);
+        sd_in_q <= s_src0_stream_m2s.data(g_axi_data_width - 1 downto 0);
+        sd_data_2 <= sd_data_next;
+      end if;
+    end if;
+  end process;
 
   ------------------------------------------------------------------------
   -- ADD per-lane datapath: rescale both operands, sum, saturate to int8.
@@ -461,23 +586,42 @@ begin
   -- value, see entity-level comment).
   ------------------------------------------------------------------------
 
-  add_lane_gen : for l in 0 to c_bytes_per_beat - 1 generate
-    signal va, vb : signed(7 downto 0);
-    signal prod_a, prod_b : signed(c_product_width - 1 downto 0);
-    signal ra, rb : signed(c_product_width - 1 downto 0);
-    signal sum_ext : signed(c_sum_width - 1 downto 0);
-    signal sat_byte : signed(7 downto 0);
+  -- One beat may enter the pipeline per cycle; the whole pipeline freezes
+  -- together whenever its output stage is full and the sink is not ready.
+  add_pipe_en <= (not add_valid_q(4)) or m_dst_stream_s2m.ready;
+
+  add_accept <= '1' when state_q = s_add_run
+    and s_src0_stream_m2s.valid = '1' and s_src1_stream_m2s.valid = '1'
+    and add_pipe_en = '1' else '0';
+
+  -- The destination stream is driven from the ADD pipeline for as long as
+  -- it holds beats, which outlasts 's_add_run' by up to four cycles.
+  add_active <= '1' when state_q = s_add_run or state_q = s_add_drain else '0';
+
+  add_control : process(clk)
   begin
-    va <= signed(s_src0_stream_m2s.data(8 * l + 7 downto 8 * l));
-    vb <= signed(s_src1_stream_m2s.data(8 * l + 7 downto 8 * l));
+    if rising_edge(clk) then
+      if reset = '1' then
+        add_valid_q <= (others => '0');
+      elsif add_pipe_en = '1' then
+        add_valid_q <= add_accept & add_valid_q(1 to 3);
+        add_last_q <= s_src0_stream_m2s.last & add_last_q(1 to 3);
+      end if;
+    end if;
+  end process;
 
-    prod_a <= va * requant_scale_q;
-    prod_b <= vb * requant_scale_q;
-
-    ra <= round_shift_right_signed(prod_a, combined_shift_q);
-    rb <= round_shift_right_signed(prod_b, combined_shift_q);
-
-    sum_ext <= resize(ra, c_sum_width) + resize(rb, c_sum_width);
+  add_lane_gen : for l in 0 to c_bytes_per_beat - 1 generate
+    signal va_1, vb_1 : signed(7 downto 0) := (others => '0');
+    signal prod_a_2, prod_b_2 : signed(c_product_width - 1 downto 0) := (others => '0');
+    signal ra_3, rb_3 : signed(c_product_width - 1 downto 0) := (others => '0');
+    signal sum_ext_3 : signed(c_sum_width - 1 downto 0);
+    signal sat_byte_3 : signed(7 downto 0);
+    signal byte_4 : std_ulogic_vector(7 downto 0) := (others => '0');
+  begin
+    -- Stage 4's input. Combinational off stage 3's registers, so the
+    -- saturating add is a stage of its own rather than the tail of the
+    -- shift.
+    sum_ext_3 <= resize(ra_3, c_sum_width) + resize(rb_3, c_sum_width);
 
     saturate_inst : entity math.saturate_signed
       generic map (
@@ -488,13 +632,31 @@ begin
       port map (
         clk => clk,
         input_valid => '1',
-        input_value => sum_ext,
+        input_value => sum_ext_3,
         result_valid => open,
-        result_value => sat_byte,
+        result_value => sat_byte_3,
         result_is_saturated => open
       );
 
-    add_data_next(8 * l + 7 downto 8 * l) <= std_ulogic_vector(sat_byte);
+    lane_pipeline : process(clk)
+    begin
+      if rising_edge(clk) then
+        if add_pipe_en = '1' then
+          va_1 <= signed(s_src0_stream_m2s.data(8 * l + 7 downto 8 * l));
+          vb_1 <= signed(s_src1_stream_m2s.data(8 * l + 7 downto 8 * l));
+
+          prod_a_2 <= va_1 * requant_scale_q;
+          prod_b_2 <= vb_1 * requant_scale_q;
+
+          ra_3 <= round_shift_right_signed(prod_a_2, combined_shift_q);
+          rb_3 <= round_shift_right_signed(prod_b_2, combined_shift_q);
+
+          byte_4 <= std_ulogic_vector(sat_byte_3);
+        end if;
+      end if;
+    end process;
+
+    add_data_4(8 * l + 7 downto 8 * l) <= byte_4;
   end generate add_lane_gen;
 
   ------------------------------------------------------------------------
@@ -507,8 +669,8 @@ begin
   -- the payload mux is a separate signal, concatenated with zero-padding
   -- below rather than inline.
   dst_data_muxed <=
-    sd_data_next when state_q = s_sd_run else
-    add_data_next when state_q = s_add_run else
+    sd_data_2 when sd_active = '1' else
+    add_data_4 when add_active = '1' else
     pixel_buf_q when state_q = s_up_run_dst else
     (g_axi_data_width - 1 downto 0 => '0');
 
@@ -516,16 +678,16 @@ begin
     dst_data_muxed;
 
   m_dst_stream_m2s.valid <=
-    s_src0_stream_m2s.valid when state_q = s_sd_run else
-    (s_src0_stream_m2s.valid and s_src1_stream_m2s.valid) when state_q = s_add_run else
+    sd_valid_q(2) when sd_active = '1' else
+    add_valid_q(4) when add_active = '1' else
     '1' when state_q = s_up_run_dst else
     '0';
 
   m_dst_stream_m2s.last <=
-    s_src0_stream_m2s.last when state_q = s_sd_run else
+    sd_last_q(2) when sd_active = '1' else
     -- src0/src1/dst were all requested with the same length ('xfer_len_q'),
     -- so their 'last' beats coincide; see entity-level comment.
-    s_src0_stream_m2s.last when state_q = s_add_run else
+    add_last_q(4) when add_active = '1' else
     '1' when (state_q = s_up_run_dst and beat_in_burst_q = 1) else
     '0';
 
@@ -593,32 +755,17 @@ begin
                   end if;
                 end if;
 
-              elsif opcode = c_opcode_add then
+              elsif opcode = c_opcode_add or opcode = c_opcode_upsample then
+                -- Latch the raw geometry only; the products that turn it
+                -- into a byte count are evaluated over the next two
+                -- states. ADD's output frame is its input frame, so both
+                -- opcodes share one 'n_tiles * out_h * out_w' evaluation.
                 in_w64 := resize(in_width, 64);
                 in_h64 := resize(in_height, 64);
                 in_c64 := resize(in_channels, 64);
                 n_tiles64 := (in_c64 + to_unsigned(c_bytes_per_beat, 64) - 1) /
                              to_unsigned(c_bytes_per_beat, 64);
-                total64 := mul64(mul64(mul64(n_tiles64, in_h64), in_w64),
-                                  to_unsigned(c_bytes_per_beat, 64));
-                bad := in_w64 = 0 or in_h64 = 0 or in_c64 = 0 or
-                       total64 = 0 or total64 > to_unsigned(g_max_xfer_bytes, 64);
-                if bad then
-                  error_code_q <= c_err_bad_geometry;
-                  state_q <= s_bad;
-                else
-                  xfer_len_q <= resize(total64, 32);
-                  cur_addr_q <= src0_addr;
-                  cur_len_q <= resize(total64, 32);
-                  state_q <= s_add_req_src0;
-                end if;
 
-              elsif opcode = c_opcode_upsample then
-                in_w64 := resize(in_width, 64);
-                in_h64 := resize(in_height, 64);
-                in_c64 := resize(in_channels, 64);
-                n_tiles64 := (in_c64 + to_unsigned(c_bytes_per_beat, 64) - 1) /
-                             to_unsigned(c_bytes_per_beat, 64);
                 -- 'unsigned "*" natural' (numeric_std A.17) converts the
                 -- natural to an unsigned of L'length bits before
                 -- multiplying, so a bare 'in_w64 * 2' produces a
@@ -627,31 +774,25 @@ begin
                 -- runtime (bound check failure), not at analysis time.
                 -- Route through 'mul64' like every other product in this
                 -- process, for the same reason its own comment gives.
-                out_w64 := mul64(in_w64, to_unsigned(2, 64));
-                out_h64 := mul64(in_h64, to_unsigned(2, 64));
-                total64 := mul64(mul64(mul64(n_tiles64, out_h64), out_w64),
-                                  to_unsigned(c_bytes_per_beat, 64));
-                bad := in_w64 = 0 or in_h64 = 0 or in_c64 = 0 or
-                       total64 = 0 or total64 > to_unsigned(g_max_xfer_bytes, 64);
-                if bad then
-                  error_code_q <= c_err_bad_geometry;
-                  state_q <= s_bad;
+                if opcode = c_opcode_upsample then
+                  out_w64 := mul64(in_w64, to_unsigned(2, 64));
+                  out_h64 := mul64(in_h64, to_unsigned(2, 64));
                 else
-                  n_tiles_q <= resize(n_tiles64, 32);
-                  in_w_q <= resize(in_w64, 32);
-                  in_h_q <= resize(in_h64, 32);
-                  out_w_q <= resize(out_w64, 32);
-                  out_h_q <= resize(out_h64, 32);
-                  c_tile_q <= (others => '0');
-                  iy_q <= (others => '0');
-                  ix_q <= (others => '0');
-                  row_phase_q <= 0;
-
-                  addr64 := resize(src0_addr, 64);
-                  cur_addr_q <= resize(addr64, 32);
-                  cur_len_q <= to_unsigned(c_bytes_per_beat, 32);
-                  state_q <= s_up_req_src0;
+                  out_w64 := in_w64;
+                  out_h64 := in_h64;
                 end if;
+
+                n_tiles_q <= resize(n_tiles64, 32);
+                in_w_q <= resize(in_w64, 32);
+                in_h_q <= resize(in_h64, 32);
+                out_w_q <= resize(out_w64, 32);
+                out_h_q <= resize(out_h64, 32);
+                if in_w64 = 0 or in_h64 = 0 or in_c64 = 0 then
+                  geom_zero_q <= '1';
+                else
+                  geom_zero_q <= '0';
+                end if;
+                state_q <= s_geom_rows;
 
               else
                 error_code_q <= c_err_unsupported_op;
@@ -690,6 +831,68 @@ begin
             end if;
 
           ------------------------------------------------------------------
+          -- Geometry, step 1: rows = n_tiles * out_h.
+          --
+          -- Exact in 32 bits: 'n_tiles <= ceil(65535/c_bytes_per_beat)'
+          -- and 'out_h <= 2*65535', so the product is below 2**31 for
+          -- every descriptor the ISA can encode. Both operands are sliced
+          -- to their true widths so this is a two-DSP cascade rather than
+          -- a 32x32 array.
+          ------------------------------------------------------------------
+          when s_geom_rows =>
+            geom_rows_q <= resize(
+              n_tiles_q(15 downto 0) * out_h_q(17 downto 0), 32
+            );
+            state_q <= s_geom_total;
+
+          ------------------------------------------------------------------
+          -- Geometry, step 2: total bytes = rows * out_w * bytes_per_beat,
+          -- validated, and then the opcode's own entry state.
+          ------------------------------------------------------------------
+          when s_geom_total =>
+            geom_total_q <= mul64(
+              resize(geom_rows_q * out_w_q(17 downto 0), 64),
+              to_unsigned(c_bytes_per_beat, 64)
+            );
+            state_q <= s_geom_check;
+
+          ------------------------------------------------------------------
+          -- Geometry, step 3: validate and dispatch. A separate state from
+          -- the multiply above so that the range comparison and the whole
+          -- opcode dispatch (which drives the set/reset and enable pins of
+          -- every UPSAMPLE counter) do not hang off the product's carry
+          -- chain.
+          ------------------------------------------------------------------
+          when s_geom_check =>
+            total64 := geom_total_q;
+            bad := geom_zero_q = '1' or
+                   total64 = 0 or total64 > to_unsigned(g_max_xfer_bytes, 64);
+            if bad then
+              error_code_q <= c_err_bad_geometry;
+              state_q <= s_bad;
+            elsif opcode_q = c_opcode_add then
+              xfer_len_q <= resize(total64, 32);
+              cur_addr_q <= src0_addr_q;
+              cur_len_q <= resize(total64, 32);
+              state_q <= s_add_req_src0;
+            else
+              c_tile_q <= (others => '0');
+              iy_q <= (others => '0');
+              ix_q <= (others => '0');
+              row_phase_q <= 0;
+
+              -- Seed the two UPSAMPLE address accumulators for pixel 0:
+              -- source at 'src0_addr', destination row base at index 0.
+              up_src_addr_q <= src0_addr_q;
+              up_row_base_q <= (others => '0');
+              up_two_out_w_q <= shift_left(out_w_q, 1);
+
+              cur_addr_q <= src0_addr_q;
+              cur_len_q <= to_unsigned(c_bytes_per_beat, 32);
+              state_q <= s_up_req_src0;
+            end if;
+
+          ------------------------------------------------------------------
           -- COPY / ACT: stream src0 -> (LUT or passthrough) -> dst.
           ------------------------------------------------------------------
           when s_sd_req_src0 =>
@@ -705,8 +908,14 @@ begin
             end if;
 
           when s_sd_run =>
-            if s_src0_stream_m2s.valid = '1' and m_dst_stream_s2m.ready = '1' and
-               s_src0_stream_m2s.last = '1' then
+            if sd_accept = '1' and s_src0_stream_m2s.last = '1' then
+              state_q <= s_sd_drain;
+            end if;
+
+          -- The last input beat has entered the pipeline; 'sd_active'
+          -- keeps driving the destination stream until it is empty.
+          when s_sd_drain =>
+            if sd_valid_q = (sd_valid_q'range => '0') then
               state_q <= s_finish;
             end if;
 
@@ -733,8 +942,16 @@ begin
             end if;
 
           when s_add_run =>
-            if s_src0_stream_m2s.valid = '1' and s_src1_stream_m2s.valid = '1' and
-               m_dst_stream_s2m.ready = '1' and s_src0_stream_m2s.last = '1' then
+            if add_accept = '1' and s_src0_stream_m2s.last = '1' then
+              state_q <= s_add_drain;
+            end if;
+
+          -- The last input beat has entered the pipeline; up to four beats
+          -- are still in it. 'add_active' keeps driving the destination
+          -- stream from here, and the command is only finished once every
+          -- one of them has been accepted.
+          when s_add_drain =>
+            if add_valid_q = (add_valid_q'range => '0') then
               state_q <= s_finish;
             end if;
 
@@ -753,9 +970,14 @@ begin
               pixel_buf_q <= s_src0_stream_m2s.data(g_axi_data_width - 1 downto 0);
 
               -- out_pixel_index = (c_tile*out_h + (2*iy + row_phase))*out_w + 2*ix
-              tmp64 := mul64(c_tile_q, out_h_q) + resize(2 * iy_q, 64) +
-                       to_unsigned(row_phase_q, 64);
-              out_idx64 := mul64(tmp64, out_w_q) + resize(2 * ix_q, 64);
+              --                  = up_row_base_q + row_phase*out_w + 2*ix,
+              -- with 'up_row_base_q' the accumulator described at its
+              -- declaration. Three adds and a constant shift, where this
+              -- used to be two chained runtime multiplies.
+              out_idx64 := resize(up_row_base_q, 64) + resize(2 * ix_q, 64);
+              if row_phase_q = 1 then
+                out_idx64 := out_idx64 + resize(out_w_q, 64);
+              end if;
               addr64 := resize(dst_addr_q, 64) + mul64(out_idx64, to_unsigned(c_bytes_per_beat, 64));
               cur_addr_q <= resize(addr64, 32);
               cur_len_q <= to_unsigned(2 * c_bytes_per_beat, 32);
@@ -774,8 +996,10 @@ begin
                 if row_phase_q = 0 then
                   row_phase_q <= 1;
 
-                  tmp64 := mul64(c_tile_q, out_h_q) + resize(2 * iy_q, 64) + to_unsigned(1, 64);
-                  out_idx64 := mul64(tmp64, out_w_q) + resize(2 * ix_q, 64);
+                  -- Row phase 1 of the same pixel: exactly one output
+                  -- row further on, i.e. '+ out_w' output positions.
+                  out_idx64 := resize(up_row_base_q, 64) + resize(2 * ix_q, 64)
+                               + resize(out_w_q, 64);
                   addr64 := resize(dst_addr_q, 64) + mul64(out_idx64, to_unsigned(c_bytes_per_beat, 64));
                   cur_addr_q <= resize(addr64, 32);
                   cur_len_q <= to_unsigned(2 * c_bytes_per_beat, 32);
@@ -823,15 +1047,21 @@ begin
               iy_q <= next_iy_v;
               c_tile_q <= next_tile_v;
 
-              -- pixel_idx = (c_tile*in_h + iy)*in_w + ix, for the pixel
-              -- about to be latched above (the *next* counters, not the
-              -- current ones).
-              tmp64 := mul64(next_tile_v, in_h_q) + resize(next_iy_v, 64);
-              pixel_idx64 := mul64(tmp64, in_w_q) + resize(next_ix_v, 64);
-              addr64 := resize(src0_addr_q, 64) +
-                        mul64(pixel_idx64, to_unsigned(c_bytes_per_beat, 64));
-              cur_addr_q <= resize(addr64, 32);
+              -- 'pixel_idx = (c_tile*in_h + iy)*in_w + ix' advances by
+              -- exactly one per step of this (tile, iy, ix) raster loop --
+              -- including across both wraps -- so the source address is
+              -- one add, not two chained multiplies.
+              up_src_addr_q <= up_src_addr_q + to_unsigned(c_bytes_per_beat, 32);
+              cur_addr_q <= up_src_addr_q + to_unsigned(c_bytes_per_beat, 32);
               cur_len_q <= to_unsigned(c_bytes_per_beat, 32);
+
+              -- The destination row base steps by '2*out_w' at every ix
+              -- wrap and does not move within a row -- see its
+              -- declaration for why the iy and tile wraps coincide.
+              if next_ix_v = 0 then
+                up_row_base_q <= up_row_base_q + up_two_out_w_q;
+              end if;
+
               state_q <= s_up_req_src0;
             end if;
 

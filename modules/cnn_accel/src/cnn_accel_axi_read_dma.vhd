@@ -162,8 +162,23 @@ architecture a of cnn_accel_axi_read_dma is
   -- This request's next AR burst, computed combinationally from 'addr_q'/
   -- 'bytes_remaining_q' (proposal doc section 6.2) -- stable between
   -- acceptances since both registers only change on an accepted AR.
-  signal burst_bytes_c : unsigned(31 downto 0) := (others => '0');
-  signal burst_beats_c : positive range 1 to axi_max_burst_length_beats := 1;
+  -- The next AR burst's size, REGISTERED rather than computed
+  -- combinationally from 'addr_q'/'bytes_remaining_q'.
+  --
+  -- 'axi_read_throttle' decides 'ar.ready' by comparing 'ar.len' against
+  -- the read-data FIFO space it has left, so with 'ar.len' derived
+  -- combinationally from 'addr_q' the whole loop -- 4 KiB-boundary split,
+  -- throttle comparison, 'ar.ready', 'beats_issued_q + burst_beats' --
+  -- was one 25-level path, and the worst path in the accelerator once the
+  -- pool and window-generator reworks had landed. Registering the burst
+  -- size takes the split off the front of that loop and the
+  -- 'beats_issued_q' adder off the back (the accept signal now only
+  -- reaches those registers' clock enables). It costs no cycles: the value
+  -- for the next burst is computed in the cycle the current one is
+  -- accepted, and the first one when the request is latched, both of
+  -- which are cycles in which no AR can be issued anyway.
+  signal burst_bytes_q : unsigned(31 downto 0) := (others => '0');
+  signal burst_beats_q : positive range 1 to axi_max_burst_length_beats := 1;
 
   signal ar_issue_active_i : std_ulogic;
   signal ar_accepted_i : std_ulogic;
@@ -211,6 +226,44 @@ architecture a of cnn_accel_axi_read_dma is
   signal stream_fifo_input_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
   signal stream_fifo_input_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
 
+
+  -- Bytes the next AR burst may cover:
+  -- 'min(bytes_remaining, bytes to the next 4 KiB boundary, c_max_burst_bytes)'.
+  --
+  -- Evaluated at 13 bits, not 32. Every term of the minimum is bounded by
+  -- 4096 ('c_max_burst_bytes <= 4096' is asserted below, and it must be:
+  -- AXI's own 4 KiB rule makes a longer burst illegal regardless), so
+  -- 'bytes_remaining' only has to be compared against the others after
+  -- being saturated at 4096 -- which is a zero-test on its high bits, not
+  -- a 32-bit comparison. Identical result: if 'bytes_remaining' exceeds
+  -- 4096 it can never be the minimum, so replacing it with 4096 cannot
+  -- change which term wins.
+  function next_burst_bytes(
+    addr_low : unsigned(11 downto 0);
+    remaining : unsigned(31 downto 0)
+  ) return unsigned is
+    variable v_to_4k : unsigned(12 downto 0);
+    variable v_result : unsigned(12 downto 0);
+  begin
+    v_to_4k := to_unsigned(4096, 13) - resize(addr_low, 13);
+
+    if remaining(31 downto 12) /= 0 then
+      v_result := to_unsigned(4096, 13);
+    else
+      v_result := resize(remaining(11 downto 0), 13);
+    end if;
+
+    if v_to_4k < v_result then
+      v_result := v_to_4k;
+    end if;
+    if to_unsigned(c_max_burst_bytes, 13) < v_result then
+      v_result := to_unsigned(c_max_burst_bytes, 13);
+    end if;
+
+    return resize(v_result, 32);
+  end function;
+
+
 begin
 
   ------------------------------------------------------------------------
@@ -257,35 +310,10 @@ begin
   -- from the currently latched 'addr_q'/'bytes_remaining_q'.
   ------------------------------------------------------------------------
 
-  burst_calc : process(all)
-    variable v_bytes_to_4k : unsigned(31 downto 0);
-    variable v_burst_bytes : unsigned(31 downto 0);
-  begin
-    if addr_q(11 downto 0) = 0 then
-      v_bytes_to_4k := to_unsigned(4096, 32);
-    else
-      v_bytes_to_4k := to_unsigned(4096, 32) - resize(addr_q(11 downto 0), 32);
-    end if;
-
-    v_burst_bytes := bytes_remaining_q;
-    if v_bytes_to_4k < v_burst_bytes then
-      v_burst_bytes := v_bytes_to_4k;
-    end if;
-    if to_unsigned(c_max_burst_bytes, 32) < v_burst_bytes then
-      v_burst_bytes := to_unsigned(c_max_burst_bytes, 32);
-    end if;
-
-    burst_bytes_c <= v_burst_bytes;
-
-    if v_burst_bytes = 0 then
-      -- No burst pending ('bytes_remaining_q = 0') -- dummy, safe value;
-      -- never actually issued since 'ar_issue_active_i' is low whenever
-      -- 'bytes_remaining_q = 0'.
-      burst_beats_c <= 1;
-    else
-      burst_beats_c <= to_integer(v_burst_bytes) / c_bytes_per_beat;
-    end if;
-  end process;
+  assert c_max_burst_bytes <= 4096
+    report "cnn_accel_axi_read_dma: c_max_burst_bytes exceeds the AXI 4 KiB " &
+      "burst boundary, which 'next_burst_bytes' relies on"
+    severity failure;
 
   ar_issue_active_i <= '1' when (state_q = s_active and bytes_remaining_q /= 0) else '0';
   ar_accepted_i <= '1' when (ar_issue_active_i = '1' and throttle_input_s2m.ar.ready = '1') else '0';
@@ -293,7 +321,7 @@ begin
   throttle_input_m2s.ar.valid <= ar_issue_active_i;
   throttle_input_m2s.ar.id <= (others => '0');
   throttle_input_m2s.ar.addr <= resize(addr_q, throttle_input_m2s.ar.addr'length);
-  throttle_input_m2s.ar.len <= to_len(burst_beats_c);
+  throttle_input_m2s.ar.len <= to_len(burst_beats_q);
   throttle_input_m2s.ar.size <= to_size(g_axi_data_width);
   throttle_input_m2s.ar.burst <= axi_a_burst_incr;
 
@@ -347,6 +375,9 @@ begin
   ------------------------------------------------------------------------
 
   main : process(clk)
+    variable v_addr_next : unsigned(31 downto 0);
+    variable v_bytes_next : unsigned(31 downto 0);
+    variable v_burst : unsigned(31 downto 0);
   begin
     if rising_edge(clk) then
       if reset = '1' then
@@ -370,9 +401,23 @@ begin
         end if;
       else
         if ar_accepted_i = '1' then
-          addr_q <= addr_q + burst_bytes_c;
-          bytes_remaining_q <= bytes_remaining_q - burst_bytes_c;
-          beats_issued_q <= beats_issued_q + burst_beats_c;
+          v_addr_next := addr_q + burst_bytes_q;
+          v_bytes_next := bytes_remaining_q - burst_bytes_q;
+
+          addr_q <= v_addr_next;
+          bytes_remaining_q <= v_bytes_next;
+          beats_issued_q <= beats_issued_q + burst_beats_q;
+
+          -- Size the burst after this one, from the values just computed.
+          v_burst := next_burst_bytes(v_addr_next(11 downto 0), v_bytes_next);
+          burst_bytes_q <= v_burst;
+          if v_burst = 0 then
+            -- No burst left. Dummy, safe value; never issued, because
+            -- 'ar_issue_active_i' is low whenever 'bytes_remaining_q' is 0.
+            burst_beats_q <= 1;
+          else
+            burst_beats_q <= to_integer(v_burst) / c_bytes_per_beat;
+          end if;
         end if;
 
         if r_pop_active_i = '1' then
@@ -393,6 +438,18 @@ begin
               addr_q <= req_m2s.req.addr;
               bytes_remaining_q <= req_m2s.req.length;
               total_beats_q <= req_m2s.req.length / to_unsigned(c_bytes_per_beat, 32);
+
+              -- The request's first burst. No AR can be issued in this
+              -- cycle or the next, so registering it costs nothing.
+              v_burst := next_burst_bytes(
+                req_m2s.req.addr(11 downto 0), req_m2s.req.length
+              );
+              burst_bytes_q <= v_burst;
+              if v_burst = 0 then
+                burst_beats_q <= 1;
+              else
+                burst_beats_q <= to_integer(v_burst) / c_bytes_per_beat;
+              end if;
               r_beat_count_q <= (others => '0');
               err_pending_q <= '0';
               beats_issued_q <= (others => '0');

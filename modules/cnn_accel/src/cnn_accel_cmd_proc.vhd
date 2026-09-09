@@ -230,6 +230,19 @@ entity cnn_accel_cmd_proc is
     conv_cfg_clamp_min : out std_ulogic_vector(7 downto 0) := (others => '0');
     conv_cfg_clamp_max : out std_ulogic_vector(7 downto 0) := (others => '0');
     conv_cfg_per_channel_en : out std_ulogic := '0';
+    -- Output frame dimensions for the command being started:
+    -- '(in_dim + pad_lo + pad_hi - kernel) / stride + 1' per axis, from
+    -- the 'st_div_w'/'st_div_h' restoring divider, i.e. the same
+    -- 'out_w_q'/'out_h_q' this module already uses to size the output
+    -- plane. Both window generators (conv and pool) latch these at their
+    -- 'start' rather than dividing again in one combinational cone off
+    -- 'desc_q', which is what made 'out_height_q' a 135-logic-level
+    -- endpoint. They are shared across the two engines because only one
+    -- engine is ever started for a given descriptor, and the divider is
+    -- fed from the conv or the pool kernel/stride fields according to
+    -- that same class decision.
+    geom_out_width : out std_ulogic_vector(15 downto 0) := (others => '0');
+    geom_out_height : out std_ulogic_vector(15 downto 0) := (others => '0');
     conv_start : out std_ulogic := '0';
     conv_done : in std_ulogic;
     m_conv_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
@@ -354,7 +367,7 @@ architecture a of cnn_accel_cmd_proc is
     st_idle,
     st_fetch, st_fetch_wait,
     st_validate,
-    st_geom_mul, st_div_w, st_div_h, st_geom_out, st_range,
+    st_geom_mul, st_div_w, st_div_h, st_geom_out, st_geom_out2, st_range, st_range_dst,
     st_wgt_setup, st_wgt_req, st_wgt_run,
     st_pass_setup, st_pass_req_dst, st_pass_run, st_pass_drain,
     st_xfer_req_src, st_xfer_req_dst, st_xfer_run,
@@ -392,6 +405,15 @@ architecture a of cnn_accel_cmd_proc is
   signal in_total_bytes_q : unsigned(31 downto 0) := (others => '0');
   signal out_plane_bytes_q : unsigned(31 downto 0) := (others => '0');
   signal out_total_bytes_q : unsigned(31 downto 0) := (others => '0');
+  -- 'out_w * out_h' and 'in_w * in_h', registered between the two
+  -- geometry-output states so that neither total is two chained
+  -- multiplies deep. 32 bits: 16x16 is exactly 32 in numeric_std.
+  -- Source-extent verdict, carried from 'st_range' to 'st_range_dst'.
+  signal range_err_q : err_code_t := c_err_none;
+
+  signal out_plane_words_q : unsigned(31 downto 0) := (others => '0');
+  signal in_plane_words_q : unsigned(31 downto 0) := (others => '0');
+
   signal out_w_q : unsigned(15 downto 0) := (others => '0');
   signal out_h_q : unsigned(15 downto 0) := (others => '0');
   signal row_words_q : unsigned(15 downto 0) := (others => '0');  -- in_width * T
@@ -1045,10 +1067,26 @@ begin
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
 
         --------------------------------------------------------------
-        -- Geometry, step 2: everything that needed the output dimensions.
+        -- Geometry, step 2a: the output plane itself. Nothing that needs a
+        -- SECOND multiply on top of this product happens here -- chaining
+        -- 'out_w * out_h' into '* n_ot' (and 'in_w * in_h' into
+        -- '* n_tiles') put two runtime multipliers in one cycle and cost
+        -- 3.1 ns of setup slack at 150 MHz. Both second products moved to
+        -- 'st_geom_out2', off the register written here. One more cycle
+        -- per command.
         when st_geom_out =>
           v_prod := resize(out_w_q * out_h_q, v_prod'length);
+          out_plane_words_q <= v_prod;
           out_plane_bytes_q <= shift_left(v_prod, c_word_shift);
+          in_plane_words_q <= resize(desc_q.in_width * desc_q.in_height, v_prod'length);
+
+          state <= st_geom_out2;
+          watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
+
+        --------------------------------------------------------------
+        -- Geometry, step 2b: the totals, each one product off a register.
+        when st_geom_out2 =>
+          v_prod := out_plane_words_q;
 
           if cls_q = cls_conv then
             -- One OT pass writes exactly one output plane (asserted
@@ -1074,9 +1112,7 @@ begin
           end if;
 
           in_total_bytes_q <= shift_left(
-            resize(
-              resize(desc_q.in_width * desc_q.in_height, 32) * n_tiles_q, 32
-            ),
+            resize(in_plane_words_q * n_tiles_q, 32),
             c_word_shift
           );
 
@@ -1088,9 +1124,14 @@ begin
         -- exist. 'LOCAL_TENSOR' is bounded by 'g_tensor_bytes', 'DDR' by
         -- 'g_ddr_limit' (sections 3 and 6).
         when st_range =>
+          -- Source extent only. The destination extent, the geometry
+          -- bounds and the class dispatch move to 'st_range_dst': doing
+          -- all of them in one cycle was a 19-level chain of 33-bit adds
+          -- and comparisons off 'cls_q' and 'desc_q', and one of the
+          -- accelerator's worst remaining paths at 150 MHz. Per command,
+          -- so the extra cycle is free.
           v_err := c_err_none;
 
-          -- Source extent.
           if cls_q = cls_xfer or cls_q = cls_elem then
             v_len := desc_q.xfer_bytes;
             if cls_q = cls_elem and (desc_q.opcode = c_opcode_add
@@ -1111,7 +1152,16 @@ begin
             end if;
           end if;
 
-          -- Destination extent.
+          range_err_q <= v_err;
+          state <= st_range_dst;
+          watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
+
+        --------------------------------------------------------------
+        -- Validation, part 2b: destination extent, the row-bank and
+        -- output-dimension bounds, and the dispatch.
+        when st_range_dst =>
+          v_err := range_err_q;
+
           if v_err = c_err_none then
             if cls_q = cls_xfer then
               v_len := desc_q.xfer_bytes;
@@ -1892,6 +1942,9 @@ begin
   -- latched descriptor, so they are stable for the whole command and no
   -- engine can sample a half-updated configuration.
   ------------------------------------------------------------------------
+
+  geom_out_width <= std_ulogic_vector(out_w_q);
+  geom_out_height <= std_ulogic_vector(out_h_q);
 
   conv_cfg_kernel_h <= std_ulogic_vector(desc_q.kernel_h);
   conv_cfg_kernel_w <= std_ulogic_vector(desc_q.kernel_w);

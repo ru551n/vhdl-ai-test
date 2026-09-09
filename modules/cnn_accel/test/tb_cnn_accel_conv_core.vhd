@@ -167,6 +167,11 @@ architecture tb of tb_cnn_accel_conv_core is
   signal cfg_pad_value : std_ulogic_vector(7 downto 0) := (others => '0');
   signal cfg_in_width : std_ulogic_vector(15 downto 0) := (others => '0');
   signal cfg_in_height : std_ulogic_vector(15 downto 0) := (others => '0');
+  -- Pre-computed output frame dimensions (see the DUT's port comment):
+  -- driven from this testbench's own 'v_out_width'/'v_out_height', the
+  -- same values the expected-output model is built from.
+  signal cfg_out_width : std_ulogic_vector(15 downto 0) := (others => '0');
+  signal cfg_out_height : std_ulogic_vector(15 downto 0) := (others => '0');
   signal cfg_in_channels : std_ulogic_vector(15 downto 0) := (others => '0');
 
   signal cfg_bias_en : std_ulogic := '0';
@@ -316,6 +321,8 @@ begin
       cfg_pad_value => cfg_pad_value,
       cfg_in_width => cfg_in_width,
       cfg_in_height => cfg_in_height,
+      cfg_out_width => cfg_out_width,
+      cfg_out_height => cfg_out_height,
       cfg_in_channels => cfg_in_channels,
 
       cfg_bias_en => cfg_bias_en,
@@ -573,6 +580,8 @@ begin
       cfg_in_width <= std_ulogic_vector(to_unsigned(v_in_width, 16));
       cfg_in_height <= std_ulogic_vector(to_unsigned(v_in_height, 16));
       cfg_in_channels <= std_ulogic_vector(to_unsigned(v_in_channels, 16));
+      cfg_out_width <= std_ulogic_vector(to_unsigned(v_out_width, 16));
+      cfg_out_height <= std_ulogic_vector(to_unsigned(v_out_height, 16));
       cfg_bias_en <= to_sl((flags / 2) mod 2 = 1);
       cfg_requant_en <= to_sl((flags / 4) mod 2 = 1);
       cfg_relu_en <= to_sl(flags mod 2 = 1);

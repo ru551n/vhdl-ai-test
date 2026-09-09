@@ -95,6 +95,24 @@ end entity cnn_accel_pool;
 
 architecture a of cnn_accel_pool is
 
+  function to_sl_local(cond : boolean) return std_ulogic is
+  begin
+    if cond then
+      return '1';
+    else
+      return '0';
+    end if;
+  end function;
+
+  function to_integer_sl(value : std_ulogic) return natural is
+  begin
+    if value = '1' then
+      return 1;
+    else
+      return 0;
+    end if;
+  end function;
+
   ------------------------------------------------------------------------
   -- Local sizing constants.
   ------------------------------------------------------------------------
@@ -119,35 +137,51 @@ architecture a of cnn_accel_pool is
     return result;
   end function;
 
-  -- Linear (unrolled, single combinational stage) max reduction over the
-  -- 'active_count' lowest-indexed taps; lanes at/above 'active_count' are
-  -- excluded via the loop guard, not via a masked identity value. Not a
-  -- literal balanced binary tree (functionally equivalent for a
-  -- generic-parameterized lane count) -- see proposal doc section 4.
-  function reduce_max(taps : tap_arr_t; active_count : natural) return signed is
-    variable result : signed(7 downto 0) := to_signed(-128, 8);
+  -- Smallest 'k' with '2**k >= n' -- the depth of a balanced binary
+  -- reduction tree over 'n' leaves, and (plus 8) the width the masked sum
+  -- of 'n' int8 taps needs to be carried at without overflow.
+  function clog2_ceil(n : positive) return natural is
+    variable v_k : natural := 0;
   begin
-    for i in 0 to c_max_taps - 1 loop
-      if i < active_count and taps(i) > result then
-        result := taps(i);
-      end if;
+    while 2 ** v_k < n loop
+      v_k := v_k + 1;
     end loop;
-    return result;
+    return v_k;
   end function;
 
-  -- Linear (unrolled) full-precision sum over the 'active_count'
-  -- lowest-indexed taps, each sign-extended to 'g_accum_width' before
-  -- accumulation -- no intermediate rounding/saturation.
-  function reduce_sum(taps : tap_arr_t; active_count : natural) return signed is
-    variable result : signed(g_accum_width - 1 downto 0) := (others => '0');
+  constant c_levels : natural := clog2_ceil(c_max_taps);
+
+  -- 'sum(|tap|) <= c_max_taps * 128 <= 2**c_levels * 128 = 2**(c_levels+7)',
+  -- so 'c_levels + 8' bits of two's complement hold every reachable window
+  -- sum exactly. The tree therefore carries the sum at this width and
+  -- sign-extends once, at the root, to 'g_accum_width' -- identical values
+  -- to accumulating at 'g_accum_width' throughout, at a fraction of the
+  -- carry-chain length.
+  constant c_sum_width : positive := c_levels + 8;
+
+  -- Number of live nodes at tree level 'level' (level 0 = the taps).
+  function level_count(level : natural) return positive is
+    variable v_n : positive := c_max_taps;
   begin
-    for i in 0 to c_max_taps - 1 loop
-      if i < active_count then
-        result := result + resize(taps(i), g_accum_width);
-      end if;
+    for i in 1 to level loop
+      v_n := (v_n + 1) / 2;
     end loop;
-    return result;
+    return v_n;
   end function;
+
+  -- The tree is cut in half by a register stage: levels 1 .. c_split are
+  -- evaluated in the cycle a window beat is accepted, levels c_split+1 ..
+  -- c_levels in the next. At 5x5 that is two compare/add levels then
+  -- three, instead of five in one cycle -- which, together with the
+  -- registered mask, is what takes 'out_max_q' off the design's critical
+  -- path. Purely a re-timing of the same tree: no operand, no operator and
+  -- no association order changes, so the result is bit-identical.
+  constant c_split : natural := c_levels / 2;
+
+  type sum_level_t is array (0 to c_max_taps - 1) of signed(c_sum_width - 1 downto 0);
+  type sum_tree_t is array (0 to c_levels) of sum_level_t;
+  type max_level_t is array (0 to c_max_taps - 1) of signed(7 downto 0);
+  type max_tree_t is array (0 to c_levels) of max_level_t;
 
   ------------------------------------------------------------------------
   -- Combinational reduction over the current 's_window_m2s' beat.
@@ -160,23 +194,87 @@ architecture a of cnn_accel_pool is
   signal is_avg_sel : std_ulogic;
 
   ------------------------------------------------------------------------
-  -- Single one-entry output register, shared by both output streams:
-  -- 'out_is_avg_q' tags which port the held result belongs to. See
-  -- proposal doc section 4 for why one tagged register (not two
-  -- independent per-port registers) structurally guarantees the
-  -- mutual-exclusion requirement.
+  -- Per-command tap mask, registered.
+  --
+  -- 'cfg_pool_kernel_h * cfg_pool_kernel_w' is per-command geometry, and
+  -- computing it in the beat datapath -- a runtime 8x8 multiply feeding
+  -- the reduction network's lane guards -- was the deepest combinational
+  -- cone in the whole accelerator (82 logic levels from 'cmd_proc's
+  -- 'desc_q' to 'out_max_q', -49.5 ns at 150 MHz in the first top-level
+  -- build). It is now evaluated once into 'tap_mask_q', a plain
+  -- one-hot-prefix mask, and the reduction sees only registers.
+  --
+  -- 'cfg_match' is what keeps that bit-exact without weakening the port
+  -- contract: 'tap_mask_q' lags 'cfg_pool_kernel_h/w' by one cycle, so
+  -- the cycle in which either changes cannot be allowed to accept a beat.
+  -- Deasserting 'ready' for that one cycle (AXI4-Stream legal: 'ready'
+  -- may fall at any time) costs a single bubble per kernel-shape change
+  -- and nothing at all inside a command, where the descriptor is constant.
   ------------------------------------------------------------------------
 
-  signal out_valid_q : std_ulogic := '0';
-  signal out_is_avg_q : std_ulogic := '0';
-  signal out_last_q : std_ulogic := '0';
-  signal out_max_q : signed(7 downto 0) := (others => '0');
-  signal out_avgsum_q : signed(g_accum_width - 1 downto 0) := (others => '0');
+  signal tap_mask_q : std_ulogic_vector(0 to c_max_taps - 1) := (others => '0');
+  signal cfg_kernel_h_q : std_ulogic_vector(7 downto 0) := (others => '0');
+  signal cfg_kernel_w_q : std_ulogic_vector(7 downto 0) := (others => '0');
+  signal cfg_match : std_ulogic;
 
-  -- 'ready' of whichever output port the held (or about-to-be-held)
-  -- result targets; gates both the register's own advance and
-  -- 's_window_s2m.ready'.
+  ------------------------------------------------------------------------
+  -- Pipeline stage 1: the partially reduced tree, plus the beat's own
+  -- sidebands. 'p1_is_avg_q' is the tag that decides which output port the
+  -- result eventually leaves by; it travels with the beat, so a
+  -- 'cfg_opcode' change between beats can never retag one already in
+  -- flight.
+  ------------------------------------------------------------------------
+
+  signal front_max : max_level_t;
+  signal front_sum : sum_level_t;
+
+  signal p1_valid_q : std_ulogic := '0';
+  signal p1_is_avg_q : std_ulogic := '0';
+  signal p1_last_q : std_ulogic := '0';
+  signal p1_max_q : max_level_t := (others => (others => '0'));
+  signal p1_sum_q : sum_level_t := (others => (others => '0'));
+
+  ------------------------------------------------------------------------
+  -- Two-entry tagged output buffer, shared by both output streams.
+  --
+  -- Still one register per result and one tag bit per result -- entry 'e'
+  -- is presented on 'm_max' or on 'm_avgsum' according to its own
+  -- 'out_is_avg_q(e)', never on both -- so proposal doc section 4's
+  -- structural mutual-exclusion argument is unchanged. What changed is the
+  -- DEPTH, from one entry to two, and the reason is 'ready':
+  --
+  --   's_window_s2m.ready' used to be a combinational function of the
+  --   selected output port's 'ready'. At the top level that made one
+  --   chain out of the ofmap sink's ready, the descriptor's opcode (which
+  --   selects between the MAX and AVG output paths), all eight pool
+  --   lanes, their AND, and the window generator's launch control -- 14
+  --   levels and 10.8 ns of mostly routing, and the largest single group
+  --   of failing endpoints in the design.
+  --
+  --   With two entries, a beat may always be accepted while fewer than
+  --   two are buffered, so 'ready' is a function of this entity's own
+  --   registers and nothing else. The buffer still empties at one beat per
+  --   cycle, so throughput is unchanged; only latency grows, by two
+  --   cycles per window.
+  ------------------------------------------------------------------------
+
+  constant c_buf_depth : positive := 2;
+
+  type buf_max_t is array (0 to c_buf_depth - 1) of signed(7 downto 0);
+  type buf_sum_t is array (0 to c_buf_depth - 1) of signed(g_accum_width - 1 downto 0);
+
+  signal buf_count_q : natural range 0 to c_buf_depth := 0;
+  signal out_is_avg_q : std_ulogic_vector(0 to c_buf_depth - 1) := (others => '0');
+  signal out_last_q : std_ulogic_vector(0 to c_buf_depth - 1) := (others => '0');
+  signal out_max_q : buf_max_t := (others => (others => '0'));
+  signal out_avgsum_q : buf_sum_t := (others => (others => '0'));
+
+  -- 'ready' of whichever output port the buffer's HEAD entry targets. Pops
+  -- the head; deliberately does NOT reach 's_window_s2m.ready'.
   signal selected_output_ready : std_ulogic;
+  signal out_valid : std_ulogic;
+  signal pop : std_ulogic;
+  signal push : std_ulogic;
   signal accepted : std_ulogic;
 
 begin
@@ -190,6 +288,11 @@ begin
   -- streams are still fixed-width 'axi_stream_m2s_t', so their payloads
   -- are what needs checking -- 'm_max' is one int8 and can never
   -- overflow, 'm_avgsum' is 'g_accum_width' wide.
+  assert g_accum_width >= c_sum_width
+    report "cnn_accel_pool: g_accum_width is too narrow to hold the widest " &
+      "possible window sum (c_levels + 8 bits)"
+    severity failure;
+
   assert g_accum_width <= axi_stream_data_sz
     report "cnn_accel_pool: g_accum_width exceeds axi_stream_data_sz " &
       "(the fixed-width axi_stream_pkg data field cannot carry that wide a sum)"
@@ -201,57 +304,192 @@ begin
 
   taps <= extract_taps(s_window_m2s.data);
   active_count <= to_integer(unsigned(cfg_pool_kernel_h)) * to_integer(unsigned(cfg_pool_kernel_w));
-  max_result <= reduce_max(taps, active_count);
-  avgsum_result <= reduce_sum(taps, active_count);
   is_avg_sel <= '1' when cfg_opcode = OPCODE_POOL_AVG else '0';
 
+  cfg_match <= '1'
+    when cfg_pool_kernel_h = cfg_kernel_h_q and cfg_pool_kernel_w = cfg_kernel_w_q
+    else '0';
+
+  -- Resetless: 'tap_mask_q' is configuration, and it tracks the config
+  -- ports unconditionally, so one cycle after reset releases it is already
+  -- consistent with them (and 'cfg_match' reports as much).
+  config_stage : process(clk)
+  begin
+    if rising_edge(clk) then
+      cfg_kernel_h_q <= cfg_pool_kernel_h;
+      cfg_kernel_w_q <= cfg_pool_kernel_w;
+      for i in 0 to c_max_taps - 1 loop
+        tap_mask_q(i) <= '1' when i < active_count else '0';
+      end loop;
+    end if;
+  end process;
+
   ------------------------------------------------------------------------
-  -- One-entry elastic output register: 'accepted' pops 's_window' into the
-  -- register whenever it is empty, or is being drained by the selected
-  -- output's 'ready' this same cycle (full throughput, no bubble, no loss/
-  -- duplication -- see proposal doc section 4/6 for the AXI4-Stream
-  -- compliance argument).
+  -- Masked balanced reduction trees.
+  --
+  -- Bit-exact against the linear reductions they replace: an inactive lane
+  -- contributes the identity of its operator (-128 for max, which is also
+  -- the linear version's seed and the minimum int8, and 0 for the sum), and
+  -- both operators are associative and commutative over the values that can
+  -- reach them, so re-associating the 'c_max_taps' lanes into a tree cannot
+  -- change the result. The sum carries 'c_sum_width' bits, proven above to
+  -- be free of overflow, and is sign-extended once at the root.
+  --
+  -- Depth is 'c_levels' (5 for a 5x5 pool) instead of 'c_max_taps' (25).
   ------------------------------------------------------------------------
 
-  selected_output_ready <= m_avgsum_s2m.ready when out_is_avg_q = '1' else m_max_s2m.ready;
-  s_window_s2m.ready <= (not out_valid_q) or selected_output_ready;
+  -- Levels 1 .. c_split, combinational off the accepted beat.
+  reduce_front : process(all)
+    variable v_sum : sum_tree_t;
+    variable v_max : max_tree_t;
+  begin
+    for i in 0 to c_max_taps - 1 loop
+      if tap_mask_q(i) = '1' then
+        v_sum(0)(i) := resize(taps(i), c_sum_width);
+        v_max(0)(i) := taps(i);
+      else
+        v_sum(0)(i) := (others => '0');
+        v_max(0)(i) := to_signed(-128, 8);
+      end if;
+    end loop;
+
+    for level in 1 to c_split loop
+      for i in 0 to level_count(level) - 1 loop
+        if 2 * i + 1 < level_count(level - 1) then
+          v_sum(level)(i) := v_sum(level - 1)(2 * i) + v_sum(level - 1)(2 * i + 1);
+          if v_max(level - 1)(2 * i) > v_max(level - 1)(2 * i + 1) then
+            v_max(level)(i) := v_max(level - 1)(2 * i);
+          else
+            v_max(level)(i) := v_max(level - 1)(2 * i + 1);
+          end if;
+        else
+          v_sum(level)(i) := v_sum(level - 1)(2 * i);
+          v_max(level)(i) := v_max(level - 1)(2 * i);
+        end if;
+      end loop;
+    end loop;
+
+    front_max <= v_max(c_split);
+    front_sum <= v_sum(c_split);
+  end process;
+
+  -- Levels c_split+1 .. c_levels, combinational off stage 1's registers.
+  reduce_back : process(all)
+    variable v_sum : sum_tree_t;
+    variable v_max : max_tree_t;
+  begin
+    v_sum(c_split) := p1_sum_q;
+    v_max(c_split) := p1_max_q;
+
+    for level in c_split + 1 to c_levels loop
+      for i in 0 to level_count(level) - 1 loop
+        if 2 * i + 1 < level_count(level - 1) then
+          v_sum(level)(i) := v_sum(level - 1)(2 * i) + v_sum(level - 1)(2 * i + 1);
+          if v_max(level - 1)(2 * i) > v_max(level - 1)(2 * i + 1) then
+            v_max(level)(i) := v_max(level - 1)(2 * i);
+          else
+            v_max(level)(i) := v_max(level - 1)(2 * i + 1);
+          end if;
+        else
+          v_sum(level)(i) := v_sum(level - 1)(2 * i);
+          v_max(level)(i) := v_max(level - 1)(2 * i);
+        end if;
+      end loop;
+    end loop;
+
+    max_result <= v_max(c_levels)(0);
+    avgsum_result <= resize(v_sum(c_levels)(0), g_accum_width);
+  end process;
+
+  ------------------------------------------------------------------------
+  -- Elastic control.
+  --
+  -- 'ready' is a function of this entity's own registers only: a beat may
+  -- enter stage 1 whenever stage 1 is empty, or whenever stage 1 can move
+  -- on because the output buffer is not full. It deliberately ignores the
+  -- fact that a pop may free a slot in the same cycle -- taking credit for
+  -- that would put the downstream 'ready' back into this signal, which is
+  -- the whole thing the two-entry buffer exists to avoid. The buffer
+  -- settles at one entry under a ready sink, so nothing is lost: one beat
+  -- in and one beat out per cycle.
+  ------------------------------------------------------------------------
+
+  out_valid <= '1' when buf_count_q > 0 else '0';
+  selected_output_ready <= m_avgsum_s2m.ready when out_is_avg_q(0) = '1' else m_max_s2m.ready;
+
+  pop <= out_valid and selected_output_ready;
+  push <= p1_valid_q when buf_count_q < c_buf_depth else '0';
+
+  s_window_s2m.ready <=
+    cfg_match and ((not p1_valid_q) or to_sl_local(buf_count_q < c_buf_depth));
   accepted <= s_window_m2s.valid and s_window_s2m.ready;
 
-  register_stage : process(clk)
+  pipeline : process(clk)
   begin
     if rising_edge(clk) then
       if reset = '1' then
-        out_valid_q <= '0';
+        p1_valid_q <= '0';
+        buf_count_q <= 0;
       else
-        if out_valid_q = '1' and selected_output_ready = '1' then
-          out_valid_q <= '0';
+        -- Stage 1. Held (not overwritten) whenever it cannot move on.
+        if p1_valid_q = '0' or push = '1' then
+          p1_valid_q <= accepted;
+          if accepted = '1' then
+            p1_is_avg_q <= is_avg_sel;
+            p1_last_q <= s_window_m2s.last;
+            p1_max_q <= front_max;
+            p1_sum_q <= front_sum;
+          end if;
         end if;
 
-        if accepted = '1' then
-          out_valid_q <= '1';
-          out_is_avg_q <= is_avg_sel;
-          out_last_q <= s_window_m2s.last;
-          out_max_q <= max_result;
-          out_avgsum_q <= avgsum_result;
+        -- Output buffer: shift down on a pop, append on a push.
+        if pop = '1' then
+          for e in 0 to c_buf_depth - 2 loop
+            out_is_avg_q(e) <= out_is_avg_q(e + 1);
+            out_last_q(e) <= out_last_q(e + 1);
+            out_max_q(e) <= out_max_q(e + 1);
+            out_avgsum_q(e) <= out_avgsum_q(e + 1);
+          end loop;
+        end if;
+
+        if push = '1' then
+          for e in 0 to c_buf_depth - 1 loop
+            -- The slot the pushed beat lands in: the tail, one lower if a
+            -- pop is shifting the queue down in this same cycle.
+            if e = buf_count_q - to_integer_sl(pop) then
+              out_is_avg_q(e) <= p1_is_avg_q;
+              out_last_q(e) <= p1_last_q;
+              out_max_q(e) <= max_result;
+              out_avgsum_q(e) <= avgsum_result;
+            end if;
+          end loop;
+        end if;
+
+        if push = '1' and pop = '0' then
+          buf_count_q <= buf_count_q + 1;
+        elsif push = '0' and pop = '1' then
+          buf_count_q <= buf_count_q - 1;
         end if;
       end if;
     end if;
   end process;
 
   ------------------------------------------------------------------------
-  -- Output routing: mutually exclusive by construction (one shared
-  -- register, one tag bit) -- never both 'valid' in the same cycle.
+  -- Output routing: mutually exclusive by construction (one buffer entry,
+  -- one tag bit per entry) -- never both 'valid' in the same cycle.
   ------------------------------------------------------------------------
 
-  m_max_m2s.valid <= out_valid_q and not out_is_avg_q;
-  m_max_m2s.last <= out_last_q;
-  m_max_m2s.data <= std_ulogic_vector(to_unsigned(0, axi_stream_data_sz - 8)) & std_ulogic_vector(out_max_q);
+  m_max_m2s.valid <= out_valid and not out_is_avg_q(0);
+  m_max_m2s.last <= out_last_q(0);
+  m_max_m2s.data <=
+    std_ulogic_vector(to_unsigned(0, axi_stream_data_sz - 8)) & std_ulogic_vector(out_max_q(0));
   m_max_m2s.user <= (others => '-');
 
-  m_avgsum_m2s.valid <= out_valid_q and out_is_avg_q;
-  m_avgsum_m2s.last <= out_last_q;
+  m_avgsum_m2s.valid <= out_valid and out_is_avg_q(0);
+  m_avgsum_m2s.last <= out_last_q(0);
   m_avgsum_m2s.data <=
-    std_ulogic_vector(to_unsigned(0, axi_stream_data_sz - g_accum_width)) & std_ulogic_vector(out_avgsum_q);
+    std_ulogic_vector(to_unsigned(0, axi_stream_data_sz - g_accum_width)) &
+    std_ulogic_vector(out_avgsum_q(0));
   m_avgsum_m2s.user <= (others => '-');
 
 end architecture a;

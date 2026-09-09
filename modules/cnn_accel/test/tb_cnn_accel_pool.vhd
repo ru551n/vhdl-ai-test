@@ -328,6 +328,41 @@ begin
       end if;
     end procedure;
 
+    -- Pushes one 's_window' beat WITHOUT ever deasserting 'valid': the
+    -- next call changes 'cfg_pool_kernel_h/w' and 'data' in the same delta
+    -- in which the previous beat was accepted, so the configuration
+    -- changes with a beat continuously in flight. That is the hazard the
+    -- registered tap mask introduces, and the DUT absorbs it by holding
+    -- 'ready' low for the one cycle in which the mask is stale.
+    procedure send_beat_held(
+      kernel_h : natural;
+      kernel_w : natural;
+      p_taps : taps_arr_t;
+      p_opcode : std_ulogic_vector(7 downto 0);
+      beat_last : std_ulogic
+    ) is
+      variable active_count : natural;
+    begin
+      active_count := kernel_h * kernel_w;
+
+      cfg_opcode <= p_opcode;
+      cfg_pool_kernel_h <= std_ulogic_vector(to_unsigned(kernel_h, 8));
+      cfg_pool_kernel_w <= std_ulogic_vector(to_unsigned(kernel_w, 8));
+      s_window_m2s.data <= pack_window(p_taps, active_count);
+      s_window_m2s.last <= beat_last;
+      s_window_m2s.valid <= '1';
+
+      wait until rising_edge(clk) and s_window_s2m.ready = '1';
+
+      if p_opcode = OPCODE_POOL_AVG then
+        push(avgsum_expected_q, to_signed(golden_sum(p_taps, active_count), c_accum_width));
+        push(avgsum_expected_q, beat_last);
+      else
+        push(max_expected_q, to_signed(golden_max(p_taps, active_count), 8));
+        push(max_expected_q, beat_last);
+      end if;
+    end procedure;
+
     -- Random beats across the full kernel-shape sweep, all with the same
     -- fixed opcode.
     procedure run_kernel_sweep(p_opcode : std_ulogic_vector(7 downto 0); beats_per_shape : positive) is
@@ -433,6 +468,27 @@ begin
           beat_idx := beat_idx + 1;
         end loop;
       end loop;
+      drain_and_check(2000);
+
+    elsif run("test_config_change_back_to_back") then
+      -- Every beat a different kernel shape and opcode, with 'valid' never
+      -- dropping between beats: the configuration changes underneath a
+      -- beat that is already being offered. Values must still be exact --
+      -- the DUT may only insert bubbles, never mispair a mask with a beat.
+      for beat in 0 to 199 loop
+        random_taps(taps);
+        if beat mod 2 = 0 then
+          opcode := OPCODE_POOL_MAX;
+        else
+          opcode := OPCODE_POOL_AVG;
+        end if;
+        send_beat_held(
+          c_shapes(beat mod c_shapes'length).h,
+          c_shapes(beat mod c_shapes'length).w,
+          taps, opcode, to_sl(beat = 199)
+        );
+      end loop;
+      s_window_m2s.valid <= '0';
       drain_and_check(2000);
 
     elsif run("test_full_throughput") then

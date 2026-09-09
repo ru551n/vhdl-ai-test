@@ -90,6 +90,12 @@ architecture tb of tb_cnn_accel_window_gen is
   signal cfg_pad_value : std_ulogic_vector(7 downto 0) := (others => '0');
   signal cfg_in_width : std_ulogic_vector(15 downto 0) := (others => '0');
   signal cfg_in_height : std_ulogic_vector(15 downto 0) := (others => '0');
+  -- Pre-computed output frame dimensions, which the DUT no longer derives
+  -- itself. Computed here from this testbench's own frame parameters with
+  -- the formula in the requirement, so a DUT that mis-latched them would
+  -- fail rather than agree with itself.
+  signal cfg_out_width : std_ulogic_vector(15 downto 0) := (others => '0');
+  signal cfg_out_height : std_ulogic_vector(15 downto 0) := (others => '0');
   signal cfg_in_channels : std_ulogic_vector(15 downto 0) := (others => '0');
 
   signal start : std_ulogic := '0';
@@ -336,6 +342,8 @@ begin
       cfg_pad_value => cfg_pad_value,
       cfg_in_width => cfg_in_width,
       cfg_in_height => cfg_in_height,
+      cfg_out_width => cfg_out_width,
+      cfg_out_height => cfg_out_height,
       cfg_in_channels => cfg_in_channels,
       start => start,
       done => done,
@@ -504,6 +512,8 @@ begin
       cfg_in_width <= std_ulogic_vector(to_unsigned(inw, 16));
       cfg_in_height <= std_ulogic_vector(to_unsigned(inh, 16));
       cfg_in_channels <= std_ulogic_vector(to_unsigned(in_channels, 16));
+      cfg_out_width <= std_ulogic_vector(to_unsigned((inw + pl + pr - kw) / sw + 1, 16));
+      cfg_out_height <= std_ulogic_vector(to_unsigned((inh + pt + pb - kh) / sh + 1, 16));
       start <= '1';
       wait until rising_edge(clk);
       start <= '0';
@@ -787,6 +797,16 @@ begin
     elsif run("test_full_throughput") then
       random_frame(8, 7);
       run_frame(8, 7, 3, 3, 1, 1, 0, 0, 0, 0, 0, 0, 500);
+
+    elsif run("test_full_throughput_1x1") then
+      -- The 1x1 shape at zero stall on both links: the case the
+      -- multi-buffer tap assembly exists for, where a column walk is a
+      -- single cycle and the window generator is the convolution's
+      -- throughput limit. Kept as its own test because 'test_full_
+      -- throughput' above is 3x3, and the two shapes exercise completely
+      -- different steady states of 'walk_control'.
+      random_frame(8, 7);
+      run_frame(8, 7, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 500);
 
     elsif run("test_row_bank_interlock_full_rate") then
       -- The row-bank interlock ('write_freeze_i' against
