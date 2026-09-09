@@ -1,0 +1,158 @@
+"""The guard that spatial tiling stays **opt-in**.
+
+Every extension tiling needed -- unit-granular bank confinement,
+DDR-pinned tensors, `RowCopyOp`, the tiler itself -- was added to modules
+the whole existing catalogue already runs through. The acceptance
+criterion for all of them is the same and is not negotiable: a graph that
+asks for none of it must plan, place and lower *byte for byte* as it did
+before. This file is the permanent statement of that.
+
+It works by digest rather than by prose. For every case in every
+catalogue it hashes the things a placement bug would move -- the ordered
+local placements, the DDR placements, every tensor's DDR address, every
+resolved step, the predicted traffic and the encoded bytes of every
+emitted descriptor -- and compares against a constant recorded when the
+untiled behaviour was last ratified.
+
+**If this test fails**, the change under test moved something in the
+untiled path. That may well be intended (a deliberate planner
+improvement), but it is never a detail: re-run
+`print_catalogue_digest()` below, diff the two dumps to see exactly which
+case and which buffer moved, convince yourself it is what you meant, and
+only then update `_RATIFIED_DIGEST` in the same commit that explains it.
+Silently refreshing the constant defeats the entire point.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+
+from accel_v2 import (
+    cases,
+    cases_concat_split,
+    cases_conv_pad,
+    cases_error,
+    cases_pool_pad,
+    cases_yolo,
+    isa,
+)
+from accel_v2.planner import ComputeStep, MoveStep, RowCopyStep
+
+_CATALOGUES = (cases, cases_concat_split, cases_conv_pad, cases_error, cases_pool_pad, cases_yolo)
+
+#: sha256 of `catalogue_dump()`, ratified while landing spatial tiling on
+#: top of `main` at d695c21.
+#:
+#: How it was established, since a digest taken *after* a change proves
+#: nothing on its own: the same dump was taken on unmodified d695c21 and
+#: again after each tiling step, and diffed field by field across all 64
+#: cases. The two are identical except for the two new
+#: `DdrTraffic.pinned_*_bytes` counters, which appear as `0` in every
+#: untiled case because nothing is pinned. No placement, no step, no
+#: descriptor byte and no other counter moved.
+_RATIFIED_DIGEST = "51fae7817e02d5aa8d9e5f20b27afb311c2e144bb432c5fa52684c490201176c"
+
+#: The number of cases the digest covers, asserted separately so that
+#: *deleting* a case cannot silently keep the digest meaningful.
+_RATIFIED_CASE_COUNT = 64
+
+
+def _step_record(step) -> list:
+    if isinstance(step, MoveStep):
+        return [
+            "move",
+            step.tensor.name,
+            step.src_space,
+            step.src_addr,
+            step.dst_space,
+            step.dst_addr,
+            step.nbytes,
+            step.kind,
+        ]
+    if isinstance(step, RowCopyStep):
+        return ["rowcopy", step.op.name, step.src_space, step.dst_space, step.transfers]
+    assert isinstance(step, ComputeStep)
+    return [
+        "compute",
+        step.op.name,
+        type(step.op).__name__,
+        step.input_spaces,
+        step.input_addrs,
+        step.output_space,
+        step.output_addr,
+    ]
+
+
+def catalogue_dump() -> dict:
+    """Everything about the catalogue a placement or lowering change
+    would perturb, in a form a human can diff."""
+    dump: dict = {}
+    for module in _CATALOGUES:
+        for case in module.all_cases():
+            planned = case.planned
+            dump[f"{module.__name__}.{case.name}"] = {
+                "local_placements": [list(p) for p in planned.local_placements],
+                "ddr_placements": [list(p) for p in planned.ddr_placements],
+                "pinned_placements": [list(p) for p in planned.pinned_placements],
+                "tensor_ddr_addr": dict(planned.tensor_ddr_addr),
+                "traffic": vars(planned.traffic),
+                "tensor_mem_bytes": planned.tensor_mem_bytes,
+                "bank_bytes": planned.bank_bytes,
+                "steps": [_step_record(s) for s in planned.steps],
+                "descs": [isa.encode_desc(d).hex() for d in case.program.descs],
+                "program_addr": case.program.program_addr,
+            }
+    return dump
+
+
+def catalogue_digest() -> str:
+    payload = json.dumps(catalogue_dump(), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def print_catalogue_digest() -> None:  # pragma: no cover - developer helper
+    """`python -c "from accel_v2.tests.test_tiling_guard import *;
+    print_catalogue_digest()"` -- prints the digest and writes the full
+    dump to `catalogue_dump.json` for diffing against another checkout."""
+    with open("catalogue_dump.json", "w") as handle:
+        json.dump(catalogue_dump(), handle, indent=1, sort_keys=True)
+    print(catalogue_digest())
+
+
+def test_no_catalogue_case_asks_for_any_tiling_feature() -> None:
+    """The structural half of the guard, and the one that keeps failing
+    for the right reason: not one existing tensor sets `pin_ddr` or
+    `confine_unit_bytes`, and not one existing op is a `RowCopyOp`. So
+    every tiling code path is reached only by a graph that asked for it,
+    and the digest below is testing the *unmodified* lowering."""
+    from accel_v2.model import RowCopyOp
+
+    for module in _CATALOGUES:
+        for case in module.all_cases():
+            model = case.planned.model
+            for tensor in model.tensors:
+                assert not tensor.pin_ddr, f"{case.name}: '{tensor.name}' is pinned"
+                assert tensor.confine_unit_bytes is None, (
+                    f"{case.name}: '{tensor.name}' sets confine_unit_bytes"
+                )
+                assert tensor.origin is None, f"{case.name}: '{tensor.name}' is a strip"
+            for op in model.ops:
+                assert not isinstance(op, RowCopyOp), f"{case.name}: '{op.name}' is a row copy"
+
+
+def test_every_catalogue_case_still_plans_byte_for_byte() -> None:
+    """The digest itself. See this module's docstring before touching
+    `_RATIFIED_DIGEST`."""
+    dump = catalogue_dump()
+    assert len(dump) == _RATIFIED_CASE_COUNT, (
+        f"the digest was ratified over {_RATIFIED_CASE_COUNT} cases but the catalogue now "
+        f"has {len(dump)}. Adding a case is fine -- re-ratify both constants together, in a "
+        "commit that says so."
+    )
+    assert catalogue_digest() == _RATIFIED_DIGEST, (
+        "the untiled catalogue no longer plans byte for byte. Run "
+        "`print_catalogue_digest()` in this module on both checkouts and diff the two "
+        "`catalogue_dump.json` files to find which case and which buffer moved; see this "
+        "module's docstring."
+    )
