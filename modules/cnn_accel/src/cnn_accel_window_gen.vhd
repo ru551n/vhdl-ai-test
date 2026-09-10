@@ -343,6 +343,27 @@ architecture a of cnn_accel_window_gen is
   -- base index, never the kernel-row number itself.)
   signal kr_base_capture_q : kr_base_arr_t := (others => 0);
   signal kc_capture_q : unsigned(7 downto 0) := (others => '0');
+
+  -- The capture stage's tap slot, PRE-DECODED to one-hot and registered
+  -- alongside the rest of the capture pipeline.
+  --
+  -- The capture write enable used to be
+  -- 't = kr_base_capture_q(b) + to_integer(kc_capture_q)', i.e. an adder
+  -- and a comparator per (row, tap) evaluated combinationally out of
+  -- 'kc_capture_q' into every one of the assembly buffers' clock enables.
+  -- Post-route 'kc_capture_q -> assembly_q[*]' was 224 of the design's
+  -- worst 400 endpoints at 6-8 logic levels (the 5x5 pool instance; the
+  -- 3x3 conv one is the same code, one third the width).
+  --
+  -- 'shared/TimingAndResources.md', Fundamentals, "Control structure":
+  -- decode the index into one-bit registered flags once, at the point the
+  -- index is latched, and have every site test its flag. The decode is
+  -- computed from exactly the same 'kr_base_walk_q'/'kc_q' pair, one cycle
+  -- earlier and in the same register stage as 'kc_capture_q' itself, so
+  -- the selected slot is bit-identical; only its arrival time moves.
+  type tap_sel_arr_t is array (0 to g_max_kernel_size - 1) of
+    std_ulogic_vector(0 to g_max_kernel_size * g_max_kernel_size - 1);
+  signal tap_sel_capture_q : tap_sel_arr_t := (others => (others => '0'));
   -- '1' the cycle after any cycle 'issue_q' was high -- i.e. this
   -- cycle's 'bank_rd_data' is meaningful and should be captured.
   signal capture_valid_q : std_ulogic := '0';
@@ -1621,6 +1642,7 @@ begin
         kc_capture_q <= (others => '0');
         in_frame_capture_q <= (others => '0');
         kr_base_capture_q <= (others => 0);
+        tap_sel_capture_q <= (others => (others => '0'));
         kr_base_walk_q <= (others => 0);
         row_ok_walk_q <= (others => '0');
         assembly_q <= (others => (others => (others => '0')));
@@ -1657,6 +1679,15 @@ begin
         kr_base_capture_q <= kr_base_walk_q;
         in_frame_capture_q <= in_frame_now;
         buf_capture_q <= buf_issue_q;
+        -- Same tap slot, one-hot -- see 'tap_sel_capture_q'. Both loop
+        -- bounds are generics, so this is a fixed comparator array, not a
+        -- variable-bound loop.
+        for b in 0 to g_max_kernel_size - 1 loop
+          for t in 0 to g_max_kernel_size * g_max_kernel_size - 1 loop
+            tap_sel_capture_q(b)(t) <=
+              to_sl(t = kr_base_walk_q(b) + to_integer(kc_q));
+          end loop;
+        end loop;
 
         --------------------------------------------------------------
         -- 1b. Registered pad-clear of the buffer reserved one cycle ago.
@@ -1687,7 +1718,7 @@ begin
               for b in 0 to g_max_kernel_size - 1 loop
                 if in_frame_capture_q(b) = '1' then
                   for t in 0 to g_max_kernel_size * g_max_kernel_size - 1 loop
-                    if t = kr_base_capture_q(b) + to_integer(kc_capture_q) then
+                    if tap_sel_capture_q(b)(t) = '1' then
                       for c in 0 to g_tile_channels - 1 loop
                         assembly_q(buf)(t * g_tile_channels + c) <=
                           bank_rd_data(b)(8 * (c + 1) - 1 downto 8 * c);

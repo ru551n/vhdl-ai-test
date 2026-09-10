@@ -366,8 +366,9 @@ architecture a of cnn_accel_cmd_proc is
   type state_t is (
     st_idle,
     st_fetch, st_fetch_wait,
-    st_validate,
-    st_geom_mul, st_div_w, st_div_h, st_geom_out, st_geom_out2, st_range, st_range_dst,
+    st_precheck, st_validate, st_validate2,
+    st_geom_mul, st_div_w, st_div_h, st_geom_out, st_geom_out2,
+    st_range_sum, st_range, st_range_dst,
     st_wgt_setup, st_wgt_req, st_wgt_run,
     st_pass_setup, st_pass_req_dst, st_pass_run, st_pass_drain,
     st_xfer_req_src, st_xfer_req_dst, st_xfer_run,
@@ -384,6 +385,77 @@ architecture a of cnn_accel_cmd_proc is
   signal desc_q : desc_v2_t := desc_v2_init;
   signal pc_q : unsigned(31 downto 0) := (others => '0');
   signal cls_q : cmd_class_t := cls_halt;
+
+  ------------------------------------------------------------------------
+  -- Pre-decoded descriptor predicates ('st_precheck').
+  --
+  -- 'st_validate' used to test the raw descriptor: one 8-bit opcode
+  -- compared against ~15 literals scattered through the reserved-field,
+  -- space-tag, alignment and geometry rules, each of those rules itself a
+  -- wide '/= 0' or '<=' over a 16/32-bit field, and all of it collapsing
+  -- into one priority chain that ends on 'pending_err_q's clock enable and
+  -- 'state'. Post-route that was 19 logic levels with 8 CARRY4 and
+  -- -1.218 ns -- the second failing family in the design, and the exact
+  -- shape 'shared/TimingAndResources.md' Fundamentals, "Control structure"
+  -- names: "one wide field (an opcode, a mode) compared against a dozen-plus
+  -- literals scattered across a controller's validation and dispatch logic".
+  --
+  -- The fix it prescribes is to decode the whole set into one-bit flags
+  -- once, registered, and have every site test its flag. 'st_precheck' is
+  -- that cycle: every wide comparison the validation rules need is reduced
+  -- to a single registered bit here, so 'st_validate' is a chain of 1-bit
+  -- terms plus the (3-bit) space tags. It costs exactly one cycle per
+  -- instruction, against commands that run for thousands.
+  signal op_is_add_q : std_ulogic := '0';
+  signal op_is_act_q : std_ulogic := '0';
+  signal op_is_loadw_q : std_ulogic := '0';
+  signal op_is_copy_q : std_ulogic := '0';
+  signal op_is_v12_q : std_ulogic := '0';
+  signal op_is_upsample_q : std_ulogic := '0';
+
+  -- Source/destination extents ('base + length'), computed in
+  -- 'st_range_sum' and only COMPARED in 'st_range'/'st_range_dst'.
+  --
+  -- The range checks used to select the operand length off the raw opcode
+  -- and then do 'resize(addr, 33) + len > limit' in the same cycle as the
+  -- error-priority chain that consumes the result. Post-route that was the
+  -- design's worst path (-0.697 ns, 15-16 levels: one opcode-decode LUT,
+  -- the length mux, SIX chained CARRY4 for the 33-bit add-and-compare, then
+  -- five LUT levels of priority chain into 'pending_err_q's clock enable
+  -- and 'state'). 'shared/TimingAndResources.md', Fundamentals: "Split
+  -- adders wider than the budget allows across stages", and section 2 --
+  -- this is per-command work, so a cycle is free and a logic level is not.
+  signal src_end_q : unsigned(32 downto 0) := (others => '0');
+  signal dst_end_q : unsigned(32 downto 0) := (others => '0');
+
+  -- 'in_width + pad_left + pad_right' and 'in_height + pad_top +
+  -- pad_bottom', gated by 'FLAG_PAD_EN', precomputed in 'st_precheck'.
+  --
+  -- Both were formed inline in 'st_geom_mul'/'st_div_w' as TWO chained
+  -- 32-bit adds, then compared against the kernel size and subtracted from
+  -- again, all in the cycle that also decides 'state'. Post-route
+  -- 'desc_q[flags][3] -> state[*]' was 11-14 logic levels at -0.771 ns.
+  -- Everything here fits in 18 bits ('in_width' is 16, each pad field 8),
+  -- so this is also the "bound the arithmetic before registering it" half
+  -- of 'shared/TimingAndResources.md' section 2, not just an extra stage.
+  signal padded_w_q : unsigned(17 downto 0) := (others => '0');
+  signal padded_h_q : unsigned(17 downto 0) := (others => '0');
+
+  -- 'reserved_w0 /= 0 or reserved_w10 /= 0'.
+  signal chk_reserved_bad_q : std_ulogic := '0';
+  -- 'xfer_bytes /= 0'.
+  signal chk_xfer_nz_q : std_ulogic := '0';
+  -- Per-operand 8-byte alignment.
+  signal chk_al_in_q : std_ulogic := '0';
+  signal chk_al_out_q : std_ulogic := '0';
+  signal chk_al_wgt_q : std_ulogic := '0';
+  signal chk_al_bias_q : std_ulogic := '0';
+  signal chk_al_scale_q : std_ulogic := '0';
+  signal chk_al_xfer_q : std_ulogic := '0';
+  -- Geometry predicates, already reduced.
+  signal chk_dims_nz_q : std_ulogic := '0';
+  signal chk_conv_geom_q : std_ulogic := '0';
+  signal chk_pool_geom_q : std_ulogic := '0';
 
   signal busy_q : std_ulogic := '0';
   signal err_code_q : err_code_t := c_err_none;
@@ -411,6 +483,13 @@ architecture a of cnn_accel_cmd_proc is
   -- Source-extent verdict, carried from 'st_range' to 'st_range_dst'.
   signal range_err_q : err_code_t := c_err_none;
 
+  -- Reserved-field/space-tag verdict, carried from 'st_validate' to
+  -- 'st_validate2' -- same split as 'range_err_q' above and for the same
+  -- reason (section 2): one 7-deep sequential 'v_err' chain per command
+  -- is free logic-level budget spent for nothing when a cycle boundary
+  -- is available, and this state has one.
+  signal validate_err_q : err_code_t := c_err_none;
+
   signal out_plane_words_q : unsigned(31 downto 0) := (others => '0');
   signal in_plane_words_q : unsigned(31 downto 0) := (others => '0');
 
@@ -418,6 +497,22 @@ architecture a of cnn_accel_cmd_proc is
   signal out_h_q : unsigned(15 downto 0) := (others => '0');
   signal row_words_q : unsigned(15 downto 0) := (others => '0');  -- in_width * T
   signal wgt_tile_bytes_q : unsigned(31 downto 0) := (others => '0');
+  -- 'kernel_h * kernel_w' and 'n_tiles * (kernel_h * kernel_w)', each on
+  -- its own cycle.
+  --
+  -- 'wgt_tile_bytes' was 'n_tiles_q * kernel_h * kernel_w * (pe_rows *
+  -- pe_cols)' -- three chained runtime products in one cycle, which Vivado
+  -- mapped to a DSP cascade whose inter-DSP hop
+  -- ('wgt_tile_bytes_q2 -> wgt_tile_bytes_q1', ZERO logic levels, -0.588 ns
+  -- post-route) no placement could close. This is the same defect
+  -- 'st_geom_out'/'st_geom_out2' above were already split for -- one
+  -- product per cycle - applied to the one product chain that pass missed.
+  -- ("When a fix works, search the whole design for the same pattern",
+  -- 'shared/TimingAndResources.md'.) Values are unchanged: every stage is
+  -- exact at its own width, and integer multiplication does not care about
+  -- association order.
+  signal kernel_area_q : unsigned(15 downto 0) := (others => '0');
+  signal wgt_tile_taps_q : unsigned(31 downto 0) := (others => '0');
 
   -- Sequential restoring divider, shared by the two output-dimension
   -- divides (out_w then out_h). A runtime divide by 'stride' is
@@ -545,6 +640,30 @@ architecture a of cnn_accel_cmd_proc is
   signal feed_kick : std_ulogic := '0';
   signal feed_row_q : unsigned(15 downto 0) := (others => '0');
   signal feed_tile_q : unsigned(15 downto 0) := (others => '0');
+
+  -- The '(row, tile)' strip address, maintained as an ACCUMULATOR instead
+  -- of being formed as 'in_addr + tile*in_plane_bytes + row*in_row_bytes'
+  -- in the cycle the request is presented.
+  --
+  -- 'shared/TimingAndResources.md' section 2, "Never form a runtime product
+  -- of configuration values in a datapath": both products change only at a
+  -- tile/row boundary, so they are maintained by addition at that boundary.
+  -- The old form was a DSP48E1 followed by two 32-bit adds
+  -- ('feed_req_q[req][addr]' at -1.066 ns post-route, 11 levels of which 8
+  -- were CARRY4); this form is a register read with nothing in front of it,
+  -- and the two adds that remain each sit alone on a 'fd_wait' cycle that
+  -- only ever happens once per strip.
+  --
+  -- Bit-exactness: the old expression truncated both stride operands to
+  -- their low 16 bits before multiplying and took the whole sum mod 2**32,
+  -- so the steps accumulated here are deliberately the same truncated
+  -- values -- 'c_tile_step_i'/'c_row_step_i' below.
+  signal feed_addr_q : unsigned(31 downto 0) := (others => '0');
+  -- 'in_addr + row*in_row_bytes': the strip address at tile 0 of the
+  -- current row, so a row advance does not have to undo the tile term.
+  signal feed_row_base_q : unsigned(31 downto 0) := (others => '0');
+  signal feed_tile_step_i : unsigned(31 downto 0);
+  signal feed_row_step_i : unsigned(31 downto 0);
   signal feed_split_q : std_ulogic := '0';
 
   ------------------------------------------------------------------------
@@ -613,6 +732,25 @@ architecture a of cnn_accel_cmd_proc is
 
   signal watchdog_q : unsigned(31 downto 0) := (others => '0');
   signal progress : std_ulogic;
+  -- 'progress' REGISTERED, for the watchdog reload only.
+  --
+  -- 'progress' is an OR of ten handshake/done signals gathered from every
+  -- engine and DMA in the accelerator, and the watchdog reload it drives
+  -- lands on the R/CE pins of all 32 'watchdog_q' bits. Post-route that
+  -- made 'pool_window_gen/n_res_q -> cmd_proc/watchdog_q[*]/R' the design's
+  -- worst path (-1.419 ns, 11 levels, 71 % route) -- the cross-module
+  -- ready-chain signature in 'shared/TimingAndResources.md' section 2:
+  -- "a combinational 'ready' ... derived from a descriptor or status
+  -- register several levels up and fanned out to hundreds of consumers".
+  --
+  -- Registering it costs the watchdog one cycle of reload latency out of
+  -- 'g_watchdog_cycles' (2 000 in the fastest test configuration,
+  -- 1 000 000 by default) and changes no observable behaviour: a stalled
+  -- engine still produces no progress at all, and a running one still
+  -- reloads far more often than the counter can expire. The performance
+  -- counters below deliberately keep reading the combinational 'progress'
+  -- so 'CNT_STALL' stays cycle-exact.
+  signal progress_q : std_ulogic := '0';
 
   signal cnt_cmd_q : unsigned(31 downto 0) := (others => '0');
   signal cnt_cycle_q : unsigned(31 downto 0) := (others => '0');
@@ -629,6 +767,17 @@ architecture a of cnn_accel_cmd_proc is
   ------------------------------------------------------------------------
   -- Helper functions. All pure decode/arithmetic on descriptor fields.
   ------------------------------------------------------------------------
+
+  -- 'boolean' -> 'std_ulogic', so a predicate can be reduced to one
+  -- registered bit in 'st_precheck'.
+  function to_sl(value : boolean) return std_ulogic is
+  begin
+    if value then
+      return '1';
+    else
+      return '0';
+    end if;
+  end function;
 
   function classify(opcode : std_ulogic_vector(7 downto 0)) return cmd_class_t is
   begin
@@ -729,7 +878,6 @@ begin
     variable v_cls : cmd_class_t;
     variable v_len : unsigned(31 downto 0);
     variable v_prod : unsigned(31 downto 0);
-    variable v_padded : unsigned(31 downto 0);
     variable v_ok : boolean;
     variable v_rem : unsigned(31 downto 0);
   begin
@@ -767,10 +915,12 @@ begin
       seq_error <= '0';
       feed_kick <= '0';
 
+      progress_q <= progress;
+
       if watchdog_q /= 0 then
         watchdog_q <= watchdog_q - 1;
       end if;
-      if progress = '1' then
+      if progress_q = '1' then
         watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
       end if;
 
@@ -804,9 +954,63 @@ begin
             desc_q <= fetch_desc;
             pc_q <= fetch_pc;
             cls_q <= classify(fetch_desc.opcode);
-            state <= st_validate;
+            state <= st_precheck;
             watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
           end if;
+
+        --------------------------------------------------------------
+        -- Pre-decode. Every wide comparison 'st_validate' needs, reduced
+        -- to one registered bit, and the opcode decoded to one-hot flags.
+        -- Reads only 'desc_q' (registered last cycle) and writes only
+        -- registers; no state transition logic depends on any of it.
+        when st_precheck =>
+          op_is_add_q <= to_sl(desc_q.opcode = c_opcode_add);
+          op_is_act_q <= to_sl(desc_q.opcode = c_opcode_act);
+          op_is_loadw_q <= to_sl(desc_q.opcode = c_opcode_loadw);
+          op_is_copy_q <= to_sl(desc_q.opcode = c_opcode_copy);
+          op_is_v12_q <= to_sl(is_v12_opcode(desc_q.opcode));
+          op_is_upsample_q <= to_sl(desc_q.opcode = c_opcode_upsample);
+
+          padded_w_q <= resize(desc_q.in_width, 18);
+          padded_h_q <= resize(desc_q.in_height, 18);
+          if desc_q.flags(c_flag_pad_en) = '1' then
+            padded_w_q <= resize(desc_q.in_width, 18)
+              + desc_q.pad_left + desc_q.pad_right;
+            padded_h_q <= resize(desc_q.in_height, 18)
+              + desc_q.pad_top + desc_q.pad_bottom;
+          end if;
+
+          chk_reserved_bad_q <=
+            to_sl(desc_q.reserved_w0 /= x"00" or desc_q.reserved_w10 /= x"0000");
+          chk_xfer_nz_q <= to_sl(desc_q.xfer_bytes /= 0);
+
+          chk_al_in_q <= to_sl(is_aligned(desc_q.in_addr));
+          chk_al_out_q <= to_sl(is_aligned(desc_q.out_addr));
+          chk_al_wgt_q <= to_sl(is_aligned(desc_q.weight_addr));
+          chk_al_bias_q <= to_sl(is_aligned(desc_q.bias_addr));
+          chk_al_scale_q <= to_sl(is_aligned(desc_q.scale_addr));
+          chk_al_xfer_q <= to_sl(is_aligned(desc_q.xfer_bytes));
+
+          chk_dims_nz_q <= to_sl(
+            desc_q.in_width /= 0 and desc_q.in_height /= 0
+            and desc_q.in_channels /= 0
+          );
+          chk_conv_geom_q <= to_sl(
+            desc_q.out_channels /= 0
+            and desc_q.kernel_h /= 0 and desc_q.kernel_w /= 0
+            and desc_q.stride_h /= 0 and desc_q.stride_w /= 0
+            and desc_q.kernel_h <= g_max_kernel_size
+            and desc_q.kernel_w <= g_max_kernel_size
+          );
+          chk_pool_geom_q <= to_sl(
+            desc_q.pool_kernel_h /= 0 and desc_q.pool_kernel_w /= 0
+            and desc_q.pool_stride_h /= 0 and desc_q.pool_stride_w /= 0
+            and desc_q.pool_kernel_h <= g_max_pool_kernel_size
+            and desc_q.pool_kernel_w <= g_max_pool_kernel_size
+          );
+
+          state <= st_validate;
+          watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
 
         --------------------------------------------------------------
         -- Validation, part 1: everything decidable from the descriptor
@@ -831,9 +1035,8 @@ begin
           -- would turn a future ISA extension into a silent wrong answer
           -- on old hardware.
           if v_err = c_err_none
-            and (desc_q.reserved_w0 /= x"00"
-              or desc_q.reserved_w10 /= x"0000"
-              or (is_v12_opcode(desc_q.opcode) and desc_q.xfer_bytes /= 0)) then
+            and (chk_reserved_bad_q = '1'
+              or (op_is_v12_q = '1' and chk_xfer_nz_q = '1')) then
             v_err := c_err_bad_reserved;
           end if;
 
@@ -845,38 +1048,56 @@ begin
             if desc_q.space_src0 = c_space_reserved
               or desc_q.space_dst = c_space_reserved
               or desc_q.space_wgt = c_space_reserved
-              or (v_cls = cls_elem and desc_q.opcode = c_opcode_add
+              or (v_cls = cls_elem and op_is_add_q = '1'
                   and desc_q.space_src1 = c_space_reserved) then
               v_err := c_err_bad_space;
             elsif desc_q.space_src0 = c_space_local_weight then
               v_err := c_err_bad_space;
             elsif desc_q.space_dst = c_space_local_weight
-              and desc_q.opcode /= c_opcode_loadw then
+              and op_is_loadw_q = '0' then
               v_err := c_err_bad_space;
-            elsif desc_q.opcode = c_opcode_add
+            elsif op_is_add_q = '1'
               and desc_q.space_src1 = c_space_local_weight then
               v_err := c_err_bad_space;
             end if;
           end if;
+
+          -- Carry the verdict so far into 'st_validate2' -- see
+          -- 'validate_err_q's declaration comment -- rather than chaining
+          -- the alignment/geometry/xfer-bytes checks and the dispatch off
+          -- this same 'v_err' in the same cycle.
+          validate_err_q <= v_err;
+          state <= st_validate2;
+          watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
+
+        --------------------------------------------------------------
+        -- Validation, part 1b: alignment, geometry, operand-space
+        -- resolution and the class dispatch -- split from 'st_validate'
+        -- above (same reasoning as 'st_range'/'st_range_dst' below: one
+        -- deep chain of checks off 'cls_q' and 'desc_q', now two shallower
+        -- ones. Per command, so the extra cycle is free.
+        when st_validate2 =>
+          v_err := validate_err_q;
+          v_cls := cls_q;
 
           -- Alignment (section 3). Every operand address the command will
           -- actually use, plus its byte count, must be a whole number of
           -- 8-byte words -- both spaces are word-granular and neither
           -- DMA can express a sub-word burst.
           if v_err = c_err_none and v_cls /= cls_halt then
-            v_ok := is_aligned(desc_q.in_addr) and is_aligned(desc_q.out_addr);
+            v_ok := chk_al_in_q = '1' and chk_al_out_q = '1';
             if v_cls = cls_conv then
-              v_ok := v_ok and is_aligned(desc_q.weight_addr)
-                and is_aligned(desc_q.bias_addr)
-                and is_aligned(desc_q.scale_addr);
+              v_ok := v_ok and chk_al_wgt_q = '1'
+                and chk_al_bias_q = '1'
+                and chk_al_scale_q = '1';
             end if;
-            if desc_q.opcode = c_opcode_add then
-              v_ok := v_ok and is_aligned(desc_q.xfer_bytes);
-            elsif desc_q.opcode = c_opcode_act then
-              v_ok := v_ok and is_aligned(desc_q.weight_addr)
-                and is_aligned(desc_q.xfer_bytes);
-            elsif not is_v12_opcode(desc_q.opcode) then
-              v_ok := v_ok and is_aligned(desc_q.xfer_bytes);
+            if op_is_add_q = '1' then
+              v_ok := v_ok and chk_al_xfer_q = '1';
+            elsif op_is_act_q = '1' then
+              v_ok := v_ok and chk_al_wgt_q = '1'
+                and chk_al_xfer_q = '1';
+            elsif op_is_v12_q = '0' then
+              v_ok := v_ok and chk_al_xfer_q = '1';
             end if;
             if not v_ok then
               v_err := c_err_misaligned;
@@ -887,20 +1108,11 @@ begin
           -- actually consumes are checked, so a 'LOAD' is not rejected
           -- for leaving 'in_width' at zero.
           if v_err = c_err_none and (v_cls = cls_conv or v_cls = cls_pool) then
-            v_ok := desc_q.in_width /= 0 and desc_q.in_height /= 0
-              and desc_q.in_channels /= 0;
+            v_ok := chk_dims_nz_q = '1';
             if v_cls = cls_conv then
-              v_ok := v_ok and desc_q.out_channels /= 0
-                and desc_q.kernel_h /= 0 and desc_q.kernel_w /= 0
-                and desc_q.stride_h /= 0 and desc_q.stride_w /= 0
-                and desc_q.kernel_h <= g_max_kernel_size
-                and desc_q.kernel_w <= g_max_kernel_size;
+              v_ok := v_ok and chk_conv_geom_q = '1';
             else
-              v_ok := v_ok and desc_q.pool_kernel_h /= 0
-                and desc_q.pool_kernel_w /= 0
-                and desc_q.pool_stride_h /= 0 and desc_q.pool_stride_w /= 0
-                and desc_q.pool_kernel_h <= g_max_pool_kernel_size
-                and desc_q.pool_kernel_w <= g_max_pool_kernel_size;
+              v_ok := v_ok and chk_pool_geom_q = '1';
             end if;
             if not v_ok then
               v_err := c_err_bad_geometry;
@@ -908,14 +1120,13 @@ begin
           end if;
 
           if v_err = c_err_none and v_cls = cls_elem
-            and desc_q.opcode /= c_opcode_copy and desc_q.opcode /= c_opcode_act then
-            if desc_q.in_width = 0 or desc_q.in_height = 0
-              or desc_q.in_channels = 0 then
+            and op_is_copy_q = '0' and op_is_act_q = '0' then
+            if chk_dims_nz_q = '0' then
               v_err := c_err_bad_geometry;
             end if;
           end if;
 
-          if v_err = c_err_none and v_cls = cls_xfer and desc_q.xfer_bytes = 0 then
+          if v_err = c_err_none and v_cls = cls_xfer and chk_xfer_nz_q = '0' then
             v_err := c_err_bad_geometry;
           end if;
 
@@ -938,12 +1149,12 @@ begin
           side_is_local_q <= '0';
           side_is_src1_q <= '0';
           side_is_lut_q <= '0';
-          if desc_q.opcode = c_opcode_add then
+          if op_is_add_q = '1' then
             side_is_src1_q <= '1';
-          elsif desc_q.opcode = c_opcode_act then
+          elsif op_is_act_q = '1' then
             side_is_lut_q <= '1';
           end if;
-          if desc_q.opcode = c_opcode_add then
+          if op_is_add_q = '1' then
             if desc_q.space_src1 = c_space_ddr then
               side_is_ddr_q <= '1';
             elsif desc_q.space_src1 = c_space_local_tensor then
@@ -1003,35 +1214,29 @@ begin
             desc_q.in_width * ceil_shift(desc_q.in_channels, c_word_shift),
             row_words_q'length
           );
+          -- First of the three 'wgt_tile_bytes' products.
+          kernel_area_q <= resize(desc_q.kernel_h * desc_q.kernel_w, 16);
 
           -- Set up the first divide: out_w = (in_w + pad_l + pad_r - k_w)
           -- / stride_w + 1, or the pooling equivalent. 'pad_en' gates the
           -- padding fields exactly as the golden model does.
           if cls_q = cls_conv then
-            v_padded := resize(desc_q.in_width, 32);
-            if desc_q.flags(c_flag_pad_en) = '1' then
-              v_padded := v_padded + desc_q.pad_left + desc_q.pad_right;
-            end if;
-            if v_padded < desc_q.kernel_w then
+            if padded_w_q < desc_q.kernel_w then
               pending_err_q <= c_err_bad_geometry;
               state <= st_error;
             else
-              div_num_q <= v_padded - desc_q.kernel_w;
+              div_num_q <= resize(padded_w_q - desc_q.kernel_w, 32);
               div_den_q <= resize(desc_q.stride_w, 32);
               state <= st_div_w;
             end if;
           else
             -- ISA v2.1: pooling is padded too, with the same fields and
-            -- the same 'pad_en' gate the conv branch above uses.
-            v_padded := resize(desc_q.in_width, 32);
-            if desc_q.flags(c_flag_pad_en) = '1' then
-              v_padded := v_padded + desc_q.pad_left + desc_q.pad_right;
-            end if;
-            if v_padded < desc_q.pool_kernel_w then
+            -- the same 'pad_en' gate 'padded_w_q' already applied.
+            if padded_w_q < desc_q.pool_kernel_w then
               pending_err_q <= c_err_bad_geometry;
               state <= st_error;
             else
-              div_num_q <= v_padded - desc_q.pool_kernel_w;
+              div_num_q <= resize(padded_w_q - desc_q.pool_kernel_w, 32);
               div_den_q <= resize(desc_q.pool_stride_w, 32);
               state <= st_div_w;
             end if;
@@ -1040,8 +1245,11 @@ begin
           if cls_q = cls_xfer then
             -- A pure move is described entirely by 'xfer_bytes': no
             -- shape, no divide, and nothing in 'st_geom_out'/'out2' that
-            -- its validation reads.
-            state <= st_range;
+            -- its validation reads. It still goes through 'st_range_sum':
+            -- that is where BOTH extents are formed, and skipping it would
+            -- range-check this command against the previous command's
+            -- addresses.
+            state <= st_range_sum;
           elsif cls_q = cls_elem then
             -- No output-dimension divide either -- an elementwise
             -- command's output is the same shape as its input -- but it
@@ -1083,28 +1291,20 @@ begin
             div_quot_q <= (others => '0');
             div_rem_q <= (others => '0');
             if cls_q = cls_conv then
-              v_padded := resize(desc_q.in_height, 32);
-              if desc_q.flags(c_flag_pad_en) = '1' then
-                v_padded := v_padded + desc_q.pad_top + desc_q.pad_bottom;
-              end if;
-              if v_padded < desc_q.kernel_h then
+              if padded_h_q < desc_q.kernel_h then
                 pending_err_q <= c_err_bad_geometry;
                 state <= st_error;
               else
-                div_num_q <= v_padded - desc_q.kernel_h;
+                div_num_q <= resize(padded_h_q - desc_q.kernel_h, 32);
                 div_den_q <= resize(desc_q.stride_h, 32);
                 state <= st_div_h;
               end if;
             else
-              v_padded := resize(desc_q.in_height, 32);
-              if desc_q.flags(c_flag_pad_en) = '1' then
-                v_padded := v_padded + desc_q.pad_top + desc_q.pad_bottom;
-              end if;
-              if v_padded < desc_q.pool_kernel_h then
+              if padded_h_q < desc_q.pool_kernel_h then
                 pending_err_q <= c_err_bad_geometry;
                 state <= st_error;
               else
-                div_num_q <= v_padded - desc_q.pool_kernel_h;
+                div_num_q <= resize(padded_h_q - desc_q.pool_kernel_h, 32);
                 div_den_q <= resize(desc_q.pool_stride_h, 32);
                 state <= st_div_h;
               end if;
@@ -1159,11 +1359,8 @@ begin
             n_planes_out_q <= n_ot_q;
             -- One weight tile is, per 'pack_weights_for_hw'
             -- (T x k_h x k_w x pe_rows x pe_cols int8), this many bytes.
-            wgt_tile_bytes_q <= resize(
-              n_tiles_q * desc_q.kernel_h * desc_q.kernel_w
-              * to_unsigned(g_pe_rows * g_pe_cols, 16),
-              wgt_tile_bytes_q'length
-            );
+            -- Second product; the third is in 'st_range_sum'.
+            wgt_tile_taps_q <= resize(n_tiles_q * kernel_area_q, 32);
             pass_q <= (others => '0');
             -- Pass-offset accumulators start with 'pass_q' -- see their
             -- declaration.
@@ -1192,6 +1389,50 @@ begin
             c_word_shift
           );
 
+          state <= st_range_sum;
+          watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
+
+        --------------------------------------------------------------
+        -- Range check, step 0: the two extents. Nothing but the operand
+        -- length select and one 33-bit add each; the comparisons and the
+        -- error-priority chain that consume them are in the two states
+        -- below. All of it is per-command.
+        when st_range_sum =>
+          -- Source extent.
+          if cls_q = cls_xfer or cls_q = cls_elem then
+            v_len := desc_q.xfer_bytes;
+            if cls_q = cls_elem
+              and (op_is_add_q = '1' or op_is_upsample_q = '1') then
+              v_len := in_total_bytes_q;
+            end if;
+          else
+            v_len := in_total_bytes_q;
+          end if;
+          src_end_q <= resize(desc_q.in_addr, 33) + v_len;
+
+          -- Destination extent.
+          if cls_q = cls_xfer then
+            v_len := desc_q.xfer_bytes;
+          elsif cls_q = cls_elem then
+            v_len := desc_q.xfer_bytes;
+            if op_is_add_q = '1' then
+              v_len := in_total_bytes_q;
+            elsif op_is_upsample_q = '1' then
+              -- Nearest-2x2 quadruples the pixel count (section 5.2).
+              v_len := shift_left(in_total_bytes_q, 2);
+            end if;
+          else
+            v_len := out_total_bytes_q;
+          end if;
+          dst_end_q <= resize(desc_q.out_addr, 33) + v_len;
+
+          -- Third and last 'wgt_tile_bytes' product. Landing it here is
+          -- still three states ahead of 'st_wgt_setup', the first reader.
+          wgt_tile_bytes_q <= resize(
+            wgt_tile_taps_q * to_unsigned(g_pe_rows * g_pe_cols, 16),
+            wgt_tile_bytes_q'length
+          );
+
           state <= st_range;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
 
@@ -1208,22 +1449,12 @@ begin
           -- so the extra cycle is free.
           v_err := c_err_none;
 
-          if cls_q = cls_xfer or cls_q = cls_elem then
-            v_len := desc_q.xfer_bytes;
-            if cls_q = cls_elem and (desc_q.opcode = c_opcode_add
-              or desc_q.opcode = c_opcode_upsample) then
-              v_len := in_total_bytes_q;
-            end if;
-          else
-            v_len := in_total_bytes_q;
-          end if;
-
           if desc_q.space_src0 = c_space_local_tensor then
-            if resize(desc_q.in_addr, 33) + v_len > g_tensor_bytes then
+            if src_end_q > g_tensor_bytes then
               v_err := c_err_local_range;
             end if;
           elsif desc_q.space_src0 = c_space_ddr then
-            if resize(desc_q.in_addr, 33) + v_len > g_ddr_limit then
+            if src_end_q > g_ddr_limit then
               v_err := c_err_ddr_range;
             end if;
           end if;
@@ -1239,26 +1470,12 @@ begin
           v_err := range_err_q;
 
           if v_err = c_err_none then
-            if cls_q = cls_xfer then
-              v_len := desc_q.xfer_bytes;
-            elsif cls_q = cls_elem then
-              v_len := desc_q.xfer_bytes;
-              if desc_q.opcode = c_opcode_add then
-                v_len := in_total_bytes_q;
-              elsif desc_q.opcode = c_opcode_upsample then
-                -- Nearest-2x2 quadruples the pixel count (section 5.2).
-                v_len := shift_left(in_total_bytes_q, 2);
-              end if;
-            else
-              v_len := out_total_bytes_q;
-            end if;
-
             if desc_q.space_dst = c_space_local_tensor then
-              if resize(desc_q.out_addr, 33) + v_len > g_tensor_bytes then
+              if dst_end_q > g_tensor_bytes then
                 v_err := c_err_local_range;
               end if;
             elsif desc_q.space_dst = c_space_ddr then
-              if resize(desc_q.out_addr, 33) + v_len > g_ddr_limit then
+              if dst_end_q > g_ddr_limit then
                 v_err := c_err_ddr_range;
               end if;
             end if;
@@ -1600,6 +1817,9 @@ begin
   -- flight and the 'src_done' pulse is unambiguous.
   ------------------------------------------------------------------------
 
+  feed_tile_step_i <= resize(in_plane_bytes_q(15 downto 0), 32);
+  feed_row_step_i <= resize(in_row_bytes_q(15 downto 0), 32);
+
   feeder : process(clk)
   begin
     if rising_edge(clk) then
@@ -1608,6 +1828,8 @@ begin
           if feed_kick = '1' then
             feed_row_q <= (others => '0');
             feed_tile_q <= (others => '0');
+            feed_addr_q <= desc_q.in_addr;
+            feed_row_base_q <= desc_q.in_addr;
             if engine_conv_q = '1' and n_tiles_q > 1 then
               feed_split_q <= '1';
             else
@@ -1621,9 +1843,7 @@ begin
             if feed_split_q = '1' then
               -- One '(row, tile)' strip: plane 'tile' is
               -- 'in_plane_bytes' away, row 'row' is 'in_row_bytes' into it.
-              feed_req_q.req.addr <= desc_q.in_addr
-                + resize(feed_tile_q * in_plane_bytes_q(15 downto 0), 32)
-                + resize(feed_row_q * in_row_bytes_q(15 downto 0), 32);
+              feed_req_q.req.addr <= feed_addr_q;
               feed_req_q.req.length <= in_row_bytes_q;
             elsif engine_pool_q = '1' then
               feed_req_q.req.addr <= desc_q.in_addr + in_pass_off_q;
@@ -1648,10 +1868,15 @@ begin
                 feed_state <= fd_done;
               else
                 feed_row_q <= feed_row_q + 1;
+                -- Row advance: back to tile 0 of the next row. One add,
+                -- shared between both registers.
+                feed_row_base_q <= feed_row_base_q + feed_row_step_i;
+                feed_addr_q <= feed_row_base_q + feed_row_step_i;
                 feed_state <= fd_issue;
               end if;
             else
               feed_tile_q <= feed_tile_q + 1;
+              feed_addr_q <= feed_addr_q + feed_tile_step_i;
               feed_state <= fd_issue;
             end if;
           end if;
@@ -2027,83 +2252,113 @@ begin
   -- engine can sample a half-updated configuration.
   ------------------------------------------------------------------------
 
-  geom_out_width <= std_ulogic_vector(out_w_q);
-  geom_out_height <= std_ulogic_vector(out_h_q);
-
-  conv_cfg_kernel_h <= std_ulogic_vector(desc_q.kernel_h);
-  conv_cfg_kernel_w <= std_ulogic_vector(desc_q.kernel_w);
-  conv_cfg_stride_h <= std_ulogic_vector(desc_q.stride_h);
-  conv_cfg_stride_w <= std_ulogic_vector(desc_q.stride_w);
-  conv_cfg_in_width <= std_ulogic_vector(desc_q.in_width);
-  conv_cfg_in_height <= std_ulogic_vector(desc_q.in_height);
-  conv_cfg_in_channels <= std_ulogic_vector(desc_q.in_channels);
-
-  -- 'FLAG_PAD_EN' gates the four padding fields as one group, exactly as
-  -- the golden model does; a descriptor with padding values but the flag
-  -- clear convolves unpadded.
-  pad_gate : process(all)
+  -- REGISTERED, not combinational off 'desc_q'.
+  --
+  -- 'shared/ModernVHDL.md', "Per-command configuration boundary" /
+  -- 'shared/TimingAndResources.md' section 2: "Put a register stage on
+  -- every engine's configuration boundary. No engine's combinational cone
+  -- may begin at the controller's descriptor register." Driven straight
+  -- from 'desc_q' these nets ran from one register in 'cnn_accel_cmd_proc'
+  -- to consumers placed wherever their own engine sits -- 'pool_cfg_opcode'
+  -- into all eight 'pool_lane_gen' clock enables, 'pool_cfg_requant_scale'
+  -- into 'pool_requant's DSP A/B ports. Post-route those were 100+ of the
+  -- worst 400 endpoints, several of them at ZERO logic levels: pure route,
+  -- with no placement that could satisfy them because launch and capture
+  -- flip-flop were fixed at opposite ends of the path.
+  --
+  -- A register here gives the placer a flip-flop it can put next to each
+  -- consumer group (and replicate). It costs one cycle of configuration
+  -- latency, which is free by construction: every field below is a pure
+  -- function of 'desc_q', latched in 'st_fetch_wait', while the earliest
+  -- 'start' pulse any engine can see is issued in 'st_range_dst' -- seven
+  -- states later. No engine can sample a stale value.
+  cfg_out : process(clk)
   begin
-    conv_cfg_pad_top <= (others => '0');
-    conv_cfg_pad_bottom <= (others => '0');
-    conv_cfg_pad_left <= (others => '0');
-    conv_cfg_pad_right <= (others => '0');
-    if desc_q.flags(c_flag_pad_en) = '1' then
-      conv_cfg_pad_top <= std_ulogic_vector(desc_q.pad_top);
-      conv_cfg_pad_bottom <= std_ulogic_vector(desc_q.pad_bottom);
-      conv_cfg_pad_left <= std_ulogic_vector(desc_q.pad_left);
-      conv_cfg_pad_right <= std_ulogic_vector(desc_q.pad_right);
+    if rising_edge(clk) then
+      geom_out_width <= std_ulogic_vector(out_w_q);
+      geom_out_height <= std_ulogic_vector(out_h_q);
+
+      conv_cfg_kernel_h <= std_ulogic_vector(desc_q.kernel_h);
+      conv_cfg_kernel_w <= std_ulogic_vector(desc_q.kernel_w);
+      conv_cfg_stride_h <= std_ulogic_vector(desc_q.stride_h);
+      conv_cfg_stride_w <= std_ulogic_vector(desc_q.stride_w);
+      conv_cfg_in_width <= std_ulogic_vector(desc_q.in_width);
+      conv_cfg_in_height <= std_ulogic_vector(desc_q.in_height);
+      conv_cfg_in_channels <= std_ulogic_vector(desc_q.in_channels);
+
+      -- 'FLAG_PAD_EN' gates the four padding fields as one group, exactly as
+      -- the golden model does; a descriptor with padding values but the flag
+      -- clear convolves unpadded.
+      conv_cfg_pad_top <= (others => '0');
+      conv_cfg_pad_bottom <= (others => '0');
+      conv_cfg_pad_left <= (others => '0');
+      conv_cfg_pad_right <= (others => '0');
+      if desc_q.flags(c_flag_pad_en) = '1' then
+        conv_cfg_pad_top <= std_ulogic_vector(desc_q.pad_top);
+        conv_cfg_pad_bottom <= std_ulogic_vector(desc_q.pad_bottom);
+        conv_cfg_pad_left <= std_ulogic_vector(desc_q.pad_left);
+        conv_cfg_pad_right <= std_ulogic_vector(desc_q.pad_right);
+      end if;
+
+      -- Ungated, see the port comment.
+      conv_cfg_pad_value <= std_ulogic_vector(desc_q.pad_value);
+
+      -- Fusion (section 5.3): the epilogue is configuration on the compute
+      -- engine, never a second command, so the int32 accumulator tensor is
+      -- never materialised anywhere this module can see.
+      conv_cfg_bias_en <= desc_q.flags(c_flag_bias_en);
+      conv_cfg_requant_en <= desc_q.flags(c_flag_requant_en);
+      conv_cfg_relu_en <= desc_q.flags(c_flag_relu_en);
+      conv_cfg_clamp_en <= desc_q.flags(c_flag_clamp_en);
+      conv_cfg_per_channel_en <= desc_q.flags(c_flag_per_channel_en);
+      conv_cfg_requant_scale <= std_ulogic_vector(desc_q.requant_scale);
+      conv_cfg_requant_shift <= std_ulogic_vector(desc_q.requant_shift);
+      conv_cfg_output_offset <= std_ulogic_vector(desc_q.output_offset);
+      conv_cfg_clamp_min <= std_ulogic_vector(desc_q.clamp_min);
+      conv_cfg_clamp_max <= std_ulogic_vector(desc_q.clamp_max);
+
+      pool_cfg_kernel_h <= std_ulogic_vector(desc_q.pool_kernel_h);
+      pool_cfg_kernel_w <= std_ulogic_vector(desc_q.pool_kernel_w);
+      pool_cfg_stride_h <= std_ulogic_vector(desc_q.pool_stride_h);
+      pool_cfg_stride_w <= std_ulogic_vector(desc_q.pool_stride_w);
+      pool_cfg_pad_top <= x"00";
+      if desc_q.flags(c_flag_pad_en) = '1' then
+        pool_cfg_pad_top <= std_ulogic_vector(desc_q.pad_top);
+      end if;
+      pool_cfg_pad_bottom <= x"00";
+      if desc_q.flags(c_flag_pad_en) = '1' then
+        pool_cfg_pad_bottom <= std_ulogic_vector(desc_q.pad_bottom);
+      end if;
+      pool_cfg_pad_left <= x"00";
+      if desc_q.flags(c_flag_pad_en) = '1' then
+        pool_cfg_pad_left <= std_ulogic_vector(desc_q.pad_left);
+      end if;
+      pool_cfg_pad_right <= x"00";
+      if desc_q.flags(c_flag_pad_en) = '1' then
+        pool_cfg_pad_right <= std_ulogic_vector(desc_q.pad_right);
+      end if;
+      pool_cfg_pad_value <= std_ulogic_vector(desc_q.pad_value);
+      pool_cfg_in_width <= std_ulogic_vector(desc_q.in_width);
+      pool_cfg_in_height <= std_ulogic_vector(desc_q.in_height);
+      pool_cfg_opcode <= desc_q.opcode;
+      pool_cfg_requant_scale <= std_ulogic_vector(desc_q.requant_scale);
+      pool_cfg_requant_shift <= std_ulogic_vector(desc_q.requant_shift);
+
+      ew_opcode <= desc_q.opcode;
+      ew_src0_addr <= desc_q.in_addr;
+      -- W15 is a union: 'src1_addr' for ADD, a byte count for everything else
+      -- (section 5.1, which is authoritative over section 5.2's prose).
+      ew_src1_addr <= desc_q.xfer_bytes;
+      ew_dst_addr <= desc_q.out_addr;
+      ew_lut_addr <= desc_q.weight_addr;
+      ew_xfer_bytes <= desc_q.xfer_bytes;
+      ew_in_width <= desc_q.in_width;
+      ew_in_height <= desc_q.in_height;
+      ew_in_channels <= desc_q.in_channels;
+      ew_requant_scale <= desc_q.requant_scale;
+      ew_requant_shift <= desc_q.requant_shift;
     end if;
   end process;
-
-  -- Ungated, see the port comment.
-  conv_cfg_pad_value <= std_ulogic_vector(desc_q.pad_value);
-
-  -- Fusion (section 5.3): the epilogue is configuration on the compute
-  -- engine, never a second command, so the int32 accumulator tensor is
-  -- never materialised anywhere this module can see.
-  conv_cfg_bias_en <= desc_q.flags(c_flag_bias_en);
-  conv_cfg_requant_en <= desc_q.flags(c_flag_requant_en);
-  conv_cfg_relu_en <= desc_q.flags(c_flag_relu_en);
-  conv_cfg_clamp_en <= desc_q.flags(c_flag_clamp_en);
-  conv_cfg_per_channel_en <= desc_q.flags(c_flag_per_channel_en);
-  conv_cfg_requant_scale <= std_ulogic_vector(desc_q.requant_scale);
-  conv_cfg_requant_shift <= std_ulogic_vector(desc_q.requant_shift);
-  conv_cfg_output_offset <= std_ulogic_vector(desc_q.output_offset);
-  conv_cfg_clamp_min <= std_ulogic_vector(desc_q.clamp_min);
-  conv_cfg_clamp_max <= std_ulogic_vector(desc_q.clamp_max);
-
-  pool_cfg_kernel_h <= std_ulogic_vector(desc_q.pool_kernel_h);
-  pool_cfg_kernel_w <= std_ulogic_vector(desc_q.pool_kernel_w);
-  pool_cfg_stride_h <= std_ulogic_vector(desc_q.pool_stride_h);
-  pool_cfg_stride_w <= std_ulogic_vector(desc_q.pool_stride_w);
-  pool_cfg_pad_top <=
-    std_ulogic_vector(desc_q.pad_top) when desc_q.flags(c_flag_pad_en) = '1' else x"00";
-  pool_cfg_pad_bottom <=
-    std_ulogic_vector(desc_q.pad_bottom) when desc_q.flags(c_flag_pad_en) = '1' else x"00";
-  pool_cfg_pad_left <=
-    std_ulogic_vector(desc_q.pad_left) when desc_q.flags(c_flag_pad_en) = '1' else x"00";
-  pool_cfg_pad_right <=
-    std_ulogic_vector(desc_q.pad_right) when desc_q.flags(c_flag_pad_en) = '1' else x"00";
-  pool_cfg_pad_value <= std_ulogic_vector(desc_q.pad_value);
-  pool_cfg_in_width <= std_ulogic_vector(desc_q.in_width);
-  pool_cfg_in_height <= std_ulogic_vector(desc_q.in_height);
-  pool_cfg_opcode <= desc_q.opcode;
-  pool_cfg_requant_scale <= std_ulogic_vector(desc_q.requant_scale);
-  pool_cfg_requant_shift <= std_ulogic_vector(desc_q.requant_shift);
-
-  ew_opcode <= desc_q.opcode;
-  ew_src0_addr <= desc_q.in_addr;
-  -- W15 is a union: 'src1_addr' for ADD, a byte count for everything else
-  -- (section 5.1, which is authoritative over section 5.2's prose).
-  ew_src1_addr <= desc_q.xfer_bytes;
-  ew_dst_addr <= desc_q.out_addr;
-  ew_lut_addr <= desc_q.weight_addr;
-  ew_xfer_bytes <= desc_q.xfer_bytes;
-  ew_in_width <= desc_q.in_width;
-  ew_in_height <= desc_q.in_height;
-  ew_in_channels <= desc_q.in_channels;
-  ew_requant_scale <= desc_q.requant_scale;
-  ew_requant_shift <= desc_q.requant_shift;
 
   ------------------------------------------------------------------------
   -- Counters (section 8). Every one of them is an exact event count, not

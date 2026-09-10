@@ -721,9 +721,13 @@ begin
     variable mac_taps_v : natural range 0 to c_kernel_max * c_kernel_max * g_tile_channels;
     variable num_groups_v : natural range
       0 to (c_kernel_max * c_kernel_max * g_tile_channels + g_pe_cols - 1) / g_pe_cols;
-    variable effective_base_v : natural;
-    variable idx_v : natural;
-    variable weight_lane_v : natural;
+    -- All three bounded ('shared/ModernVHDL.md', "Always constrain the
+    -- range -- no exceptions"): unconstrained they synthesise the full
+    -- 32-bit multiply/add even though every value here is a small index.
+    variable effective_base_v : natural range 0 to 2 ** c_ptr_width - 1;
+    variable idx_v : natural range
+      0 to c_max_groups_per_tile * g_pe_cols + g_pe_cols - 1;
+    variable weight_lane_v : natural range 0 to g_pe_rows * g_pe_cols - 1;
     variable final_accum_v : accum_array_t(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0);
     -- Set by the 'case' below when a new 's_window' beat is being accepted
     -- this cycle, together with the weight-row base the CURRENT beat

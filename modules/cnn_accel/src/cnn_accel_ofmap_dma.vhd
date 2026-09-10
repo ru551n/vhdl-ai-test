@@ -94,6 +94,20 @@ architecture a of cnn_accel_ofmap_dma is
   signal aw_issued_q : unsigned(31 downto 0) := (others => '0');
   signal bresp_acked_q : unsigned(31 downto 0) := (others => '0');
   signal error_latched_q : std_ulogic := '0';
+  -- Terminal-count flag: '1' exactly when the NEXT accepted 'B' response is
+  -- this request's last one.
+  --
+  -- 'shared/TimingAndResources.md', Fundamentals: "Compare against
+  -- terminal-count flags, not wide counters". 'bresp_acked_q + 1 =
+  -- expected_beats_q' is a 32-bit add and a 32-bit compare, and it used to
+  -- sit combinationally in front of 'dma_done' -- which 'cnn_accel_cmd_proc'
+  -- consumes as 'dst_done' to advance its five 32-bit pass-offset
+  -- accumulators. Post-route that made
+  -- 'ofmap_dma/bresp_acked_q -> cmd_proc/*_pass_off_q[*]/R' a 14-logic-level
+  -- family, 68 of the design's worst 400 endpoints. The compare is now
+  -- register-to-register inside this entity and the cross-module cone is
+  -- one flag.
+  signal bresp_last_q : std_ulogic := '0';
 
   -- Deliberately not cleared by 'reset' -- see proposal doc section 4.
   signal outstanding_q : unsigned(7 downto 0) := (others => '0');
@@ -176,7 +190,7 @@ begin
   aw_handshake_i <= axi_write_m2s.aw.valid and axi_write_s2m.aw.ready;
   b_handshake_i <= axi_write_m2s.b.ready and axi_write_s2m.b.valid;
   b_completes_request_i <= b_handshake_i
-    when state_q = s_active and bresp_acked_q + 1 = expected_beats_q else '0';
+    when state_q = s_active and bresp_last_q = '1' else '0';
 
 
   ------------------------------------------------------------------------------
@@ -255,6 +269,7 @@ begin
       if reset = '1' then
         aw_issued_q <= (others => '0');
         bresp_acked_q <= (others => '0');
+        bresp_last_q <= '0';
         error_latched_q <= '0';
         addr_q <= (others => '0');
         length_q <= (others => '0');
@@ -277,6 +292,10 @@ begin
               expected_beats_q <= shift_right(req_m2s.req.length, c_bytes_to_beats_shift);
               aw_issued_q <= (others => '0');
               bresp_acked_q <= (others => '0');
+              bresp_last_q <= '0';
+              if shift_right(req_m2s.req.length, c_bytes_to_beats_shift) = 1 then
+                bresp_last_q <= '1';
+              end if;
               error_latched_q <= '0';
 
               if shift_right(req_m2s.req.length, c_bytes_to_beats_shift) = 0 then
@@ -298,12 +317,18 @@ begin
 
             if b_handshake_i = '1' then
               bresp_acked_q <= bresp_acked_q + 1;
+              -- One ahead: after this acceptance, is the following one the
+              -- last? Same compare, but now register-to-register.
+              bresp_last_q <= '0';
+              if bresp_acked_q + 2 = expected_beats_q then
+                bresp_last_q <= '1';
+              end if;
 
               if axi_write_s2m.b.resp /= axi_resp_okay then
                 error_latched_q <= '1';
               end if;
 
-              if bresp_acked_q + 1 = expected_beats_q then
+              if bresp_last_q = '1' then
                 state_q <= s_idle;
               end if;
             end if;

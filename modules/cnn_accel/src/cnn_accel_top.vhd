@@ -355,6 +355,9 @@ architecture a of cnn_accel_top is
   signal pool_done : std_ulogic := '0';
   signal pool_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
   signal pool_stream_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+  -- Same link, past the elastic stage below.
+  signal pool_stream_piped_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal pool_stream_piped_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
   signal pool_out_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
   signal pool_out_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
 
@@ -1068,12 +1071,63 @@ begin
       -- been reduced and accepted.
       done => open,
 
-      s_stream_m2s => pool_stream_m2s,
-      s_stream_s2m => pool_stream_s2m,
+      s_stream_m2s => pool_stream_piped_m2s,
+      s_stream_s2m => pool_stream_piped_s2m,
 
       m_window_m2s => pool_window_m2s,
       m_window_s2m => pool_window_s2m
     );
+
+  ------------------------------------------------------------------------
+  -- Elastic stage on the POOL lane's activation ingest.
+  --
+  -- The CONV lane already has exactly this stage: 'cnn_accel_conv_core'
+  -- instantiates 's_stream_pipeline_inst' on its own 's_stream' before
+  -- handing it to its window generator. The pool lane's window generator is
+  -- instantiated directly here and had none, so its 's_stream_s2m.ready' --
+  -- a combinational function of the reservation counter 'n_res_q' and two
+  -- CARRY4s -- ran straight back into 'cnn_accel_cmd_proc's 'src_ready'
+  -- mux, from there into the physical read ports' back-pressure, the feeder
+  -- FSM, the performance counters and the watchdog reload. Post-route that
+  -- single net owned 176 of the design's worst 400 endpoints at 10-11 logic
+  -- levels and 71 % route delay.
+  --
+  -- 'shared/TimingAndResources.md' section 2, "A ready chain across several
+  -- modules is the same failure with the fix at the wrong end": the fix is a
+  -- skid/elastic register at the hierarchy boundary, not placement. This is
+  -- the same 'common.handshake_pipeline' idiom, with the same generics, as
+  -- 'conv_core's stage and as 'tm_read_pipeline_gen' below --
+  -- 'full_throughput => true', so the lane still sustains one beat per
+  -- cycle and only its latency moves, by one cycle.
+  --
+  -- Unlike 'tm_read_pipeline_gen' there is no 'done' to re-derive here: the
+  -- pool engine's completion is already taken from the far end of the
+  -- reduction pipeline ('pool_done', see the 'done => open' above), never
+  -- from beats accepted on this link.
+  ------------------------------------------------------------------------
+
+  pool_stream_pipeline_inst : entity common.handshake_pipeline
+    generic map (
+      data_width => axi_stream_data_sz,
+      full_throughput => true,
+      pipeline_control_signals => true,
+      pipeline_data_signals => true
+    )
+    port map (
+      clk => clk,
+
+      input_ready => pool_stream_s2m.ready,
+      input_valid => pool_stream_m2s.valid,
+      input_last => pool_stream_m2s.last,
+      input_data => pool_stream_m2s.data,
+
+      output_ready => pool_stream_piped_s2m.ready,
+      output_valid => pool_stream_piped_m2s.valid,
+      output_last => pool_stream_piped_m2s.last,
+      output_data => pool_stream_piped_m2s.data
+    );
+
+  pool_stream_piped_m2s.user <= (others => '-');
 
   -- The lanes are structurally identical and see identical inputs, so their
   -- readys are identical too; ANDing them is a zero-cost statement of that

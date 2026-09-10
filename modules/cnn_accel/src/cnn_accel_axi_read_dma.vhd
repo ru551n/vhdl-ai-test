@@ -102,6 +102,19 @@ architecture a of cnn_accel_axi_read_dma is
   ------------------------------------------------------------------------
 
   constant c_bytes_per_beat : positive := g_axi_data_width / 8;
+  -- log2(c_bytes_per_beat); every '/ c_bytes_per_beat' below is written
+  -- as a shift by this so no divider can be inferred. The power-of-two
+  -- property is asserted at elaboration next to the AXI 4 KiB assert.
+  function beat_shift_of(bytes : positive) return natural is
+    variable v_k : natural range 0 to 16 := 0;
+  begin
+    while 2 ** v_k < bytes loop
+      v_k := v_k + 1;
+    end loop;
+    return v_k;
+  end function;
+
+  constant c_beat_shift : natural range 0 to 8 := beat_shift_of(c_bytes_per_beat);
   constant c_max_burst_bytes : positive := axi_max_burst_length_beats * c_bytes_per_beat;
 
   -- Must be at least 2x the max burst length, not 1x: 'axi_read_throttle's
@@ -181,6 +194,52 @@ architecture a of cnn_accel_axi_read_dma is
   signal burst_bytes_q : unsigned(12 downto 0) := (others => '0');
   signal burst_beats_q : positive range 1 to axi_max_burst_length_beats := 1;
 
+  -- 'burst_bytes_q'/'burst_beats_q' are now derived by a FREE-RUNNING
+  -- pipeline stage from the registered 'addr_q'/'bytes_remaining_q' only,
+  -- never from values computed in the same cycle -- this flag says whether
+  -- that stage has caught up with the current 'addr_q'/'bytes_remaining_q'.
+  --
+  -- Registering the burst size (the previous pass) took the 4 KiB split off
+  -- the front of the 'ar.ready' loop, but the *update* of the registered
+  -- value still ran 'bytes_remaining_q - burst_bytes_q' (a 32-bit subtract,
+  -- 8 CARRY4) and fed its result straight into 'next_burst_bytes' and the
+  -- beat divide, all inside the cycle an AR is accepted -- and the accept
+  -- itself comes back through 'axi_read_throttle' from 'burst_beats_q', so
+  -- the whole thing was one 19-21 level self-loop
+  -- ('burst_beats_q_reg -> burst_beats_q_reg', -1.300 ns post-route, the
+  -- worst path in the accelerator).
+  --
+  -- 'shared/TimingAndResources.md', Fundamentals, "A self-updating value
+  -- with a multi-op body is the same problem in disguise": register the
+  -- subtraction, then derive the clamp/divide from the REGISTERED result on
+  -- the following cycle. The subtract now only feeds 'bytes_remaining_q's
+  -- own D pin (in parallel with, not in series before, the split), and the
+  -- accept path into 'burst_bytes_q'/'burst_beats_q' is gone entirely.
+  --
+  -- Cost: one idle cycle between consecutive AR beats of the same request.
+  -- A burst covers up to 'axi_max_burst_length_beats' R beats, so this is a
+  -- sub-0.5 % effect on the smallest possible burst and unmeasurable on the
+  -- 256-beat bursts every real transfer uses.
+  signal burst_valid_q : std_ulogic := '0';
+  -- ... and the first half of that stage, which is now TWO cycles deep.
+  --
+  -- Even with the accept-cycle subtract gone, the remaining cone --
+  -- '4096 - addr_q(11:0)', the saturate of 'bytes_remaining_q' at 4096, and
+  -- the three-way minimum between them and 'c_max_burst_bytes' -- was still
+  -- 11 logic levels with 4 CARRY4 and the design's worst path
+  -- ('addr_q -> burst_beats_q', -0.830 ns post-route) once the families
+  -- above it had gone. Splitting the minimum from the two subtractions that
+  -- feed it is the same rule applied one level further in: register the
+  -- subtraction, derive the clamp from the registered result.
+  --
+  -- 'to_4k_q' and 'rem_sat_q' are both free-running functions of the
+  -- registered 'addr_q'/'bytes_remaining_q' alone, exactly like the stage
+  -- they feed, so no accept-cycle logic reaches either.
+  signal to_4k_q : unsigned(12 downto 0) := (others => '0');
+  signal rem_sat_q : unsigned(12 downto 0) := (others => '0');
+  -- 'to_4k_q'/'rem_sat_q' match the current 'addr_q'/'bytes_remaining_q'.
+  signal pre_valid_q : std_ulogic := '0';
+
   signal ar_issue_active_i : std_ulogic;
   signal ar_accepted_i : std_ulogic;
 
@@ -251,23 +310,36 @@ architecture a of cnn_accel_axi_read_dma is
   -- the values actually occupy and the arithmetic collapses. Values are
   -- unchanged -- the old code computed exactly this and then zero-extended
   -- it.
+  -- Stage 1 of the burst split: bytes to the next 4 KiB boundary.
+  function bytes_to_4k(addr_low : unsigned(11 downto 0)) return unsigned is
+  begin
+    return to_unsigned(4096, 13) - resize(addr_low, 13);
+  end function;
+
+  -- Stage 1 of the burst split: 'bytes_remaining' saturated at 4096. A
+  -- zero-test on the high bits, not a 32-bit comparison -- if
+  -- 'bytes_remaining' exceeds 4096 it can never win the minimum below, so
+  -- replacing it with 4096 cannot change which term does.
+  function remaining_sat(remaining : unsigned(31 downto 0)) return unsigned is
+  begin
+    if remaining(31 downto 12) /= 0 then
+      return to_unsigned(4096, 13);
+    end if;
+    return resize(remaining(11 downto 0), 13);
+  end function;
+
+  -- Stage 2: the three-way minimum. Identical result to the single-cycle
+  -- form this replaces; only the cycle it lands in has moved.
   function next_burst_bytes(
-    addr_low : unsigned(11 downto 0);
-    remaining : unsigned(31 downto 0)
+    to_4k : unsigned(12 downto 0);
+    rem_sat : unsigned(12 downto 0)
   ) return unsigned is
-    variable v_to_4k : unsigned(12 downto 0);
     variable v_result : unsigned(12 downto 0);
   begin
-    v_to_4k := to_unsigned(4096, 13) - resize(addr_low, 13);
+    v_result := rem_sat;
 
-    if remaining(31 downto 12) /= 0 then
-      v_result := to_unsigned(4096, 13);
-    else
-      v_result := resize(remaining(11 downto 0), 13);
-    end if;
-
-    if v_to_4k < v_result then
-      v_result := v_to_4k;
+    if to_4k < v_result then
+      v_result := to_4k;
     end if;
     if to_unsigned(c_max_burst_bytes, 13) < v_result then
       v_result := to_unsigned(c_max_burst_bytes, 13);
@@ -323,12 +395,38 @@ begin
   -- from the currently latched 'addr_q'/'bytes_remaining_q'.
   ------------------------------------------------------------------------
 
+  assert 2 ** c_beat_shift = c_bytes_per_beat
+    report "cnn_accel_axi_read_dma: g_axi_data_width/8 (" &
+      positive'image(c_bytes_per_beat) & ") must be a power of two -- the " &
+      "beat count is derived by shifting, not dividing"
+    severity failure;
+
   assert c_max_burst_bytes <= 4096
     report "cnn_accel_axi_read_dma: c_max_burst_bytes exceeds the AXI 4 KiB " &
       "burst boundary, which 'next_burst_bytes' relies on"
     severity failure;
 
-  ar_issue_active_i <= '1' when (state_q = s_active and bytes_remaining_q /= 0) else '0';
+  -- 'reset' is a term here, not just an FSM input, and it has to be.
+  --
+  -- 'ar_issue_active_i' drives 'ar.valid' towards 'axi_read_throttle' and
+  -- 'axi_read_pipeline', which are RESETLESS by design: an AR they accept is
+  -- on the bus and its beats WILL come back. The clocked process below
+  -- skips its whole 'ar_accepted_i' body while 'reset' is high, so an AR
+  -- accepted in a cycle where reset is also asserted was issued without ever
+  -- being added to 'beats_issued_q' -- and therefore without being counted
+  -- into 'stale_beats_q' and drained by 's_drain_stale'. Its first beat then
+  -- leaks into the NEXT request's stream as that request's leading beat.
+  --
+  -- That hole has always been there; it only became reachable when the burst
+  -- sizing gained its second pipeline stage and the first AR of a request
+  -- moved one cycle later -- onto exactly the edge
+  -- 'tb_cnn_accel_axi_read_dma.test_reset_mid_transfer' asserts reset. The
+  -- test is right and it caught a real defect: a module being reset must not
+  -- launch a new bus transaction. Closing it here, at the one place 'ar.valid'
+  -- is formed, is both correct and cheaper than reconstructing the count.
+  ar_issue_active_i <= '1' when
+    (state_q = s_active and bytes_remaining_q /= 0 and burst_valid_q = '1'
+     and reset = '0') else '0';
   ar_accepted_i <= '1' when (ar_issue_active_i = '1' and throttle_input_s2m.ar.ready = '1') else '0';
 
   throttle_input_m2s.ar.valid <= ar_issue_active_i;
@@ -393,10 +491,34 @@ begin
     variable v_burst : unsigned(12 downto 0);
   begin
     if rising_edge(clk) then
+      -- Free-running burst-size stage. Its ONLY inputs are the registered
+      -- 'addr_q'/'bytes_remaining_q', so this cone never sits behind the
+      -- accept-cycle subtract or behind 'axi_read_throttle's 'ar.ready'.
+      -- Every later assignment to 'burst_valid_q' in this process (reset,
+      -- AR accept, request latch) overrides the '1' below, which is exactly
+      -- the intent: the stage is stale for one cycle after anything moves
+      -- 'addr_q'/'bytes_remaining_q'.
+      to_4k_q <= bytes_to_4k(addr_q(11 downto 0));
+      rem_sat_q <= remaining_sat(bytes_remaining_q);
+      pre_valid_q <= '1';
+
+      v_burst := next_burst_bytes(to_4k_q, rem_sat_q);
+      burst_bytes_q <= v_burst;
+      if v_burst = 0 then
+        -- No burst left. Dummy, safe value; never issued, because
+        -- 'ar_issue_active_i' is low whenever 'bytes_remaining_q' is 0.
+        burst_beats_q <= 1;
+      else
+        burst_beats_q <= to_integer(shift_right(v_burst, c_beat_shift));
+      end if;
+      burst_valid_q <= pre_valid_q;
+
       if reset = '1' then
         state_q <= s_idle;
         addr_q <= (others => '0');
         bytes_remaining_q <= (others => '0');
+        pre_valid_q <= '0';
+        burst_valid_q <= '0';
         total_beats_q <= (others => '0');
         r_beat_count_q <= (others => '0');
         err_pending_q <= '0';
@@ -421,16 +543,12 @@ begin
           bytes_remaining_q <= v_bytes_next;
           beats_issued_q <= beats_issued_q + burst_beats_q;
 
-          -- Size the burst after this one, from the values just computed.
-          v_burst := next_burst_bytes(v_addr_next(11 downto 0), v_bytes_next);
-          burst_bytes_q <= v_burst;
-          if v_burst = 0 then
-            -- No burst left. Dummy, safe value; never issued, because
-            -- 'ar_issue_active_i' is low whenever 'bytes_remaining_q' is 0.
-            burst_beats_q <= 1;
-          else
-            burst_beats_q <= to_integer(v_burst) / c_bytes_per_beat;
-          end if;
+          -- The burst after this one is sized by the free-running stage at
+          -- the top of this process, from 'addr_q'/'bytes_remaining_q' as
+          -- they will read NEXT cycle. Nothing but the subtract above is in
+          -- this cycle's cone.
+          pre_valid_q <= '0';
+          burst_valid_q <= '0';
         end if;
 
         if r_pop_active_i = '1' then
@@ -450,19 +568,15 @@ begin
             if req_m2s.valid = '1' then
               addr_q <= req_m2s.req.addr;
               bytes_remaining_q <= req_m2s.req.length;
-              total_beats_q <= req_m2s.req.length / to_unsigned(c_bytes_per_beat, 32);
+              -- 'c_bytes_per_beat' is a power of two (asserted below), so
+              -- this is a shift. Written as '/' it was an unsigned divide by
+              -- a 32-bit operand that Vivado is not obliged to fold.
+              total_beats_q <= shift_right(req_m2s.req.length, c_beat_shift);
 
-              -- The request's first burst. No AR can be issued in this
-              -- cycle or the next, so registering it costs nothing.
-              v_burst := next_burst_bytes(
-                req_m2s.req.addr(11 downto 0), req_m2s.req.length
-              );
-              burst_bytes_q <= v_burst;
-              if v_burst = 0 then
-                burst_beats_q <= 1;
-              else
-                burst_beats_q <= to_integer(v_burst) / c_bytes_per_beat;
-              end if;
+              -- The request's first burst is sized by the free-running
+              -- stage at the top of this process, two cycles from now.
+              pre_valid_q <= '0';
+              burst_valid_q <= '0';
               r_beat_count_q <= (others => '0');
               err_pending_q <= '0';
               beats_issued_q <= (others => '0');

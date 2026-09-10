@@ -139,7 +139,13 @@ architecture a of cnn_accel_cmd_fetch is
   signal error_code_q : err_code_t := c_err_none;
   -- Watchdog: counts cycles since 'start' was accepted; only meaningful
   -- (and only ever incremented) while 'g_timeout_cycles > 0'.
-  signal timeout_count_q : natural := 0;
+  -- Bounded, not a bare 'natural': an unconstrained 'natural' counter is a
+  -- 32-bit register with a 32-bit carry chain and a 32-bit compare against
+  -- 'g_timeout_cycles', for a value that never exceeds that generic
+  -- ('shared/ModernVHDL.md', "Always constrain the range -- no exceptions").
+  -- It saturates at the bound rather than wrapping, which is what the
+  -- '>= g_timeout_cycles' test already wanted.
+  signal timeout_count_q : natural range 0 to g_timeout_cycles := 0;
 
 begin
 
@@ -198,10 +204,14 @@ begin
               error_code_q <= c_err_timeout;
               state_q <= s_error;
             elsif instr_req_s2m.ready = '1' then
-              timeout_count_q <= timeout_count_q + 1;
+              if timeout_count_q < g_timeout_cycles then
+                timeout_count_q <= timeout_count_q + 1;
+              end if;
               state_q <= s_collect;
             else
-              timeout_count_q <= timeout_count_q + 1;
+              if timeout_count_q < g_timeout_cycles then
+                timeout_count_q <= timeout_count_q + 1;
+              end if;
             end if;
 
           when s_collect =>
@@ -209,7 +219,9 @@ begin
               error_code_q <= c_err_timeout;
               state_q <= s_error;
             else
-              timeout_count_q <= timeout_count_q + 1;
+              if timeout_count_q < g_timeout_cycles then
+                timeout_count_q <= timeout_count_q + 1;
+              end if;
 
               if s_instr_stream_m2s.valid = '1' then
                 -- Constant-bound loop with the beat index as a per-lane

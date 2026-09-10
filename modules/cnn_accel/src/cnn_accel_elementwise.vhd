@@ -698,7 +698,9 @@ begin
   fsm : process(clk)
     variable in_w64, in_h64, in_c64, n_tiles64, total64, out_w64, out_h64 : unsigned(63 downto 0);
     variable pixel_idx64, out_idx64, addr64, tmp64 : unsigned(63 downto 0);
-    variable shift_raw : natural;
+    -- 'requant_shift' is 8 bits ('shared/ModernVHDL.md', "Always constrain
+    -- the range"): unconstrained this was a 32-bit compare and add.
+    variable shift_raw : natural range 0 to 2 ** 8 - 1;
     variable bad : boolean;
     -- 's_up_next' scratch: the loop counters for the *next* pixel this
     -- state advances to (computed here so the following 's_up_req_src0'
