@@ -522,6 +522,27 @@ architecture a of cnn_accel_cmd_proc is
   -- registering it" -- the loop-invariant-hoisting half of it.
   signal n_tiles_m1_q : unsigned(15 downto 0) := (others => '0');
   signal row_words_m1_q : unsigned(15 downto 0) := (others => '0');
+  -- Transpose-buffer copies of the two frame dimensions, latched in
+  -- 'st_geom_mul' beside 'n_tiles_m1_q' and read ONLY by the tile-buffer
+  -- drain block and 'tb_last_q'. Coherent for exactly the same reason
+  -- 'n_tiles_m1_q' is: both are latched once per command, before the pass
+  -- that reads them starts.
+  --
+  -- Why they exist: at 175 MHz the drain's per-beat pointer walk
+  -- ('tb_rd_ptr_q + desc_q.in_width') and its two '- 1' bound tests all
+  -- started at the shared descriptor register, and the resulting
+  -- 'desc_q[in_width] -> rowbuf/ADDRBWRADDR' path was -0.529 ns with 8
+  -- logic levels (4 CARRY4) and 60% of its delay in pure routing --
+  -- 'desc_q' is one high-fan-out register far from this block. A local
+  -- copy both removes the two subtracts (the tests become compares
+  -- against a register) and lets the placer put the walk's source next to
+  -- the walk. 'shared/TimingAndResources.md' §2.
+  --
+  -- Wrap-around is preserved exactly as above: for a zero dimension these
+  -- hold x"FFFF", which is what the inline '- 1' produced.
+  signal tb_in_width_q : unsigned(15 downto 0) := (others => '0');
+  signal tb_in_width_m1_q : unsigned(15 downto 0) := (others => '0');
+  signal tb_in_height_m1_q : unsigned(15 downto 0) := (others => '0');
   signal wgt_tile_bytes_q : unsigned(31 downto 0) := (others => '0');
   -- 'kernel_h * kernel_w' and 'n_tiles * (kernel_h * kernel_w)', each on
   -- its own cycle.
@@ -1231,6 +1252,11 @@ begin
           n_tiles_m1_q <= resize(
             ceil_shift(desc_q.in_channels, c_word_shift), n_tiles_q'length
           ) - 1;
+          -- See the declarations: the tile-buffer drain reads these
+          -- instead of walking off 'desc_q' every beat.
+          tb_in_width_q <= desc_q.in_width;
+          tb_in_width_m1_q <= desc_q.in_width - 1;
+          tb_in_height_m1_q <= desc_q.in_height - 1;
           n_ot_q <= resize(
             ceil_shift(desc_q.out_channels, c_word_shift), n_ot_q'length
           );
@@ -1964,12 +1990,12 @@ begin
         if tb_drain_q = '1' and m_conv_stream_s2m.ready = '1' then
           if tb_tile_q = n_tiles_m1_q then
             tb_tile_q <= (others => '0');
-            if tb_col_q = desc_q.in_width - 1 then
+            if tb_col_q = tb_in_width_m1_q then
               -- Row complete: back to filling, unless the frame is done.
               tb_drain_q <= '0';
               tb_col_q <= (others => '0');
               tb_rd_ptr_q <= (others => '0');
-              if tb_row_q = desc_q.in_height - 1 then
+              if tb_row_q = tb_in_height_m1_q then
                 tb_row_q <= (others => '0');
               else
                 tb_row_q <= tb_row_q + 1;
@@ -1981,7 +2007,7 @@ begin
             end if;
           else
             tb_tile_q <= tb_tile_q + 1;
-            tb_rd_ptr_q <= tb_rd_ptr_q + desc_q.in_width;
+            tb_rd_ptr_q <= tb_rd_ptr_q + tb_in_width_q;
           end if;
         end if;
       end if;
@@ -2007,7 +2033,7 @@ begin
 
   -- Final beat of the frame: last tile of the last column of the last row.
   tb_last_q <= '1' when tb_drain_q = '1' and tb_tile_q = n_tiles_m1_q
-    and tb_col_q = desc_q.in_width - 1 and tb_row_q = desc_q.in_height - 1
+    and tb_col_q = tb_in_width_m1_q and tb_row_q = tb_in_height_m1_q
     else '0';
 
   ------------------------------------------------------------------------

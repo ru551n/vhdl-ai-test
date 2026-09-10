@@ -426,12 +426,13 @@ architecture a of cnn_accel_elementwise is
   -- and the design's second-worst endpoint after the pool reduction.
   --
   -- The stages are: 1 operand registers (which also give the DSP its A/B
-  -- registers), 2 products, 3 rounded/shifted products, 4 sum + saturate.
-  -- One shared enable 'add_pipe_en' stalls all four together when the
-  -- destination stalls -- the same structure 'cnn_accel_bias_requant'
-  -- uses, for the same reason. Throughput is unchanged at one beat per
-  -- cycle; only latency grows, by four cycles per ADD command, absorbed
-  -- by 's_add_drain'.
+  -- registers), 2 raw products (the DSP's M register), 3 cascade-added
+  -- products (the DSP's P register), 4 rounded/shifted products,
+  -- 5 sum + saturate. One shared enable 'add_pipe_en' stalls all five
+  -- together when the destination stalls -- the same structure
+  -- 'cnn_accel_bias_requant' uses, for the same reason. Throughput is
+  -- unchanged at one beat per cycle; only latency grows, by five cycles
+  -- per ADD command, absorbed by 's_add_drain'.
   --
   -- 'requant_scale_q'/'combined_shift_q' are read live rather than
   -- carried down the pipeline: both are written only in 's_idle', and the
@@ -442,9 +443,24 @@ architecture a of cnn_accel_elementwise is
   signal add_pipe_en : std_ulogic;
   signal add_accept : std_ulogic;
   signal add_active : std_ulogic;
-  signal add_valid_q : std_ulogic_vector(1 to 4) := (others => '0');
-  signal add_last_q : std_ulogic_vector(1 to 4) := (others => '0');
-  signal add_data_4 : std_ulogic_vector(g_axi_data_width - 1 downto 0);
+  -- Five stages, not four: the int8 * int32 requant multiply is 40 bits
+  -- wide, which is two cascaded DSP48E1s, and stage 2 exists purely so the
+  -- DSP's own M register sits between the multiplier and the cascade
+  -- adder. Without it the routed path ran
+  -- 'vb_1 -> DSP48E1 multiply -> PCIN of the second DSP' unregistered:
+  -- -0.530 ns at 175 MHz with ONE logic level and 77% of the delay inside
+  -- the block -- the single worst family in the design, and the only one
+  -- worse than -0.369. 'shared/TimingAndResources.md', Fundamentals:
+  -- "use the block's internal pipeline registers (input, product,
+  -- output); an unregistered product leaving a DSP block is a guaranteed
+  -- worst path."
+  --
+  -- Latency only: one extra cycle from src to dst on the ADD path,
+  -- throughput is unchanged at one beat per cycle, and the extra stage is
+  -- covered by the same 'add_pipe_en' as the rest (§5).
+  signal add_valid_q : std_ulogic_vector(1 to 5) := (others => '0');
+  signal add_last_q : std_ulogic_vector(1 to 5) := (others => '0');
+  signal add_data_5 : std_ulogic_vector(g_axi_data_width - 1 downto 0);
 
   ------------------------------------------------------------------------
   -- COPY / ACT datapath pipeline (2 stages).
@@ -613,7 +629,7 @@ begin
 
   -- One beat may enter the pipeline per cycle; the whole pipeline freezes
   -- together whenever its output stage is full and the sink is not ready.
-  add_pipe_en <= (not add_valid_q(4)) or m_dst_stream_s2m.ready;
+  add_pipe_en <= (not add_valid_q(5)) or m_dst_stream_s2m.ready;
 
   add_accept <= '1' when state_q = s_add_run
     and s_src0_stream_m2s.valid = '1' and s_src1_stream_m2s.valid = '1'
@@ -629,24 +645,29 @@ begin
       if reset = '1' then
         add_valid_q <= (others => '0');
       elsif add_pipe_en = '1' then
-        add_valid_q <= add_accept & add_valid_q(1 to 3);
-        add_last_q <= s_src0_stream_m2s.last & add_last_q(1 to 3);
+        add_valid_q <= add_accept & add_valid_q(1 to 4);
+        add_last_q <= s_src0_stream_m2s.last & add_last_q(1 to 4);
       end if;
     end if;
   end process;
 
   add_lane_gen : for l in 0 to c_bytes_per_beat - 1 generate
     signal va_1, vb_1 : signed(7 downto 0) := (others => '0');
-    signal prod_a_2, prod_b_2 : signed(c_product_width - 1 downto 0) := (others => '0');
-    signal ra_3, rb_3 : signed(c_product_width - 1 downto 0) := (others => '0');
-    signal sum_ext_3 : signed(c_sum_width - 1 downto 0);
-    signal sat_byte_3 : signed(7 downto 0);
-    signal byte_4 : std_ulogic_vector(7 downto 0) := (others => '0');
+    -- Stage 2: the raw product, nothing else. This is the register Vivado
+    -- maps onto the DSP48E1's M register, which is what puts a flip-flop
+    -- between the multiplier and the second DSP's cascade adder.
+    signal prod_a_m2, prod_b_m2 : signed(c_product_width - 1 downto 0) := (others => '0');
+    -- Stage 3: the cascade adder's output (the DSP's P register).
+    signal prod_a_3, prod_b_3 : signed(c_product_width - 1 downto 0) := (others => '0');
+    signal ra_4, rb_4 : signed(c_product_width - 1 downto 0) := (others => '0');
+    signal sum_ext_4 : signed(c_sum_width - 1 downto 0);
+    signal sat_byte_4 : signed(7 downto 0);
+    signal byte_5 : std_ulogic_vector(7 downto 0) := (others => '0');
   begin
-    -- Stage 4's input. Combinational off stage 3's registers, so the
+    -- Stage 5's input. Combinational off stage 4's registers, so the
     -- saturating add is a stage of its own rather than the tail of the
     -- shift.
-    sum_ext_3 <= resize(ra_3, c_sum_width) + resize(rb_3, c_sum_width);
+    sum_ext_4 <= resize(ra_4, c_sum_width) + resize(rb_4, c_sum_width);
 
     saturate_inst : entity math.saturate_signed
       generic map (
@@ -657,9 +678,9 @@ begin
       port map (
         clk => clk,
         input_valid => '1',
-        input_value => sum_ext_3,
+        input_value => sum_ext_4,
         result_valid => open,
-        result_value => sat_byte_3,
+        result_value => sat_byte_4,
         result_is_saturated => open
       );
 
@@ -670,18 +691,24 @@ begin
           va_1 <= signed(s_src0_stream_m2s.data(8 * l + 7 downto 8 * l));
           vb_1 <= signed(s_src1_stream_m2s.data(8 * l + 7 downto 8 * l));
 
-          prod_a_2 <= va_1 * requant_scale_q;
-          prod_b_2 <= vb_1 * requant_scale_q;
+          -- Stage 2 / stage 3: multiply, then cascade-add, one cycle
+          -- each. Split so the DSP's M register lands between them --
+          -- see 'prod_a_m2'. Bit-exact: a register never changes a value.
+          prod_a_m2 <= va_1 * requant_scale_q;
+          prod_b_m2 <= vb_1 * requant_scale_q;
 
-          ra_3 <= round_shift_right_signed(prod_a_2, combined_shift_q);
-          rb_3 <= round_shift_right_signed(prod_b_2, combined_shift_q);
+          prod_a_3 <= prod_a_m2;
+          prod_b_3 <= prod_b_m2;
 
-          byte_4 <= std_ulogic_vector(sat_byte_3);
+          ra_4 <= round_shift_right_signed(prod_a_3, combined_shift_q);
+          rb_4 <= round_shift_right_signed(prod_b_3, combined_shift_q);
+
+          byte_5 <= std_ulogic_vector(sat_byte_4);
         end if;
       end if;
     end process;
 
-    add_data_4(8 * l + 7 downto 8 * l) <= byte_4;
+    add_data_5(8 * l + 7 downto 8 * l) <= byte_5;
   end generate add_lane_gen;
 
   ------------------------------------------------------------------------
@@ -695,7 +722,7 @@ begin
   -- below rather than inline.
   dst_data_muxed <=
     sd_data_2 when sd_active = '1' else
-    add_data_4 when add_active = '1' else
+    add_data_5 when add_active = '1' else
     pixel_buf_q when state_q = s_up_run_dst else
     (g_axi_data_width - 1 downto 0 => '0');
 
@@ -704,7 +731,7 @@ begin
 
   m_dst_stream_m2s.valid <=
     sd_valid_q(2) when sd_active = '1' else
-    add_valid_q(4) when add_active = '1' else
+    add_valid_q(5) when add_active = '1' else
     '1' when state_q = s_up_run_dst else
     '0';
 
@@ -712,7 +739,7 @@ begin
     sd_last_q(2) when sd_active = '1' else
     -- src0/src1/dst were all requested with the same length ('xfer_len_q'),
     -- so their 'last' beats coincide; see entity-level comment.
-    add_last_q(4) when add_active = '1' else
+    add_last_q(5) when add_active = '1' else
     '1' when (state_q = s_up_run_dst and beat_in_burst_q = 1) else
     '0';
 

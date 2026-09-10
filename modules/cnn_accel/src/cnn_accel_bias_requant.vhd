@@ -212,7 +212,17 @@ architecture a of cnn_accel_bias_requant is
   -- inserted while the consumer keeps up.
   ------------------------------------------------------------------------
 
-  constant c_stages : positive := 7;
+  -- 8, not 7: stage 7 used to do the int8 saturate, the bypass select
+  -- AND the [lo, hi] clamp in one cycle. Post-route at 175 MHz that was
+  -- 8 logic levels spread over ~8 slices with 74 % of the delay in pure
+  -- routing (-0.521 ns, the design's worst path, and the same cone in
+  -- BOTH instantiations -- 'pool_requant' and conv's 'bias_requant' --
+  -- for 107 failing endpoints between them). Saturate and clamp are two
+  -- independent operations chained only by data, so they split cleanly
+  -- into one stage each; see the 'Into stage 7'/'Into stage 8' comments
+  -- in 'lane_gen'. 'shared/TimingAndResources.md', Fundamentals:
+  -- "Budget logic depth per stage, and check it."
+  constant c_stages : positive := 8;
 
   -- 'combined_shift' is always 15 plus a non-negative clamp, so the
   -- rounding logic may rely on shift >= 15. It really only needs >= 1 (so
@@ -245,7 +255,7 @@ architecture a of cnn_accel_bias_requant is
   type shift_pipe_t is array (1 to 4) of shift_lanes_t;
   type scale_pipe_t is array (1 to 2) of scale_lanes_t;
   type offset_pipe_t is array (1 to 4) of signed(15 downto 0);
-  type bound_pipe_t is array (1 to 6) of signed(7 downto 0);
+  type bound_pipe_t is array (1 to 7) of signed(7 downto 0);
 
   ------------------------------------------------------------------------
   -- Per-beat control signal decoding: the per-lane (scale, shift) select
@@ -287,7 +297,7 @@ architecture a of cnn_accel_bias_requant is
   signal shift_p : shift_pipe_t := (others => (others => 15));
   -- Consumed at stage 4 (bypass offset add) and stage 5 (offset + round_up).
   signal offset_p : offset_pipe_t := (others => (others => '0'));
-  -- Consumed at stage 7 (the clamp).
+  -- Consumed at stage 8 (the clamp).
   signal lo_p : bound_pipe_t := (others => (others => '0'));
   signal hi_p : bound_pipe_t := (others => (others => '0'));
 
@@ -322,6 +332,12 @@ architecture a of cnn_accel_bias_requant is
   signal offs_round_next : offs_round_lanes_t;
   signal scaled_next : product_lanes_t;
   signal final_lane : byte_lanes_t;
+  -- Stage 7: saturated / bypass-selected byte, before the [lo, hi] clamp.
+  -- The register that splits the old single-cycle saturate+clamp cone.
+  -- 'pre_clamp_next' is its combinational input, at architecture level
+  -- (not inside 'lane_gen') so the sequential process can register it.
+  signal pre_clamp_next : byte_lanes_t;
+  signal pre_clamp_7 : byte_lanes_t := (others => (others => '0'));
 
   signal next_out_data_full : std_ulogic_vector(axi_stream_data_sz - 1 downto 0);
 
@@ -548,10 +564,19 @@ begin
       );
 
     pre_clamp_l <= sat_result_l when requant_en_p(6) = '1' else bypass_6(l);
+    pre_clamp_next(l) <= pre_clamp_l;
 
-    final_lane(l) <= hi_p(6) when (pre_clamp_l > hi_p(6) or lo_p(6) > hi_p(6)) else
-                     lo_p(6) when pre_clamp_l < lo_p(6) else
-                     pre_clamp_l;
+    --------------------------------------------------------------------
+    -- Into stage 8: the [lo, hi] clamp, off stage 7's register. Reading
+    -- 'pre_clamp_7' rather than 'pre_clamp_l' is the whole split -- the
+    -- saturate cone above and the clamp's compare/carry chain below no
+    -- longer share a cycle. Bit-exact: same expression, same operands,
+    -- one cycle later.
+    --------------------------------------------------------------------
+
+    final_lane(l) <= hi_p(7) when (pre_clamp_7(l) > hi_p(7) or lo_p(7) > hi_p(7)) else
+                     lo_p(7) when pre_clamp_7(l) < lo_p(7) else
+                     pre_clamp_7(l);
 
     next_out_data_full(8 * (l + 1) - 1 downto 8 * l) <= std_ulogic_vector(final_lane(l));
 
@@ -648,9 +673,17 @@ begin
         lo_p(6) <= lo_p(5);
         hi_p(6) <= hi_p(5);
 
-        -- Stage 7: the output register.
+        -- Stage 7: the int8 saturate and the bypass select, registered
+        -- before the clamp. See 'c_stages' for why this is its own stage.
         valid_q(7) <= valid_q(6);
         last_q(7) <= last_q(6);
+        pre_clamp_7 <= pre_clamp_next;
+        lo_p(7) <= lo_p(6);
+        hi_p(7) <= hi_p(6);
+
+        -- Stage 8: the clamp result, in the output register.
+        valid_q(8) <= valid_q(7);
+        last_q(8) <= last_q(7);
         out_data_q <= next_out_data_full;
       end if;
     end if;

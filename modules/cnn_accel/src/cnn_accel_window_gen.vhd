@@ -690,6 +690,22 @@ architecture a of cnn_accel_window_gen is
   signal row_start_words_q : word_t := (others => '0');
   signal n_tiles_words_q : word_t := (others => '0');
 
+  -- The two raw products the three address seeds above are built from,
+  -- registered between setup stage 2 (which multiplies) and setup stage 3
+  -- (which does the subtract/negate and the mod). Splitting them out is
+  -- what keeps the DSP48E1 product off the same cycle as its fixup
+  -- arithmetic: at 175 MHz the cone
+  -- 'n_tiles_q -> DSP48E1 -> (- n_tiles + 1) -> col_step/rd_base' was the
+  -- worst path in the whole design (-0.631 ns, logic 3.819 ns of a
+  -- 6.235 ns path, 3 levels with the DSP unregistered in the middle).
+  -- 'shared/TimingAndResources.md' §2 says derived configuration is
+  -- computed once at command start *over as many cycles as it needs* --
+  -- one-shot is not the same as free, because a one-shot cone is still a
+  -- timed register-to-register path. Cost is zero extra cycles: stage 3
+  -- already existed and already runs before 'active_q' rises.
+  signal sw_ntiles_q : natural range 0 to 255 * 65535 := 0;
+  signal pl_ntiles_q : natural range 0 to 255 * 65535 := 0;
+
   -- Read-address accumulator, advanced once per 'kc_q' step: as 'kc_q'
   -- increments by 1 'input_col' increments by 1, so the cell address
   -- increments by exactly 'n_tiles_q'. 'rd_word_q' is the raw modular
@@ -1182,16 +1198,14 @@ begin
         col_left_start_next_q <= v_col_left + v_sw;
         col_right_start_next_q <= v_col_left + v_sw + v_kw - 1;
 
-        -- The only multiplies left in this entity, and all three are
-        -- one-shot frame setup (same argument as the divisions above).
+        -- The only multiplies left in this entity, and both are one-shot
+        -- frame setup (same argument as the divisions above). Only the
+        -- RAW PRODUCTS are formed here; the subtract/negate and the mod
+        -- that turn them into address seeds happen in stage 3, off these
+        -- registers -- see 'sw_ntiles_q'/'pl_ntiles_q' for why.
         n_tiles_words_q <= to_unsigned(v_n_tiles mod 2 ** c_addr_width, c_addr_width);
-        col_step_words_q <= to_unsigned(
-          (v_sw * v_n_tiles - v_n_tiles + 1) mod 2 ** c_addr_width, c_addr_width
-        );
-        row_start_words_q <= to_unsigned(
-          (-v_pl * v_n_tiles) mod 2 ** c_addr_width, c_addr_width
-        );
-        rd_base_q <= to_unsigned((-v_pl * v_n_tiles) mod 2 ** c_addr_width, c_addr_width);
+        sw_ntiles_q <= v_sw * v_n_tiles;
+        pl_ntiles_q <= v_pl * v_n_tiles;
 
         setup2_q <= '1';
 
@@ -1209,6 +1223,18 @@ begin
         setup2_q <= '0';
         active_q <= '1';
         launch_active_q <= '1';
+
+        -- The three address seeds, derived from the products registered in
+        -- stage 2. Written on the same edge that raises 'active_q'/
+        -- 'launch_active_q', so they are valid from the first live cycle --
+        -- nothing reads them during stage 3 itself.
+        col_step_words_q <= to_unsigned(
+          (sw_ntiles_q - to_integer(n_tiles_q) + 1) mod 2 ** c_addr_width, c_addr_width
+        );
+        row_start_words_q <= to_unsigned(
+          (-pl_ntiles_q) mod 2 ** c_addr_width, c_addr_width
+        );
+        rd_base_q <= to_unsigned((-pl_ntiles_q) mod 2 ** c_addr_width, c_addr_width);
 
         v_kh := to_integer(kernel_h_q);
         v_kw := to_integer(kernel_w_q);

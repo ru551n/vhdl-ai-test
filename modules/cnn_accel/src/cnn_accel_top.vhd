@@ -409,6 +409,10 @@ architecture a of cnn_accel_top is
   signal ew_src0_stream_s2m, ew_src1_stream_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
   signal ew_dst_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
   signal ew_dst_stream_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
+  -- Skid-buffered copy of the elementwise engine's destination stream --
+  -- see 'ew_dst_pipeline_inst' below for why it exists.
+  signal ew_dst_stream_piped_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
+  signal ew_dst_stream_piped_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
   signal ew_lut_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
   signal ew_lut_stream_s2m : axi_stream_s2m_t := axi_stream_s2m_init;
 
@@ -675,8 +679,8 @@ begin
       m_ew_src1_stream_s2m => ew_src1_stream_s2m,
       ew_dst_req_m2s => ew_dst_req_m2s,
       ew_dst_req_s2m => ew_dst_req_s2m,
-      s_ew_dst_stream_m2s => ew_dst_stream_m2s,
-      s_ew_dst_stream_s2m => ew_dst_stream_s2m,
+      s_ew_dst_stream_m2s => ew_dst_stream_piped_m2s,
+      s_ew_dst_stream_s2m => ew_dst_stream_piped_s2m,
       ew_lut_req_m2s => ew_lut_req_m2s,
       ew_lut_req_s2m => ew_lut_req_s2m,
       m_ew_lut_stream_m2s => ew_lut_stream_m2s,
@@ -1266,6 +1270,59 @@ begin
   -- request that sizes the transfer is issued before the first data beat
   -- either way, so all that changes is when the beats land.
   ------------------------------------------------------------------------
+
+  ------------------------------------------------------------------------
+  -- Skid stage on the elementwise engine's destination stream.
+  --
+  -- 'cnn_accel_elementwise' drives 'm_dst_stream_m2s.valid' combinationally
+  -- off its own 'state_q' ('add_active'/'sd_active'/'s_up_run_dst'), and
+  -- that valid enters 'cnn_accel_cmd_proc's operand-port binding mux, whose
+  -- ready comes back out to EVERY engine bound to the scratchpad write
+  -- port. The result was a combinational path from the elementwise state
+  -- register into the POOL pipeline's clock enables: at 175 MHz,
+  -- 'elementwise/state_q[4]' was the single source of 1128 failing
+  -- endpoints -- 'pool_requant/quot_5|scaled_6|prod_4/CE',
+  -- 'pool_lane_gen[*]/out_avgsum_q/CE' and more -- 10 logic levels and
+  -- ~6.2 ns, worst -0.724 ns. Pool and elementwise are alternative
+  -- engines for a command and never run in the same cycle, so that
+  -- coupling is entirely an artefact of the shared mux, not a real
+  -- dependency.
+  --
+  -- Registering the elementwise side of the mux breaks it: the mux now
+  -- sees a flip-flop, not a state decode, so no pool clock enable can
+  -- depend on elementwise's state any more. Same 'full_throughput' skid as
+  -- 'tm_write_pipeline_gen' above and for the same class of reason
+  -- ('shared/TimingAndResources.md' §2, "a ready chain across several
+  -- modules"; 'shared/DesignPatterns.md', "Ready/valid elastic stage" --
+  -- the payload here is one 'axi_stream_data_sz' beat, not a multi-kilobit
+  -- window, so the width caveat recorded there does not apply).
+  --
+  -- Bit-exact: a stream pipeline neither creates, drops nor reorders
+  -- beats; only the cycle a beat lands moves.
+  ------------------------------------------------------------------------
+
+  ew_dst_pipeline_inst : entity common.handshake_pipeline
+    generic map (
+      data_width => axi_stream_data_sz,
+      full_throughput => true,
+      pipeline_control_signals => true,
+      pipeline_data_signals => true
+    )
+    port map (
+      clk => clk,
+
+      input_ready => ew_dst_stream_s2m.ready,
+      input_valid => ew_dst_stream_m2s.valid,
+      input_last => ew_dst_stream_m2s.last,
+      input_data => ew_dst_stream_m2s.data,
+
+      output_ready => ew_dst_stream_piped_s2m.ready,
+      output_valid => ew_dst_stream_piped_m2s.valid,
+      output_last => ew_dst_stream_piped_m2s.last,
+      output_data => ew_dst_stream_piped_m2s.data
+    );
+
+  ew_dst_stream_piped_m2s.user <= (others => '-');
 
   tm_write_pipeline_gen : for w in 0 to 1 generate
     signal input_m2s, output_m2s : axi_stream_m2s_t;

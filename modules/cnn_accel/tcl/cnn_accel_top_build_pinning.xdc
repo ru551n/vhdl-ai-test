@@ -9,6 +9,15 @@
 # is the minimum Vivado needs to route and write a bitstream for the harness
 # wrapper: five pins in one bank, with the harness' own I/O timing declared
 # irrelevant.
+#
+# HISTORY: a 175 MHz stretch-target exploration (feat/timing-round3) ran a
+# structural pass against this constraint pushed to 5.714 ns, reached
+# 161.2 MHz (WNS -0.489 ns at that tighter target) and stopped at a genuine
+# placement wall -- see that branch's agent report for detail. The RTL
+# changes from that pass are retained (they are a net improvement at any
+# target), but the constraint itself is reverted here to the real 150 MHz
+# spec before merging, per the branch's own note not to carry an unmet
+# target's constraint back to main.
 # ------------------------------------------------------------------------------
 
 # ------------------------------------------------------------------------------
