@@ -395,6 +395,10 @@ architecture a of cnn_accel_top is
   signal ew_src0_addr, ew_src1_addr, ew_dst_addr, ew_lut_addr : unsigned(31 downto 0);
   signal ew_xfer_bytes : unsigned(31 downto 0);
   signal ew_in_width, ew_in_height, ew_in_channels : unsigned(15 downto 0);
+  -- DEPTH_TO_SPACE only (every other elementwise opcode is
+  -- channel-preserving and has no factor).
+  signal ew_out_channels : unsigned(15 downto 0);
+  signal ew_dts_factor : unsigned(7 downto 0);
   signal ew_requant_scale : signed(31 downto 0);
   signal ew_requant_shift : unsigned(7 downto 0);
   signal ew_done : std_ulogic := '0';
@@ -663,6 +667,8 @@ begin
       ew_in_width => ew_in_width,
       ew_in_height => ew_in_height,
       ew_in_channels => ew_in_channels,
+      ew_out_channels => ew_out_channels,
+      ew_dts_factor => ew_dts_factor,
       ew_requant_scale => ew_requant_scale,
       ew_requant_shift => ew_requant_shift,
       ew_done => ew_done,
@@ -1575,6 +1581,8 @@ begin
       in_width => ew_in_width,
       in_height => ew_in_height,
       in_channels => ew_in_channels,
+      out_channels => ew_out_channels,
+      dts_factor => ew_dts_factor,
       requant_scale => ew_requant_scale,
       requant_shift => ew_requant_shift,
 

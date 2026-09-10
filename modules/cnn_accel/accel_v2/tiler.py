@@ -91,6 +91,7 @@ from accel_v2.model import (
     RowRange,
     StripOrigin,
     Tensor,
+    DepthToSpaceOp,
     UpsampleOp,
     alias_plane_offset_total,
     alias_root,
@@ -328,7 +329,10 @@ def input_rows(op: Op, out_rows: RowRange) -> list[RowRange]:
         sh = op.stride[0]
         pad_top = op.padding[0]
         return [RowRange(a * sh - pad_top, (b - 1) * sh + kh - pad_top)]
-    if isinstance(op, UpsampleOp):
+    if isinstance(op, (UpsampleOp, DepthToSpaceOp)):
+        # Both scale the frame by `factor` in both dimensions, so the row
+        # recurrence is identical; that DEPTH_TO_SPACE also divides the
+        # channel count is orthogonal to rows.
         f = op.factor
         return [RowRange(a // f, -(-b // f))]
     if isinstance(op, (AddOp, CopyOp, ActOp)):
@@ -357,7 +361,7 @@ def output_rows(op: Op, in_rows: RowRange, *, pad_top: int, pad_bottom: int) -> 
         # row this strip computes, in the FULL tensor's coordinates.
         first = (in_rows.r0 - pad_top + op.padding[0]) // sh
         return RowRange(first, first + rows)
-    if isinstance(op, UpsampleOp):
+    if isinstance(op, (UpsampleOp, DepthToSpaceOp)):
         f = op.factor
         return RowRange(in_rows.r0 * f, in_rows.r1 * f)
     return in_rows
@@ -713,7 +717,7 @@ class _Tiler:
     #: (whole buffer in one bank), which is what every untiled tensor
     #: uses; if it then does not fit, the planner's ordinary DDR fallback
     #: takes it.
-    _UNPLANNED_REQUEST_OPS = (CopyOp, ActOp, UpsampleOp)
+    _UNPLANNED_REQUEST_OPS = (CopyOp, ActOp, UpsampleOp, DepthToSpaceOp)
 
     def _relax_unconfinable(self) -> None:
         """Undo `tag`'s plane confinement wherever an op would issue a
@@ -1061,6 +1065,11 @@ class _Tiler:
 
         if isinstance(op, UpsampleOp):
             out = self.out.upsample2x(operands[0], name=name)
+            produced = output_rows(op, requested[0].clip(op.inputs[0].height), pad_top=0, pad_bottom=0)
+            return out, produced
+
+        if isinstance(op, DepthToSpaceOp):
+            out = self.out.depth_to_space(operands[0], factor=op.factor, name=name)
             produced = output_rows(op, requested[0].clip(op.inputs[0].height), pad_top=0, pad_bottom=0)
             return out, produced
 

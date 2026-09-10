@@ -51,6 +51,11 @@ package cnn_accel_v2_pkg is
   constant c_opcode_copy     : std_ulogic_vector(7 downto 0) := OPCODE_COPY;
   constant c_opcode_act      : std_ulogic_vector(7 downto 0) := OPCODE_ACT;
 
+  -- ISA v2.2 (spec section 5.2): DEPTH_TO_SPACE / pixel-shuffle, executed
+  -- by 'cnn_accel_elementwise' alongside ADD/UPSAMPLE/COPY/ACT. Aliases
+  -- the generated constant, like every opcode above it.
+  constant c_opcode_depth_to_space : std_ulogic_vector(7 downto 0) := OPCODE_DEPTH_TO_SPACE;
+
   ------------------------------------------------------------------------
   -- Flag bit indices (W0 bits [15:8], spec section 5.1). 'c_flag_relu_en'
   -- .. 'c_flag_per_channel_en' alias the generated v1.2 'FLAG_*' constants;
@@ -161,11 +166,19 @@ package cnn_accel_v2_pkg is
     -- path only; zero (the value every v2.0 program left in this
     -- then-reserved byte) is the old zero-padding behaviour.
     pad_value       : signed(7 downto 0);
-    -- W0 byte 3 and W10 bytes 42-43: must be zero (section 5.1). The W10
-    -- gap shrank from three bytes to two when v2.1 claimed byte 41 for
-    -- 'pad_value'.
+    -- ISA v2.2, W10 byte 42: 'OPCODE_DEPTH_TO_SPACE's upscale factor r.
+    -- Read by that opcode alone; v1 hardware accepts only r = 2 and
+    -- 'cnn_accel_cmd_proc' rejects anything else with 'ERR_BAD_GEOMETRY'.
+    -- Zero (the value every earlier revision left in this then-reserved
+    -- byte) is not a legal factor, so a stale byte can never be misread
+    -- as a real one.
+    dts_factor      : unsigned(7 downto 0);
+    -- W0 byte 3 and W10 byte 43: must be zero (section 5.1). The W10 gap
+    -- shrank from three bytes to two when v2.1 claimed byte 41 for
+    -- 'pad_value', and from two to ONE when v2.2 claimed byte 42 for
+    -- 'dts_factor' -- byte 43 is all that is left of it.
     reserved_w0     : std_ulogic_vector(7 downto 0);
-    reserved_w10    : std_ulogic_vector(15 downto 0);
+    reserved_w10    : std_ulogic_vector(7 downto 0);
   end record;
 
   -- All-zero descriptor (opcode HALT, space DDR everywhere), useful as a
@@ -258,6 +271,7 @@ package body cnn_accel_v2_pkg is
       xfer_bytes      => (others => '0'),
       reserved_w0     => (others => '0'),
       pad_value       => (others => '0'),
+      dts_factor      => (others => '0'),
       reserved_w10    => (others => '0')
     );
   begin
@@ -329,13 +343,16 @@ package body cnn_accel_v2_pkg is
 
     result.pad_value       := signed(field(c_off_pad_value, 8));
 
+    result.dts_factor      := unsigned(field(c_off_dts_factor, 8));
+
     -- The two reserved gaps. Their positions are derived, not stated: W0
     -- byte 3 is the byte after the 'spaces' tag byte, and the W10 gap is
-    -- the two bytes after 'pad_value' (it was the three bytes after
-    -- 'requant_shift' until v2.1 claimed the first of them for
-    -- 'pad_value' -- exactly the revisit this comment used to predict).
+    -- the ONE byte after 'dts_factor' (it was the three bytes after
+    -- 'requant_shift' until v2.1 claimed the first for 'pad_value' and
+    -- v2.2 the second for 'dts_factor' -- exactly the revisit this
+    -- comment used to predict, twice over).
     result.reserved_w0     := field(c_off_spaces + 1, 8);
-    result.reserved_w10    := field(c_off_pad_value + 1, 16);
+    result.reserved_w10    := field(c_off_dts_factor + 1, 8);
 
     return result;
   end function;

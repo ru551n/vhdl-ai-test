@@ -267,6 +267,48 @@ def case_upsample() -> TbCase:
     return build_case("upsample", build, seed=11)
 
 
+def case_depth_to_space() -> TbCase:
+    """`DEPTH_TO_SPACE` (ISA v2.2): ESPCN's sub-pixel-convolution tail --
+    a conv that widens 8 channels to `factor**2 * 8 = 32`, then the
+    pixel-shuffle that trades those back for a 2x larger frame.
+
+    Exactly ONE output channel tile, so this isolates the inner
+    `(dy, dx)` sweep and the destination row-base recurrence from the
+    outer `c_tile_out` loop -- which `case_depth_to_space_two_tiles`
+    below then adds on top."""
+
+    def build(model: Model) -> None:
+        x = model.input(_H, _W, _C, name="x")
+        h = model.conv2d(x, 4 * _C, kernel=(3, 3), padding=(1, 1, 1, 1), name="h")
+        y = model.depth_to_space(h, name="y")
+        model.output(y)
+
+    return build_case("depth_to_space", build, seed=15)
+
+
+def case_depth_to_space_two_tiles() -> TbCase:
+    """`DEPTH_TO_SPACE` over TWO output channel tiles, on a deliberately
+    NON-SQUARE frame (4 rows x 8 columns).
+
+    Two things `case_depth_to_space` structurally cannot catch:
+
+     * the `c_tile_out` loop and the source plane stride. With one output
+       tile the stride term `plane * n_tiles_out * in_h * in_w` is
+       indistinguishable from `plane * in_h * in_w`, so a missing
+       `n_tiles_out` factor passes; with two, it does not.
+     * a transposed `in_width`/`in_height`. On the 8x8 frames every other
+       case uses, swapping the two is invisible in both the address
+       arithmetic and the golden comparison."""
+
+    def build(model: Model) -> None:
+        x = model.input(4, _W, _C, name="x")
+        h = model.conv2d(x, 8 * _C, kernel=(3, 3), padding=(1, 1, 1, 1), name="h")
+        y = model.depth_to_space(h, name="y")
+        model.output(y)
+
+    return build_case("depth_to_space_two_tiles", build, seed=16)
+
+
 def case_copy() -> TbCase:
     """`COPY` between two local buffers: pure data movement through the
     elementwise engine, with no arithmetic to hide a layout bug behind."""
@@ -341,6 +383,8 @@ CASE_BUILDERS = (
     case_conv_per_channel_scale,
     case_pool_max,
     case_upsample,
+    case_depth_to_space,
+    case_depth_to_space_two_tiles,
     case_copy,
     case_act_lut,
     case_multi_op_network,

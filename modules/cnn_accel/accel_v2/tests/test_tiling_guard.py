@@ -75,11 +75,23 @@ _CATALOGUES = (cases, cases_concat_split, cases_conv_pad, cases_error, cases_poo
 #:   convolutions with the same weights: none of those three is reachable
 #:   from an untiled graph, which is what the structural test above
 #:   independently guarantees.
-_RATIFIED_DIGEST = "541f43044a53abcab01839f2e7df80c11bced396f5052d5f4c68ba537a217695"
+#: * this digest (ISA v2.2 `DEPTH_TO_SPACE`, on top of 22e3aea):
+#:   re-ratified for ADDED CASES ONLY -- `cases.depth_to_space`,
+#:   `cases.depth_to_space_two_tiles`, `cases_error.err_dts_bad_factor`
+#:   and `cases_error.err_dts_bad_channels`, taking the catalogue from 64
+#:   to 68. Established the way this file demands rather than by
+#:   refreshing the constant: the dump was taken on the change under
+#:   test, the four new keys removed, and the remaining 64 re-hashed --
+#:   giving back 541f4304... exactly, i.e. every pre-existing case's
+#:   `local_placements`, `ddr_placements`, `pinned_placements`,
+#:   `tensor_ddr_addr`, `traffic`, `steps`, `descs` and `program_addr` is
+#:   byte-identical. Nothing in the untiled path moved; the new opcode
+#:   only added rows.
+_RATIFIED_DIGEST = "32db8b488fd0d88825b70071fb0af6a8c79a45b8b3aeb702b098bb14b84f003a"
 
 #: The number of cases the digest covers, asserted separately so that
 #: *deleting* a case cannot silently keep the digest meaningful.
-_RATIFIED_CASE_COUNT = 64
+_RATIFIED_CASE_COUNT = 68
 
 
 def _step_record(step) -> list:

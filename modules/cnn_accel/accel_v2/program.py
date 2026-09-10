@@ -49,7 +49,7 @@ import cnn_accel_model as golden
 from accel_v2 import isa
 from accel_v2.ddrmap import DdrMap
 from accel_v2.memimage import MemoryImage
-from accel_v2.model import ActOp, AddOp, Conv2dOp, CopyOp, PoolOp, UpsampleOp
+from accel_v2.model import ActOp, AddOp, Conv2dOp, CopyOp, DepthToSpaceOp, PoolOp, UpsampleOp
 from accel_v2.planner import (
     ComputeStep,
     ConstLoadStep,
@@ -402,6 +402,26 @@ def _compute_desc(
             in_channels=a.channels,
             requant_scale=op.requant_scale,
             requant_shift=op.requant_shift,
+            next_instr_addr=next_addr,
+        )
+
+    if isinstance(op, DepthToSpaceOp):
+        x = op.inputs[0]
+        # The only elementwise descriptor that carries `out_channels`:
+        # every other opcode in the family is channel-preserving, so the
+        # field is left at 0 there and the engine derives everything from
+        # `in_channels`. `dts_factor` (W10 byte 42) is ISA v2.2.
+        return isa.DescV2(
+            opcode=isa.OPCODE_DEPTH_TO_SPACE,
+            space_src0=step.input_spaces[0],
+            space_dst=step.output_space,
+            in_addr=step.input_addrs[0],
+            out_addr=step.output_addr,
+            in_width=x.width,
+            in_height=x.height,
+            in_channels=x.channels,
+            out_channels=op.output.channels,
+            dts_factor=op.factor,
             next_instr_addr=next_addr,
         )
 
