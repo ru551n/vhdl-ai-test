@@ -16,11 +16,21 @@ from accel_v2 import isa
 
 
 def test_isa_version_and_word_size() -> None:
-    # v2.1 adds the W10 'pad_value' byte and pooling padding; both were
-    # reserved-must-be-0 in v2.0, so the word size is unchanged and every
-    # v2.0 program is still valid.
-    assert isa.ISA_VERSION == 0x0201
+    # v2.2 adds the DEPTH_TO_SPACE opcode and its W10 'dts_factor' byte;
+    # both were unassigned/reserved-must-be-0 in v2.1, so the word size is
+    # unchanged and every v2.1 program is still valid.
+    assert isa.ISA_VERSION == 0x0202
     assert isa.INSTR_WORD_BYTES == 64
+
+
+def test_dts_factor_round_trips() -> None:
+    for value in (0, 2, 3, 4, 255):
+        d = isa.DescV2(opcode=isa.OPCODE_DEPTH_TO_SPACE, dts_factor=value)
+        assert isa.decode_desc(isa.encode_desc(d)).dts_factor == value
+    # Default-zero: a descriptor that never mentions dts_factor encodes the
+    # byte as 0, i.e. exactly the v2.1 reserved-zero word -- and 0 is not a
+    # legal factor, so an old program can never be misread as requesting one.
+    assert isa.encode_desc(isa.DescV2())[42] == 0
 
 
 def test_pad_value_round_trips_signed() -> None:
@@ -53,6 +63,7 @@ def test_opcodes_reuse_v12_values_and_add_v20_family() -> None:
     assert isa.OPCODES["UPSAMPLE"] == 0x14
     assert isa.OPCODES["COPY"] == 0x15
     assert isa.OPCODES["ACT"] == 0x16
+    assert isa.OPCODES["DEPTH_TO_SPACE"] == 0x17
     # Every v1.2 opcode value/name matches cnn_accel_constants exactly.
     import cnn_accel_constants as const
 

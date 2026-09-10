@@ -173,7 +173,13 @@ class DescV2:
     # i.e. exactly v2.0 behaviour. Consumed by every opcode that pads a
     # window: POOL_MAX/POOL_AVG and CONV2D/DWCONV2D/FC alike.
     pad_value: int = 0
-    # The `reserved, must be 0` gaps (W0 byte 3, W10 bytes 42-43). A
+    # ISA v2.2, W10 byte 42: DEPTH_TO_SPACE's upscale factor r. 0 -- the
+    # value every v2.1 program left in this then-reserved byte -- is not a
+    # legal factor, so it can never be misread as a real one; only
+    # DEPTH_TO_SPACE reads this field. v1 hardware validates `r == 2`
+    # only, per `cnn_accel_cmd_proc`.
+    dts_factor: int = 0
+    # The `reserved, must be 0` gaps (W0 byte 3, W10 byte 43). A
     # well-formed program always leaves these zero, and they are exposed
     # here for exactly one purpose: letting the error-case tests emit a
     # deliberately malformed program to prove the hardware raises
@@ -262,6 +268,7 @@ def encode_desc(d: DescV2) -> bytes:
     struct.pack_into("<I", buf, _OFF_SCALE_ADDR, d.scale_addr & 0xFFFFFFFF)
     struct.pack_into("<I", buf, _OFF_XFER_BYTES, d.xfer_bytes & 0xFFFFFFFF)
     struct.pack_into("<b", buf, _OFF_PAD_VALUE, d.pad_value)
+    buf[_OFF_DTS_FACTOR] = d.dts_factor & 0xFF
     return bytes(buf)
 
 
@@ -312,6 +319,7 @@ def decode_desc(data: bytes) -> DescV2:
         scale_addr=struct.unpack_from("<I", data, _OFF_SCALE_ADDR)[0],
         xfer_bytes=struct.unpack_from("<I", data, _OFF_XFER_BYTES)[0],
         pad_value=struct.unpack_from("<b", data, _OFF_PAD_VALUE)[0],
+        dts_factor=data[_OFF_DTS_FACTOR],
     )
 
 

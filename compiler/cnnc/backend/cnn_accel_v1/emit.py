@@ -174,6 +174,11 @@ class Descriptor:
     # `encode_descriptor` accepts it only as 0 -- and `lower.to_hir`
     # refuses the lowerings that would need it, naming `pad_value`.
     pad_value: int = 0
+    # ISA v2.2, W10 byte 42: `DEPTH_TO_SPACE`'s upscale factor r. Same
+    # pre-version-gate rule as `pad_value` above: on a pre-v2.2 target
+    # this is not an ISA field, so `encode_descriptor` accepts it only as
+    # 0, and only the `depth_to_space` lowering ever writes it non-zero.
+    dts_factor: int = 0
 
 
 @dataclasses.dataclass(frozen=True)

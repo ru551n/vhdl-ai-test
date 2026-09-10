@@ -174,6 +174,11 @@ class LayerDesc:
     # border tap, which for convolution is a constant `sum(w) * zp` bias
     # on every border output rather than a rounding artefact.
     pad_value: int = 0
+    # ISA v2.2, W10 byte 42: `OPCODE_DEPTH_TO_SPACE`'s upscale factor r.
+    # 0 (the reserved-must-be-0 value every earlier revision wrote) is not
+    # a legal factor, so it can never be misread as a real one; only
+    # DEPTH_TO_SPACE reads this field.
+    dts_factor: int = 0
 
     @property
     def relu_en(self) -> bool:
@@ -251,6 +256,7 @@ def encode_instruction(desc: LayerDesc) -> bytes:
     struct.pack_into("<I", buf, OFF_SCALE_ADDR, desc.scale_addr & 0xFFFFFFFF)
     struct.pack_into("<I", buf, OFF_XFER_BYTES, desc.xfer_bytes & 0xFFFFFFFF)
     struct.pack_into("<b", buf, OFF_PAD_VALUE, desc.pad_value)
+    buf[OFF_DTS_FACTOR] = desc.dts_factor & 0xFF
     return bytes(buf)
 
 
@@ -310,6 +316,7 @@ def decode_instruction(data: bytes) -> LayerDesc:
         scale_addr=struct.unpack_from("<I", data, OFF_SCALE_ADDR)[0],
         xfer_bytes=struct.unpack_from("<I", data, OFF_XFER_BYTES)[0],
         pad_value=struct.unpack_from("<b", data, OFF_PAD_VALUE)[0],
+        dts_factor=data[OFF_DTS_FACTOR],
     )
 
 
@@ -1207,6 +1214,68 @@ def upsample_nearest(input_values: list[int], desc: LayerDesc, factor: int = UPS
     return out
 
 
+#: `OPCODE_DEPTH_TO_SPACE` supports only this factor in v1 hardware
+#: (`cnn_accel_cmd_proc` rejects any other `dts_factor` with
+#: `ERR_BAD_GEOMETRY`), the same initial-scope choice `UPSAMPLE_FACTOR`
+#: made -- except `dts_factor` is a real descriptor field (W10 byte 42),
+#: so a wider factor is a validation-range change later, not another ISA
+#: revision. This reference function itself is written generically in
+#: `factor`, since the math has no dependency on 2 specifically.
+DEPTH_TO_SPACE_FACTOR = 2
+
+
+def depth_to_space(input_values: list[int], desc: LayerDesc, factor: int = DEPTH_TO_SPACE_FACTOR) -> list[int]:
+    """`OPCODE_DEPTH_TO_SPACE`: sub-pixel convolution's pixel-shuffle step.
+    Regroups an `in_height x in_width x in_channels` LOGICAL tensor,
+    where `in_channels = factor**2 * desc.out_channels`, into an
+    `(in_height*factor) x (in_width*factor) x desc.out_channels` tensor.
+
+    PLANE-MAJOR grouping (chosen over PyTorch `nn.PixelShuffle`'s
+    channel-major grouping specifically so the hardware engine never has
+    to gather/scatter individual byte lanes out of a channel tile -- see
+    the design note in `cnn_accel_elementwise.vhd`'s DEPTH_TO_SPACE
+    section): the `in_channels` input channels are `factor**2`
+    back-to-back, contiguous `out_channels`-wide PLANES, one plane per
+    `(dy, dx)` output sub-position:
+
+        cin(dy, dx, c) = (dy * factor + dx) * out_channels + c
+
+    A caller whose channels are in PyTorch's channel-major order
+    (`cin = c * factor**2 + dy * factor + dx`) must permute them into
+    plane-major order first -- at compile time, since this is a pure
+    reordering of which weight row produces which channel, not a
+    runtime operation (see the compiler frontend's handling of a
+    `PixelShuffle`-shaped TOSA import).
+
+    A pure index permutation: no arithmetic, no rounding, no saturation,
+    so there is nothing here for a second implementation to diverge on
+    (same rationale as `upsample_nearest`)."""
+    if factor < 2:
+        raise ValueError(f"DEPTH_TO_SPACE factor {factor} must be >= 2")
+    in_w, in_h, in_c = desc.in_width, desc.in_height, desc.in_channels
+    out_c = desc.out_channels
+    expected_in_c = factor * factor * out_c
+    if in_c != expected_in_c:
+        raise ValueError(
+            f"DEPTH_TO_SPACE in_channels {in_c} != factor**2 * out_channels "
+            f"= {factor}**2 * {out_c} = {expected_in_c}"
+        )
+    expected = in_w * in_h * in_c
+    if len(input_values) != expected:
+        raise ValueError(f"DEPTH_TO_SPACE input length {len(input_values)} != {in_w}*{in_h}*{in_c} = {expected}")
+    out_h, out_w = in_h * factor, in_w * factor
+    out = [0] * (out_h * out_w * out_c)
+    for y in range(in_h):
+        for x in range(in_w):
+            for dy in range(factor):
+                for dx in range(factor):
+                    plane = dy * factor + dx
+                    src = (y * in_w + x) * in_c + plane * out_c
+                    dst = ((y * factor + dy) * out_w + (x * factor + dx)) * out_c
+                    out[dst : dst + out_c] = input_values[src : src + out_c]
+    return out
+
+
 def act_lut(input_values: list[int], lut: list[int]) -> list[int]:
     """`OPCODE_ACT`: the standalone 256-entry signed int8 -> int8 lookup
     table (`FLAG_ACT_LUT_EN`), indexed by the input byte's UNSIGNED value,
@@ -1397,6 +1466,18 @@ def run_layer(memory: bytearray, desc: LayerDesc) -> None:
             output = act_lut(input_values, lut)
             out_w, out_h = in_w, in_h
         out_c = in_c  # all three are channel-preserving
+
+    elif desc.opcode == OPCODE_DEPTH_TO_SPACE:
+        # NOT channel-preserving (unlike ADD/UPSAMPLE/ACT above): the
+        # whole point of this opcode is trading channels for spatial
+        # resolution, so `out_c` comes from the descriptor, not `in_c`.
+        in_size = activation_bytes(in_w, in_h, in_c)
+        input_bytes = memory[desc.in_addr : desc.in_addr + in_size]
+        input_planes = [b - 256 if b >= 128 else b for b in input_bytes]
+        input_values = unpack_activation_planes(input_planes, in_w, in_h, in_c)
+        output = depth_to_space(input_values, desc, factor=desc.dts_factor)
+        out_c = desc.out_channels
+        out_w, out_h = in_w * desc.dts_factor, in_h * desc.dts_factor
 
     elif desc.opcode in (OPCODE_LOAD, OPCODE_STORE, OPCODE_LOADW):
         # The DMA family only means anything with two address spaces to
