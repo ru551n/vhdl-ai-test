@@ -498,13 +498,14 @@ Per stage (`--dump-after-all` writes `NN_<stage>.txt` + `.json`):
 |---|---|---|
 | parsed MLIR | `00_mlir.txt` | generic form only; every SSA use defined; result types match op signature |
 | imported GIR | `01_gir.txt` | shapes consistent (conv output = formula), dtypes ∈ {i8,i32}, N=1, consts present for zp/mult/shift, quant params integer, `scale32` |
-| normalized GIR | `02_normalize.txt` | no identity clamp; still verifies |
-| legalized GIR | `03_legalize.txt` | every rescale has `shift >= 15`, mult < 2^31, rounding ∈ accepted set |
-| fused GIR | `04_fuse.txt` | every `fused_conv`'s epilogue ∈ target `epilogue`; `interp` equivalence test |
-| HIR (mapped) | `05_hir.txt` | every op has a `unit` whose capability list admits its params; every constraint satisfied |
-| HIR (scheduled) | `06_sched.txt` | `seq` total order; every dep has smaller `seq`; every read buffer written earlier or is input/const |
-| HIR (planned) | `07_memplan.txt` | §8 verifier |
-| program | `08_program.txt` (decoded descriptors) | `decode(encode(d)) == d`; `next_instr_addr` chain ends in `HALT`; all addresses ∈ planned buffers; reserved bytes 0 |
+| channel-permuted GIR | `02_depth_to_space_channels.txt` | every `depth_to_space` that has a permutable producing conv is `plane_major`; `interp` equivalence test |
+| normalized GIR | `03_normalize.txt` | no identity clamp; still verifies |
+| legalized GIR | `04_legalize_rescale.txt` | every rescale has `shift >= 15`, mult < 2^31, rounding ∈ accepted set |
+| fused GIR | `05_fuse.txt` | every `fused_conv`'s epilogue ∈ target `epilogue`; `interp` equivalence test |
+| HIR (mapped) | `06_hir.txt` | every op has a `unit` whose capability list admits its params; every constraint satisfied |
+| HIR (scheduled) | `07_sched.txt` | `seq` total order; every dep has smaller `seq`; every read buffer written earlier or is input/const |
+| HIR (planned) | `08_memplan.txt` | §8 verifier |
+| program | `09_program.txt` (decoded descriptors) | `decode(encode(d)) == d`; `next_instr_addr` chain ends in `HALT`; all addresses ∈ planned buffers; reserved bytes 0 |
 
 End-to-end: the equality chain of §6/§10, with (a) fixed fixtures (golden
 outputs committed), (b) randomized weights/inputs with fixed seeds, (c)
@@ -596,7 +597,7 @@ TESTS: 3 planner cases, 4 verifier negative cases, determinism (two runs identic
 **M8 — backend `cnn_accel_v1` + CLI + MVP end-to-end**
 INPUT: M7, `cnn_accel_model.py`.
 TASK: `emit.py` (HIR → `LayerDesc` list via `cnn_accel_model.encode_program`, constants blob, manifest), `run.py` (memory image → `run_program` → output tensor), `driver.py`/`cli.py` (`cnnc compile x.mlir --target cnn_accel_v1 --out dir --dump-after-all`).
-ACCEPTANCE: **MVP**: fixture compiled; `run.py` output == `interp` output == IREE output (byte-exact) for 3 seeds; decoded descriptors match HIR params; `08_program.txt` shows `CONV2D` + `HALT`. Note: passes only after H0 (until then the target refuses; test marked `xfail(reason="H0 pending")` so the gate is visible, not hidden).
+ACCEPTANCE: **MVP**: fixture compiled; `run.py` output == `interp` output == IREE output (byte-exact) for 3 seeds; decoded descriptors match HIR params; `09_program.txt` shows `CONV2D` + `HALT`. Note: passes only after H0 (until then the target refuses; test marked `xfail(reason="H0 pending")` so the gate is visible, not hidden).
 TESTS: e2e ×3 seeds, decode round-trip, CLI smoke test producing all 9 dumps.
 
 **M9 — two-layer + stride-2 + Cin=3 fixtures**

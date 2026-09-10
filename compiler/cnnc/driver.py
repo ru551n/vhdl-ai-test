@@ -1,11 +1,14 @@
 """End-to-end TOSA -> `cnn_accel_v1` compile driver (doc/tosa_compiler_plan.md
 §11 table, §13 M8).
 
-`compile_tosa` runs every stage in order -- parse, import, normalize,
-legalize_rescale, fuse, to_hir, schedule, plan_memory, emit -- and, when
-`dump_after_all=True`, writes the numbered `NN_<stage>.txt`/`.json` dumps
-§11 specifies (`00_mlir` .. `08_program`; `02`-`04` are written by
-`passes.framework.run_pipeline` itself, keyed by each pass's own `.name`).
+`compile_tosa` runs every stage in order -- parse, import,
+depth_to_space_channels, normalize, legalize_rescale, fuse, to_hir,
+schedule, plan_memory, emit -- and, when `dump_after_all=True`, writes the
+numbered `NN_<stage>.txt`/`.json` dumps §11 specifies (`00_mlir` ..
+`09_program`; `02`-`05` are written by `passes.framework.run_pipeline`
+itself, keyed by each pass's own `.name`, so the post-pass indices move
+whenever the pipeline gains or loses a pass -- as they did when
+`PermuteDepthToSpaceChannelsPass` was added).
 `program.bin`/`constants.bin`/`manifest.json` are written to `out_dir`
 whenever one is given, independent of `dump_after_all` -- those are the
 compiler's actual output artifacts, not debug dumps.
@@ -96,24 +99,24 @@ def compile_tosa(
 
     hir_mapped = to_hir(fused_graph, target)
     if dump_dir is not None:
-        _write_text(dump_dir / "05_hir.txt", print_hir(hir_mapped))
-        _write_json(dump_dir / "05_hir.json", hir_to_json(hir_mapped))
+        _write_text(dump_dir / "06_hir.txt", print_hir(hir_mapped))
+        _write_json(dump_dir / "06_hir.json", hir_to_json(hir_mapped))
 
     hir_scheduled = schedule(hir_mapped)
     if dump_dir is not None:
-        _write_text(dump_dir / "06_sched.txt", print_hir(hir_scheduled))
-        _write_json(dump_dir / "06_sched.json", hir_to_json(hir_scheduled))
+        _write_text(dump_dir / "07_sched.txt", print_hir(hir_scheduled))
+        _write_json(dump_dir / "07_sched.json", hir_to_json(hir_scheduled))
 
     hir_planned = plan_memory(hir_scheduled, target)
     if dump_dir is not None:
-        _write_text(dump_dir / "07_memplan.txt", print_hir(hir_planned))
-        _write_json(dump_dir / "07_memplan.json", hir_to_json(hir_planned))
+        _write_text(dump_dir / "08_memplan.txt", print_hir(hir_planned))
+        _write_json(dump_dir / "08_memplan.json", hir_to_json(hir_planned))
 
     program = emit_program(hir_planned, target)
     if dump_dir is not None:
         program_addr = hir_planned.buffer(hir_planned.program).addr
         descriptors = decode_program(program.program_bytes, target, program_addr=program_addr)
-        _write_text(dump_dir / "08_program.txt", print_program(descriptors, target, program_addr=program_addr))
+        _write_text(dump_dir / "09_program.txt", print_program(descriptors, target, program_addr=program_addr))
 
     if out_path is not None:
         (out_path / "program.bin").write_bytes(program.program_bytes)

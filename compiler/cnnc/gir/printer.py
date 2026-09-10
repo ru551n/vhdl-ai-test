@@ -9,7 +9,18 @@ import dataclasses
 import hashlib
 import json
 
-from cnnc.gir.ir import AddAttrs, Attrs, ConvAttrs, FusedConvAttrs, Graph, Op, PoolAttrs, RescaleParams, Tensor
+from cnnc.gir.ir import (
+    AddAttrs,
+    Attrs,
+    ConvAttrs,
+    DepthToSpaceAttrs,
+    FusedConvAttrs,
+    Graph,
+    Op,
+    PoolAttrs,
+    RescaleParams,
+    Tensor,
+)
 
 
 def _shape_dtype(shape: tuple[int, ...], dtype: str) -> str:
@@ -87,6 +98,12 @@ def _format_op(graph: Graph, op: Op) -> str:
         return f"{op.id} = table {operands} : {shape_str}"
     if op.kind == "upsample":
         return f"{op.id} = upsample {operands} {{factor={op.attrs.factor}}} : {shape_str}"
+    if op.kind == "depth_to_space":
+        dts: DepthToSpaceAttrs = op.attrs
+        return (
+            f"{op.id} = depth_to_space {operands} "
+            f"{{factor={dts.factor} channel_order={dts.channel_order}}} : {shape_str}"
+        )
     if op.kind == "concat":
         return f"{op.id} = concat {operands} {{axis={op.attrs.axis}}} : {shape_str}"
     if op.kind == "slice":

@@ -262,7 +262,9 @@ def test_run_pipeline_writes_numbered_dumps(tmp_path):
     ctx = PassContext(target=target, dump_dir=tmp_path)
     run_pipeline(g, default_pipeline(target), ctx)
 
-    for idx, name in ((2, "normalize"), (3, "legalize_rescale"), (4, "fuse")):
+    for idx, name in (
+        (2, "depth_to_space_channels"), (3, "normalize"), (4, "legalize_rescale"), (5, "fuse")
+    ):
         txt = tmp_path / f"{idx:02d}_{name}.txt"
         js = tmp_path / f"{idx:02d}_{name}.json"
         assert txt.is_file(), f"missing {txt}"
@@ -288,5 +290,12 @@ def test_run_pipeline_verifies_after_every_pass():
 
 def test_default_pipeline_contains_normalize_legalize_fuse():
     passes = default_pipeline(load_target("cnn_accel"))
-    assert [p.name for p in passes] == ["normalize", "legalize_rescale", "fuse"]
-    assert isinstance(passes[2], FusePass)
+    # `depth_to_space_channels` runs first, on the graph exactly as
+    # imported: it rewrites the constants of the convolution feeding a
+    # pixel shuffle, which is easiest to find before `fuse` folds that
+    # convolution's epilogue in and before `normalize` may delete the
+    # clamp between the two.
+    assert [p.name for p in passes] == [
+        "depth_to_space_channels", "normalize", "legalize_rescale", "fuse"
+    ]
+    assert isinstance(passes[-1], FusePass)

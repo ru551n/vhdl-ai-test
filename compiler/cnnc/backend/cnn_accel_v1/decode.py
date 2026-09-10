@@ -5,7 +5,7 @@ row 08, §13 M8).
 64-byte `Descriptor` at a time and following its own `next_instr_addr`
 (mirroring `cnn_accel_model.run_program`'s fetch loop) until `HALT`,
 using only `target.isa` -- this module never imports `cnn_accel_model`.
-`print_program` renders the `08_program.txt` dump.
+`print_program` renders the `09_program.txt` dump.
 """
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ def _flag_names(flags: int, target: "Target") -> list[str]:
 
 def print_program(descriptors: tuple[Descriptor, ...], target: "Target", *, program_addr: int = 0) -> str:
     """Deterministic text dump matching doc/tosa_compiler_plan.md §11's
-    `08_program.txt` row: one line per decoded descriptor."""
+    `09_program.txt` row: one line per decoded descriptor."""
     opcode_name = {v: k for k, v in target.isa.opcodes.items()}
     word = target.isa.instr_word_bytes
     lines = []

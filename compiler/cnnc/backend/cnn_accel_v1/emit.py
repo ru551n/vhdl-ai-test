@@ -89,6 +89,16 @@ _ACT_FIELD_PARAMS = ("in_width", "in_height", "in_channels")
 # checked at lowering time rather than encoded here.
 _UPSAMPLE_FIELD_PARAMS = ("in_width", "in_height", "in_channels")
 
+# `HirOp.params` keys an ISA v2.2 `depth_to_space` op sets. The input
+# geometry, like every other elementwise opcode -- PLUS `out_channels`
+# and `dts_factor`, because this is the one opcode in the family whose
+# output channel count is not its input's, and the hardware's defensive
+# geometry re-check reads both (`cnn_accel_elementwise.vhd`). The output
+# spatial size stays implied (`factor` x in both dimensions).
+_DEPTH_TO_SPACE_FIELD_PARAMS = (
+    "in_width", "in_height", "in_channels", "out_channels", "dts_factor",
+)
+
 # ISA v2.1 W10 byte 41, opcode-agnostic (see `Descriptor.pad_value`).
 _PAD_VALUE_PARAM = "pad_value"
 
@@ -252,6 +262,7 @@ def _reject_unknown_params(op: HirOp, isa_version: str) -> None:
         | set(_ADD_FIELD_PARAMS)
         | set(_ACT_FIELD_PARAMS)
         | set(_UPSAMPLE_FIELD_PARAMS)
+        | set(_DEPTH_TO_SPACE_FIELD_PARAMS)
         | set(_FLAG_PARAM_TO_FLAG_NAME)
         | {_PAD_VALUE_PARAM}
     )
@@ -573,6 +584,62 @@ def _build_upsample_descriptor(
     )
 
 
+def _build_depth_to_space_descriptor(
+    op: HirOp, module: HirModule, target: "Target", program_addr: int, index: int, isa_version: str
+) -> Descriptor:
+    """One ISA v2.2 `DEPTH_TO_SPACE` instruction: one ifmap in, one ofmap
+    `dts_factor` times larger in both spatial dimensions and
+    `dts_factor**2` times narrower in channels.
+
+    The one elementwise opcode that writes `out_channels`: UPSAMPLE/ADD/
+    ACT are all channel-preserving and leave it at 0, whereas here the
+    input geometry alone does not determine the output. `dts_factor`
+    (W10 byte 42) is likewise the only per-instruction knob -- and it is
+    still `lower.to_hir` that checks the value against what the hardware
+    implements, since a v1 device rejects anything but its own factor.
+
+    No flags, no weights, no requant: like UPSAMPLE this is a pure index
+    permutation, so `xfer_bytes` stays 0 (a shaped opcode, not a byte
+    mover)."""
+    _reject_unknown_params(op, isa_version)
+
+    params = op.params
+    if len(op.reads) != 1:
+        raise CompilerError(
+            f"depth_to_space op must read exactly 1 buffer (input), got {len(op.reads)}",
+            op_id=op.id, stage=_STAGE,
+        )
+    if len(op.writes) != 1:
+        raise CompilerError(
+            f"depth_to_space op must write exactly 1 buffer, got {len(op.writes)}",
+            op_id=op.id, stage=_STAGE,
+        )
+    in_buf = module.buffer(op.reads[0])
+    out_buf = module.buffer(op.writes[0])
+    for label, buf in (("in", in_buf), ("out", out_buf)):
+        if buf.addr is None:
+            raise CompilerError(f"buffer {buf.id!r} ({label}) has no addr", op_id=op.id, stage=_STAGE)
+
+    opcode = target.isa.opcodes.get("DEPTH_TO_SPACE")
+    if opcode is None:
+        raise CapabilityError("target ISA has no DEPTH_TO_SPACE opcode", op_id=op.id, stage=_STAGE)
+
+    for key in _DEPTH_TO_SPACE_FIELD_PARAMS:
+        if key not in params:
+            raise CompilerError(
+                f"depth_to_space op missing required param {key!r}", op_id=op.id, stage=_STAGE
+            )
+
+    return Descriptor(
+        opcode=opcode,
+        flags=_assemble_flags(op, target),
+        in_addr=in_buf.addr,
+        out_addr=out_buf.addr,
+        next_instr_addr=program_addr + (index + 1) * target.isa.instr_word_bytes,
+        **{key: params[key] for key in _DEPTH_TO_SPACE_FIELD_PARAMS},
+    )
+
+
 def _isa_version(target: "Target", ops: list) -> str:
     versions = {target.unit(op.unit).isa_version for op in ops}
     if not versions:
@@ -690,6 +757,7 @@ def emit_program(module: HirModule, target: "Target") -> Program:
         "add": _build_add_descriptor,
         "act": _build_act_descriptor,
         "upsample": _build_upsample_descriptor,
+        "depth_to_space": _build_depth_to_space_descriptor,
     }
     for index, op in enumerate(ops_sorted):
         builder = builders.get(op.kind)

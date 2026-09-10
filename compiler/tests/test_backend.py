@@ -4,7 +4,7 @@ row 08, §13 M8.
 
 MVP acceptance (§13 M8): the fixture compiles; `run_program` output ==
 `gir.interp` output == IREE output (byte-exact) for 3 seeds; decoded
-descriptors match the emitted ones and the HIR params; `08_program.txt`
+descriptors match the emitted ones and the HIR params; `09_program.txt`
 shows `CONV2D` + `HALT`. HW milestone H0 (half-up rounding) has landed
 on the real target, so these run directly against `cnn_accel_v1`
 (the `target` fixture from `tests/conftest.py`), no rounding-gate
