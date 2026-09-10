@@ -344,7 +344,7 @@ begin
         -- expected to size its own transfers, never emit an empty one):
         -- report it the same way as a bank-crossing/out-of-range-bank
         -- request (severity 'error', run continues) rather than let it
-        -- vanish into the 'beats = 0' no-op path below.
+        -- vanish into the 'raw_beats = 0' no-op path below.
         assert raw_beats /= 0
           report "cnn_accel_tensor_mem: w0 request has zero length; a zero-length " &
             "request is a caller bug"
@@ -361,7 +361,37 @@ begin
           beats := raw_beats;
         end if;
 
-        if beats = 0 then
+        -- 'raw_beats /= 0', not 'beats /= 0' -- the two are the same
+        -- predicate, but only this spelling keeps the request decode out
+        -- of the accept path.
+        --
+        -- Why they are equal. 'beats' is 'raw_beats' clamped to the
+        -- addressed bank:
+        --   * clamp branch: 'beats = g_bank_words - decode.offset', and
+        --     'decode.offset' is a 'word_off_t' (0 .. g_bank_words - 1),
+        --     so this is at least 1 and can never be zero;
+        --   * pass-through branch: 'beats = raw_beats' exactly.
+        -- So 'beats = 0' holds in the pass-through branch alone, and
+        -- there only when 'raw_beats' is already zero.
+        --
+        -- Why it matters. This predicate gates 'wN_busy'/'rN_busy', and
+        -- 'ready' is 'not busy' -- so it lands on the clock-enable of
+        -- every register written here, and on the accept term of the
+        -- whole channel. Spelled over 'beats' it drags the clamp with
+        -- it: the bank-crossing compare 'decode.offset + raw_beats >
+        -- g_bank_words' and the subtract behind it are a six-deep CARRY4
+        -- chain, and routed P&R put exactly that chain (14 logic levels,
+        -- request register in 'cnn_accel_top' to these CE pins) on the
+        -- design's worst setup path. Spelled over 'raw_beats' the
+        -- predicate is an OR-reduce of the byte length -- two LUT levels,
+        -- no carry chain -- and the clamp arithmetic keeps only the D
+        -- inputs, where it has a full cycle and a short local route.
+        --
+        -- 'beats' is still what gets *stored*; only the zero test moved.
+        -- See shared/TimingAndResources.md 4, "Keep arithmetic off the
+        -- enables", and hdl-modules' handshake conventions on not making
+        -- 'ready' a function of the payload.
+        if raw_beats = 0 then
           w0_done_q <= '1';
         else
           w0_busy <= '1';
@@ -401,7 +431,7 @@ begin
         raw_beats := to_integer(w1_req_m2s.req.length) / c_bytes_per_word;
 
         -- See 'write_fsm_0' for why this is asserted rather than just
-        -- silently falling into the 'beats = 0' no-op path below.
+        -- silently falling into the 'raw_beats = 0' no-op path below.
         assert raw_beats /= 0
           report "cnn_accel_tensor_mem: w1 request has zero length; a zero-length " &
             "request is a caller bug"
@@ -418,7 +448,9 @@ begin
           beats := raw_beats;
         end if;
 
-        if beats = 0 then
+        -- See 'write_fsm_0' for why the zero test is spelled over
+        -- 'raw_beats' and not over the clamped 'beats'.
+        if raw_beats = 0 then
           w1_done_q <= '1';
         else
           w1_busy <= '1';
@@ -725,7 +757,7 @@ begin
           -- A zero-length read is worse than the write-side equivalent:
           -- there is no beat to carry a 'last', so 'r0_done' would never
           -- pulse and a requester waiting on it would hang forever (see
-          -- 'beats /= 0' below). Asserted the same way as a bank-crossing/
+          -- 'raw_beats /= 0' below). Asserted the same way as a bank-crossing/
           -- out-of-range-bank request (severity 'error', run continues)
           -- so the caller bug is visible without turning a bad program
           -- into a stopped simulation.
@@ -745,7 +777,9 @@ begin
             beats := raw_beats;
           end if;
 
-          if beats /= 0 then
+          -- 'raw_beats /= 0' rather than 'beats /= 0': the same
+          -- predicate, kept off the clock enables. See 'write_fsm_0'.
+          if raw_beats /= 0 then
             r0_busy <= '1';
             r0_bank <= decode.bank;
             r0_offset_next <= decode.offset;
@@ -832,7 +866,9 @@ begin
             beats := raw_beats;
           end if;
 
-          if beats /= 0 then
+          -- 'raw_beats /= 0' rather than 'beats /= 0': the same
+          -- predicate, kept off the clock enables. See 'write_fsm_0'.
+          if raw_beats /= 0 then
             r1_busy <= '1';
             r1_bank <= decode.bank;
             r1_offset_next <= decode.offset;

@@ -1129,9 +1129,6 @@ begin
 
   pool_stream_piped_m2s.user <= (others => '-');
 
-  -- The lanes are structurally identical and see identical inputs, so their
-  -- readys are identical too; ANDing them is a zero-cost statement of that
-  -- invariant rather than real arbitration.
   req_in_m2s(c_req_load) <= load_req_m2s;
   req_in_m2s(c_req_wgt) <= wgt_req_m2s;
   req_in_m2s(c_req_store) <= store_req_m2s;
@@ -1311,7 +1308,57 @@ begin
     end generate;
   end generate;
 
-  pool_window_s2m.ready <= and pool_lane_ready_vec;
+  ------------------------------------------------------------------------
+  -- Pool-window ready: one lane's, not the AND of all of them.
+  --
+  -- The lanes are structurally identical and see identical inputs -- the
+  -- same 'valid', the same 'first_tile'/'last_tile', the same
+  -- configuration -- and a lane's 'ready' is a function of its occupancy
+  -- counter alone, never of the activation values it was handed. So
+  -- 'pool_lane_ready_vec' is 'g_tile_channels' copies of a single bit,
+  -- and taking lane 0 is not a weakening of the AND: it is the same bit.
+  --
+  -- The AND was previously described here as "a zero-cost statement of
+  -- that invariant rather than real arbitration". The invariant is real;
+  -- the zero-cost part was not. Routed P&R put the reduction on the
+  -- design's worst setup path:
+  --
+  --   pool_lane_gen[0].pool_inst/buf_count_q  (lane 0's occupancy)
+  --     -> lane 0's 'ready'
+  --     -> the reduction, which placement had scattered across the lanes
+  --     -> 'pool_window_s2m.ready', back at the top level
+  --     -> 'pool_window_gen_inst/walk_start' (fanout 67)
+  --     -> the reset pin of 'out_col_q', the output-column counter.
+  --
+  -- Eight logic levels, but 5.0 ns of the 6.4 ns was routing: the AND
+  -- made a signal that lives in one lane depend on all the others, so the
+  -- chain crossed the die to collect bits it already knew, then crossed
+  -- back to steer the walk. Reading one lane deletes those hops and the
+  -- LUTs that performed them, and costs nothing -- no register, no
+  -- latency, no extra logic.
+  --
+  -- What is *not* free is the assumption, so it is checked rather than
+  -- trusted: 'pool_lane_ready_check' below fails the run the moment two
+  -- lanes disagree. That is a strictly better deal than the AND, which
+  -- silently absorbed a divergence into a stall and would have turned a
+  -- lane bug into a mysterious throughput loss instead of a test failure.
+  ------------------------------------------------------------------------
+
+  pool_window_s2m.ready <= pool_lane_ready_vec(0);
+
+  pool_lane_ready_check : process(clk)
+  begin
+    if rising_edge(clk) then
+      for lane in pool_lane_ready_vec'range loop
+        assert pool_lane_ready_vec(lane) = pool_lane_ready_vec(0)
+          report "cnn_accel_top: pool lane " & natural'image(lane) & " disagrees with " &
+            "lane 0 about 'ready'; the pool lanes are required to be in lockstep, and " &
+            "'pool_window_s2m.ready' is taken from lane 0 alone"
+          severity failure;
+      end loop;
+    end if;
+  end process;
+
 
   pool_lane_gen : for lane in 0 to g_tile_channels - 1 generate
 

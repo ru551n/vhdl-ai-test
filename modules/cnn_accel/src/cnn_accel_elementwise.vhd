@@ -325,6 +325,31 @@ architecture a of cnn_accel_elementwise is
   signal n_tiles_q : unsigned(31 downto 0) := (others => '0');
   signal in_w_q : unsigned(31 downto 0) := (others => '0');
   signal in_h_q : unsigned(31 downto 0) := (others => '0');
+
+  -- The same three bounds, less one, registered at the same instant as
+  -- the bounds themselves.
+  --
+  -- The UPSAMPLE raster loop asks "is this counter at its last value?"
+  -- once per pixel, three times over -- against 'in_w_q - 1',
+  -- 'in_h_q - 1' and 'n_tiles_q - 1'. Spelled inline those are three
+  -- 32-bit subtracts feeding three 32-bit compares, rebuilt every cycle
+  -- out of values that have not changed since the descriptor was
+  -- decoded, and routed P&R made exactly that the design's worst setup
+  -- path: 'in_w_q' to the reset pin of 'up_row_base_q', twelve logic
+  -- levels of which six were CARRY4.
+  --
+  -- The bounds are loop invariants -- written once in 's_decode' and
+  -- read-only for the whole descriptor -- so the subtract belongs there,
+  -- once, and the loop keeps only the compares. Wrap-around is preserved
+  -- rather than avoided: for a zero bound these hold 'x"FFFFFFFF"',
+  -- exactly what the inline '- 1' produced, so the guarded-by-
+  -- 'geom_zero_q' degenerate case behaves bit-identically.
+  --
+  -- See shared/TimingAndResources.md 2, "Bound the arithmetic before
+  -- registering it" -- the loop-invariant-hoisting half of it.
+  signal n_tiles_m1_q : unsigned(31 downto 0) := (others => '0');
+  signal in_w_m1_q : unsigned(31 downto 0) := (others => '0');
+  signal in_h_m1_q : unsigned(31 downto 0) := (others => '0');
   signal out_w_q : unsigned(31 downto 0) := (others => '0');
   signal out_h_q : unsigned(31 downto 0) := (others => '0');
   signal c_tile_q : unsigned(31 downto 0) := (others => '0');
@@ -787,6 +812,13 @@ begin
                 n_tiles_q <= resize(n_tiles64, 32);
                 in_w_q <= resize(in_w64, 32);
                 in_h_q <= resize(in_h64, 32);
+
+                -- See the declarations: the raster loop's three
+                -- "is this the last one?" compares read these instead of
+                -- rebuilding the subtract every cycle.
+                n_tiles_m1_q <= resize(n_tiles64, 32) - 1;
+                in_w_m1_q <= resize(in_w64, 32) - 1;
+                in_h_m1_q <= resize(in_h64, 32) - 1;
                 out_w_q <= resize(out_w64, 32);
                 out_h_q <= resize(out_h64, 32);
                 if in_w64 = 0 or in_h64 = 0 or in_c64 = 0 then
@@ -1026,16 +1058,16 @@ begin
             -- *pre-advance* counters, one pixel stale. Doing both the
             -- advance and the address computation in the same state, from
             -- the same local variables, avoids that hazard entirely.
-            last_pixel := ix_q >= in_w_q - 1 and iy_q >= in_h_q - 1 and
-                          c_tile_q >= n_tiles_q - 1;
+            last_pixel := ix_q >= in_w_m1_q and iy_q >= in_h_m1_q and
+                          c_tile_q >= n_tiles_m1_q;
             if last_pixel then
               state_q <= s_finish;
             else
-              if ix_q < in_w_q - 1 then
+              if ix_q < in_w_m1_q then
                 next_ix_v := ix_q + 1;
                 next_iy_v := iy_q;
                 next_tile_v := c_tile_q;
-              elsif iy_q < in_h_q - 1 then
+              elsif iy_q < in_h_m1_q then
                 next_ix_v := (others => '0');
                 next_iy_v := iy_q + 1;
                 next_tile_v := c_tile_q;

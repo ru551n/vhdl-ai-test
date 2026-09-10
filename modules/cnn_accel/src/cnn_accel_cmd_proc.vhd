@@ -496,6 +496,32 @@ architecture a of cnn_accel_cmd_proc is
   signal out_w_q : unsigned(15 downto 0) := (others => '0');
   signal out_h_q : unsigned(15 downto 0) := (others => '0');
   signal row_words_q : unsigned(15 downto 0) := (others => '0');  -- in_width * T
+
+  -- 'n_tiles_q' and 'row_words_q' less one, registered in the same cycle
+  -- as the values themselves.
+  --
+  -- The tile-buffer control asks "last tile?" and "last word of the row?"
+  -- once per beat, in four places between them, and each inline '- 1'
+  -- rebuilds a 16-bit subtract out of a register that has not changed
+  -- since 'st_geom_mul' decoded the descriptor. Routed P&R made the
+  -- result the design's worst setup path: 'n_tiles_q' to the write
+  -- address of 'rowbuf', nine logic levels of which five were CARRY4.
+  --
+  -- Both sources are written at exactly one place -- the 'st_geom_mul'
+  -- state below -- so a copy written in that same cycle is not a
+  -- pipeline stage and cannot skew against its source: the pair updates
+  -- atomically, one clock edge, and every reader sees them together.
+  -- (That is why only these two are hoisted and 'desc_q.in_width - 1'
+  -- and friends are left alone: 'desc_q' is written elsewhere too, so a
+  -- copy of it would need its own argument about when it is coherent.)
+  --
+  -- Wrap-around is preserved rather than avoided: for a zero source
+  -- these hold x"FFFF", exactly what the inline '- 1' produced.
+  --
+  -- See shared/TimingAndResources.md 2, "Bound the arithmetic before
+  -- registering it" -- the loop-invariant-hoisting half of it.
+  signal n_tiles_m1_q : unsigned(15 downto 0) := (others => '0');
+  signal row_words_m1_q : unsigned(15 downto 0) := (others => '0');
   signal wgt_tile_bytes_q : unsigned(31 downto 0) := (others => '0');
   -- 'kernel_h * kernel_w' and 'n_tiles * (kernel_h * kernel_w)', each on
   -- its own cycle.
@@ -1200,6 +1226,11 @@ begin
           n_tiles_q <= resize(
             ceil_shift(desc_q.in_channels, c_word_shift), n_tiles_q'length
           );
+          -- See the declaration: the tile-buffer's "last tile?" tests read
+          -- this instead of rebuilding the subtract every beat.
+          n_tiles_m1_q <= resize(
+            ceil_shift(desc_q.in_channels, c_word_shift), n_tiles_q'length
+          ) - 1;
           n_ot_q <= resize(
             ceil_shift(desc_q.out_channels, c_word_shift), n_ot_q'length
           );
@@ -1214,6 +1245,10 @@ begin
             desc_q.in_width * ceil_shift(desc_q.in_channels, c_word_shift),
             row_words_q'length
           );
+          row_words_m1_q <= resize(
+            desc_q.in_width * ceil_shift(desc_q.in_channels, c_word_shift),
+            row_words_q'length
+          ) - 1;
           -- First of the three 'wgt_tile_bytes' products.
           kernel_area_q <= resize(desc_q.kernel_h * desc_q.kernel_w, 16);
 
@@ -1862,7 +1897,7 @@ begin
           if src_done = '1' then
             if feed_split_q = '0' then
               feed_state <= fd_done;
-            elsif feed_tile_q = n_tiles_q - 1 then
+            elsif feed_tile_q = n_tiles_m1_q then
               feed_tile_q <= (others => '0');
               if feed_row_q = desc_q.in_height - 1 then
                 feed_state <= fd_done;
@@ -1910,7 +1945,7 @@ begin
         -- column, which is what the drain side indexes.
         if tb_fill_q = '1' and src_m2s.valid = '1' then
           rowbuf(to_integer(tb_wr_ptr_q)) <= src_m2s.data(word_t'range);
-          if tb_wr_ptr_q = row_words_q - 1 then
+          if tb_wr_ptr_q = row_words_m1_q then
             tb_wr_ptr_q <= (others => '0');
             tb_fill_q <= '0';
             tb_drain_q <= '1';
@@ -1927,7 +1962,7 @@ begin
         -- restarts at the next column when the pixel's tiles are done, so
         -- no multiplier is needed on the critical path.
         if tb_drain_q = '1' and m_conv_stream_s2m.ready = '1' then
-          if tb_tile_q = n_tiles_q - 1 then
+          if tb_tile_q = n_tiles_m1_q then
             tb_tile_q <= (others => '0');
             if tb_col_q = desc_q.in_width - 1 then
               -- Row complete: back to filling, unless the frame is done.
@@ -1971,7 +2006,7 @@ begin
   end process;
 
   -- Final beat of the frame: last tile of the last column of the last row.
-  tb_last_q <= '1' when tb_drain_q = '1' and tb_tile_q = n_tiles_q - 1
+  tb_last_q <= '1' when tb_drain_q = '1' and tb_tile_q = n_tiles_m1_q
     and tb_col_q = desc_q.in_width - 1 and tb_row_q = desc_q.in_height - 1
     else '0';
 
