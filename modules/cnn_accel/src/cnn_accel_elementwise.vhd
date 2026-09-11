@@ -222,7 +222,7 @@ use cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_activation_plane_channels;
 -- single-beat burst -- no beat replay exists to exploit.
 --
 -- Address generation is accumulators, not per-iteration multiplies (the
--- same discipline 'up_src_addr_q'/'up_row_base_q' follow, and for the same
+-- same discipline 'up_src_addr_q'/'ew_row_base_bytes_q' follow, and for the same
 -- timing reason -- see their declarations):
 --
 --  * The src index splits exactly into 'plane*plane_stride + base', where
@@ -239,11 +239,15 @@ use cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_activation_plane_channels;
 --    that total shifted right by 2 (for factor 2).
 --  * The dst row base '(c_tile_out*out_h + y_in*factor)*out_w' steps by
 --    'factor*out_w' at every 'x_in' wrap and by nothing within a row --
---    the identical accumulator UPSAMPLE's 'up_row_base_q' already is,
---    including the tile-wrap coincidence its declaration proves ('out_h =
---    factor*in_h' makes the tile step and the row step equal). Both
---    opcodes therefore share 'up_row_base_q'/'up_two_out_w_q'; they can
---    never be in flight at once.
+--    the identical recurrence UPSAMPLE needs, including the tile-wrap
+--    coincidence ('out_h = factor*in_h' makes the tile step and the row
+--    step equal). Both opcodes therefore share ONE accumulator set,
+--    'ew_row_base_bytes_q'/'ew_pix_bytes_q'/'ew_dst_q' -- held in BYTES
+--    and pre-offset by 'dst_addr', so that forming a destination address
+--    costs one add instead of four. See the destination-address note at
+--    'ew_pix_bytes_q', and the measurements that forced it.
+--  * Consequently NOTHING in the destination address is computed on the
+--    beat-arrival cycle: 's_dts_run_src0' copies a register.
 --
 -- Input and output occupy the SAME number of bytes (a permutation
 -- quadruples the pixel count and quarters the channel count), so the one
@@ -391,6 +395,11 @@ architecture a of cnn_accel_elementwise is
   -- assertion turns any future 'g_axi_data_width'/'c_dts_factor' change
   -- that invalidates it into an elaboration failure.
   constant c_dts_group_shift : natural := 5;
+  -- 'log2(c_bytes_per_beat)'. Scaling a TILE index into a BYTE address is
+  -- the one place this opcode's address maths could smuggle in a runtime
+  -- multiply, so it is a constant shift (pure wiring) and is ASSERTED
+  -- below for the same reason 'c_dts_group_shift' is.
+  constant c_beat_shift : natural := 3;
 
   type state_t is (
     s_idle,
@@ -444,8 +453,9 @@ architecture a of cnn_accel_elementwise is
   -- 32-bit subtracts feeding three 32-bit compares, rebuilt every cycle
   -- out of values that have not changed since the descriptor was
   -- decoded, and routed P&R made exactly that the design's worst setup
-  -- path: 'in_w_q' to the reset pin of 'up_row_base_q', twelve logic
-  -- levels of which six were CARRY4.
+  -- path: 'in_w_q' to the reset pin of the UPSAMPLE row-base accumulator
+  -- (today 'ew_row_base_bytes_q'), twelve logic levels of which six were
+  -- CARRY4.
   --
   -- The bounds are loop invariants -- written once in 's_decode' and
   -- read-only for the whole descriptor -- so the subtract belongs there,
@@ -456,14 +466,47 @@ architecture a of cnn_accel_elementwise is
   --
   -- See shared/TimingAndResources.md 2, "Bound the arithmetic before
   -- registering it" -- the loop-invariant-hoisting half of it.
-  signal n_tiles_m1_q : unsigned(31 downto 0) := (others => '0');
-  signal in_w_m1_q : unsigned(31 downto 0) := (others => '0');
-  signal in_h_m1_q : unsigned(31 downto 0) := (others => '0');
+  -- The shared raster loop's counters and bounds are sized to what they
+  -- can actually HOLD, not to the 32-bit address space they help address.
+  -- All three bounds derive from 16-bit descriptor fields ('in_width',
+  -- 'in_height', and a tile count that is 'in_channels' divided by at
+  -- least 8), so 16 bits is exact, not an estimate.
+  --
+  -- This is 'shared/TimingAndResources.md' 2's "bound the arithmetic
+  -- before registering it", and it was forced by measurement: carried at
+  -- 32 bits, the compare-and-increment cone behind 'last_pixel_q' was the
+  -- design's worst path after place and route (WNS -0.006 ns, 17 logic
+  -- levels, 12 of them CARRY4) purely because every compare and every
+  -- increment in it was twice as wide as any value it would ever see.
+  constant c_loop_width : positive := 16;
+  subtype loop_count_t is unsigned(c_loop_width - 1 downto 0);
+
+  signal n_tiles_m1_q : loop_count_t := (others => '0');
+  signal in_w_m1_q : loop_count_t := (others => '0');
+  signal in_h_m1_q : loop_count_t := (others => '0');
+  -- Terminal-count flag for the shared '(c_tile, iy, ix)' raster loop:
+  -- '1' exactly when the counters stand on the LAST pixel, so that
+  -- "is this the final iteration?" is one registered bit rather than
+  -- three 32-bit compares ANDed together.
+  --
+  -- Spelling it inline was measured, after place and route, as the worst
+  -- path in the design once the destination-address chain above was fixed
+  -- (WNS -0.122 ns at 150 MHz): the compare tree landed on the CLOCK
+  -- ENABLE of 'cur_addr_q'/'cur_len_q', i.e. 'n_tiles_m1_q' ->
+  -- comparators -> 32 CE pins, 10 logic levels and 70 % route delay.
+  -- That is the classic "arithmetic on a clock enable" signature
+  -- ('shared/TimingAndResources.md' 2, and the '/CE endpoint' row of
+  -- 'skills/vivado-design' A8), whose prescribed fix is exactly this: a
+  -- terminal-count flag, evaluated from the NEXT counter values in the
+  -- same state that computes them, where it has a full cycle on a single
+  -- flip-flop's D input and the tool is free to replicate the flag near
+  -- its consumers.
+  signal last_pixel_q : std_ulogic := '0';
   signal out_w_q : unsigned(31 downto 0) := (others => '0');
   signal out_h_q : unsigned(31 downto 0) := (others => '0');
-  signal c_tile_q : unsigned(31 downto 0) := (others => '0');
-  signal iy_q : unsigned(31 downto 0) := (others => '0');
-  signal ix_q : unsigned(31 downto 0) := (others => '0');
+  signal c_tile_q : loop_count_t := (others => '0');
+  signal iy_q : loop_count_t := (others => '0');
+  signal ix_q : loop_count_t := (others => '0');
   -- '0' = top output row ('2*iy'), '1' = bottom output row ('2*iy + 1').
   signal row_phase_q : natural range 0 to 1 := 0;
   -- Which of the 2 replay beats of the current write burst is next.
@@ -522,14 +565,12 @@ architecture a of cnn_accel_elementwise is
   ------------------------------------------------------------------------
 
   signal up_src_addr_q : unsigned(31 downto 0) := (others => '0');
-  signal up_row_base_q : unsigned(31 downto 0) := (others => '0');
-  signal up_two_out_w_q : unsigned(31 downto 0) := (others => '0');
 
   ------------------------------------------------------------------------
   -- DEPTH_TO_SPACE loop state (see the entity-level design note).
   --
-  -- 'up_row_base_q'/'up_two_out_w_q'/'c_tile_q'/'iy_q'/'ix_q' and the
-  -- three '..._m1_q' bounds are shared with UPSAMPLE unchanged -- the two
+  -- The destination accumulators, 'c_tile_q'/'iy_q'/'ix_q' and the
+  -- three '..._m1_q' bounds are all shared with UPSAMPLE -- the two
   -- opcodes' outer raster loops and destination row-base recurrence are
   -- literally the same, and only one command is ever in flight.
   ------------------------------------------------------------------------
@@ -551,6 +592,70 @@ architecture a of cnn_accel_elementwise is
   -- consecutive '(dy, dx)' planes. Loop-invariant, derived once at command
   -- start as 'geom_total_q' shifted right by 2 (entity-level note).
   signal dts_plane_stride_q : unsigned(31 downto 0) := (others => '0');
+
+  -- DESTINATION address generation, in BYTES and entirely by accumulator,
+  -- SHARED by UPSAMPLE and DEPTH_TO_SPACE. The two opcodes walk the same
+  -- '(c_tile, iy, ix)' raster loop and grow the frame by the same factor
+  -- of 2 in each dimension; they differ only in what they emit per input
+  -- pixel (two 2-beat row writes vs. four 1-beat scattered writes), which
+  -- is an offset off the same pixel base. Only one command is ever in
+  -- flight, so one set of accumulators serves both -- and replaces the
+  -- 'up_row_base_q'/'up_two_out_w_q' pair that used to serve UPSAMPLE in
+  -- output-INDEX units, needing a shift and two further adds to become an
+  -- address.
+  --
+  -- The obvious spelling of the destination -- evaluate
+  -- 'dst_addr + T*(up_row_base + 2*ix + dy*out_w + dx)' in
+  -- 's_dts_run_src0' -- was measured, after place and route, as the worst
+  -- path in the whole design (WNS -0.419 ns at 150 MHz, 16 logic levels,
+  -- 11 of them CARRY4, 65 % logic delay). Four adders chained inside one
+  -- cycle, and that cycle is gated on 's_src0_stream_m2s.valid', i.e. the
+  -- beat-arrival path. UPSAMPLE gets away with the same shape only
+  -- because it has one conditional add fewer.
+  --
+  -- So every term is maintained incrementally instead, in the states that
+  -- have a spare cycle, and 's_dts_run_src0' is left with a register copy
+  -- and no arithmetic at all. The decomposition is exact:
+  --
+  --   dst = dst_addr + T*(up_row_base + 2*ix)  +  T*(dy*out_w + dx)
+  --         \________________________________/    \_______________/
+  --                  'ew_pix_bytes_q'             'dts_plane_off_q(p)'
+  --
+  -- The left term moves only on a raster step, the right term only on a
+  -- plane step, and the two never move on the same cycle -- so each of
+  -- 's_dts_next's branches needs exactly ONE add (see there).
+
+  -- 'T*out_w' and 'T*2*out_w': the destination row pitch and the
+  -- row-base step, both in bytes. Constant shifts of
+  -- 'out_w_q', derived once in 's_geom_check'.
+  signal ew_two_out_w_bytes_q : unsigned(31 downto 0) := (others => '0');
+  -- 'T*out_w': one destination row, in bytes. UPSAMPLE's second write of
+  -- each pixel lands exactly this far past its first.
+  signal ew_row_bytes_q : unsigned(31 downto 0) := (others => '0');
+  -- 'dst_addr + T*up_row_base': the destination byte address of column 0
+  -- of the current output row pair. The output-index row-base recurrence
+  -- both opcodes need, pre-scaled to bytes and pre-offset by 'dst_addr' so
+  -- that
+  -- neither has to be added back in later. Steps by
+  -- 'ew_two_out_w_bytes_q' at every 'x_in' wrap and nowhere else --
+  -- including at the tile wrap ('out_h = factor*in_h' makes the tile step
+  -- and the row step equal).
+  signal ew_row_base_bytes_q : unsigned(31 downto 0) := (others => '0');
+  -- 'dst_addr + T*(up_row_base + 2*ix)': the destination byte address of
+  -- sub-position (0, 0) of the input pixel currently being shuffled.
+  -- Within a row it steps by the constant '2*T'; at an 'x_in' wrap it
+  -- restarts from the new row base.
+  signal ew_pix_bytes_q : unsigned(31 downto 0) := (others => '0');
+  -- 'T*(dy*out_w + dx)' for each of the 'factor**2' sub-positions, i.e.
+  -- {0, T, T*out_w, T*out_w + T} for factor 2. Loop-invariant, so it is
+  -- computed once in 's_geom_check' and thereafter only INDEXED -- the
+  -- 'dy'/'dx' decode and its two conditional adds disappear from the
+  -- per-iteration path entirely, becoming a 4:1 mux of registered values.
+  type dts_plane_off_t is array (0 to c_dts_planes - 1) of unsigned(31 downto 0);
+  signal dts_plane_off_q : dts_plane_off_t := (others => (others => '0'));
+  -- The fully-formed destination byte address of the plane currently in
+  -- flight, ready one whole state before 's_dts_req_dst' needs it.
+  signal ew_dst_q : unsigned(31 downto 0) := (others => '0');
   -- Defensive geometry verdict for DEPTH_TO_SPACE, evaluated in
   -- 's_geom_rows' (a state with nothing else in it but one multiply) off
   -- registers latched at 'start', and consumed by 's_geom_check' alongside
@@ -689,6 +794,11 @@ begin
   assert 2 ** c_dts_group_shift = c_dts_group_bytes
     report "cnn_accel_elementwise: c_dts_group_shift must be log2 of " &
            "c_dts_group_bytes (factor**2 * bytes-per-beat)"
+    severity failure;
+
+  assert 2 ** c_beat_shift = c_bytes_per_beat
+    report "cnn_accel_elementwise: c_beat_shift must be log2 of " &
+           "c_bytes_per_beat"
     severity failure;
 
   assert c_lut_entries mod c_bytes_per_beat = 0
@@ -908,7 +1018,6 @@ begin
 
   fsm : process(clk)
     variable in_w64, in_h64, in_c64, n_tiles64, total64, out_w64, out_h64 : unsigned(63 downto 0);
-    variable pixel_idx64, out_idx64, addr64, tmp64 : unsigned(63 downto 0);
     -- 'requant_shift' is 8 bits ('shared/ModernVHDL.md', "Always constrain
     -- the range"): unconstrained this was a 32-bit compare and add.
     variable shift_raw : natural range 0 to 2 ** 8 - 1;
@@ -917,8 +1026,7 @@ begin
     -- state advances to (computed here so the following 's_up_req_src0'
     -- request's address can be latched in the same state, rather than
     -- split across a second process -- see entity-level comment history).
-    variable next_ix_v, next_iy_v, next_tile_v : unsigned(31 downto 0);
-    variable last_pixel : boolean;
+    variable next_ix_v, next_iy_v, next_tile_v : loop_count_t;
   begin
     if rising_edge(clk) then
       if reset = '1' then
@@ -1018,9 +1126,9 @@ begin
                 -- See the declarations: the raster loop's three
                 -- "is this the last one?" compares read these instead of
                 -- rebuilding the subtract every cycle.
-                n_tiles_m1_q <= resize(n_tiles64, 32) - 1;
-                in_w_m1_q <= resize(in_w64, 32) - 1;
-                in_h_m1_q <= resize(in_h64, 32) - 1;
+                n_tiles_m1_q <= resize(n_tiles64, c_loop_width) - 1;
+                in_w_m1_q <= resize(in_w64, c_loop_width) - 1;
+                in_h_m1_q <= resize(in_h64, c_loop_width) - 1;
                 out_w_q <= resize(out_w64, 32);
                 out_h_q <= resize(out_h64, 32);
                 if in_w64 = 0 or in_h64 = 0 or in_c64 = 0 then
@@ -1154,8 +1262,27 @@ begin
               iy_q <= (others => '0');
               ix_q <= (others => '0');
               row_phase_q <= 0;
-              up_row_base_q <= (others => '0');
-              up_two_out_w_q <= shift_left(out_w_q, 1);
+
+              -- Pixel 0 is also the last one exactly when the frame is a
+              -- single pixel of a single tile. Evaluated here, off the
+              -- bounds latched in 's_idle', so the flag is already valid
+              -- when the first 's_*_next' reads it.
+              if in_w_m1_q = 0 and in_h_m1_q = 0 and n_tiles_m1_q = 0 then
+                last_pixel_q <= '1';
+              else
+                last_pixel_q <= '0';
+              end if;
+              -- Destination accumulators for pixel 0 (see their
+              -- declarations). 'up_row_base' and 'ix' are both zero there,
+              -- so all three byte accumulators start at 'dst_addr' itself.
+              -- Every term is a constant shift of a register, and none of
+              -- them is on a per-iteration path.
+              ew_two_out_w_bytes_q <= shift_left(out_w_q, c_beat_shift + 1);
+              ew_row_bytes_q <= shift_left(out_w_q, c_beat_shift);
+              ew_row_base_bytes_q <= dst_addr_q;
+              ew_pix_bytes_q <= dst_addr_q;
+              ew_dst_q <= dst_addr_q;
+
               cur_addr_q <= src0_addr_q;
               cur_len_q <= to_unsigned(c_bytes_per_beat, 32);
 
@@ -1169,6 +1296,15 @@ begin
                 -- 'n_tiles_out*in_h*in_w*T' -- is exactly this shifted
                 -- right by 2. No extra multiply (entity-level note).
                 dts_plane_stride_q <= resize(shift_right(geom_total_q, 2), 32);
+
+                -- The '(dy, dx)' offsets; the pixel-base accumulators
+                -- they add to are seeded above, shared with UPSAMPLE.
+                dts_plane_off_q(0) <= (others => '0');
+                dts_plane_off_q(1) <= to_unsigned(c_bytes_per_beat, 32);
+                dts_plane_off_q(2) <= shift_left(out_w_q, c_beat_shift);
+                dts_plane_off_q(3) <= shift_left(out_w_q, c_beat_shift) +
+                                      to_unsigned(c_bytes_per_beat, 32);
+
                 state_q <= s_dts_req_src0;
               else
                 -- Seed the UPSAMPLE source accumulator for pixel 0.
@@ -1254,17 +1390,16 @@ begin
             if s_src0_stream_m2s.valid = '1' then
               pixel_buf_q <= s_src0_stream_m2s.data(g_axi_data_width - 1 downto 0);
 
-              -- out_pixel_index = (c_tile*out_h + (2*iy + row_phase))*out_w + 2*ix
-              --                  = up_row_base_q + row_phase*out_w + 2*ix,
-              -- with 'up_row_base_q' the accumulator described at its
-              -- declaration. Three adds and a constant shift, where this
-              -- used to be two chained runtime multiplies.
-              out_idx64 := resize(up_row_base_q, 64) + resize(2 * ix_q, 64);
-              if row_phase_q = 1 then
-                out_idx64 := out_idx64 + resize(out_w_q, 64);
-              end if;
-              addr64 := resize(dst_addr_q, 64) + mul64(out_idx64, to_unsigned(c_bytes_per_beat, 64));
-              cur_addr_q <= resize(addr64, 32);
+              -- The destination address was formed by the accumulators
+              -- at 'ew_dst_q' a whole state ago. This state is gated on
+              -- 's_src0_stream_m2s.valid' -- the beat-arrival path -- so
+              -- it deliberately holds no arithmetic: evaluating
+              -- 'dst_addr + T*(up_row_base + 2*ix + row_phase*out_w)'
+              -- right here was, measured after place and route, the worst
+              -- path in the design (WNS -0.166 ns, three chained adds).
+              -- 's_up_run_src0' is only ever entered with 'row_phase_q'
+              -- at 0, and 'ew_dst_q' holds exactly that phase's address.
+              cur_addr_q <= ew_dst_q;
               cur_len_q <= to_unsigned(2 * c_bytes_per_beat, 32);
               beat_in_burst_q <= 0;
               state_q <= s_up_req_dst;
@@ -1282,11 +1417,11 @@ begin
                   row_phase_q <= 1;
 
                   -- Row phase 1 of the same pixel: exactly one output
-                  -- row further on, i.e. '+ out_w' output positions.
-                  out_idx64 := resize(up_row_base_q, 64) + resize(2 * ix_q, 64)
-                               + resize(out_w_q, 64);
-                  addr64 := resize(dst_addr_q, 64) + mul64(out_idx64, to_unsigned(c_bytes_per_beat, 64));
-                  cur_addr_q <= resize(addr64, 32);
+                  -- row further on, which in bytes is one add off the
+                  -- registered pixel base. 'ew_dst_q' follows so that the
+                  -- address stays available a state ahead, as in phase 0.
+                  cur_addr_q <= ew_pix_bytes_q + ew_row_bytes_q;
+                  ew_dst_q <= ew_pix_bytes_q + ew_row_bytes_q;
                   cur_len_q <= to_unsigned(2 * c_bytes_per_beat, 32);
                   beat_in_burst_q <= 0;
                   state_q <= s_up_req_dst;
@@ -1309,9 +1444,7 @@ begin
             -- *pre-advance* counters, one pixel stale. Doing both the
             -- advance and the address computation in the same state, from
             -- the same local variables, avoids that hazard entirely.
-            last_pixel := ix_q >= in_w_m1_q and iy_q >= in_h_m1_q and
-                          c_tile_q >= n_tiles_m1_q;
-            if last_pixel then
+            if last_pixel_q = '1' then
               state_q <= s_finish;
             else
               if ix_q < in_w_m1_q then
@@ -1332,6 +1465,17 @@ begin
               iy_q <= next_iy_v;
               c_tile_q <= next_tile_v;
 
+              -- Re-evaluate the terminal-count flag from the counters
+              -- being committed above, so the next visit to this state
+              -- reads a register instead of a compare tree.
+              if next_ix_v >= in_w_m1_q and next_iy_v >= in_h_m1_q and
+                 next_tile_v >= n_tiles_m1_q
+              then
+                last_pixel_q <= '1';
+              else
+                last_pixel_q <= '0';
+              end if;
+
               -- 'pixel_idx = (c_tile*in_h + iy)*in_w + ix' advances by
               -- exactly one per step of this (tile, iy, ix) raster loop --
               -- including across both wraps -- so the source address is
@@ -1342,9 +1486,20 @@ begin
 
               -- The destination row base steps by '2*out_w' at every ix
               -- wrap and does not move within a row -- see its
-              -- declaration for why the iy and tile wraps coincide.
+              -- declaration for why the iy and tile wraps coincide -- and
+              -- the pixel base follows it, in bytes. The next pixel is
+              -- always entered at row phase 0, whose address IS the pixel
+              -- base, so 'ew_dst_q' needs no second add. Identical to the
+              -- DEPTH_TO_SPACE raster step, on the same registers.
               if next_ix_v = 0 then
-                up_row_base_q <= up_row_base_q + up_two_out_w_q;
+                ew_row_base_bytes_q <= ew_row_base_bytes_q + ew_two_out_w_bytes_q;
+                ew_pix_bytes_q <= ew_row_base_bytes_q + ew_two_out_w_bytes_q;
+                ew_dst_q <= ew_row_base_bytes_q + ew_two_out_w_bytes_q;
+              else
+                ew_pix_bytes_q <= ew_pix_bytes_q +
+                                  to_unsigned(2 * c_bytes_per_beat, 32);
+                ew_dst_q <= ew_pix_bytes_q +
+                            to_unsigned(2 * c_bytes_per_beat, 32);
               end if;
 
               state_q <= s_up_req_src0;
@@ -1368,28 +1523,15 @@ begin
             if s_src0_stream_m2s.valid = '1' then
               pixel_buf_q <= s_src0_stream_m2s.data(g_axi_data_width - 1 downto 0);
 
-              -- dst tile index
-              --   = (c_tile_out*out_h + (y_in*factor + dy))*out_w
-              --     + x_in*factor + dx
-              --   = up_row_base_q + factor*ix + dy*out_w + dx,
-              -- with 'up_row_base_q' the '(c_tile_out, y_in)' accumulator
-              -- shared with UPSAMPLE. 'dy'/'dx' are the two halves of
-              -- 'dts_plane_q' ('plane = dy*factor + dx'), so for factor 2
-              -- they are its top and bottom bit and neither needs a
-              -- divide: adds and one constant shift, no runtime multiply.
-              out_idx64 := resize(up_row_base_q, 64) + resize(2 * ix_q, 64);
-              if dts_plane_q >= c_dts_factor then
-                -- dy = 1: one whole output row further down.
-                out_idx64 := out_idx64 + resize(out_w_q, 64);
-              end if;
-              if (dts_plane_q mod c_dts_factor) /= 0 then
-                -- dx = 1: the next output column, one tile along.
-                out_idx64 := out_idx64 + to_unsigned(1, 64);
-              end if;
-
-              addr64 := resize(dst_addr_q, 64)
-                        + mul64(out_idx64, to_unsigned(c_bytes_per_beat, 64));
-              cur_addr_q <= resize(addr64, 32);
+              -- The destination address was fully formed one state ago,
+              -- by the accumulators described at 'ew_dst_q'. This state
+              -- is gated on 's_src0_stream_m2s.valid' -- the beat-arrival
+              -- path -- so it deliberately contains NO arithmetic: the
+              -- earlier spelling evaluated
+              -- 'dst_addr + T*(up_row_base + 2*ix + dy*out_w + dx)'
+              -- right here and was the worst path in the design after
+              -- place and route.
+              cur_addr_q <= ew_dst_q;
               cur_len_q <= to_unsigned(c_bytes_per_beat, 32);
               state_q <= s_dts_req_dst;
             end if;
@@ -1419,11 +1561,17 @@ begin
               dts_src_q <= dts_src_q + dts_plane_stride_q;
               cur_addr_q <= dts_src_q + dts_plane_stride_q;
               cur_len_q <= to_unsigned(c_bytes_per_beat, 32);
+
+              -- Same input pixel, next sub-position: the pixel base does
+              -- not move, so the destination is one add away from a
+              -- registered base and a registered, indexed offset. The
+              -- index is in range because this branch is exactly the
+              -- 'dts_plane_q /= c_dts_planes - 1' case.
+              ew_dst_q <= ew_pix_bytes_q + dts_plane_off_q(dts_plane_q + 1);
+
               state_q <= s_dts_req_src0;
             else
-              last_pixel := ix_q >= in_w_m1_q and iy_q >= in_h_m1_q and
-                            c_tile_q >= n_tiles_m1_q;
-              if last_pixel then
+              if last_pixel_q = '1' then
                 state_q <= s_finish;
               else
                 if ix_q < in_w_m1_q then
@@ -1444,6 +1592,16 @@ begin
                 iy_q <= next_iy_v;
                 c_tile_q <= next_tile_v;
 
+                -- Re-evaluate the terminal-count flag from the counters
+                -- being committed above (see its declaration).
+                if next_ix_v >= in_w_m1_q and next_iy_v >= in_h_m1_q and
+                   next_tile_v >= n_tiles_m1_q
+                then
+                  last_pixel_q <= '1';
+                else
+                  last_pixel_q <= '0';
+                end if;
+
                 -- 'base = (c_tile_out*in_h + y_in)*in_w + x_in' advances
                 -- by exactly one tile per step of this raster loop,
                 -- across both wraps -- the same accumulator argument
@@ -1457,9 +1615,21 @@ begin
 
                 -- The destination row base steps by 'factor*out_w' at
                 -- every 'x_in' wrap and nowhere else -- identical to
-                -- UPSAMPLE's, including at the tile wrap.
+                -- UPSAMPLE's, including at the tile wrap -- and the pixel
+                -- base follows it, in bytes. The plane sweep restarts at
+                -- sub-position (0, 0), whose offset is zero, so the new
+                -- pixel base IS the new destination address and no second
+                -- add is needed. Identical to UPSAMPLE's raster step,
+                -- on the same shared registers.
                 if next_ix_v = 0 then
-                  up_row_base_q <= up_row_base_q + up_two_out_w_q;
+                  ew_row_base_bytes_q <= ew_row_base_bytes_q + ew_two_out_w_bytes_q;
+                  ew_pix_bytes_q <= ew_row_base_bytes_q + ew_two_out_w_bytes_q;
+                  ew_dst_q <= ew_row_base_bytes_q + ew_two_out_w_bytes_q;
+                else
+                  ew_pix_bytes_q <= ew_pix_bytes_q +
+                                     to_unsigned(2 * c_bytes_per_beat, 32);
+                  ew_dst_q <= ew_pix_bytes_q +
+                               to_unsigned(2 * c_bytes_per_beat, 32);
                 end if;
 
                 state_q <= s_dts_req_src0;
