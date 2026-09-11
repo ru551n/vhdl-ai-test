@@ -39,6 +39,19 @@ package cnn_accel_python_ffi_pkg is
     num_bytes : natural
   ) return integer_array_t;
 
+  -- Like 'ffi_seed_bytes', but calls 'function_name(index)' instead of
+  -- 'function_name()' -- for seeding one of several regions a case
+  -- reports (e.g. 'get_program_regions'/'get_program_data' in
+  -- top_level_bridge.py), where one Python function alone cannot name
+  -- which region's bytes to return.
+  procedure ffi_seed_indexed_bytes(
+    memory : memory_t;
+    function_name : string;
+    index : natural;
+    base_addr : natural;
+    num_bytes : natural
+  );
+
 end package;
 
 package body cnn_accel_python_ffi_pkg is
@@ -89,5 +102,34 @@ package body cnn_accel_python_ffi_pkg is
     end loop;
     return data;
   end function;
+
+  procedure ffi_seed_indexed_bytes(
+    memory : memory_t;
+    function_name : string;
+    index : natural;
+    base_addr : natural;
+    num_bytes : natural
+  ) is
+    variable data : integer_array_t;
+  begin
+    if num_bytes = 0 then
+      return;
+    end if;
+
+    data := python_call(function_name, arg => index);
+    check_equal(
+      length(data), num_bytes,
+      "ffi_seed_indexed_bytes: python_call(""" & function_name & """, " & to_string(index)
+      & ") returned " & to_string(length(data)) & " bytes, expected " & to_string(num_bytes)
+    );
+
+    for i in 0 to num_bytes - 1 loop
+      write_word(
+        memory => memory,
+        address => base_addr + i,
+        word => std_logic_vector(to_unsigned(get(data, i), 8))
+      );
+    end loop;
+  end procedure;
 
 end package body;

@@ -2924,18 +2924,22 @@ class Module(BaseModule):
         """The rev-2 top-level integration testbench (arch doc section 11).
 
         `tb_cnn_accel_top` is the project's ONE top-level testbench and it
-        is completely generic: it loads a DDR image from CSV, starts the
-        DUT through the CSR, waits for DONE/ERROR, then exports the CSR
-        counters plus a byte region of the DDR model back to CSV. Every
-        decision about what to run, and all numerical verification, lives
-        in `accel_v2/cases.py` + `accel_v2/tbcase.py`, so one VUnit config
-        per case is the whole registration -- adding a test never touches
-        VHDL.
+        is completely generic: it seeds the compiler's own output (the
+        descriptor chain and weight/bias/scale/LUT tables) and the
+        graph's input tensors, then reads back the CSR counters plus the
+        exported DDR region, entirely live over VUnit's Python FFI
+        (`python_call`/`python_execute`) -- no file is read or written
+        anywhere. It starts the DUT through the CSR and waits for
+        DONE/ERROR. Every decision about what to run, and all numerical
+        verification, lives in `accel_v2/cases.py` + `accel_v2/tbcase.py`,
+        so one VUnit config per case is the whole registration -- adding
+        a test never touches VHDL.
 
-        `pre_config` writes that case's `mem_image.csv` into VUnit's own
-        per-config `output_path`; `post_check` reads `result.csv` (the
-        bytes the DUT itself wrote over AXI) and `counters.csv` back out
-        of it. Nothing is checked into the repository.
+        `check_live` (called from `test/python_bridge/top_level_bridge.py`,
+        itself called from VHDL via `python_call`, right after
+        `STATUS.DONE`/`STATUS.ERROR`) does the verification; there is no
+        `pre_config`/`post_check` hook at all -- both directions of the
+        run go through the live FFI path.
         """
         # Imported here rather than at module scope: `accel_v2` is only
         # needed to register these configs, and `module_cnn_accel.py` is
@@ -2990,54 +2994,28 @@ class Module(BaseModule):
         ):
             # VUnit's own `add_config` rather than tsfpga's
             # `add_vunit_config` helper: the helper always appends every
-            # generic to the config name, and these configs carry ten of
-            # them, which would bury the one identifier that matters (the
-            # case name) in a 200-character test name. The case name is
-            # already the reproducible handle -- `cases.py` maps it to its
-            # seed and geometry -- so the generics add nothing here.
+            # generic to the config name, and these configs carry a dozen
+            # of them, which would bury the one identifier that matters
+            # (the case name) in a 200-character test name. The case name
+            # is already the reproducible handle -- `cases.py` maps it to
+            # its seed and geometry -- so the generics add nothing here.
             #
-            # `case.pre_config`/`case.post_check` are bound methods of that
-            # one case object, so each config carries its own state; a
-            # closure over the loop variable would instead run every hook
-            # against the last case built.
+            # No `pre_config`/`post_check` hook: seeding DDR and verifying
+            # the run both happen entirely inside the simulation, over
+            # `python_call` (see `top_level_bridge.py`). Leaving both
+            # unset is VUnit's own "nothing to run" default, not a gap.
+            #
+            # `g_case_name` is the only per-case generic: the testbench
+            # fetches everything else about the case (program base
+            # address, export/input DDR windows, expect_error, the
+            # compiled-region layout) live, via `python_call`, right
+            # after `top_level_bridge.set_test_case` -- see
+            # `TbCase.generics`'s own docstring for why that split is
+            # drawn where it is.
             tb.add_config(
                 name=case.name,
-                generics=case.generics(),
-                pre_config=case.pre_config,
-                post_check=case.post_check,
+                generics={**case.generics(), "g_case_name": case.name},
             )
-
-        # PILOT (branch feat/vunit-python-ffi-pilot): a second config for
-        # ONE existing case, 'single_conv' (the catalogue's own reference
-        # point for "does the minimal end-to-end path work at all" -- see
-        # that case's docstring), checked LIVE via python_call instead of
-        # counters.csv/result.csv -- see top_level_bridge.py and
-        # TbCase.check_live. `pre_config` is unchanged (mem_image.csv is
-        # still how the program gets INTO the simulation; only the
-        # OUTPUT side moves to a python_call). `post_check` is
-        # deliberately omitted: the live path already asserted everything
-        # from inside the simulation via `check_true`, so there is
-        # nothing left to check afterward -- an unset `post_check` is
-        # VUnit's own "nothing to run" default, not a gap.
-        single_conv_case = next(c for c in cases.all_cases() if c.name == "single_conv")
-        inputs_base, inputs_bytes = single_conv_case.input_region()
-        tb.add_config(
-            name="single_conv_live_check_pilot",
-            generics={
-                **single_conv_case.generics(),
-                "g_check_live": True,
-                "g_case_name": "single_conv",
-                "g_inputs_base": inputs_base,
-                "g_inputs_bytes": inputs_bytes,
-            },
-            # 'live_pre_config' (not 'pre_config'): the compiler's own
-            # output -- descriptors, weight/bias/scale/LUT tables -- still
-            # goes into mem_image.csv exactly as before; only the graph's
-            # input tensors are left out of that file and seeded live
-            # instead (see cnn_accel_python_ffi_pkg.vhd's
-            # 'ffi_seed_bytes' and top_level_bridge.py's 'input_bytes').
-            pre_config=single_conv_case.live_pre_config,
-        )
 
     def _setup_cnn_accel_bias_requant(self, library) -> None:
         tb = library.test_bench("tb_cnn_accel_bias_requant")

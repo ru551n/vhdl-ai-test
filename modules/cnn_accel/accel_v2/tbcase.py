@@ -1,33 +1,36 @@
 """The Python half of `test/tb_cnn_accel_top.vhd`.
 
-`tb_cnn_accel_top` is deliberately dumb: it loads a DDR image from CSV,
-pokes `PROGRAM_BASE_ADDR` + `CTRL.START`, waits for `DONE`/`ERROR`,
-dumps the CSR counters and exports a byte region back to CSV. Every
-decision about *what* to run and *whether the result is right* lives
-here, so adding a test adds a Python function and never VHDL (arch doc
-section 11).
+`tb_cnn_accel_top` is deliberately dumb: it seeds a DDR image, pokes
+`PROGRAM_BASE_ADDR` + `CTRL.START`, waits for `DONE`/`ERROR`, then reads
+back the CSR counters and a byte region -- all of it live, over VUnit's
+Python FFI (`python_call`/`python_execute`, bridged through
+`test/python_bridge/top_level_bridge.py`). No file is read or written
+anywhere in this path. Every decision about *what* to run and *whether
+the result is right* lives here, so adding a test adds a Python function
+and never VHDL (arch doc section 11).
 
 A `TbCase` bundles the four things one VUnit config needs:
 
 * the `Model` (what to compute) and its `PlannedProgram` (where every
   tensor lives, and the predicted DDR traffic),
-* the `ProgramImage` (descriptor chain + weights + seeded inputs) that
-  becomes `mem_image.csv`,
+* the `ProgramImage` (descriptor chain + weights + seeded inputs) --
+  `compiled_regions`/`compiled_region_bytes` and `input_region`/
+  `input_bytes` are the live-FFI views the bridge reads from it,
 * the VUnit generics that tell the testbench the program entry point,
   the export window and the scratchpad geometry,
-* `pre_config` / `post_check` hooks.
+* `check_live`, the one verification entry point.
 
-The verification `post_check` performs is deliberately in two layers:
+The verification `check_live` performs is deliberately in two layers:
 
-1. **Data**: every graph output is read back out of `result.csv` -- i.e.
-   out of the bytes the DUT itself wrote to the memory model over AXI --
-   unpacked from the hardware's plane layout and compared element by
-   element against `reference.run_reference`. Nothing is compared against
-   a value the DUT reported about itself.
+1. **Data**: every graph output is read back out of the exported DDR
+   bytes -- i.e. out of the bytes the DUT itself wrote to the memory
+   model over AXI -- unpacked from the hardware's plane layout and
+   compared element by element against `reference.run_reference`.
+   Nothing is compared against a value the DUT reported about itself.
 2. **Traffic**: the DUT's own CSR counters are compared against
    `Planner`'s prediction *and* against the testbench's passive AXI
-   monitor (`axi_*` in `counters.csv`). The residency invariants of arch
-   doc section 10 are the whole point of rev 2, and a counter that only
+   monitor (the `axi_*` counters). The residency invariants of arch doc
+   section 10 are the whole point of rev 2, and a counter that only
    agrees with itself proves nothing -- `DDR_WR_BYTES` must agree with
    independently observed W-channel handshakes, or the "the intermediate
    never went to DDR" claim rests on the same logic it is testing.
@@ -35,8 +38,8 @@ The verification `post_check` performs is deliberately in two layers:
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
+from typing import Callable
 
 import cnn_accel_constants
 import cnn_accel_model as golden
@@ -55,12 +58,7 @@ from accel_v2.planner import (
 )
 from accel_v2.program import ProgramImage, emit_program
 from accel_v2.reference import ExecutionResult, run_reference
-
-#: File names the testbench and this module agree on, all directly
-#: inside VUnit's per-config `output_path`.
-MEM_IMAGE_CSV = "mem_image.csv"
-RESULT_CSV = "result.csv"
-COUNTERS_CSV = "counters.csv"
+from accel_v2.tiling_checks import GeometryError
 
 #: Bytes per `MemoryImage`/AXI word. Same constant the testbench derives
 #: from the generated AXI data width.
@@ -68,78 +66,8 @@ WORD_BYTES = 8
 
 
 class CheckFailure(Exception):
-    """Raised (and caught) inside `TbCase.post_check` so that every
+    """Raised (and caught) inside `TbCase.check_live` so that every
     failure is reported through one formatter."""
-
-
-# ---------------------------------------------------------------------------
-# counters.csv
-# ---------------------------------------------------------------------------
-
-#: Every key `tb_cnn_accel_top` writes to `counters.csv`. Listed here so
-#: a testbench/harness disagreement fails loudly with a diff of names
-#: rather than a `KeyError` deep inside a check.
-COUNTER_KEYS = (
-    # CSR, decoded
-    "status",
-    "busy",
-    "done",
-    "error",
-    "err_code",
-    "err_pc_low",
-    "hw_info",
-    "hw_info2",
-    "hw_info3",
-    "cmd_count",
-    "cycle_count",
-    "compute_cycles",
-    "stall_cycles",
-    "ddr_rd_bytes",
-    "ddr_wr_bytes",
-    "tensor_load_count",
-    "tensor_store_count",
-    "weight_load_bytes",
-    "local_bytes",
-    # Testbench's own passive AXI monitor -- independent of anything the
-    # DUT says about itself.
-    "axi_ar_count",
-    "axi_aw_count",
-    "axi_rd_beats",
-    "axi_wr_beats",
-    "axi_rd_bytes",
-    "axi_wr_bytes",
-    "axi_wr_lo_addr",
-    "axi_wr_hi_addr",
-)
-
-
-def read_counters(path: str) -> dict[str, int]:
-    """Parse a `counters.csv` written by `tb_cnn_accel_top`."""
-    with open(path) as handle:
-        lines = [line.strip() for line in handle]
-
-    values: dict[str, int] = {}
-    seen_header = False
-    for lineno, line in enumerate(lines, start=1):
-        if not line or line.startswith("#"):
-            continue
-        if not seen_header:
-            if line != "name,value":
-                raise CheckFailure(f"{path}:{lineno}: expected header 'name,value', got {line!r}")
-            seen_header = True
-            continue
-        name, _, raw = line.partition(",")
-        if not _:
-            raise CheckFailure(f"{path}:{lineno}: malformed record {line!r}")
-        values[name] = int(raw, 10)
-
-    if not seen_header:
-        raise CheckFailure(f"{path}: no 'name,value' header line -- did the testbench die early?")
-
-    missing = [key for key in COUNTER_KEYS if key not in values]
-    if missing:
-        raise CheckFailure(f"{path}: testbench did not write counter(s) {missing}")
-    return values
 
 
 # ---------------------------------------------------------------------------
@@ -225,13 +153,29 @@ class TbCase:
     traffic: TrafficPolicy = field(default_factory=TrafficPolicy)
     #: Extra generic overrides merged last into `generics()`.
     generic_overrides: dict[str, object] = field(default_factory=dict)
+    #: One additional check, run first by `check_live`, for a catalogue
+    #: that needs to assert something about the *plan* itself (not
+    #: runtime data) -- e.g. "no spill/reload step at all" (cases_tiling.py,
+    #: cases_yolo.py, cases_concat_split.py's own `_with_extra_check`).
+    #: Takes the case itself and raises `CheckFailure`/`GeometryError` on
+    #: disagreement; `None` (the default) runs nothing extra.
+    extra_check: Callable[["TbCase"], None] | None = None
     _expected: ExecutionResult | None = field(default=None, repr=False)
 
     # -- VUnit plumbing ---------------------------------------------------
 
     def generics(self) -> dict[str, object]:
-        """The generics for `add_vunit_config`. `output_path` is filled in
-        by VUnit itself and must not appear here."""
+        """The generics for `add_vunit_config`. `output_path` and
+        `g_case_name` are filled in by the caller (VUnit itself, and
+        `module_cnn_accel.py`'s registration loop, respectively) and must
+        not appear here. Every other per-case value -- the program base
+        address, the export/input DDR windows, whether the program is
+        expected to error -- is fetched live by the testbench instead
+        (`top_level_bridge.get_program_start_address`/`get_output_region`/
+        `get_input_region`/`get_expect_error`), so it is not duplicated
+        into a generic here either: only values that affect DUT/testbench
+        ELABORATION (generics feeding a `generic map`, fixed before any
+        `python_call` is even possible) belong in this dict."""
         # Sized from THIS case's own map, not from the class constant: a
         # tiled case plans against `DdrMap(scale=N)` (one descriptor per
         # plane per row copy runs the default 60 KiB PROGRAM region out),
@@ -242,10 +186,6 @@ class TbCase:
         ddr_bytes = self.planned.ddr_map.limit
         generics: dict[str, object] = {
             "g_ddr_bytes": ddr_bytes,
-            "g_program_base": self.program.program_addr,
-            "g_export_base": self.export_base,
-            "g_export_bytes": self.export_bytes,
-            "g_expect_error": self.expect_error,
             "g_num_banks": self.num_banks,
             "g_bank_words": self.bank_words,
             "g_ddr_limit": ddr_bytes,
@@ -268,24 +208,6 @@ class TbCase:
         generics.update(self.generic_overrides)
         return generics
 
-    def pre_config(self, output_path: str) -> bool:
-        """Write `mem_image.csv` into VUnit's per-config `output_path`.
-        Nothing is checked into the repository and the testbench reads
-        nothing else."""
-        os.makedirs(output_path, exist_ok=True)
-        self.program.image.write_csv(
-            os.path.join(output_path, MEM_IMAGE_CSV),
-            comment_lines=(
-                f"case: {self.name}",
-                f"model: {self.model.name} seed={self.model.seed}",
-                f"program_base: 0x{self.program.program_addr:08x} "
-                f"({len(self.program.descs)} descriptors incl. HALT)",
-                f"tensor_mem: {self.num_banks} banks x {self.bank_words} words "
-                f"= {self.tensor_mem_bytes} bytes",
-            ),
-        )
-        return True
-
     def input_region(self) -> tuple[int, int]:
         """`(base_addr, num_bytes)` of the DDR `INPUTS` region this case
         actually seeds: `DdrMap.INPUTS`'s fixed bounds, narrowed to the
@@ -304,46 +226,32 @@ class TbCase:
         bytes `pre_config` would otherwise have written into
         `mem_image.csv` there, produced by the same compiler pipeline
         (`accel_v2.program.emit_program`). Read live by
-        `top_level_bridge.input_bytes` (test/python_bridge/
+        `top_level_bridge.get_input_data` (test/python_bridge/
         top_level_bridge.py) instead of being written to a file."""
         lo, nbytes = self.input_region()
         return self.program.image.read_bytes(lo, nbytes)
 
-    def live_pre_config(self, output_path: str) -> bool:
-        """Like `pre_config`, except the `INPUTS` region is left out of
-        `mem_image.csv`: those bytes are seeded live instead, via a
-        `python_call` into `input_bytes` above. Everything the compiler
-        itself produces -- the descriptor chain and the weight/bias/
-        scale/LUT tables -- is completely unaffected and still arrives
-        exactly as `pre_config` would write it; only the transport of
-        the graph's own input tensors changes, from a CSV round trip to
-        a live FFI call."""
-        os.makedirs(output_path, exist_ok=True)
-        lo, nbytes = self.input_region()
-        compiled = self.program.image.without_range(lo, lo + nbytes) if nbytes else self.program.image
-        compiled.write_csv(
-            os.path.join(output_path, MEM_IMAGE_CSV),
-            comment_lines=(
-                f"case: {self.name} (live-input pilot: INPUTS region seeded via "
-                "python_call, not this file)",
-                f"model: {self.model.name} seed={self.model.seed}",
-                f"program_base: 0x{self.program.program_addr:08x} "
-                f"({len(self.program.descs)} descriptors incl. HALT)",
-                f"tensor_mem: {self.num_banks} banks x {self.bank_words} words "
-                f"= {self.tensor_mem_bytes} bytes",
-            ),
-        )
-        return True
+    def compiled_regions(self) -> list[tuple[int, int]]:
+        """`[(addr, num_bytes), ...]`, ascending by address: the
+        contiguous byte runs of everything the compiler itself produces
+        (the descriptor chain and the weight/bias/scale/LUT tables),
+        with the `INPUTS` region excluded -- those bytes are seeded
+        separately, via `input_bytes` above (renamed `get_input_data` in
+        the bridge). Runs rather than one
+        `[lowest, highest]` span: `DdrMap`'s regions sit at fixed,
+        far-apart bases regardless of how much of each a given case
+        actually uses, so spanning the whole range would mean seeding
+        mostly unused gap bytes for every case."""
+        lo, hi = self.planned.ddr_map.region_bounds(DdrMap.INPUTS)
+        image = self.program.image.without_range(lo, hi)
+        return image.regions()
 
-    def post_check(self, output_path: str) -> bool:
-        """Verify the run. Returns False (after printing a diagnosable
-        report) rather than raising, which is what VUnit wants from a
-        `post_check` hook."""
-        try:
-            self._post_check(output_path)
-        except CheckFailure as exc:
-            print(f"\npost_check FAILED for case '{self.name}':\n{exc}\n")
-            return False
+    def compiled_region_bytes(self, index: int) -> bytes:
+        """The bytes of `compiled_regions()[index]` -- read live by
+        `top_level_bridge.get_program_data` instead of being written
+        to `mem_image.csv`."""
+        addr, nbytes = self.compiled_regions()[index]
+        return self.program.image.read_bytes(addr, nbytes)
         return True
 
     # -- derived values ---------------------------------------------------
@@ -369,46 +277,39 @@ class TbCase:
 
     # -- checking ---------------------------------------------------------
 
-    def _post_check(self, output_path: str) -> None:
-        counters = read_counters(os.path.join(output_path, COUNTERS_CSV))
-        # HW_INFO/HW_INFO2/HW_INFO3 are read unconditionally by the
-        # testbench regardless of how the program ends, so check them
-        # unconditionally too, before branching on expect_error.
-        self._check_hw_info(counters)
-        self._check_status(counters)
-
-        if self.expect_error:
-            # A rejected program has no meaningful output tensors and no
-            # meaningful traffic prediction: the whole point is that the
-            # DUT stopped. The one traffic claim that still holds is the
-            # arch doc's "never partially writes a validated-bad
-            # command's destination" promise, checked below.
-            self._check_error_wrote_nothing_unexpected(counters)
-            return
-        self._check_outputs(output_path)
-        self._check_traffic(counters)
-
     def check_live(self, counters: dict[str, int], export_base: int, export_bytes: list[int]) -> bool:
-        """PILOT (modules/cnn_accel/test/python_bridge/top_level_bridge.py):
-        the same verification `post_check` performs, but fed live values
-        from a VUnit `python_call` instead of `output_path`'s
-        `counters.csv`/`result.csv` files -- no file is read or written
-        by this path. `export_bytes` is the raw exported region as plain
-        Python ints (0..255, unsigned byte values -- the same convention
-        `MemoryImage.write_bytes` expects), starting at `export_base`.
-        Returns False (after printing a diagnosable report) rather than
-        raising, matching `post_check`'s own contract."""
+        """Verify the run: called from `top_level_bridge.check_result`
+        (test/python_bridge/top_level_bridge.py) via a `python_call`,
+        right after `STATUS.DONE`/`STATUS.ERROR` fires inside the running
+        simulation -- no `result.csv`/`counters.csv` file is read or
+        written anywhere in this path. `export_bytes` is the raw exported
+        region as plain Python ints (0..255, unsigned byte values -- the
+        same convention `MemoryImage.write_bytes` expects), starting at
+        `export_base`. Returns False (after printing a diagnosable
+        report) rather than raising, which is what VUnit's `check_true`
+        wants back from a `python_call`."""
         try:
+            if self.extra_check is not None:
+                self.extra_check(self)
+            # HW_INFO/HW_INFO2/HW_INFO3 are read unconditionally by the
+            # testbench regardless of how the program ends, so check them
+            # unconditionally too, before branching on expect_error.
             self._check_hw_info(counters)
             self._check_status(counters)
             if self.expect_error:
+                # A rejected program has no meaningful output tensors and
+                # no meaningful traffic prediction: the whole point is
+                # that the DUT stopped. The one traffic claim that still
+                # holds is the arch doc's "never partially writes a
+                # validated-bad command's destination" promise, checked
+                # below.
                 self._check_error_wrote_nothing_unexpected(counters)
             else:
                 exported = MemoryImage()
                 exported.write_bytes(export_base, bytes(export_bytes))
                 self._check_outputs_against(exported, "<live python_call, no file>")
                 self._check_traffic(counters)
-        except CheckFailure as exc:
+        except (CheckFailure, GeometryError) as exc:
             print(f"\ncheck_live FAILED for case '{self.name}':\n{exc}\n")
             return False
         return True
@@ -543,18 +444,10 @@ class TbCase:
                 f"+ HALT)\n{self._program_listing()}"
             )
 
-    def _check_outputs(self, output_path: str) -> None:
-        result_path = os.path.join(output_path, RESULT_CSV)
-        exported = MemoryImage.read_csv(result_path)
-        self._check_outputs_against(exported, result_path)
-
     def _check_outputs_against(self, exported: "MemoryImage", source_description: str) -> None:
-        """The comparison half of `_check_outputs`, taking an
-        already-built `MemoryImage` instead of a `result.csv` path --
-        shared with `check_live` (pilot: modules/cnn_accel/test/
-        python_bridge/top_level_bridge.py), which builds `exported`
-        directly from bytes handed over VUnit's python_call FFI rather
-        than a file VHDL wrote and Python re-read."""
+        """Compare every graph output tensor in `exported` (built by
+        `check_live` from the bytes a `python_call` handed over) against
+        `self.expected`."""
         if self.export_bytes == 0:
             raise CheckFailure(
                 "case exports no bytes, so no output can be verified -- "
@@ -585,7 +478,7 @@ class TbCase:
         expected: list[int],
         actual: list[int],
         addr: int,
-        result_path: str,
+        source_description: str,
     ) -> None:
         if len(expected) != len(actual):
             raise CheckFailure(
@@ -611,7 +504,7 @@ class TbCase:
                 f"  total mismatches: {n_wrong} of {len(expected)}\n"
                 f"  produced by     : {self._producer_description(tensor)}\n"
                 f"  read back from  : DDR 0x{addr:08x} (+{tensor.size_bytes} bytes), "
-                f"exported to {result_path}\n"
+                f"{source_description}\n"
                 f"{self._program_listing()}"
             )
 
@@ -998,14 +891,9 @@ def _export_window(model: Model, planned: PlannedProgram) -> tuple[int, int]:
 
 
 __all__ = [
-    "COUNTERS_CSV",
-    "COUNTER_KEYS",
     "CheckFailure",
-    "MEM_IMAGE_CSV",
-    "RESULT_CSV",
     "TbCase",
     "TrafficPolicy",
     "build_case",
     "case_from_model",
-    "read_counters",
 ]

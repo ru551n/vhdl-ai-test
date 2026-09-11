@@ -2,8 +2,6 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
-use std.textio.all;
-
 library vunit_lib;
 context vunit_lib.vunit_context;
 context vunit_lib.com_context;
@@ -37,27 +35,35 @@ use cnn_accel.cnn_accel_python_ffi_pkg.all;
 -- model, no expected tensor values, no tensor shapes and no opcode
 -- knowledge beyond the CSR map of section 8, and it never references a
 -- DUT-internal signal (no external names, no hierarchical references, no
--- forcing). Every numerical claim about a run is made later, in Python
--- ('post_check'), from the two CSV files written here. All per-test
--- variation arrives as VUnit generics plus files in 'output_path', so
--- adding a test adds a Python function and never a line of VHDL.
+-- forcing). Every numerical claim about a run -- and every byte that goes
+-- INTO DDR, not just what comes out -- is made in Python, live, over
+-- VUnit's Python FFI ('python_call'/'python_execute'). No file is read or
+-- written anywhere in this testbench: adding a test adds a Python
+-- function (see accel_v2/cases*.py and test/python_bridge/
+-- top_level_bridge.py) and never a line of VHDL.
 --
--- What it actually does, once, for whatever program happens to be in
--- 'mem_image.csv':
+-- What it actually does, once, for whichever case 'g_case_name' names:
 --
 --   1. Model DDR as one flat read_and_write allocation in a 'memory_t',
 --      starting at address 0 so DUT addresses are memory addresses.
---   2. Preload it from '<output_path>/mem_image.csv' (arch doc section 7).
---   3. Serve the DUT's single AXI4 master port from that same 'memory_t'
+--   2. Select that case ('top_level_bridge.set_test_case') and fetch its
+--      per-run values live (program base address, export/input DDR
+--      windows, whether it expects an error).
+--   3. Seed the compiler's own output (descriptor chain, weight/bias/
+--      scale/LUT tables) region by region, then the graph's own input
+--      tensors, each via one 'python_call' per region (see
+--      'cnn_accel_python_ffi_pkg.vhd's 'ffi_seed_indexed_bytes'/
+--      'ffi_seed_bytes').
+--   4. Serve the DUT's single AXI4 master port from that same 'memory_t'
 --      via bfm.axi_slave -- the only path to memory the DUT has.
---   4. Drive PROGRAM_BASE_ADDR + CTRL.START over AXI4-Lite (bfm.
+--   5. Drive PROGRAM_BASE_ADDR + CTRL.START over AXI4-Lite (bfm.
 --      axi_lite_master) using exclusively the GENERATED register
---      procedures, poll STATUS to DONE/ERROR, and dump every counter
---      register plus an independent AXI observation to 'counters.csv'.
---   5. Export the requested DDR region to 'result.csv' in the same
---      section-7 format.
+--      procedures, poll STATUS to DONE/ERROR.
+--   6. Read every counter register plus the exported DDR region and hand
+--      them straight to 'top_level_bridge.check_result' (one
+--      'python_call'), which verifies the run via 'TbCase.check_live'.
 --
--- The 'axi_*' rows of 'counters.csv' come from the passive monitor
+-- The 'axi_*' counters handed to Python come from the passive monitor
 -- process below, which only watches 'm_axi' handshakes. They exist so
 -- that Python can cross-check the DUT's self-reported DDR_RD_BYTES /
 -- DDR_WR_BYTES against an independent observation: the residency
@@ -65,27 +71,10 @@ use cnn_accel.cnn_accel_python_ffi_pkg.all;
 -- DUT's own bookkeeping.
 entity tb_cnn_accel_top is
   generic (
-    -- VUnit's own per-test-config output directory (VUnit fills this in,
-    -- with a trailing separator). Every file below is read/written
-    -- directly in this directory: 'mem_image.csv' in, 'result.csv' and
-    -- 'counters.csv' out.
-    output_path : string;
     -- Size of the modelled DDR, bytes. One flat read_and_write allocation
     -- starting at address 0, so DUT addresses map 1:1 onto memory
     -- addresses. Matches the DUT's 'g_ddr_limit' by default.
     g_ddr_bytes : positive := 16#0020_0000#;
-    -- Byte address of the program's first descriptor, written to
-    -- PROGRAM_BASE_ADDR (arch doc section 6 lays the program at 0x1000).
-    g_program_base : natural := 16#0000_1000#;
-    -- Byte region exported to 'result.csv' after the run.
-    -- 'g_export_bytes' = 0 exports nothing (but still writes a valid
-    -- header-only file, see the export step below).
-    g_export_base : natural := 16#0010_0000#;
-    g_export_bytes : natural := 0;
-    -- true when STATUS.ERROR is the expected outcome of this program.
-    -- Which ERR_CODE is expected is per-program knowledge that this
-    -- testbench must not have -- Python checks that from 'counters.csv'.
-    g_expect_error : boolean := false;
     -- Testbench-level liveness bound: cycles waited after START before
     -- the TB itself fails the test. Independent of the DUT's own
     -- watchdog ('g_watchdog_cycles'). The DUT is contractually required
@@ -103,30 +92,18 @@ entity tb_cnn_accel_top is
     g_watchdog_cycles : positive := 1_000_000;
     -- AXI slave BFM randomized stalling, percent. 0 = no stalling.
     stall_probability_percent : natural := 0;
-    -- PILOT (branch feat/vunit-python-ffi-pilot): when true, skip
-    -- 'result.csv'/'counters.csv' entirely and instead call
-    -- 'top_level_bridge.check_live_result' (a python_call, see
-    -- test/python_bridge/top_level_bridge.py) with the same values those
-    -- files would have held, right here, before test_runner_cleanup --
-    -- 'post_check' is left unset for a config that sets this. Default
-    -- false: every existing config's behaviour is completely unchanged.
-    g_check_live : boolean := false;
-    -- Which pre-built 'TbCase' the live path checks against -- passed to
-    -- 'top_level_bridge.select_case' once, before CTRL.START. Only reads
-    -- from 'accel_v2.cases.all_cases()' (the pilot's one catalogue), and
-    -- only meaningful when 'g_check_live' is true.
-    g_case_name : string := "";
-    -- PILOT (g_check_live): DDR byte window of the case's graph-input
-    -- tensors ('TbCase.input_region()'). When 'g_check_live' is true,
-    -- this window is NOT in 'mem_image.csv' ('TbCase.live_pre_config'
-    -- leaves it out) -- it is seeded live instead, via
-    -- 'ffi_seed_bytes(memory, "input_bytes", ...)', right after
-    -- 'mem_image.csv' loads everything the compiler itself produced
-    -- (the descriptor chain and the weight/bias/scale/LUT tables).
-    -- 'g_inputs_bytes' = 0 both disables the call and matches a case
-    -- with no graph inputs to seed.
-    g_inputs_base : natural := 0;
-    g_inputs_bytes : natural := 0;
+    -- Which pre-built 'TbCase' this run checks against -- passed to
+    -- 'top_level_bridge.set_test_case' once, before CTRL.START. Reads from
+    -- 'accel_v2.cases.all_cases()' plus the other six catalogues
+    -- 'module_cnn_accel.py' registers configs from. The ONE generic that
+    -- has to stay a generic: every other per-case value (the program
+    -- base address, the export/input DDR windows, whether the program
+    -- is expected to error) is fetched live instead, right after
+    -- 'set_test_case' -- the case itself already knows all of it, so
+    -- there is no reason for 'module_cnn_accel.py' to also copy it into
+    -- a generic (see 'get_program_start_address'/'get_output_region'/
+    -- 'get_input_region'/'get_expect_error' in top_level_bridge.py).
+    g_case_name : string;
     runner_cfg : string
   );
 end entity tb_cnn_accel_top;
@@ -273,7 +250,10 @@ architecture tb of tb_cnn_accel_top is
     return "0";
   end function;
 
-  -- Lower case, zero padded, exactly 'num_digits' hex digits.
+  -- Lower case, zero padded, exactly 'num_digits' hex digits. Still used
+  -- by 'describe_status' below for diagnostic messages, even though the
+  -- old 'result.csv'/'counters.csv' writers that used to be its main
+  -- callers are gone.
   function to_hex(value : u_unsigned; num_digits : positive) return string is
     constant c_nibbles : string(1 to 16) := "0123456789abcdef";
     constant padded : u_unsigned(4 * num_digits - 1 downto 0) := resize(value, 4 * num_digits);
@@ -284,243 +264,6 @@ architecture tb of tb_cnn_accel_top is
     end loop;
     return result;
   end function;
-
-  function is_blank(c : character) return boolean is
-  begin
-    -- Space, HT and CR. CR matters: a CRLF-terminated CSV written on
-    -- Windows would otherwise make every record 'malformed'.
-    return c = ' ' or c = character'val(9) or c = character'val(13);
-  end function;
-
-  -- Re-index an arbitrary slice to '1 to n'. Slices keep the bounds they
-  -- were cut with, and every parser step below indexes from 1.
-  function normalize(s : string) return string is
-    variable result : string(1 to s'length) := s;
-  begin
-    return result;
-  end function;
-
-  -- Strip leading/trailing blanks and normalize the index range to
-  -- '1 to n', so callers can index the result without worrying about
-  -- where the slice came from. 'and' is short-circuit for BOOLEAN in
-  -- VHDL, so 's(lo)' is never evaluated out of range.
-  function trim(s : string) return string is
-    variable lo : integer := s'low;
-    variable hi : integer := s'high;
-  begin
-    while lo <= hi and is_blank(s(lo)) loop
-      lo := lo + 1;
-    end loop;
-    while hi >= lo and is_blank(s(hi)) loop
-      hi := hi - 1;
-    end loop;
-    if lo > hi then
-      return "";
-    end if;
-    return normalize(s(lo to hi));
-  end function;
-
-  function to_lower(s : string) return string is
-    variable result : string(1 to s'length) := s;
-  begin
-    for i in result'range loop
-      if result(i) >= 'A' and result(i) <= 'Z' then
-        result(i) := character'val(character'pos(result(i)) + 32);
-      end if;
-    end loop;
-    return result;
-  end function;
-
-  -- 1-based position of the first 'c' in 's', 0 if absent. 's' is always
-  -- a 'trim' result here, so its range is '1 to n'.
-  function index_of(s : string; c : character) return natural is
-  begin
-    for i in s'range loop
-      if s(i) = c then
-        return i;
-      end if;
-    end loop;
-    return 0;
-  end function;
-
-  -- -1 for anything that is not a hex digit. Both cases accepted on read.
-  function hex_digit_value(c : character) return integer is
-  begin
-    case c is
-      when '0' to '9' => return character'pos(c) - character'pos('0');
-      when 'a' to 'f' => return character'pos(c) - character'pos('a') + 10;
-      when 'A' to 'F' => return character'pos(c) - character'pos('A') + 10;
-      when others => return -1;
-    end case;
-  end function;
-
-  function is_hex_string(s : string; num_digits : positive) return boolean is
-  begin
-    if s'length /= num_digits then
-      return false;
-    end if;
-    for i in s'range loop
-      if hex_digit_value(s(i)) < 0 then
-        return false;
-      end if;
-    end loop;
-    return true;
-  end function;
-
-  function hex_to_unsigned(s : string; num_bits : positive) return u_unsigned is
-    variable result : u_unsigned(num_bits - 1 downto 0) := (others => '0');
-  begin
-    for i in s'range loop
-      result := shift_left(result, 4);
-      result(3 downto 0) := to_unsigned(hex_digit_value(s(i)), 4);
-    end loop;
-    return result;
-  end function;
-
-  procedure write_text_line(file f : text; s : string) is
-    variable l : line;
-  begin
-    write(l, s);
-    writeline(f, l);
-  end procedure;
-
-  ------------------------------------------------------------------------
-  -- CSV memory-image reader (arch doc section 7).
-  --
-  -- Strictness is the whole point of this parser. A silently misparsed
-  -- memory image is indistinguishable from a DUT data bug in the Python
-  -- post-check, so every malformed record fails the test immediately and
-  -- names the file, the line number and the offending line text. The
-  -- first bad record stops the parse: continuing would write garbage
-  -- into the memory model and bury the real message under a pile of
-  -- follow-on noise.
-  ------------------------------------------------------------------------
-
-  procedure load_memory_image(file_name : string; num_words_loaded : out natural) is
-    file f : text;
-    variable open_status : file_open_status;
-    variable l : line;
-    variable line_no : natural := 0;
-    variable num_records : natural := 0;
-    variable header_seen : boolean := false;
-    variable stop_parsing : boolean := false;
-
-    procedure bad_line(line_text : string; reason : string) is
-    begin
-      check_failed(
-        "tb_cnn_accel_top: '" & file_name & "' line " & to_string(line_no) & ": " & reason
-        & ". Offending line: '" & line_text & "'"
-      );
-    end procedure;
-
-    -- One physical line of the file. 'abort_parse' is set on the first
-    -- malformed record.
-    procedure handle_line(raw : string; abort_parse : out boolean) is
-      constant txt : string := trim(raw);
-      variable comma_pos : natural := 0;
-      variable addr_u : u_unsigned(31 downto 0);
-      variable data_u : u_unsigned(63 downto 0);
-    begin
-      abort_parse := false;
-
-      -- Blank lines and lines whose first non-blank character is '#' are
-      -- comments.
-      if txt'length = 0 or txt(1) = '#' then
-        return;
-      end if;
-
-      -- The first non-comment line must be the 'address,data' header.
-      if not header_seen then
-        header_seen := true;
-        if to_lower(txt) /= "address,data" then
-          bad_line(txt, "expected the required 'address,data' header line");
-          abort_parse := true;
-        end if;
-        return;
-      end if;
-
-      comma_pos := index_of(txt, ',');
-      if comma_pos = 0 then
-        bad_line(txt, "record has no ',' separator");
-        abort_parse := true;
-        return;
-      end if;
-
-      if not is_hex_string(txt(1 to comma_pos - 1), 8) then
-        bad_line(txt, "address field must be exactly 8 hex digits");
-        abort_parse := true;
-        return;
-      end if;
-
-      if not is_hex_string(txt(comma_pos + 1 to txt'length), 16) then
-        bad_line(txt, "data field must be exactly 16 hex digits");
-        abort_parse := true;
-        return;
-      end if;
-
-      addr_u := hex_to_unsigned(txt(1 to comma_pos - 1), 32);
-      data_u := hex_to_unsigned(txt(comma_pos + 1 to txt'length), 64);
-
-      -- Checked as unsigned, before any 'to_integer': an address at or
-      -- above 2**31 would overflow VHDL's signed 'integer'.
-      if addr_u mod c_bytes_per_beat /= 0 then
-        bad_line(
-          txt,
-          "address is not " & to_string(c_bytes_per_beat) & "-byte aligned"
-        );
-        abort_parse := true;
-        return;
-      end if;
-
-      if resize(addr_u, 33) + c_bytes_per_beat > to_unsigned(g_ddr_bytes, 33) then
-        bad_line(
-          txt,
-          "address is outside the modelled DDR (g_ddr_bytes = " & to_string(g_ddr_bytes) & ")"
-        );
-        abort_parse := true;
-        return;
-      end if;
-
-      -- Default (little) endianness, so the 16 hex digits are exactly the
-      -- 64-bit word as it appears on AXI RDATA/WDATA and 'read_word' with
-      -- the same endianness recovers them byte for byte.
-      write_word(
-        memory => memory,
-        address => to_integer(addr_u),
-        word => std_logic_vector(data_u)
-      );
-      num_records := num_records + 1;
-    end procedure;
-
-  begin
-    num_words_loaded := 0;
-
-    file_open(open_status, f, file_name, read_mode);
-    if open_status /= open_ok then
-      check_failed(
-        "tb_cnn_accel_top: could not open the memory image '" & file_name
-        & "'. It is written by the Python pre_config hook before the simulation starts."
-      );
-      return;
-    end if;
-
-    while not endfile(f) loop
-      readline(f, l);
-      line_no := line_no + 1;
-      handle_line(l.all, stop_parsing);
-      exit when stop_parsing;
-    end loop;
-
-    file_close(f);
-
-    if not stop_parsing and not header_seen then
-      check_failed(
-        "tb_cnn_accel_top: '" & file_name & "' contains no 'address,data' header line"
-      );
-    end if;
-
-    num_words_loaded := num_records;
-  end procedure;
 
 begin
 
@@ -670,17 +413,40 @@ begin
   ------------------------------------------------------------------------
   main : process
     variable ddr : buffer_t;
-    variable num_words : natural;
-    -- PILOT (g_check_live): the exported region, built the same way
-    -- 'result.csv' is (one byte per 'read_word' call), but handed to
-    -- Python directly instead of written to a file.
+    -- The exported region, read one byte per 'read_word' call and
+    -- handed to Python directly (see 'ffi_export_bytes').
     variable export_bytes : integer_array_t;
+    -- Discards 'python_call("set_test_case", ...)''s return value: Python's
+    -- 'set_test_case' has nothing meaningful to report back, so only the
+    -- call (and its exception-to-VHDL-failure path, should the case name
+    -- be unknown) matters.
+    variable discard : integer;
+
+    -- Per-case values, fetched live from the selected 'TbCase' right
+    -- after 'set_test_case' -- the case already knows all of this, so it
+    -- is never duplicated into a generic (see top_level_bridge.py's
+    -- 'get_program_start_address'/'get_output_region'/'get_input_region'/
+    -- 'get_expect_error').
+    variable region : integer_array_t;
+    variable v_program_base : natural;
+    variable v_export_base : natural;
+    variable v_export_bytes : natural;
+    variable v_inputs_base : natural;
+    variable v_inputs_bytes : natural;
+    variable v_expect_error : boolean;
+
+    -- The compiler's own output (descriptor chain, weight/bias/scale/LUT
+    -- tables), seeded region by region -- see 'get_program_regions'/
+    -- 'get_program_data' in top_level_bridge.py and
+    -- 'ffi_seed_indexed_bytes' in cnn_accel_python_ffi_pkg.vhd.
+    variable compiled_bounds : integer_array_t;
+    variable num_compiled_regions : natural;
 
     -- Every register is read as a raw 'register_t' and, where it has
     -- fields, converted with the generated 'to_cnn_accel_*' function.
-    -- Two reasons: the raw value is what 'counters.csv' reports, and a
-    -- single read keeps the raw value and the decoded fields consistent
-    -- (two reads of a live STATUS could disagree).
+    -- Two reasons: the raw value is what 'check_result' is handed,
+    -- and a single read keeps the raw value and the decoded fields
+    -- consistent (two reads of a live STATUS could disagree).
     variable status_slv : register_t := (others => '0');
     variable status : cnn_accel_status_t := cnn_accel_status_init;
     variable hw_info_slv : register_t := (others => '0');
@@ -700,9 +466,6 @@ begin
     variable start_time : time;
     variable elapsed_cycles : natural := 0;
 
-    file f : text;
-    variable open_status : file_open_status;
-
     -- Renders the last STATUS read both raw and field-by-field. Used by
     -- the timeout and the unexpected-error messages, which both have to
     -- be diagnosable straight from the log.
@@ -716,28 +479,20 @@ begin
         & ", err_pc_low=" & to_dec(status.err_pc_low) & ")";
     end function;
 
-    procedure open_output(file_base_name : string) is
-    begin
-      file_open(open_status, f, output_path & file_base_name, write_mode);
-      if open_status /= open_ok then
-        check_failed(
-          "tb_cnn_accel_top: could not open '" & output_path & file_base_name & "' for writing"
-        );
-      end if;
-    end procedure;
-
-    procedure put_counter(counter_name : string; value : string) is
-    begin
-      write_text_line(f, counter_name & "," & value);
-    end procedure;
-
   begin
     test_runner_setup(runner, runner_cfg);
 
-    if g_check_live then
-      python_execute(file_name => tb_path(runner_cfg) & "python_bridge/top_level_bridge.py");
-      python_execute(source => "select_case(" & """" & g_case_name & """" & ")");
-    end if;
+    python_execute(file_name => tb_path(runner_cfg) & "python_bridge/top_level_bridge.py");
+    discard := python_call("set_test_case", arg => g_case_name);
+
+    v_program_base := python_call("get_program_start_address");
+    v_expect_error := python_call("get_expect_error");
+    region := python_call("get_output_region");
+    v_export_base := get(region, 0);
+    v_export_bytes := get(region, 1);
+    region := python_call("get_input_region");
+    v_inputs_base := get(region, 0);
+    v_inputs_bytes := get(region, 1);
 
     ----------------------------------------------------------------------
     -- The modelled DDR. The first allocation in a fresh 'memory_t' starts
@@ -756,43 +511,54 @@ begin
       "the DDR allocation must start at address 0 so DUT addresses map 1:1 onto memory addresses"
     );
 
-    -- The export region is described in whole 64-bit words by the CSV
-    -- format, so both ends must be word aligned, and it has to be inside
-    -- the modelled DDR to be readable at all.
+    -- The export region is described in whole 64-bit words, so both ends
+    -- must be word aligned, and it has to be inside the modelled DDR to
+    -- be readable at all.
     check_equal(
-      g_export_base mod c_bytes_per_beat,
+      v_export_base mod c_bytes_per_beat,
       0,
-      "g_export_base must be " & to_string(c_bytes_per_beat) & "-byte aligned"
+      "the case's export_base must be " & to_string(c_bytes_per_beat) & "-byte aligned"
     );
     check_equal(
-      g_export_bytes mod c_bytes_per_beat,
+      v_export_bytes mod c_bytes_per_beat,
       0,
-      "g_export_bytes must be a whole number of " & to_string(c_bytes_per_beat) & "-byte words"
+      "the case's export_bytes must be a whole number of " & to_string(c_bytes_per_beat)
+      & "-byte words"
     );
     check(
-      g_export_base + g_export_bytes <= g_ddr_bytes,
+      v_export_base + v_export_bytes <= g_ddr_bytes,
       "the export region must lie inside the modelled DDR (g_ddr_bytes = "
       & to_string(g_ddr_bytes) & ")"
     );
 
-    load_memory_image(output_path & "mem_image.csv", num_words);
+    -- The compiler's own output: one 'ffi_seed_indexed_bytes' call per
+    -- contiguous compiled region (the descriptor chain, then whichever
+    -- of the weight/bias/scale/LUT tables this case actually uses) --
+    -- see 'get_program_regions'/'get_program_data' in
+    -- top_level_bridge.py for why this is regions rather than one flat
+    -- span: 'DdrMap' places each region at a fixed, far-apart base
+    -- regardless of how much of it any one case fills.
+    compiled_bounds := python_call("get_program_regions");
+    num_compiled_regions := length(compiled_bounds) / 2;
+    for r in 0 to num_compiled_regions - 1 loop
+      ffi_seed_indexed_bytes(
+        memory, "get_program_data", r,
+        base_addr => get(compiled_bounds, 2 * r),
+        num_bytes => get(compiled_bounds, 2 * r + 1)
+      );
+    end loop;
     info(
-      "tb_cnn_accel_top: loaded " & to_string(num_words) & " words from '"
-      & output_path & "mem_image.csv'"
+      "tb_cnn_accel_top: live-seeded " & to_string(num_compiled_regions)
+      & " compiled region(s) via python_call(""get_program_data"")"
     );
 
-    -- PILOT (g_check_live): the compiler's own output (program, weights,
-    -- bias, scale, LUT tables) just arrived from 'mem_image.csv' above,
-    -- unaffected. Only the graph's own input tensors are missing from
-    -- that file ('TbCase.live_pre_config' leaves them out) -- seed them
-    -- here instead, live, via one python_call.
-    if g_check_live then
-      ffi_seed_bytes(memory, "input_bytes", g_inputs_base, g_inputs_bytes);
-      info(
-        "tb_cnn_accel_top: live-seeded " & to_string(g_inputs_bytes)
-        & " input bytes via python_call(""input_bytes"")"
-      );
-    end if;
+    -- The graph's own input tensors: a separate region, seeded the same
+    -- way (see 'get_input_data' in top_level_bridge.py).
+    ffi_seed_bytes(memory, "get_input_data", v_inputs_base, v_inputs_bytes);
+    info(
+      "tb_cnn_accel_top: live-seeded " & to_string(v_inputs_bytes)
+      & " input bytes via python_call(""get_input_data"")"
+    );
 
     ----------------------------------------------------------------------
     -- Release reset and let the DUT settle before the first CSR access.
@@ -814,7 +580,7 @@ begin
       -- itself (arch doc section 6). CTRL.START is self-clearing in
       -- hardware, so it is never written back to '0'.
       --------------------------------------------------------------------
-      write_cnn_accel_program_base_addr_addr(net, to_unsigned(g_program_base, 32));
+      write_cnn_accel_program_base_addr_addr(net, to_unsigned(v_program_base, 32));
       write_cnn_accel_ctrl_start(net, '1');
 
       --------------------------------------------------------------------
@@ -846,7 +612,7 @@ begin
       end loop;
 
       --------------------------------------------------------------------
-      -- Every counter register, read once, in 'counters.csv' order.
+      -- Every counter register, read once.
       --------------------------------------------------------------------
       read_cnn_accel_hw_info(net, hw_info_slv);
       read_cnn_accel_hw_info2(net, hw_info2_slv);
@@ -863,137 +629,67 @@ begin
       read_cnn_accel_local_bytes(net, local_bytes_slv);
 
       --------------------------------------------------------------------
-      -- PILOT (g_check_live): the same counters and the same exported
-      -- region, handed straight to 'top_level_bridge.check_live_result'
-      -- (one python_call) instead of 'counters.csv'/'result.csv'. See
-      -- that function's docstring for the exact argument-to-column
-      -- mapping -- it is deliberately the same set, same names, so this
-      -- branch and the 'else' branch below are checking identical data,
-      -- just by two different transports.
+      -- Every counter, plus the exported DDR region, handed straight to
+      -- 'top_level_bridge.check_result' (one python_call), which
+      -- runs 'TbCase.check_live' -- no file is read or written anywhere
+      -- in this step.
       --------------------------------------------------------------------
-      if g_check_live then
-        export_bytes := ffi_export_bytes(memory, g_export_base, g_export_bytes);
+      export_bytes := ffi_export_bytes(memory, v_export_base, v_export_bytes);
 
-        check_true(
-          python_call(
-            "check_live_result",
-            arg => export_bytes,
-            kwargs =>
-              kw("export_base", g_export_base) &
-              kw("status", u_unsigned(status_slv)) &
-              kw("busy", status.busy) &
-              kw("done", status.done) &
-              kw("error", status.error) &
-              kw("err_code", std_ulogic_vector(status.err_code)) &
-              kw("err_pc_low", std_ulogic_vector(status.err_pc_low)) &
-              kw("hw_info", u_unsigned(hw_info_slv)) &
-              kw("hw_info2", u_unsigned(hw_info2_slv)) &
-              kw("hw_info3", u_unsigned(hw_info3_slv)) &
-              kw("cmd_count", u_unsigned(cmd_count_slv)) &
-              kw("cycle_count", u_unsigned(cycle_count_slv)) &
-              kw("compute_cycles", u_unsigned(compute_cycles_slv)) &
-              kw("stall_cycles", u_unsigned(stall_cycles_slv)) &
-              kw("ddr_rd_bytes", u_unsigned(ddr_rd_bytes_slv)) &
-              kw("ddr_wr_bytes", u_unsigned(ddr_wr_bytes_slv)) &
-              kw("tensor_load_count", u_unsigned(tensor_load_count_slv)) &
-              kw("tensor_store_count", u_unsigned(tensor_store_count_slv)) &
-              kw("weight_load_bytes", u_unsigned(weight_load_bytes_slv)) &
-              kw("local_bytes", u_unsigned(local_bytes_slv)) &
-              kw("axi_ar_count", axi_ar_count) &
-              kw("axi_aw_count", axi_aw_count) &
-              kw("axi_rd_beats", axi_rd_beats) &
-              kw("axi_wr_beats", axi_wr_beats) &
-              kw("axi_wr_bytes", axi_wr_bytes) &
-              kw("axi_wr_lo_addr", axi_wr_lo_addr) &
-              kw("axi_wr_hi_addr", axi_wr_hi_addr)
-          ),
-          "check_live_result reported a failure for case " & g_case_name & " -- see the printed "
-          & "Python traceback/report above for which check failed"
-        );
-
-      else
-
-      --------------------------------------------------------------------
-      -- 'counters.csv': the DUT's own bookkeeping first, then this
-      -- testbench's independent AXI observation. Python compares the two.
-      --------------------------------------------------------------------
-      open_output("counters.csv");
-      write_text_line(f, "name,value");
-      put_counter("status", to_dec(u_unsigned(status_slv)));
-      put_counter("busy", to_dec(status.busy));
-      put_counter("done", to_dec(status.done));
-      put_counter("error", to_dec(status.error));
-      put_counter("err_code", to_dec(status.err_code));
-      put_counter("err_pc_low", to_dec(status.err_pc_low));
-      put_counter("hw_info", to_dec(u_unsigned(hw_info_slv)));
-      put_counter("hw_info2", to_dec(u_unsigned(hw_info2_slv)));
-      put_counter("hw_info3", to_dec(u_unsigned(hw_info3_slv)));
-      put_counter("cmd_count", to_dec(u_unsigned(cmd_count_slv)));
-      put_counter("cycle_count", to_dec(u_unsigned(cycle_count_slv)));
-      put_counter("compute_cycles", to_dec(u_unsigned(compute_cycles_slv)));
-      put_counter("stall_cycles", to_dec(u_unsigned(stall_cycles_slv)));
-      put_counter("ddr_rd_bytes", to_dec(u_unsigned(ddr_rd_bytes_slv)));
-      put_counter("ddr_wr_bytes", to_dec(u_unsigned(ddr_wr_bytes_slv)));
-      put_counter("tensor_load_count", to_dec(u_unsigned(tensor_load_count_slv)));
-      put_counter("tensor_store_count", to_dec(u_unsigned(tensor_store_count_slv)));
-      put_counter("weight_load_bytes", to_dec(u_unsigned(weight_load_bytes_slv)));
-      put_counter("local_bytes", to_dec(u_unsigned(local_bytes_slv)));
-      put_counter("axi_ar_count", to_dec(axi_ar_count));
-      put_counter("axi_aw_count", to_dec(axi_aw_count));
-      put_counter("axi_rd_beats", to_dec(axi_rd_beats));
-      put_counter("axi_wr_beats", to_dec(axi_wr_beats));
-      put_counter("axi_rd_bytes", to_dec(axi_rd_beats * c_bytes_per_beat));
-      put_counter("axi_wr_bytes", to_dec(axi_wr_bytes));
-      put_counter("axi_wr_lo_addr", to_dec(axi_wr_lo_addr));
-      put_counter("axi_wr_hi_addr", to_dec(axi_wr_hi_addr));
-      file_close(f);
-
-      --------------------------------------------------------------------
-      -- 'result.csv': the exported region in the section-7 format. Always
-      -- written, even when 'g_export_bytes' = 0, so that 'post_check' can
-      -- tell "this config exports nothing" from "the testbench died".
-      --------------------------------------------------------------------
-      open_output("result.csv");
-      write_text_line(f, "# cnn_accel memory image v1");
-      write_text_line(
-        f,
-        "# written by tb_cnn_accel_top, export region ["
-        & to_dec(to_unsigned(g_export_base, 32)) & ", "
-        & to_dec(to_unsigned(g_export_base + g_export_bytes, 32)) & ")"
+      check_true(
+        python_call(
+          "check_result",
+          arg => export_bytes,
+          kwargs =>
+            kw("export_base", v_export_base) &
+            kw("status", u_unsigned(status_slv)) &
+            kw("busy", status.busy) &
+            kw("done", status.done) &
+            kw("error", status.error) &
+            -- Resized to 32 bits like every other kwarg below: passing
+            -- 'status.err_code'/'err_pc_low' at their native (4-bit/
+            -- 16-bit) field widths corrupted the values on the Python
+            -- side -- invisible for every case that only ever exercises
+            -- err_code=0/err_pc_low=0, caught by 'err_bad_geometry'
+            -- (real, nonzero values) once every case ran the live path.
+            kw("err_code", resize(status.err_code, 32)) &
+            kw("err_pc_low", resize(status.err_pc_low, 32)) &
+            kw("hw_info", u_unsigned(hw_info_slv)) &
+            kw("hw_info2", u_unsigned(hw_info2_slv)) &
+            kw("hw_info3", u_unsigned(hw_info3_slv)) &
+            kw("cmd_count", u_unsigned(cmd_count_slv)) &
+            kw("cycle_count", u_unsigned(cycle_count_slv)) &
+            kw("compute_cycles", u_unsigned(compute_cycles_slv)) &
+            kw("stall_cycles", u_unsigned(stall_cycles_slv)) &
+            kw("ddr_rd_bytes", u_unsigned(ddr_rd_bytes_slv)) &
+            kw("ddr_wr_bytes", u_unsigned(ddr_wr_bytes_slv)) &
+            kw("tensor_load_count", u_unsigned(tensor_load_count_slv)) &
+            kw("tensor_store_count", u_unsigned(tensor_store_count_slv)) &
+            kw("weight_load_bytes", u_unsigned(weight_load_bytes_slv)) &
+            kw("local_bytes", u_unsigned(local_bytes_slv)) &
+            kw("axi_ar_count", axi_ar_count) &
+            kw("axi_aw_count", axi_aw_count) &
+            kw("axi_rd_beats", axi_rd_beats) &
+            kw("axi_wr_beats", axi_wr_beats) &
+            kw("axi_wr_bytes", axi_wr_bytes) &
+            kw("axi_wr_lo_addr", axi_wr_lo_addr) &
+            kw("axi_wr_hi_addr", axi_wr_hi_addr)
+        ),
+        "check_result reported a failure for case " & g_case_name & " -- see the printed "
+        & "Python traceback/report above for which check failed"
       );
-      write_text_line(f, "address,data");
-      if g_export_bytes > 0 then
-        for word_index in 0 to g_export_bytes / c_bytes_per_beat - 1 loop
-          write_text_line(
-            f,
-            to_hex(to_unsigned(g_export_base + word_index * c_bytes_per_beat, 32), 8) & ","
-            & to_hex(
-              u_unsigned(
-                read_word(
-                  memory => memory,
-                  address => g_export_base + word_index * c_bytes_per_beat,
-                  bytes_per_word => c_bytes_per_beat
-                )
-              ),
-              2 * c_bytes_per_beat
-            )
-          );
-        end loop;
-      end if;
-      file_close(f);
-
-      end if; -- g_check_live
 
       --------------------------------------------------------------------
-      -- The one and only pass/fail claim this testbench makes about the
-      -- run itself. Which ERR_CODE is expected is per-program knowledge,
-      -- so it is checked in Python from 'counters.csv', not here.
+      -- The one and only pass/fail claim this testbench itself makes
+      -- about the run. Which ERR_CODE is expected is per-program
+      -- knowledge, so it is checked in Python (from the counters just
+      -- handed to 'check_result'), not here.
       --------------------------------------------------------------------
-      if g_expect_error then
+      if v_expect_error then
         check_equal(
           status.error,
           '1',
-          "g_expect_error is true, so the program must end with STATUS.ERROR set. " & describe_status
+          "the case expects STATUS.ERROR, so the program must end with it set. " & describe_status
         );
       else
         check_equal(
