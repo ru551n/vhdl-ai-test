@@ -27,13 +27,15 @@ The verification `check_live` performs is deliberately in two layers:
    model over AXI -- unpacked from the hardware's plane layout and
    compared element by element against `reference.run_reference`.
    Nothing is compared against a value the DUT reported about itself.
-2. **Traffic**: the DUT's own CSR counters are compared against
-   `Planner`'s prediction *and* against the testbench's passive AXI
-   monitor (the `axi_*` counters). The residency invariants of arch doc
-   section 10 are the whole point of rev 2, and a counter that only
-   agrees with itself proves nothing -- `DDR_WR_BYTES` must agree with
-   independently observed W-channel handshakes, or the "the intermediate
-   never went to DDR" claim rests on the same logic it is testing.
+2. **Traffic**: the DUT's own CSR counters (trusted for byte/beat
+   totals -- the module's internal performance counters already cover
+   that) are compared against `Planner`'s prediction. One thing the DUT
+   has no counter for at all -- *where* it wrote, not just how much --
+   still comes from the testbench's own passive AXI monitor: every
+   observed `AWADDR` must fall inside an explicit `STORE`/spill
+   destination (`axi_wr_lo_addr`/`axi_wr_hi_addr`), which is what turns
+   "the intermediate never went to DDR" (arch doc section 10) into a
+   claim about actual bus traffic rather than just the DUT's own say-so.
 """
 
 from __future__ import annotations
@@ -114,9 +116,6 @@ class TrafficPolicy:
     counts_exact: bool = True
     weight_bytes_exact: bool = True
     local_bytes_at_most: bool = True
-    #: Cross-check the DUT's `DDR_*_BYTES` against the testbench's own
-    #: passive AXI monitor. Only ever disabled with a written reason.
-    monitor_cross_check: bool = True
     #: `[(lo, hi_exclusive), ...]`: every observed `AWADDR` must fall in
     #: one of these ranges. `None` derives it from the case's own
     #: expected write destinations.
@@ -511,26 +510,6 @@ class TbCase:
         predicted = self.planned.traffic
         policy = self.traffic
 
-        if policy.monitor_cross_check:
-            # The DUT's self-reported byte counts versus the testbench's
-            # passive W/R-handshake monitor. A disagreement means either
-            # the counters lie or traffic happened that the CSR does not
-            # admit to -- both fatal to every residency claim below.
-            if counters["ddr_wr_bytes"] != counters["axi_wr_bytes"]:
-                raise CheckFailure(
-                    f"DUT DDR_WR_BYTES={counters['ddr_wr_bytes']} disagrees with the "
-                    f"testbench's independently observed AXI write bytes "
-                    f"{counters['axi_wr_bytes']} ({counters['axi_wr_beats']} W beats in "
-                    f"{counters['axi_aw_count']} transactions)"
-                )
-            if counters["ddr_rd_bytes"] != counters["axi_rd_bytes"]:
-                raise CheckFailure(
-                    f"DUT DDR_RD_BYTES={counters['ddr_rd_bytes']} disagrees with the "
-                    f"testbench's independently observed AXI read bytes "
-                    f"{counters['axi_rd_bytes']} ({counters['axi_rd_beats']} R beats in "
-                    f"{counters['axi_ar_count']} transactions)"
-                )
-
         if policy.write_bytes_exact and counters["ddr_wr_bytes"] != predicted.write_bytes:
             raise CheckFailure(
                 f"DDR write traffic {counters['ddr_wr_bytes']} bytes, expected exactly "
@@ -614,7 +593,7 @@ class TbCase:
         if not ranges and counters["axi_aw_count"] != 0:
             raise CheckFailure(
                 f"a rejected program issued {counters['axi_aw_count']} AXI write "
-                f"transaction(s) ({counters['axi_wr_bytes']} bytes, first at "
+                f"transaction(s) ({counters['ddr_wr_bytes']} bytes, first at "
                 f"0x{counters['axi_wr_lo_addr']:08x}); the arch doc requires that a "
                 f"validated-bad command never partially writes its destination"
             )

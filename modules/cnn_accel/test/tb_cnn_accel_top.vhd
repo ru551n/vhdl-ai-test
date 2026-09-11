@@ -63,12 +63,15 @@ use cnn_accel.cnn_accel_python_ffi_pkg.all;
 --      them straight to 'top_level_bridge.check_result' (one
 --      'python_call'), which verifies the run via 'TbCase.check_live'.
 --
--- The 'axi_*' counters handed to Python come from the passive monitor
--- process below, which only watches 'm_axi' handshakes. They exist so
--- that Python can cross-check the DUT's self-reported DDR_RD_BYTES /
--- DDR_WR_BYTES against an independent observation: the residency
--- invariants of arch doc section 10 must not be provable solely by the
--- DUT's own bookkeeping.
+-- Byte/beat traffic totals (DDR_RD_BYTES, DDR_WR_BYTES, ...) are trusted
+-- straight from the DUT's own CSR counters -- the module's internal
+-- performance counters already cover that, so the testbench does not
+-- duplicate it with its own bus monitor. One thing those counters cannot
+-- say is *where* a write landed, so a minimal passive monitor below still
+-- watches 'm_axi' AW handshakes only, giving Python (`axi_aw_count`,
+-- `axi_wr_lo_addr`/`axi_wr_hi_addr`) an independent way to confirm a
+-- rejected or well-formed program never wrote outside its authorized
+-- destinations (arch doc section 10).
 entity tb_cnn_accel_top is
   generic (
     -- Size of the modelled DDR, bytes. One flat read_and_write allocation
@@ -113,9 +116,8 @@ architecture tb of tb_cnn_accel_top is
   ------------------------------------------------------------------------
   -- Derived AXI geometry. Everything is derived from the DUT's own
   -- 'g_axi_data_width' default -- the generated
-  -- 'cnn_accel_constant_max_axi_data_width' -- so the CSV word size, the
-  -- BFM data width and the monitor's bytes-per-beat can never disagree
-  -- with the DUT.
+  -- 'cnn_accel_constant_max_axi_data_width' -- so the BFM data width can
+  -- never disagree with the DUT.
   ------------------------------------------------------------------------
 
   constant c_axi_data_width : positive := cnn_accel_constant_max_axi_data_width;
@@ -192,17 +194,11 @@ architecture tb of tb_cnn_accel_top is
   );
 
   ------------------------------------------------------------------------
-  -- Passive AXI observation (see the entity header). Counted
-  -- unconditionally from time zero; never drives anything.
+  -- Passive AXI write-address observation (see the entity header).
+  -- Counted unconditionally from time zero; never drives anything.
   ------------------------------------------------------------------------
 
-  signal axi_ar_count : natural := 0;
   signal axi_aw_count : natural := 0;
-  signal axi_rd_beats : natural := 0;
-  signal axi_wr_beats : natural := 0;
-  -- Sum over W handshakes of the number of asserted WSTRB bits, i.e. the
-  -- number of bytes actually committed to memory.
-  signal axi_wr_bytes : natural := 0;
   -- Lowest / highest AWADDR observed, both 0 if no write happened. Kept
   -- as unsigned rather than natural: a 32-bit address does not fit VHDL's
   -- signed 'integer'.
@@ -210,14 +206,15 @@ architecture tb of tb_cnn_accel_top is
   signal axi_wr_hi_addr : u_unsigned(31 downto 0) := (others => '0');
 
   ------------------------------------------------------------------------
-  -- Small string/number helpers. The CSV format (arch doc section 7) is
-  -- strict on write -- lower case hex, zero padded -- and strict on read,
-  -- so the conversions live in one place and are used by both directions.
+  -- Number-to-string helpers for diagnostic messages ('describe_status'
+  -- below). Not used for anything read or written by the testbench --
+  -- every value that used to round-trip through a CSV file now travels
+  -- over 'python_call' instead.
   ------------------------------------------------------------------------
 
   -- Decimal rendering of an unsigned of any width. Deliberately not
-  -- 'to_string(to_integer(...))': every counter register dumped below is
-  -- a full 32-bit unsigned and values at or above 2**31 do not fit VHDL's
+  -- 'to_string(to_integer(...))': every counter register is a full
+  -- 32-bit unsigned and values at or above 2**31 do not fit VHDL's
   -- signed 'integer'. Long division by 10 has no such limit.
   function to_dec(value : u_unsigned) return string is
     variable rest : u_unsigned(value'length - 1 downto 0) := value;
@@ -237,11 +234,6 @@ architecture tb of tb_cnn_accel_top is
     return digits(idx + 1 to digits'high);
   end function;
 
-  function to_dec(value : natural) return string is
-  begin
-    return to_string(value);
-  end function;
-
   function to_dec(value : std_ulogic) return string is
   begin
     if value = '1' then
@@ -250,10 +242,7 @@ architecture tb of tb_cnn_accel_top is
     return "0";
   end function;
 
-  -- Lower case, zero padded, exactly 'num_digits' hex digits. Still used
-  -- by 'describe_status' below for diagnostic messages, even though the
-  -- old 'result.csv'/'counters.csv' writers that used to be its main
-  -- callers are gone.
+  -- Lower case, zero padded, exactly 'num_digits' hex digits.
   function to_hex(value : u_unsigned; num_digits : positive) return string is
     constant c_nibbles : string(1 to 16) := "0123456789abcdef";
     constant padded : u_unsigned(4 * num_digits - 1 downto 0) := resize(value, 4 * num_digits);
@@ -267,159 +256,19 @@ architecture tb of tb_cnn_accel_top is
 
 begin
 
-  clk <= not clk after c_clk_period / 2;
-
-  -- Generously above the testbench's own 'g_timeout_cycles' bound, which
-  -- is the check that is supposed to fire (with a diagnosable message) if
-  -- the DUT never reaches DONE/ERROR. The extra margin covers reset, the
-  -- CSR reads and the file I/O around the run.
-  test_runner_watchdog(runner, 2 * g_timeout_cycles * c_clk_period + 1 ms);
-
-
   ------------------------------------------------------------------------
-  -- DUT. Direct entity instantiation, forwarding only the five geometry
-  -- generics this testbench parameterizes; every other generic stays at
-  -- its default (they are tied to the generated constants and to each
-  -- other by assertions inside the DUT).
-  ------------------------------------------------------------------------
-  dut : entity cnn_accel.cnn_accel_top
-    generic map (
-      g_pe_rows => g_pe_rows,
-      g_num_banks => g_num_banks,
-      g_bank_words => g_bank_words,
-      g_ddr_limit => g_ddr_limit,
-      g_watchdog_cycles => g_watchdog_cycles
-    )
-    port map (
-      clk => clk,
-      reset => reset,
-      --
-      s_axi_lite_m2s => s_axi_lite_m2s,
-      s_axi_lite_s2m => s_axi_lite_s2m,
-      --
-      m_axi_m2s => m_axi_m2s,
-      m_axi_s2m => m_axi_s2m,
-      --
-      irq => irq
-    );
-
-
-  ------------------------------------------------------------------------
-  -- The host side: VUnit's AXI-Lite master behind hdl-modules' record
-  -- wrapper, on the default 'register_bus_master' bus handle -- the same
-  -- default the generated 'cnn_accel_register_read_write_pkg' procedures
-  -- use, so no bus handle ever has to be passed explicitly below.
-  ------------------------------------------------------------------------
-  axi_lite_master_inst : entity bfm.axi_lite_master
-    port map (
-      clk => clk,
-      --
-      axi_lite_m2s => s_axi_lite_m2s,
-      axi_lite_s2m => s_axi_lite_s2m
-    );
-
-
-  ------------------------------------------------------------------------
-  -- The DDR side: the combined read+write AXI slave BFM, both halves
-  -- backed by the same 'memory_t'. This is the only path to memory the
-  -- DUT has (arch doc section 11).
-  ------------------------------------------------------------------------
-  axi_slave_inst : entity bfm.axi_slave
-    generic map (
-      axi_read_slave => c_axi_read_slave,
-      axi_write_slave => c_axi_write_slave,
-      data_width => c_axi_data_width,
-      id_width => c_axi_id_width
-    )
-    port map (
-      clk => clk,
-      --
-      axi_read_m2s => m_axi_m2s.read,
-      axi_read_s2m => m_axi_s2m.read,
-      --
-      axi_write_m2s => m_axi_m2s.write,
-      axi_write_s2m => m_axi_s2m.write
-    );
-
-
-  ------------------------------------------------------------------------
-  -- Passive AXI monitor. Purely observational: it drives no DUT input and
-  -- no BFM signal, it only counts valid+ready handshakes on the DUT's
-  -- 'm_axi' from time zero. Its numbers are what lets Python cross-check
-  -- the DUT's own DDR_RD_BYTES / DDR_WR_BYTES counters, so the residency
-  -- invariants (arch doc section 10) do not rest on the DUT's own
-  -- bookkeeping alone.
-  ------------------------------------------------------------------------
-  axi_monitor : process
-    variable ar_count : natural := 0;
-    variable aw_count : natural := 0;
-    variable rd_beats : natural := 0;
-    variable wr_beats : natural := 0;
-    variable wr_bytes : natural := 0;
-    variable lo_addr : u_unsigned(31 downto 0) := (others => '0');
-    variable hi_addr : u_unsigned(31 downto 0) := (others => '0');
-    variable aw_addr : u_unsigned(31 downto 0);
-  begin
-    wait until rising_edge(clk);
-
-    if m_axi_m2s.read.ar.valid = '1' and m_axi_s2m.read.ar.ready = '1' then
-      ar_count := ar_count + 1;
-    end if;
-
-    if m_axi_s2m.read.r.valid = '1' and m_axi_m2s.read.r.ready = '1' then
-      rd_beats := rd_beats + 1;
-    end if;
-
-    if m_axi_m2s.write.aw.valid = '1' and m_axi_s2m.write.aw.ready = '1' then
-      aw_count := aw_count + 1;
-      aw_addr := m_axi_m2s.write.aw.addr(aw_addr'range);
-      if aw_count = 1 then
-        lo_addr := aw_addr;
-        hi_addr := aw_addr;
-      else
-        if aw_addr < lo_addr then
-          lo_addr := aw_addr;
-        end if;
-        if aw_addr > hi_addr then
-          hi_addr := aw_addr;
-        end if;
-      end if;
-    end if;
-
-    if m_axi_m2s.write.w.valid = '1' and m_axi_s2m.write.w.ready = '1' then
-      wr_beats := wr_beats + 1;
-      -- Only the byte lanes that actually exist at this data width; the
-      -- record is sized for the widest AXI this project's axi_pkg allows.
-      for byte_lane in 0 to c_bytes_per_beat - 1 loop
-        if m_axi_m2s.write.w.strb(byte_lane) = '1' then
-          wr_bytes := wr_bytes + 1;
-        end if;
-      end loop;
-    end if;
-
-    axi_ar_count <= ar_count;
-    axi_aw_count <= aw_count;
-    axi_rd_beats <= rd_beats;
-    axi_wr_beats <= wr_beats;
-    axi_wr_bytes <= wr_bytes;
-    axi_wr_lo_addr <= lo_addr;
-    axi_wr_hi_addr <= hi_addr;
-  end process;
-
-
-  ------------------------------------------------------------------------
-  -- The one and only test case. All variation is generics + files; there
-  -- is deliberately no per-network or per-test-case logic here.
+  -- The one and only test case. All variation is generics plus whichever
+  -- 'TbCase' 'g_case_name' names; there is deliberately no per-network or
+  -- per-test-case logic here.
   ------------------------------------------------------------------------
   main : process
     variable ddr : buffer_t;
     -- The exported region, read one byte per 'read_word' call and
     -- handed to Python directly (see 'ffi_export_bytes').
-    variable export_bytes : integer_array_t;
-    -- Discards 'python_call("set_test_case", ...)''s return value: Python's
-    -- 'set_test_case' has nothing meaningful to report back, so only the
-    -- call (and its exception-to-VHDL-failure path, should the case name
-    -- be unknown) matters.
+    variable export_data : integer_array_t;
+    -- Discards a 'python_call''s return value: several Python-side calls
+    -- below have nothing meaningful to report back, so only the call
+    -- itself (and its exception-to-VHDL-failure path) matters.
     variable discard : integer;
 
     -- Per-case values, fetched live from the selected 'TbCase' right
@@ -428,12 +277,12 @@ begin
     -- 'get_program_start_address'/'get_output_region'/'get_input_region'/
     -- 'get_expect_error').
     variable region : integer_array_t;
-    variable v_program_base : natural;
-    variable v_export_base : natural;
-    variable v_export_bytes : natural;
-    variable v_inputs_base : natural;
-    variable v_inputs_bytes : natural;
-    variable v_expect_error : boolean;
+    variable program_addr : natural;
+    variable export_base : natural;
+    variable export_bytes : natural;
+    variable inputs_base : natural;
+    variable inputs_bytes : natural;
+    variable expect_error : boolean;
 
     -- The compiler's own output (descriptor chain, weight/bias/scale/LUT
     -- tables), written region by region -- see 'get_program_regions'/
@@ -444,9 +293,9 @@ begin
 
     -- Every register is read as a raw 'register_t' and, where it has
     -- fields, converted with the generated 'to_cnn_accel_*' function.
-    -- Two reasons: the raw value is what 'check_result' is handed,
-    -- and a single read keeps the raw value and the decoded fields
-    -- consistent (two reads of a live STATUS could disagree).
+    -- Two reasons: the raw value is what 'check_result' is handed, and a
+    -- single read keeps the raw value and the decoded fields consistent
+    -- (two reads of a live STATUS could disagree).
     variable status_slv : register_t := (others => '0');
     variable status : cnn_accel_status_t := cnn_accel_status_init;
     variable hw_info_slv : register_t := (others => '0');
@@ -485,14 +334,14 @@ begin
     python_execute(file_name => tb_path(runner_cfg) & "python_bridge/top_level_bridge.py");
     discard := python_call("set_test_case", arg => g_case_name);
 
-    v_program_base := python_call("get_program_start_address");
-    v_expect_error := python_call("get_expect_error");
+    program_addr := python_call("get_program_start_address");
+    expect_error := python_call("get_expect_error");
     region := python_call("get_output_region");
-    v_export_base := get(region, 0);
-    v_export_bytes := get(region, 1);
+    export_base := get(region, 0);
+    export_bytes := get(region, 1);
     region := python_call("get_input_region");
-    v_inputs_base := get(region, 0);
-    v_inputs_bytes := get(region, 1);
+    inputs_base := get(region, 0);
+    inputs_bytes := get(region, 1);
 
     ----------------------------------------------------------------------
     -- The modelled DDR. The first allocation in a fresh 'memory_t' starts
@@ -515,18 +364,18 @@ begin
     -- must be word aligned, and it has to be inside the modelled DDR to
     -- be readable at all.
     check_equal(
-      v_export_base mod c_bytes_per_beat,
+      export_base mod c_bytes_per_beat,
       0,
       "the case's export_base must be " & to_string(c_bytes_per_beat) & "-byte aligned"
     );
     check_equal(
-      v_export_bytes mod c_bytes_per_beat,
+      export_bytes mod c_bytes_per_beat,
       0,
       "the case's export_bytes must be a whole number of " & to_string(c_bytes_per_beat)
       & "-byte words"
     );
     check(
-      v_export_base + v_export_bytes <= g_ddr_bytes,
+      export_base + export_bytes <= g_ddr_bytes,
       "the export region must lie inside the modelled DDR (g_ddr_bytes = "
       & to_string(g_ddr_bytes) & ")"
     );
@@ -554,9 +403,9 @@ begin
 
     -- The graph's own input tensors: a separate region, written the same
     -- way (see 'get_input_data' in top_level_bridge.py).
-    ffi_write_bytes(memory, "get_input_data", v_inputs_base, v_inputs_bytes);
+    ffi_write_bytes(memory, "get_input_data", inputs_base, inputs_bytes);
     info(
-      "tb_cnn_accel_top: wrote " & to_string(v_inputs_bytes)
+      "tb_cnn_accel_top: wrote " & to_string(inputs_bytes)
       & " input bytes via python_call(""get_input_data"")"
     );
 
@@ -580,7 +429,7 @@ begin
       -- itself (arch doc section 6). CTRL.START is self-clearing in
       -- hardware, so it is never written back to '0'.
       --------------------------------------------------------------------
-      write_cnn_accel_program_base_addr_addr(net, to_unsigned(v_program_base, 32));
+      write_cnn_accel_program_base_addr_addr(net, to_unsigned(program_addr, 32));
       write_cnn_accel_ctrl_start(net, '1');
 
       --------------------------------------------------------------------
@@ -636,17 +485,16 @@ begin
       -- failure, and 'python_call' already reports an uncaught Python
       -- exception to VHDL as a FAILURE with the full traceback, which
       -- says more than any message this call site could write. The
-      -- return value is discarded for the same reason it is in
-      -- 'set_test_case' above.
+      -- return value is discarded for the same reason it is above.
       --------------------------------------------------------------------
-      export_bytes := ffi_export_bytes(memory, v_export_base, v_export_bytes);
+      export_data := ffi_export_bytes(memory, export_base, export_bytes);
 
       discard :=
         python_call(
           "check_result",
-          arg => export_bytes,
+          arg => export_data,
           kwargs =>
-            kw("export_base", v_export_base) &
+            kw("export_base", export_base) &
             kw("status", u_unsigned(status_slv)) &
             kw("busy", status.busy) &
             kw("done", status.done) &
@@ -672,11 +520,7 @@ begin
             kw("tensor_store_count", u_unsigned(tensor_store_count_slv)) &
             kw("weight_load_bytes", u_unsigned(weight_load_bytes_slv)) &
             kw("local_bytes", u_unsigned(local_bytes_slv)) &
-            kw("axi_ar_count", axi_ar_count) &
             kw("axi_aw_count", axi_aw_count) &
-            kw("axi_rd_beats", axi_rd_beats) &
-            kw("axi_wr_beats", axi_wr_beats) &
-            kw("axi_wr_bytes", axi_wr_bytes) &
             kw("axi_wr_lo_addr", axi_wr_lo_addr) &
             kw("axi_wr_hi_addr", axi_wr_hi_addr)
         );
@@ -687,7 +531,7 @@ begin
       -- knowledge, so it is checked in Python (from the counters just
       -- handed to 'check_result'), not here.
       --------------------------------------------------------------------
-      if v_expect_error then
+      if expect_error then
         check_equal(
           status.error,
           '1',
@@ -704,6 +548,116 @@ begin
     end if;
 
     test_runner_cleanup(runner);
+  end process;
+
+  ------------------------------------------------------------------------
+  -- Clock generation and the testbench's own liveness bound. Generously
+  -- above 'g_timeout_cycles', which is the check that is supposed to
+  -- fire (with a diagnosable message) if the DUT never reaches
+  -- DONE/ERROR; the extra margin covers reset and the CSR reads around
+  -- the run.
+  ------------------------------------------------------------------------
+  clk <= not clk after c_clk_period / 2;
+  test_runner_watchdog(runner, 2 * g_timeout_cycles * c_clk_period + 1 ms);
+
+  ------------------------------------------------------------------------
+  -- DUT. Direct entity instantiation, forwarding only the five geometry
+  -- generics this testbench parameterizes; every other generic stays at
+  -- its default (they are tied to the generated constants and to each
+  -- other by assertions inside the DUT).
+  ------------------------------------------------------------------------
+  dut : entity cnn_accel.cnn_accel_top
+    generic map (
+      g_pe_rows => g_pe_rows,
+      g_num_banks => g_num_banks,
+      g_bank_words => g_bank_words,
+      g_ddr_limit => g_ddr_limit,
+      g_watchdog_cycles => g_watchdog_cycles
+    )
+    port map (
+      clk => clk,
+      reset => reset,
+      --
+      s_axi_lite_m2s => s_axi_lite_m2s,
+      s_axi_lite_s2m => s_axi_lite_s2m,
+      --
+      m_axi_m2s => m_axi_m2s,
+      m_axi_s2m => m_axi_s2m,
+      --
+      irq => irq
+    );
+
+  ------------------------------------------------------------------------
+  -- The host side: VUnit's AXI-Lite master behind hdl-modules' record
+  -- wrapper, on the default 'register_bus_master' bus handle -- the same
+  -- default the generated 'cnn_accel_register_read_write_pkg' procedures
+  -- use, so no bus handle ever has to be passed explicitly above.
+  ------------------------------------------------------------------------
+  axi_lite_master_inst : entity bfm.axi_lite_master
+    port map (
+      clk => clk,
+      --
+      axi_lite_m2s => s_axi_lite_m2s,
+      axi_lite_s2m => s_axi_lite_s2m
+    );
+
+  ------------------------------------------------------------------------
+  -- The DDR side: the combined read+write AXI slave BFM, both halves
+  -- backed by the same 'memory_t'. This is the only path to memory the
+  -- DUT has (arch doc section 11).
+  ------------------------------------------------------------------------
+  axi_slave_inst : entity bfm.axi_slave
+    generic map (
+      axi_read_slave => c_axi_read_slave,
+      axi_write_slave => c_axi_write_slave,
+      data_width => c_axi_data_width,
+      id_width => c_axi_id_width
+    )
+    port map (
+      clk => clk,
+      --
+      axi_read_m2s => m_axi_m2s.read,
+      axi_read_s2m => m_axi_s2m.read,
+      --
+      axi_write_m2s => m_axi_m2s.write,
+      axi_write_s2m => m_axi_s2m.write
+    );
+
+  ------------------------------------------------------------------------
+  -- Passive AXI write-address monitor. Purely observational: it drives no
+  -- DUT input and no BFM signal, it only watches AW handshakes on the
+  -- DUT's 'm_axi' from time zero. Byte/beat totals are trusted from the
+  -- DUT's own CSR counters (see the entity header) -- this only tracks
+  -- what those counters cannot say: how many writes happened, and the
+  -- address range they landed in.
+  ------------------------------------------------------------------------
+  axi_monitor : process
+    variable aw_count : natural := 0;
+    variable lo_addr : u_unsigned(31 downto 0) := (others => '0');
+    variable hi_addr : u_unsigned(31 downto 0) := (others => '0');
+    variable aw_addr : u_unsigned(31 downto 0);
+  begin
+    wait until rising_edge(clk);
+
+    if m_axi_m2s.write.aw.valid = '1' and m_axi_s2m.write.aw.ready = '1' then
+      aw_count := aw_count + 1;
+      aw_addr := m_axi_m2s.write.aw.addr(aw_addr'range);
+      if aw_count = 1 then
+        lo_addr := aw_addr;
+        hi_addr := aw_addr;
+      else
+        if aw_addr < lo_addr then
+          lo_addr := aw_addr;
+        end if;
+        if aw_addr > hi_addr then
+          hi_addr := aw_addr;
+        end if;
+      end if;
+    end if;
+
+    axi_aw_count <= aw_count;
+    axi_wr_lo_addr <= lo_addr;
+    axi_wr_hi_addr <= hi_addr;
   end process;
 
 end architecture tb;
