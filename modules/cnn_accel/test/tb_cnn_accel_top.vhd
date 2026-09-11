@@ -49,11 +49,11 @@ use cnn_accel.cnn_accel_python_ffi_pkg.all;
 --   2. Select that case ('top_level_bridge.set_test_case') and fetch its
 --      per-run values live (program base address, export/input DDR
 --      windows, whether it expects an error).
---   3. Seed the compiler's own output (descriptor chain, weight/bias/
+--   3. Write the compiler's own output (descriptor chain, weight/bias/
 --      scale/LUT tables) region by region, then the graph's own input
 --      tensors, each via one 'python_call' per region (see
---      'cnn_accel_python_ffi_pkg.vhd's 'ffi_seed_indexed_bytes'/
---      'ffi_seed_bytes').
+--      'cnn_accel_python_ffi_pkg.vhd's 'ffi_write_indexed_bytes'/
+--      'ffi_write_bytes').
 --   4. Serve the DUT's single AXI4 master port from that same 'memory_t'
 --      via bfm.axi_slave -- the only path to memory the DUT has.
 --   5. Drive PROGRAM_BASE_ADDR + CTRL.START over AXI4-Lite (bfm.
@@ -436,9 +436,9 @@ begin
     variable v_expect_error : boolean;
 
     -- The compiler's own output (descriptor chain, weight/bias/scale/LUT
-    -- tables), seeded region by region -- see 'get_program_regions'/
+    -- tables), written region by region -- see 'get_program_regions'/
     -- 'get_program_data' in top_level_bridge.py and
-    -- 'ffi_seed_indexed_bytes' in cnn_accel_python_ffi_pkg.vhd.
+    -- 'ffi_write_indexed_bytes' in cnn_accel_python_ffi_pkg.vhd.
     variable compiled_bounds : integer_array_t;
     variable num_compiled_regions : natural;
 
@@ -531,7 +531,7 @@ begin
       & to_string(g_ddr_bytes) & ")"
     );
 
-    -- The compiler's own output: one 'ffi_seed_indexed_bytes' call per
+    -- The compiler's own output: one 'ffi_write_indexed_bytes' call per
     -- contiguous compiled region (the descriptor chain, then whichever
     -- of the weight/bias/scale/LUT tables this case actually uses) --
     -- see 'get_program_regions'/'get_program_data' in
@@ -541,22 +541,22 @@ begin
     compiled_bounds := python_call("get_program_regions");
     num_compiled_regions := length(compiled_bounds) / 2;
     for r in 0 to num_compiled_regions - 1 loop
-      ffi_seed_indexed_bytes(
+      ffi_write_indexed_bytes(
         memory, "get_program_data", r,
         base_addr => get(compiled_bounds, 2 * r),
         num_bytes => get(compiled_bounds, 2 * r + 1)
       );
     end loop;
     info(
-      "tb_cnn_accel_top: live-seeded " & to_string(num_compiled_regions)
+      "tb_cnn_accel_top: wrote " & to_string(num_compiled_regions)
       & " compiled region(s) via python_call(""get_program_data"")"
     );
 
-    -- The graph's own input tensors: a separate region, seeded the same
+    -- The graph's own input tensors: a separate region, written the same
     -- way (see 'get_input_data' in top_level_bridge.py).
-    ffi_seed_bytes(memory, "get_input_data", v_inputs_base, v_inputs_bytes);
+    ffi_write_bytes(memory, "get_input_data", v_inputs_base, v_inputs_bytes);
     info(
-      "tb_cnn_accel_top: live-seeded " & to_string(v_inputs_bytes)
+      "tb_cnn_accel_top: wrote " & to_string(v_inputs_bytes)
       & " input bytes via python_call(""get_input_data"")"
     );
 
@@ -630,13 +630,18 @@ begin
 
       --------------------------------------------------------------------
       -- Every counter, plus the exported DDR region, handed straight to
-      -- 'top_level_bridge.check_result' (one python_call), which
-      -- runs 'TbCase.check_live' -- no file is read or written anywhere
-      -- in this step.
+      -- 'top_level_bridge.check_result' (one python_call), which runs
+      -- 'TbCase.check_live' -- no file is read or written anywhere in
+      -- this step. No 'check_true' wrapper: 'check_result' raises on
+      -- failure, and 'python_call' already reports an uncaught Python
+      -- exception to VHDL as a FAILURE with the full traceback, which
+      -- says more than any message this call site could write. The
+      -- return value is discarded for the same reason it is in
+      -- 'set_test_case' above.
       --------------------------------------------------------------------
       export_bytes := ffi_export_bytes(memory, v_export_base, v_export_bytes);
 
-      check_true(
+      discard :=
         python_call(
           "check_result",
           arg => export_bytes,
@@ -674,10 +679,7 @@ begin
             kw("axi_wr_bytes", axi_wr_bytes) &
             kw("axi_wr_lo_addr", axi_wr_lo_addr) &
             kw("axi_wr_hi_addr", axi_wr_hi_addr)
-        ),
-        "check_result reported a failure for case " & g_case_name & " -- see the printed "
-        & "Python traceback/report above for which check failed"
-      );
+        );
 
       --------------------------------------------------------------------
       -- The one and only pass/fail claim this testbench itself makes

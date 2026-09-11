@@ -2924,7 +2924,7 @@ class Module(BaseModule):
         """The rev-2 top-level integration testbench (arch doc section 11).
 
         `tb_cnn_accel_top` is the project's ONE top-level testbench and it
-        is completely generic: it seeds the compiler's own output (the
+        is completely generic: it writes the compiler's own output (the
         descriptor chain and weight/bias/scale/LUT tables) and the
         graph's input tensors, then reads back the CSR counters plus the
         exported DDR region, entirely live over VUnit's Python FFI
@@ -3000,7 +3000,7 @@ class Module(BaseModule):
             # is already the reproducible handle -- `cases.py` maps it to
             # its seed and geometry -- so the generics add nothing here.
             #
-            # No `pre_config`/`post_check` hook: seeding DDR and verifying
+            # No `pre_config`/`post_check` hook: writing DDR and verifying
             # the run both happen entirely inside the simulation, over
             # `python_call` (see `top_level_bridge.py`). Leaving both
             # unset is VUnit's own "nothing to run" default, not a gap.

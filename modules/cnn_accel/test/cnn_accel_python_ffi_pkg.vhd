@@ -8,10 +8,10 @@ use vunit_lib.integer_array_pkg.all;
 use vunit_lib.memory_pkg.all;
 use vunit_lib.check_pkg.all;
 
--- Reusable helpers for a testbench that seeds/exports DDR through
--- VUnit's Python FFI ('python_call') instead of CSV files, so that
--- writing the byte-at-a-time 'write_word'/'read_word' loop is a one-line
--- call at every call site rather than duplicated per testbench.
+-- Reusable helpers for a testbench that writes/reads DDR through VUnit's
+-- Python FFI ('python_call') instead of CSV files, so that writing the
+-- byte-at-a-time 'write_word'/'read_word' loop is a one-line call at
+-- every call site rather than duplicated per testbench.
 --
 -- Both directions work in whole bytes over a byte-addressed 'memory_t',
 -- matching the convention 'accel_v2.memimage.MemoryImage' and every
@@ -21,9 +21,9 @@ package cnn_accel_python_ffi_pkg is
   -- Call 'function_name()' (no arguments) in the current Python
   -- session, expecting an unsigned byte array of exactly 'num_bytes'
   -- elements back, and write it into 'memory' starting at 'base_addr'.
-  -- A no-op when 'num_bytes' is 0 -- a case with nothing to seed there
+  -- A no-op when 'num_bytes' is 0 -- a case with nothing to write there
   -- need not special-case the call site.
-  procedure ffi_seed_bytes(
+  procedure ffi_write_bytes(
     memory : memory_t;
     function_name : string;
     base_addr : natural;
@@ -39,12 +39,12 @@ package cnn_accel_python_ffi_pkg is
     num_bytes : natural
   ) return integer_array_t;
 
-  -- Like 'ffi_seed_bytes', but calls 'function_name(index)' instead of
-  -- 'function_name()' -- for seeding one of several regions a case
+  -- Like 'ffi_write_bytes', but calls 'function_name(index)' instead of
+  -- 'function_name()' -- for writing one of several regions a case
   -- reports (e.g. 'get_program_regions'/'get_program_data' in
   -- top_level_bridge.py), where one Python function alone cannot name
   -- which region's bytes to return.
-  procedure ffi_seed_indexed_bytes(
+  procedure ffi_write_indexed_bytes(
     memory : memory_t;
     function_name : string;
     index : natural;
@@ -56,7 +56,7 @@ end package;
 
 package body cnn_accel_python_ffi_pkg is
 
-  procedure ffi_seed_bytes(
+  procedure ffi_write_bytes(
     memory : memory_t;
     function_name : string;
     base_addr : natural;
@@ -71,7 +71,7 @@ package body cnn_accel_python_ffi_pkg is
     data := python_call(function_name);
     check_equal(
       length(data), num_bytes,
-      "ffi_seed_bytes: python_call(""" & function_name & """) returned "
+      "ffi_write_bytes: python_call(""" & function_name & """) returned "
       & to_string(length(data)) & " bytes, expected " & to_string(num_bytes)
     );
 
@@ -103,7 +103,7 @@ package body cnn_accel_python_ffi_pkg is
     return data;
   end function;
 
-  procedure ffi_seed_indexed_bytes(
+  procedure ffi_write_indexed_bytes(
     memory : memory_t;
     function_name : string;
     index : natural;
@@ -119,7 +119,7 @@ package body cnn_accel_python_ffi_pkg is
     data := python_call(function_name, arg => index);
     check_equal(
       length(data), num_bytes,
-      "ffi_seed_indexed_bytes: python_call(""" & function_name & """, " & to_string(index)
+      "ffi_write_indexed_bytes: python_call(""" & function_name & """, " & to_string(index)
       & ") returned " & to_string(length(data)) & " bytes, expected " & to_string(num_bytes)
     );
 

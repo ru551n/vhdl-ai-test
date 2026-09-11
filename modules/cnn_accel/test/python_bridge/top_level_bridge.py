@@ -1,4 +1,4 @@
-"""VUnit python_bridge entry point for tb_cnn_accel_top: seeds DDR and
+"""VUnit python_bridge entry point for tb_cnn_accel_top: writes DDR and
 verifies each run entirely live, over VUnit's Python FFI (`python_call`),
 from inside the running simulation. No file is read or written anywhere
 in this path -- not `mem_image.csv` going in, nor `result.csv`/
@@ -88,7 +88,7 @@ def get_output_region():
 
 
 def get_input_region():
-    """`[base, num_bytes]` of the DDR window `get_input_data` seeds
+    """`[base, num_bytes]` of the DDR window `get_input_data` writes
     before the run (`TbCase.input_region`)."""
     _require_test_case("get_input_region")
     return list(_CASE.input_region())
@@ -164,8 +164,15 @@ def check_result(
     read straight out of the simulator's `memory_t` model via
     `read_word`. Every other argument is one counter register/passive-
     monitor value, read straight out of the DUT/testbench -- the exact
-    same set `TbCase.check_live` expects. Returns True/False for VHDL to
-    `check_true` on."""
+    same set `TbCase.check_live` expects.
+
+    Raises on failure (via `TbCase.check_live`) rather than returning a
+    pass/fail bool: `python_call` already reports an uncaught exception
+    to VHDL as a FAILURE with the full Python traceback, so there is
+    nothing for a `check_true` at the call site to add. The return value
+    below only satisfies `python_call`'s integer-returning overload
+    (there is no argument-taking, return-nothing one) and carries no
+    meaning of its own."""
     _require_test_case("check_result")
 
     counters = {
@@ -197,4 +204,5 @@ def check_result(
         "axi_wr_lo_addr": int(axi_wr_lo_addr),
         "axi_wr_hi_addr": int(axi_wr_hi_addr),
     }
-    return _CASE.check_live(counters, int(export_base), [int(b) for b in export_bytes])
+    _CASE.check_live(counters, int(export_base), [int(b) for b in export_bytes])
+    return 0

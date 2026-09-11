@@ -1,6 +1,6 @@
 """The Python half of `test/tb_cnn_accel_top.vhd`.
 
-`tb_cnn_accel_top` is deliberately dumb: it seeds a DDR image, pokes
+`tb_cnn_accel_top` is deliberately dumb: it writes a DDR image, pokes
 `PROGRAM_BASE_ADDR` + `CTRL.START`, waits for `DONE`/`ERROR`, then reads
 back the CSR counters and a byte region -- all of it live, over VUnit's
 Python FFI (`python_call`/`python_execute`, bridged through
@@ -13,7 +13,7 @@ A `TbCase` bundles the four things one VUnit config needs:
 
 * the `Model` (what to compute) and its `PlannedProgram` (where every
   tensor lives, and the predicted DDR traffic),
-* the `ProgramImage` (descriptor chain + weights + seeded inputs) --
+* the `ProgramImage` (descriptor chain + weights + preloaded inputs) --
   `compiled_regions`/`compiled_region_bytes` and `input_region`/
   `input_bytes` are the live-FFI views the bridge reads from it,
 * the VUnit generics that tell the testbench the program entry point,
@@ -58,7 +58,6 @@ from accel_v2.planner import (
 )
 from accel_v2.program import ProgramImage, emit_program
 from accel_v2.reference import ExecutionResult, run_reference
-from accel_v2.tiling_checks import GeometryError
 
 #: Bytes per `MemoryImage`/AXI word. Same constant the testbench derives
 #: from the generated AXI data width.
@@ -210,10 +209,10 @@ class TbCase:
 
     def input_region(self) -> tuple[int, int]:
         """`(base_addr, num_bytes)` of the DDR `INPUTS` region this case
-        actually seeds: `DdrMap.INPUTS`'s fixed bounds, narrowed to the
+        actually needs written: `DdrMap.INPUTS`'s fixed bounds, narrowed to the
         bytes really written there (the region's own size is generous
         headroom, not this case's usage). `num_bytes` is 0 for a case
-        with no graph inputs to seed (e.g. an `expect_error` case that
+        with no graph inputs to write (e.g. an `expect_error` case that
         starts a program with none)."""
         lo, hi = self.planned.ddr_map.region_bounds(DdrMap.INPUTS)
         words = self.program.image.words_in_range(lo, hi)
@@ -235,12 +234,12 @@ class TbCase:
         """`[(addr, num_bytes), ...]`, ascending by address: the
         contiguous byte runs of everything the compiler itself produces
         (the descriptor chain and the weight/bias/scale/LUT tables),
-        with the `INPUTS` region excluded -- those bytes are seeded
+        with the `INPUTS` region excluded -- those bytes are written
         separately, via `input_bytes` above (renamed `get_input_data` in
         the bridge). Runs rather than one
         `[lowest, highest]` span: `DdrMap`'s regions sit at fixed,
         far-apart bases regardless of how much of each a given case
-        actually uses, so spanning the whole range would mean seeding
+        actually uses, so spanning the whole range would mean writing
         mostly unused gap bytes for every case."""
         lo, hi = self.planned.ddr_map.region_bounds(DdrMap.INPUTS)
         image = self.program.image.without_range(lo, hi)
@@ -269,7 +268,7 @@ class TbCase:
         Runs against a *fresh* `MemoryImage`, never against
         `self.program.image`: `run_reference` mutates the image it is
         given exactly as the real DDR would, and letting it write into
-        the DUT's preload would seed the DUT with its own expected
+        the DUT's preload would hand the DUT its own expected
         answers -- the most embarrassing possible backdoor."""
         if self._expected is None:
             self._expected = run_reference(self.planned, MemoryImage())
@@ -277,7 +276,7 @@ class TbCase:
 
     # -- checking ---------------------------------------------------------
 
-    def check_live(self, counters: dict[str, int], export_base: int, export_bytes: list[int]) -> bool:
+    def check_live(self, counters: dict[str, int], export_base: int, export_bytes: list[int]) -> None:
         """Verify the run: called from `top_level_bridge.check_result`
         (test/python_bridge/top_level_bridge.py) via a `python_call`,
         right after `STATUS.DONE`/`STATUS.ERROR` fires inside the running
@@ -285,34 +284,34 @@ class TbCase:
         written anywhere in this path. `export_bytes` is the raw exported
         region as plain Python ints (0..255, unsigned byte values -- the
         same convention `MemoryImage.write_bytes` expects), starting at
-        `export_base`. Returns False (after printing a diagnosable
-        report) rather than raising, which is what VUnit's `check_true`
-        wants back from a `python_call`."""
-        try:
-            if self.extra_check is not None:
-                self.extra_check(self)
-            # HW_INFO/HW_INFO2/HW_INFO3 are read unconditionally by the
-            # testbench regardless of how the program ends, so check them
-            # unconditionally too, before branching on expect_error.
-            self._check_hw_info(counters)
-            self._check_status(counters)
-            if self.expect_error:
-                # A rejected program has no meaningful output tensors and
-                # no meaningful traffic prediction: the whole point is
-                # that the DUT stopped. The one traffic claim that still
-                # holds is the arch doc's "never partially writes a
-                # validated-bad command's destination" promise, checked
-                # below.
-                self._check_error_wrote_nothing_unexpected(counters)
-            else:
-                exported = MemoryImage()
-                exported.write_bytes(export_base, bytes(export_bytes))
-                self._check_outputs_against(exported, "<live python_call, no file>")
-                self._check_traffic(counters)
-        except (CheckFailure, GeometryError) as exc:
-            print(f"\ncheck_live FAILED for case '{self.name}':\n{exc}\n")
-            return False
-        return True
+        `export_base`.
+
+        Raises `CheckFailure`/`GeometryError` on the first disagreement,
+        deliberately uncaught: `python_call` already turns an uncaught
+        Python exception into a VUnit FAILURE with the full traceback
+        (see `cnn_accel_python_ffi_pkg.vhd`'s callers), which is a
+        better error report than a bool plus a hand-written `check_true`
+        message could give VHDL -- so there is no `try`/`except` here,
+        and no need for one at any call site either."""
+        if self.extra_check is not None:
+            self.extra_check(self)
+        # HW_INFO/HW_INFO2/HW_INFO3 are read unconditionally by the
+        # testbench regardless of how the program ends, so check them
+        # unconditionally too, before branching on expect_error.
+        self._check_hw_info(counters)
+        self._check_status(counters)
+        if self.expect_error:
+            # A rejected program has no meaningful output tensors and no
+            # meaningful traffic prediction: the whole point is that the
+            # DUT stopped. The one traffic claim that still holds is the
+            # arch doc's "never partially writes a validated-bad
+            # command's destination" promise, checked below.
+            self._check_error_wrote_nothing_unexpected(counters)
+        else:
+            exported = MemoryImage()
+            exported.write_bytes(export_base, bytes(export_bytes))
+            self._check_outputs_against(exported, "<live python_call, no file>")
+            self._check_traffic(counters)
 
     def _check_hw_info(self, counters: dict[str, int]) -> None:
         """`HW_INFO`/`HW_INFO2`/`HW_INFO3` are read-only capability
