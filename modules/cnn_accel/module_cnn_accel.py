@@ -2886,6 +2886,7 @@ class Module(BaseModule):
         self._setup_cnn_accel_tensor_mem(library)
         self._setup_cnn_accel_top(library)
         self._setup_cnn_accel_elementwise_pyffi_pilot(library)
+        library.test_bench("tb_python_ffi_throughput_pilot")
 
     def _setup_cnn_accel_elementwise_pyffi_pilot(self, library) -> None:
         # PILOT ONLY (branch feat/vunit-python-ffi-pilot): needs the
@@ -3005,6 +3006,29 @@ class Module(BaseModule):
                 pre_config=case.pre_config,
                 post_check=case.post_check,
             )
+
+        # PILOT (branch feat/vunit-python-ffi-pilot): a second config for
+        # ONE existing case, 'single_conv' (the catalogue's own reference
+        # point for "does the minimal end-to-end path work at all" -- see
+        # that case's docstring), checked LIVE via python_call instead of
+        # counters.csv/result.csv -- see top_level_bridge.py and
+        # TbCase.check_live. `pre_config` is unchanged (mem_image.csv is
+        # still how the program gets INTO the simulation; only the
+        # OUTPUT side moves to a python_call). `post_check` is
+        # deliberately omitted: the live path already asserted everything
+        # from inside the simulation via `check_true`, so there is
+        # nothing left to check afterward -- an unset `post_check` is
+        # VUnit's own "nothing to run" default, not a gap.
+        single_conv_case = next(c for c in cases.all_cases() if c.name == "single_conv")
+        tb.add_config(
+            name="single_conv_live_check_pilot",
+            generics={
+                **single_conv_case.generics(),
+                "g_check_live": True,
+                "g_case_name": "single_conv",
+            },
+            pre_config=single_conv_case.pre_config,
+        )
 
     def _setup_cnn_accel_bias_requant(self, library) -> None:
         tb = library.test_bench("tb_cnn_accel_bias_requant")

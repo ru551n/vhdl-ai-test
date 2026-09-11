@@ -9,6 +9,8 @@ context vunit_lib.vunit_context;
 context vunit_lib.com_context;
 use vunit_lib.memory_pkg.all;
 use vunit_lib.axi_slave_pkg.all;
+use vunit_lib.python_pkg.all;
+use vunit_lib.integer_array_pkg.all;
 
 library axi;
 use axi.axi_pkg.all;
@@ -100,6 +102,19 @@ entity tb_cnn_accel_top is
     g_watchdog_cycles : positive := 1_000_000;
     -- AXI slave BFM randomized stalling, percent. 0 = no stalling.
     stall_probability_percent : natural := 0;
+    -- PILOT (branch feat/vunit-python-ffi-pilot): when true, skip
+    -- 'result.csv'/'counters.csv' entirely and instead call
+    -- 'top_level_bridge.check_live_result' (a python_call, see
+    -- test/python_bridge/top_level_bridge.py) with the same values those
+    -- files would have held, right here, before test_runner_cleanup --
+    -- 'post_check' is left unset for a config that sets this. Default
+    -- false: every existing config's behaviour is completely unchanged.
+    g_check_live : boolean := false;
+    -- Which pre-built 'TbCase' the live path checks against -- passed to
+    -- 'top_level_bridge.select_case' once, before CTRL.START. Only reads
+    -- from 'accel_v2.cases.all_cases()' (the pilot's one catalogue), and
+    -- only meaningful when 'g_check_live' is true.
+    g_case_name : string := "";
     runner_cfg : string
   );
 end entity tb_cnn_accel_top;
@@ -644,6 +659,10 @@ begin
   main : process
     variable ddr : buffer_t;
     variable num_words : natural;
+    -- PILOT (g_check_live): the exported region, built the same way
+    -- 'result.csv' is (one byte per 'read_word' call), but handed to
+    -- Python directly instead of written to a file.
+    variable export_bytes : integer_array_t;
 
     -- Every register is read as a raw 'register_t' and, where it has
     -- fields, converted with the generated 'to_cnn_accel_*' function.
@@ -702,6 +721,11 @@ begin
 
   begin
     test_runner_setup(runner, runner_cfg);
+
+    if g_check_live then
+      python_execute(file_name => tb_path(runner_cfg) & "python_bridge/top_level_bridge.py");
+      python_execute(source => "select_case(" & """" & g_case_name & """" & ")");
+    end if;
 
     ----------------------------------------------------------------------
     -- The modelled DDR. The first allocation in a fresh 'memory_t' starts
@@ -814,6 +838,67 @@ begin
       read_cnn_accel_local_bytes(net, local_bytes_slv);
 
       --------------------------------------------------------------------
+      -- PILOT (g_check_live): the same counters and the same exported
+      -- region, handed straight to 'top_level_bridge.check_live_result'
+      -- (one python_call) instead of 'counters.csv'/'result.csv'. See
+      -- that function's docstring for the exact argument-to-column
+      -- mapping -- it is deliberately the same set, same names, so this
+      -- branch and the 'else' branch below are checking identical data,
+      -- just by two different transports.
+      --------------------------------------------------------------------
+      if g_check_live then
+        export_bytes := new_1d(length => g_export_bytes, bit_width => 8, is_signed => false);
+        for byte_index in 0 to g_export_bytes - 1 loop
+          set(
+            export_bytes, byte_index,
+            to_integer(
+              u_unsigned(
+                read_word(memory => memory, address => g_export_base + byte_index, bytes_per_word => 1)
+              )
+            )
+          );
+        end loop;
+
+        check_true(
+          python_call(
+            "check_live_result",
+            arg => export_bytes,
+            kwargs =>
+              kw("export_base", g_export_base) &
+              kw("status", u_unsigned(status_slv)) &
+              kw("busy", status.busy) &
+              kw("done", status.done) &
+              kw("error", status.error) &
+              kw("err_code", std_ulogic_vector(status.err_code)) &
+              kw("err_pc_low", std_ulogic_vector(status.err_pc_low)) &
+              kw("hw_info", u_unsigned(hw_info_slv)) &
+              kw("hw_info2", u_unsigned(hw_info2_slv)) &
+              kw("hw_info3", u_unsigned(hw_info3_slv)) &
+              kw("cmd_count", u_unsigned(cmd_count_slv)) &
+              kw("cycle_count", u_unsigned(cycle_count_slv)) &
+              kw("compute_cycles", u_unsigned(compute_cycles_slv)) &
+              kw("stall_cycles", u_unsigned(stall_cycles_slv)) &
+              kw("ddr_rd_bytes", u_unsigned(ddr_rd_bytes_slv)) &
+              kw("ddr_wr_bytes", u_unsigned(ddr_wr_bytes_slv)) &
+              kw("tensor_load_count", u_unsigned(tensor_load_count_slv)) &
+              kw("tensor_store_count", u_unsigned(tensor_store_count_slv)) &
+              kw("weight_load_bytes", u_unsigned(weight_load_bytes_slv)) &
+              kw("local_bytes", u_unsigned(local_bytes_slv)) &
+              kw("axi_ar_count", axi_ar_count) &
+              kw("axi_aw_count", axi_aw_count) &
+              kw("axi_rd_beats", axi_rd_beats) &
+              kw("axi_wr_beats", axi_wr_beats) &
+              kw("axi_wr_bytes", axi_wr_bytes) &
+              kw("axi_wr_lo_addr", axi_wr_lo_addr) &
+              kw("axi_wr_hi_addr", axi_wr_hi_addr)
+          ),
+          "check_live_result reported a failure for case " & g_case_name & " -- see the printed "
+          & "Python traceback/report above for which check failed"
+        );
+
+      else
+
+      --------------------------------------------------------------------
       -- 'counters.csv': the DUT's own bookkeeping first, then this
       -- testbench's independent AXI observation. Python compares the two.
       --------------------------------------------------------------------
@@ -881,6 +966,8 @@ begin
         end loop;
       end if;
       file_close(f);
+
+      end if; -- g_check_live
 
       --------------------------------------------------------------------
       -- The one and only pass/fail claim this testbench makes about the

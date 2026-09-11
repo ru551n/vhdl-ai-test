@@ -339,6 +339,31 @@ class TbCase:
         self._check_outputs(output_path)
         self._check_traffic(counters)
 
+    def check_live(self, counters: dict[str, int], export_base: int, export_bytes: list[int]) -> bool:
+        """PILOT (modules/cnn_accel/test/python_bridge/top_level_bridge.py):
+        the same verification `post_check` performs, but fed live values
+        from a VUnit `python_call` instead of `output_path`'s
+        `counters.csv`/`result.csv` files -- no file is read or written
+        by this path. `export_bytes` is the raw exported region as plain
+        Python ints (0..255, unsigned byte values -- the same convention
+        `MemoryImage.write_bytes` expects), starting at `export_base`.
+        Returns False (after printing a diagnosable report) rather than
+        raising, matching `post_check`'s own contract."""
+        try:
+            self._check_hw_info(counters)
+            self._check_status(counters)
+            if self.expect_error:
+                self._check_error_wrote_nothing_unexpected(counters)
+            else:
+                exported = MemoryImage()
+                exported.write_bytes(export_base, bytes(export_bytes))
+                self._check_outputs_against(exported, "<live python_call, no file>")
+                self._check_traffic(counters)
+        except CheckFailure as exc:
+            print(f"\ncheck_live FAILED for case '{self.name}':\n{exc}\n")
+            return False
+        return True
+
     def _check_hw_info(self, counters: dict[str, int]) -> None:
         """`HW_INFO`/`HW_INFO2`/`HW_INFO3` are read-only capability
         registers, driven straight from the elaborated generics
@@ -472,7 +497,15 @@ class TbCase:
     def _check_outputs(self, output_path: str) -> None:
         result_path = os.path.join(output_path, RESULT_CSV)
         exported = MemoryImage.read_csv(result_path)
+        self._check_outputs_against(exported, result_path)
 
+    def _check_outputs_against(self, exported: "MemoryImage", source_description: str) -> None:
+        """The comparison half of `_check_outputs`, taking an
+        already-built `MemoryImage` instead of a `result.csv` path --
+        shared with `check_live` (pilot: modules/cnn_accel/test/
+        python_bridge/top_level_bridge.py), which builds `exported`
+        directly from bytes handed over VUnit's python_call FFI rather
+        than a file VHDL wrote and Python re-read."""
         if self.export_bytes == 0:
             raise CheckFailure(
                 "case exports no bytes, so no output can be verified -- "
@@ -495,7 +528,7 @@ class TbCase:
                 tensor.channels,
             )
             expected = self.expected.tensor_data[tensor.name]
-            self._compare_tensor(tensor, expected, actual, addr, result_path)
+            self._compare_tensor(tensor, expected, actual, addr, source_description)
 
     def _compare_tensor(
         self,
