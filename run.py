@@ -54,7 +54,14 @@ def _raise_stack_limit() -> None:
 _raise_stack_limit()
 
 vu = VUnit.from_argv()
-vu.add_vhdl_builtins()
+# python=True: VHDL-to-Python bridge (python_execute/python_call), fork
+# ru551n/vunit branch feature/python-ffi -- pilot for calling
+# cnn_accel_model's golden-model functions live from a testbench instead
+# of through a pre-generated reference file. Requires the venv-pyffi
+# install of that fork (see requirements.txt's own vunit-hdl pin, which
+# this venv deliberately does NOT match yet -- see that pin's own comment
+# on why the shared venv stays on the released --wave commit for now).
+vu.add_vhdl_builtins(python=True)
 # hdl-modules' bfm module (stall_bfm_pkg.vhd) needs osvvm's RandomPType;
 # VUnit ships/compiles it but it is not part of add_vhdl_builtins().
 vu.add_osvvm()
