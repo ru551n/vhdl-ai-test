@@ -286,6 +286,55 @@ class TbCase:
         )
         return True
 
+    def input_region(self) -> tuple[int, int]:
+        """`(base_addr, num_bytes)` of the DDR `INPUTS` region this case
+        actually seeds: `DdrMap.INPUTS`'s fixed bounds, narrowed to the
+        bytes really written there (the region's own size is generous
+        headroom, not this case's usage). `num_bytes` is 0 for a case
+        with no graph inputs to seed (e.g. an `expect_error` case that
+        starts a program with none)."""
+        lo, hi = self.planned.ddr_map.region_bounds(DdrMap.INPUTS)
+        words = self.program.image.words_in_range(lo, hi)
+        if not words:
+            return lo, 0
+        return lo, (max(words) - lo) + WORD_BYTES
+
+    def input_bytes(self) -> bytes:
+        """The exact packed bytes of the `INPUTS` region -- the same
+        bytes `pre_config` would otherwise have written into
+        `mem_image.csv` there, produced by the same compiler pipeline
+        (`accel_v2.program.emit_program`). Read live by
+        `top_level_bridge.input_bytes` (test/python_bridge/
+        top_level_bridge.py) instead of being written to a file."""
+        lo, nbytes = self.input_region()
+        return self.program.image.read_bytes(lo, nbytes)
+
+    def live_pre_config(self, output_path: str) -> bool:
+        """Like `pre_config`, except the `INPUTS` region is left out of
+        `mem_image.csv`: those bytes are seeded live instead, via a
+        `python_call` into `input_bytes` above. Everything the compiler
+        itself produces -- the descriptor chain and the weight/bias/
+        scale/LUT tables -- is completely unaffected and still arrives
+        exactly as `pre_config` would write it; only the transport of
+        the graph's own input tensors changes, from a CSV round trip to
+        a live FFI call."""
+        os.makedirs(output_path, exist_ok=True)
+        lo, nbytes = self.input_region()
+        compiled = self.program.image.without_range(lo, lo + nbytes) if nbytes else self.program.image
+        compiled.write_csv(
+            os.path.join(output_path, MEM_IMAGE_CSV),
+            comment_lines=(
+                f"case: {self.name} (live-input pilot: INPUTS region seeded via "
+                "python_call, not this file)",
+                f"model: {self.model.name} seed={self.model.seed}",
+                f"program_base: 0x{self.program.program_addr:08x} "
+                f"({len(self.program.descs)} descriptors incl. HALT)",
+                f"tensor_mem: {self.num_banks} banks x {self.bank_words} words "
+                f"= {self.tensor_mem_bytes} bytes",
+            ),
+        )
+        return True
+
     def post_check(self, output_path: str) -> bool:
         """Verify the run. Returns False (after printing a diagnosable
         report) rather than raising, which is what VUnit wants from a

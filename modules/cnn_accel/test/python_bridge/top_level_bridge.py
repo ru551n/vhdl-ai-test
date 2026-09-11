@@ -12,6 +12,8 @@ Loaded into the simulator's embedded Python interpreter via
 import sys
 from pathlib import Path
 
+import numpy as np
+
 _CNN_ACCEL_DIR = Path(__file__).resolve().parent.parent.parent
 if str(_CNN_ACCEL_DIR) not in sys.path:
     sys.path.insert(0, str(_CNN_ACCEL_DIR))
@@ -40,6 +42,17 @@ def select_case(name):
             f"(pilot only searches that one catalogue, not the other six module_cnn_accel.py registers)"
         )
     _CASE = by_name[name]
+
+
+def input_bytes():
+    """The selected case's DDR `INPUTS` region (see `TbCase.input_bytes`
+    and `TbCase.input_region`), called live from VHDL (`ffi_seed_bytes`
+    in `cnn_accel_python_ffi_pkg.vhd`) instead of being written into
+    `mem_image.csv`. Same bytes the compiler's own `emit_program` already
+    produced -- this only changes how they reach the simulated DDR."""
+    if _CASE is None:
+        raise RuntimeError("top_level_bridge.input_bytes: select_case was never called")
+    return np.frombuffer(_CASE.input_bytes(), dtype=np.uint8)
 
 
 def check_live_result(

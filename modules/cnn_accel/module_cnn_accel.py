@@ -3020,14 +3020,23 @@ class Module(BaseModule):
         # nothing left to check afterward -- an unset `post_check` is
         # VUnit's own "nothing to run" default, not a gap.
         single_conv_case = next(c for c in cases.all_cases() if c.name == "single_conv")
+        inputs_base, inputs_bytes = single_conv_case.input_region()
         tb.add_config(
             name="single_conv_live_check_pilot",
             generics={
                 **single_conv_case.generics(),
                 "g_check_live": True,
                 "g_case_name": "single_conv",
+                "g_inputs_base": inputs_base,
+                "g_inputs_bytes": inputs_bytes,
             },
-            pre_config=single_conv_case.pre_config,
+            # 'live_pre_config' (not 'pre_config'): the compiler's own
+            # output -- descriptors, weight/bias/scale/LUT tables -- still
+            # goes into mem_image.csv exactly as before; only the graph's
+            # input tensors are left out of that file and seeded live
+            # instead (see cnn_accel_python_ffi_pkg.vhd's
+            # 'ffi_seed_bytes' and top_level_bridge.py's 'input_bytes').
+            pre_config=single_conv_case.live_pre_config,
         )
 
     def _setup_cnn_accel_bias_requant(self, library) -> None:

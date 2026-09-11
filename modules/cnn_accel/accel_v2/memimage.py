@@ -63,6 +63,20 @@ class MemoryImage:
         a different program from one that never touches it)."""
         return dict(self._words)
 
+    def words_in_range(self, lo: int, hi: int) -> dict[int, int]:
+        """Words whose address falls in `[lo, hi)` -- e.g. splitting one
+        `DdrMap` region out of a bigger image."""
+        return {addr: value for addr, value in self._words.items() if lo <= addr < hi}
+
+    def without_range(self, lo: int, hi: int) -> "MemoryImage":
+        """Copy of this image with every word in `[lo, hi)` removed --
+        the complement of `words_in_range`, e.g. for writing "everything
+        except this one region" to a file while that region is seeded
+        some other way."""
+        copy = MemoryImage()
+        copy._words = {addr: value for addr, value in self._words.items() if not (lo <= addr < hi)}
+        return copy
+
     # -- reads ------------------------------------------------------------
 
     def read_bytes(self, addr: int, length: int) -> bytes:

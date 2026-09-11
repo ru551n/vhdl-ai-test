@@ -27,6 +27,7 @@ library cnn_accel;
 use cnn_accel.cnn_accel_regs_pkg.all;
 use cnn_accel.cnn_accel_register_record_pkg.all;
 use cnn_accel.cnn_accel_register_read_write_pkg.all;
+use cnn_accel.cnn_accel_python_ffi_pkg.all;
 
 -- VUnit-5 testbench for cnn_accel_top -- the project's ONE AND ONLY
 -- top-level testbench, specified by
@@ -115,6 +116,17 @@ entity tb_cnn_accel_top is
     -- from 'accel_v2.cases.all_cases()' (the pilot's one catalogue), and
     -- only meaningful when 'g_check_live' is true.
     g_case_name : string := "";
+    -- PILOT (g_check_live): DDR byte window of the case's graph-input
+    -- tensors ('TbCase.input_region()'). When 'g_check_live' is true,
+    -- this window is NOT in 'mem_image.csv' ('TbCase.live_pre_config'
+    -- leaves it out) -- it is seeded live instead, via
+    -- 'ffi_seed_bytes(memory, "input_bytes", ...)', right after
+    -- 'mem_image.csv' loads everything the compiler itself produced
+    -- (the descriptor chain and the weight/bias/scale/LUT tables).
+    -- 'g_inputs_bytes' = 0 both disables the call and matches a case
+    -- with no graph inputs to seed.
+    g_inputs_base : natural := 0;
+    g_inputs_bytes : natural := 0;
     runner_cfg : string
   );
 end entity tb_cnn_accel_top;
@@ -769,6 +781,19 @@ begin
       & output_path & "mem_image.csv'"
     );
 
+    -- PILOT (g_check_live): the compiler's own output (program, weights,
+    -- bias, scale, LUT tables) just arrived from 'mem_image.csv' above,
+    -- unaffected. Only the graph's own input tensors are missing from
+    -- that file ('TbCase.live_pre_config' leaves them out) -- seed them
+    -- here instead, live, via one python_call.
+    if g_check_live then
+      ffi_seed_bytes(memory, "input_bytes", g_inputs_base, g_inputs_bytes);
+      info(
+        "tb_cnn_accel_top: live-seeded " & to_string(g_inputs_bytes)
+        & " input bytes via python_call(""input_bytes"")"
+      );
+    end if;
+
     ----------------------------------------------------------------------
     -- Release reset and let the DUT settle before the first CSR access.
     ----------------------------------------------------------------------
@@ -847,17 +872,7 @@ begin
       -- just by two different transports.
       --------------------------------------------------------------------
       if g_check_live then
-        export_bytes := new_1d(length => g_export_bytes, bit_width => 8, is_signed => false);
-        for byte_index in 0 to g_export_bytes - 1 loop
-          set(
-            export_bytes, byte_index,
-            to_integer(
-              u_unsigned(
-                read_word(memory => memory, address => g_export_base + byte_index, bytes_per_word => 1)
-              )
-            )
-          );
-        end loop;
+        export_bytes := ffi_export_bytes(memory, g_export_base, g_export_bytes);
 
         check_true(
           python_call(
