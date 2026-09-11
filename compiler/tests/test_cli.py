@@ -23,14 +23,15 @@ FIXTURE_PATH = Path(__file__).parent / "fixtures" / "conv_rescale_clamp.mlir"
 _DUMP_STEMS = (
     "00_mlir.txt",
     "01_gir.txt", "01_gir.json",
-    "02_depth_to_space_channels.txt", "02_depth_to_space_channels.json",
-    "03_normalize.txt", "03_normalize.json",
-    "04_legalize_rescale.txt", "04_legalize_rescale.json",
-    "05_fuse.txt", "05_fuse.json",
-    "06_hir.txt", "06_hir.json",
-    "07_sched.txt", "07_sched.json",
-    "08_memplan.txt", "08_memplan.json",
-    "09_program.txt",
+    "02_depth_to_space_pad.txt", "02_depth_to_space_pad.json",
+    "03_depth_to_space_channels.txt", "03_depth_to_space_channels.json",
+    "04_normalize.txt", "04_normalize.json",
+    "05_legalize_rescale.txt", "05_legalize_rescale.json",
+    "06_fuse.txt", "06_fuse.json",
+    "07_hir.txt", "07_hir.json",
+    "08_sched.txt", "08_sched.json",
+    "09_memplan.txt", "09_memplan.json",
+    "10_program.txt",
 )
 _ARTIFACTS = ("program.bin", "constants.bin", "manifest.json")
 

@@ -671,6 +671,17 @@ def _build_manifest(
             "size_bytes": buf.size_bytes,
             "gir_tensor": buf.gir_tensor,
         }
+        if buf.logical_shape is not None:
+            # This buffer is STORED wider than the tensor it holds, because
+            # the hardware that writes it has a coarser granularity than the
+            # tensor's own channel count (today: a `depth_to_space` padded up
+            # to a whole activation channel tile by
+            # `passes.depth_to_space_pad`). `shape` is what the instruction
+            # writes; `logical_shape` is the tensor's real shape, and is what
+            # a reader must decode with -- `read_activation_buffer` does.
+            # `size_bytes` is the same either way: the padding lanes were
+            # already part of the buffer's whole planes.
+            entry["logical_shape"] = list(buf.logical_shape)
         if buf.alias_parent is not None:
             # A buffer view owns no bytes of its own: it is a channel-plane
             # range of `alias_parent` (`tosa.concat`/`tosa.slice`). Recorded

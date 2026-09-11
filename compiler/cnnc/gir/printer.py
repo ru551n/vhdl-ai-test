@@ -139,6 +139,8 @@ def print_gir(graph: Graph) -> str:
 
 def _tensor_json(t: Tensor) -> dict:
     d: dict = {"shape": list(t.shape), "dtype": t.dtype}
+    if t.logical_shape is not None:
+        d["logical_shape"] = list(t.logical_shape)
     if t.values is not None:
         d["numel"] = len(t.values)
         d["values_sha256"] = hashlib.sha256(

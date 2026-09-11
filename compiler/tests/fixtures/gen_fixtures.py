@@ -614,6 +614,38 @@ def espcn_tail_text() -> str:
     return _module_text(in_shape, out_shape, lines, "%dout")
 
 
+def espcn_luma_text() -> str:
+    """A REAL luma-only ESPCN tail: a 3x3 convolution producing
+    `r**2 * 1 = 4` channels, ReLU, then a CHANNEL-major
+    (`nn.PixelShuffle`) 2x shuffle down to ONE output channel.
+
+    `espcn_tail` above uses 8 output channels, which is already a whole
+    activation channel tile; this one uses the count an actual
+    super-resolution model has, and which the hardware cannot address
+    directly -- `OPCODE_DEPTH_TO_SPACE` moves whole T=8-byte tiles, so a
+    1-channel output would be one BYTE LANE of a tile. It is
+    `passes.depth_to_space_pad` that makes this compile, by giving the
+    convolution `4 * (8 - 1) = 28` dummy zero-weight output channels so
+    the shuffle produces a whole 8-lane tile of which the graph's real
+    single channel is lane 0. The stored tensor is 8 channels wide; the
+    tensor's VALUE is still 1 channel, and `Tensor.logical_shape` ->
+    manifest `logical_shape` -> `unpack_activation_planes` is what keeps
+    those two facts apart.
+
+    Same conv quantization as `espcn_tail` (see there for how `shift` was
+    chosen), so the shuffle is permuting real data."""
+    in_shape = (1, 4, 6, 4)
+    counter = _ValueCounter()
+    lines: list[str] = []
+    conv, conv_shape = _conv_layer_lines(
+        "%arg0", in_shape, 4, counter, lines, weight_seed=903, bias_seed=904,
+        mult=1073741824, shift=34,
+    )
+    chain, out_shape = depth_to_space_chain_lines(conv, conv_shape, 2, "d", channel_major=True)
+    lines += chain
+    return _module_text(in_shape, out_shape, lines, "%dout")
+
+
 # ---------------------------------------------------------------------------
 # M14 `tosa.concat` / `tosa.slice` fixtures: the buffer-view lowering.
 #
@@ -797,6 +829,7 @@ def main() -> None:
     (FIXTURES_DIR / "concat_equal_halves.mlir").write_text(concat_equal_halves_text())
     (FIXTURES_DIR / "depth_to_space2x.mlir").write_text(depth_to_space2x_text())
     (FIXTURES_DIR / "espcn_tail.mlir").write_text(espcn_tail_text())
+    (FIXTURES_DIR / "espcn_luma.mlir").write_text(espcn_luma_text())
 
 
 if __name__ == "__main__":

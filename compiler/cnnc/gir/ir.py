@@ -34,6 +34,25 @@ class Tensor:
     shape: tuple[int, ...]
     dtype: str
     values: tuple[int, ...] | None = None  # row-major constant data; None if not compile-time constant
+    #: The shape the SOURCE graph declared for this tensor, when a pass has
+    #: had to widen `shape` to suit the hardware's storage granularity.
+    #: `None` (the normal case) means `shape` is both -- nothing was
+    #: widened. Today the only producer is
+    #: `passes.depth_to_space_pad.PadDepthToSpaceChannelsPass`, which pads a
+    #: pixel shuffle's output channel count up to a whole activation channel
+    #: tile because `OPCODE_DEPTH_TO_SPACE` moves nothing smaller; the extra
+    #: channels are dummies computed from zero weights.
+    #:
+    #: `shape` stays the authority on what the hardware WRITES (and so on
+    #: what the instruction's descriptor says and how many bytes the buffer
+    #: holds); `logical_shape` is the authority on what the tensor's VALUE
+    #: is. `lower.layout.unpack_activation_planes` is the boundary between
+    #: the two, exactly as it already is for the padding lanes of any
+    #: ordinary tensor whose channel count is not a multiple of the plane
+    #: width -- a C=3 RGB input, say. Carried to the program manifest via
+    #: `hir.ir.Buffer.logical_shape` so a caller reading a result back gets
+    #: its real channels rather than the padding.
+    logical_shape: tuple[int, ...] | None = None
 
     @property
     def numel(self) -> int:

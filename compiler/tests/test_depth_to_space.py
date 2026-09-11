@@ -43,8 +43,9 @@ from cnnc.frontend.mlir_generic import parse_module
 from cnnc.frontend.tosa_import import import_tosa
 from cnnc.gir import interp
 from cnnc.gir.ir import CHANNEL_MAJOR, PLANE_MAJOR, DepthToSpaceAttrs
-from cnnc.passes import PassContext, PermuteDepthToSpaceChannelsPass
+from cnnc.passes import PadDepthToSpaceChannelsPass, PassContext, PermuteDepthToSpaceChannelsPass
 from cnnc.passes.depth_to_space_channels import plane_major_source_rows
+from cnnc.passes.depth_to_space_pad import padded_source_rows
 from cnnc.target.contract import Target
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -57,6 +58,10 @@ FIXTURES = {
     # ESPCN's tail: conv -> ReLU -> CHANNEL-major shuffle. Exercises the
     # weight-row permutation as part of a real two-instruction program.
     "espcn_tail": (1, 4, 6, 4),
+    # The same, with the output channel count a REAL luma-only ESPCN has:
+    # 1, which is not a whole activation channel tile. Exercises the
+    # channel PADDING pass on top of the permutation.
+    "espcn_luma": (1, 4, 6, 4),
 }
 
 
@@ -439,11 +444,19 @@ def test_a_factor_the_hardware_does_not_have_is_refused(target):
     assert "factor 3" in str(exc.value)
 
 
-def test_out_channels_below_one_channel_tile_is_refused(target):
-    """The luma-only ESPCN case: `out_channels = 1` makes the four input
-    planes four LANES of one channel tile, which the engine has no
-    hardware to separate. Refused by name, naming the padding that would
-    fix it -- not silently mis-encoded."""
+def test_out_channels_below_one_channel_tile_with_no_producer_is_refused(target):
+    """`out_channels = 1` makes the four input planes four LANES of one
+    channel tile, which the engine has no hardware to separate. The fix is
+    to pad the producing convolution's output channels up to a whole tile
+    (`passes.depth_to_space_pad`) -- but THIS shuffle reads the graph's own
+    INPUT, so there is no producer to widen, and widening the graph input
+    is not the compiler's to do. So it is still refused, by name.
+
+    (This test used to assert that `out_channels = 1` was refused
+    UNCONDITIONALLY. That was wrong: with a producing convolution it
+    compiles and is bit-exact -- see
+    `test_a_luma_only_espcn_out_channels_1_now_compiles` below, which is
+    the replacement for the case this test no longer covers.)"""
     from cnnc.lower.to_hir import to_hir
 
     graph = import_tosa(parse_module(_shuffle_module((1, 3, 5, 4), 2, channel_major=False)))
@@ -452,7 +465,18 @@ def test_out_channels_below_one_channel_tile_is_refused(target):
     message = str(exc.value)
     assert "out_channels 1" in message
     assert "multiple of the activation plane width 8" in message
-    assert "Pad the producing convolution" in message
+    assert "depth_to_space_pad" in message
+
+
+def test_the_pad_pass_declines_when_there_is_no_producing_convolution(target):
+    """And the pass itself is what declines, leaving the op alone and
+    saying why, rather than inventing a graph-input reshape."""
+    graph = import_tosa(parse_module(_shuffle_module((1, 3, 5, 4), 2, channel_major=False)))
+    ctx = PassContext(target=target)
+    rewritten = PadDepthToSpaceChannelsPass().run(graph, ctx)
+    (op,) = [o for o in rewritten.ops if o.kind == "depth_to_space"]
+    assert rewritten.tensor(op.outputs[0]).shape[3] == 1  # untouched
+    assert any("could not be padded" in n for n in ctx.notes)
 
 
 def test_depth_to_space_needs_a_unit_that_implements_it(target):
@@ -569,6 +593,226 @@ def test_mutation_skipping_the_channel_permutation_breaks_the_equality_test(
     result = _compile("espcn_tail", target, tmp_path)
     graph = result.imported_graph
     x = _seed_input(FIXTURES["espcn_tail"], 1)
+    expected = interp.run(graph, {graph.inputs[0]: x})
+    actual = run_program(result.program, {graph.inputs[0]: x})
+    with pytest.raises(AssertionError):
+        np.testing.assert_array_equal(actual[graph.outputs[0]], expected[graph.outputs[0]])
+
+
+# ---------------------------------------------------------------------------
+# The channel-PADDING pass: a real ESPCN's `out_channels` (1 for luma, 3
+# for RGB) is not a whole activation channel tile, and the hardware moves
+# nothing smaller. Padding the producing convolution up to a whole tile is
+# what makes such a graph compile -- with no new hardware, because the
+# padding lanes are the same ones `unpack_activation_planes` already drops
+# for every other tensor whose channel count is not a multiple of T.
+# ---------------------------------------------------------------------------
+
+
+def test_padded_source_rows_plane_major_interleaves_and_zero_fills():
+    """Plane-major grows every plane from `out_channels` to
+    `padded` wide, so the real rows scatter and the gaps are dummies."""
+    src = padded_source_rows(2, 3, 8, PLANE_MAJOR)
+    assert len(src) == 4 * 8
+    for plane in range(4):
+        for c in range(8):
+            want = plane * 3 + c if c < 3 else None
+            assert src[plane * 8 + c] == want
+    # Every real row used exactly once, nothing invented.
+    assert sorted(i for i in src if i is not None) == list(range(4 * 3))
+
+
+def test_padded_source_rows_channel_major_is_a_pure_append():
+    """Channel-major numbers channels outermost, so the added channels sit
+    entirely after the existing ones and nothing moves."""
+    src = padded_source_rows(2, 1, 8, CHANNEL_MAJOR)
+    assert len(src) == 4 * 8
+    assert src[:4] == (0, 1, 2, 3)
+    assert set(src[4:]) == {None}
+
+
+def test_the_pad_pass_widens_the_conv_rows_with_zeros(target):
+    """The added output channels are genuinely DUMMY: zero weight row,
+    zero bias. The real rows are carried over unchanged."""
+    graph = import_tosa(parse_module(_text("espcn_luma")))
+    conv = next(o for o in graph.ops if o.kind == "conv2d")
+    _x, w_id, b_id = conv.inputs
+    w_before, b_before = graph.tensor(w_id), graph.tensor(b_id)
+    assert w_before.shape[0] == 4 and b_before.shape == (4,)  # factor**2 * 1
+
+    # With `out_channels == 1` the two channel groupings are the SAME
+    # mapping (`c` only ever takes the value 0), so the frontend reports
+    # the plane-major one and the padding interleaves rather than appends:
+    # the four real rows land at 0, 8, 16, 24, one per plane.
+    (dts,) = [o for o in graph.ops if o.kind == "depth_to_space"]
+    assert dts.attrs.channel_order == PLANE_MAJOR
+    src = padded_source_rows(2, 1, 8, PLANE_MAJOR)
+    assert [j for j, i in enumerate(src) if i is not None] == [0, 8, 16, 24]
+
+    rewritten = PadDepthToSpaceChannelsPass().run(graph, PassContext(target=target))
+    w_after, b_after = rewritten.tensor(w_id), rewritten.tensor(b_id)
+
+    assert w_after.shape == (32,) + tuple(w_before.shape[1:])
+    assert b_after.shape == (32,)
+    row = w_before.shape[1] * w_before.shape[2] * w_before.shape[3]
+    for j, i in enumerate(src):
+        after = w_after.values[j * row : (j + 1) * row]
+        if i is None:
+            # A dummy channel: zero weights AND zero bias, so it computes
+            # nothing and contributes nothing.
+            assert set(after) == {0}
+            assert b_after.values[j] == 0
+        else:
+            assert after == w_before.values[i * row : (i + 1) * row]
+            assert b_after.values[j] == b_before.values[i]
+
+
+def test_the_pad_pass_widens_the_shuffle_shapes_and_keeps_the_true_one(target):
+    """GIR must not disagree with the instruction about how many channels
+    get written -- so the shuffle's shapes really are widened -- while the
+    tensor's true shape survives as `logical_shape`."""
+    graph = import_tosa(parse_module(_text("espcn_luma")))
+    (dts,) = [o for o in graph.ops if o.kind == "depth_to_space"]
+    assert graph.tensor(dts.inputs[0]).shape == (1, 4, 6, 4)
+    assert graph.tensor(dts.outputs[0]).shape == (1, 8, 12, 1)
+
+    rewritten = PadDepthToSpaceChannelsPass().run(graph, PassContext(target=target))
+    (dts,) = [o for o in rewritten.ops if o.kind == "depth_to_space"]
+    x, y = rewritten.tensor(dts.inputs[0]), rewritten.tensor(dts.outputs[0])
+    assert x.shape == (1, 4, 6, 32)  # factor**2 * 8
+    assert y.shape == (1, 8, 12, 8)
+    assert y.logical_shape == (1, 8, 12, 1)
+    assert x.logical_shape is None  # an intermediate: nobody outside reads it
+
+
+def test_padding_costs_no_bytes(target):
+    """The whole argument for doing this at all: `C = 1` and `C = 8`
+    occupy the SAME whole channel plane, so widening the tensor moves no
+    byte and costs no DDR."""
+    from cnnc.lower.layout import activation_bytes
+
+    plane_channels = target.memory.activation_plane_channels
+    assert activation_bytes((1, 8, 12, 1), plane_channels) == activation_bytes(
+        (1, 8, 12, 8), plane_channels
+    )
+
+
+def test_a_luma_only_espcn_out_channels_1_now_compiles(target, tmp_path):
+    """The case that used to be a `CapabilityError`. It compiles, and the
+    instruction says the padded count while the manifest keeps the true
+    one."""
+    result = _compile("espcn_luma", target, tmp_path)
+    planned = result.hir_planned
+    (op,) = _dts_ops(result)
+
+    # The descriptor field is the PADDED count -- a whole channel tile,
+    # which is the only thing the engine can address.
+    assert op.params["out_channels"] == 8
+    assert op.params["in_channels"] == 32  # factor**2 * 8
+    desc = decode_program(
+        result.program.program_bytes, target, program_addr=planned.buffer(planned.program).addr
+    )[1]
+    assert desc.opcode == target.isa.opcodes["DEPTH_TO_SPACE"]
+    assert (desc.out_channels, desc.in_channels, desc.dts_factor) == (8, 32, 2)
+
+    # The buffer is written 8 channels wide and is still a 1-channel
+    # tensor; both facts are recorded, and they imply the same size.
+    out_buf = planned.buffer(op.writes[0])
+    assert out_buf.shape == (1, 8, 12, 8)
+    assert out_buf.logical_shape == (1, 8, 12, 1)
+    (entry,) = [b for b in result.program.manifest["buffers"] if b["role"] == "output"]
+    assert entry["shape"] == [1, 8, 12, 8]
+    assert entry["logical_shape"] == [1, 8, 12, 1]
+    assert entry["size_bytes"] == 8 * 12 * 8
+
+
+def test_the_luma_espcn_is_still_two_instructions(target, tmp_path):
+    """Padding buys the compile with dummy CHANNELS, not with an extra
+    instruction or a host-side fixup pass."""
+    result = _compile("espcn_luma", target, tmp_path)
+    planned = result.hir_planned
+    descs = decode_program(
+        result.program.program_bytes, target, program_addr=planned.buffer(planned.program).addr
+    )
+    assert [d.opcode for d in descs] == [
+        target.isa.opcodes["CONV2D"],
+        target.isa.opcodes["DEPTH_TO_SPACE"],
+        target.isa.opcodes["HALT"],
+    ]
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3, 4])
+def test_the_luma_espcn_matches_a_plain_python_pixel_shuffle(target, tmp_path, seed):
+    """The real bar: the ACTUAL bytes the device writes for the one real
+    channel are right, padding included but ignored. Checked against
+    `nn.PixelShuffle` written out from its own definition, on the
+    convolution's own (unpadded, channel-major) output."""
+    result = _compile("espcn_luma", target, tmp_path)
+    graph = result.imported_graph
+    x = _seed_input(FIXTURES["espcn_luma"], seed)
+
+    dts = next(o for o in graph.ops if o.kind == "depth_to_space")
+    conv_out = interp.evaluate_all(graph, {graph.inputs[0]: x})[dts.inputs[0]]
+    want = _pixel_shuffle_nhwc(np.asarray(conv_out), 2)
+    assert want.shape == (1, 8, 12, 1)
+
+    got = run_program(result.program, {graph.inputs[0]: x})[graph.outputs[0]]
+    assert got.shape == (1, 8, 12, 1)  # the TRUE shape, not the padded one
+    np.testing.assert_array_equal(got, want)
+
+
+def test_the_luma_espcn_matches_the_golden_models_depth_to_space(target, tmp_path):
+    """And against `cnn_accel_model.depth_to_space` itself, fed the padded
+    plane-major tensor the instruction actually reads: the golden model's
+    8-channel result, cropped to its true 1 channel, is what comes back."""
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "modules" / "cnn_accel"))
+    import cnn_accel_model  # noqa: E402
+
+    result = _compile("espcn_luma", target, tmp_path)
+    graph = result.imported_graph
+    x = _seed_input(FIXTURES["espcn_luma"], 11)
+
+    # The padded, plane-major tensor the DEPTH_TO_SPACE instruction reads,
+    # taken from the compiled graph's own interpretation (so the padding
+    # and the permutation are both inside what is being checked).
+    (dts,) = [o for o in result.fused_graph.ops if o.kind == "depth_to_space"]
+    hw_in = np.asarray(
+        interp.evaluate_all(result.fused_graph, {graph.inputs[0]: x})[dts.inputs[0]]
+    )
+    assert hw_in.shape == (1, 4, 6, 32)
+
+    desc = cnn_accel_model.LayerDesc(
+        opcode=target.isa.opcodes["DEPTH_TO_SPACE"],
+        in_width=6, in_height=4, in_channels=32, out_channels=8,
+    )
+    flat = cnn_accel_model.depth_to_space([int(v) for v in hw_in.reshape(-1)], desc, factor=2)
+    model_out = np.asarray(flat, dtype=np.int8).reshape(1, 8, 12, 8)
+
+    got = run_program(result.program, {graph.inputs[0]: x})[graph.outputs[0]]
+    np.testing.assert_array_equal(got, model_out[:, :, :, :1])
+
+
+def test_mutation_padding_the_wrong_rows_breaks_the_equality_test(monkeypatch, target, tmp_path):
+    """The padding's ROW PLACEMENT is load-bearing, not just its row
+    COUNT. Append the real rows instead of interleaving them -- a graph
+    that still has exactly the right number of channels, the right buffer
+    size and the right descriptor -- and the ESPCN tail stops matching
+    `nn.PixelShuffle`. Without this, a pass that widened to the right
+    shape but put the real data in the wrong lanes would pass every other
+    test in this file."""
+    from cnnc.passes import depth_to_space_pad
+
+    def appended(factor, out_channels, padded_out_channels, channel_order):
+        real = factor * factor * out_channels
+        total = factor * factor * padded_out_channels
+        return tuple(list(range(real)) + [None] * (total - real))
+
+    monkeypatch.setattr(depth_to_space_pad, "padded_source_rows", appended)
+    result = _compile("espcn_luma", target, tmp_path)
+    graph = result.imported_graph
+    x = _seed_input(FIXTURES["espcn_luma"], 1)
     expected = interp.run(graph, {graph.inputs[0]: x})
     actual = run_program(result.program, {graph.inputs[0]: x})
     with pytest.raises(AssertionError):

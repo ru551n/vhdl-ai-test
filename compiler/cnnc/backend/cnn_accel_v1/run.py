@@ -139,7 +139,14 @@ def read_activation_buffer(memory: bytearray, buf: dict, plane_channels: int) ->
         raise CompilerError(f"buffer {buf['id']!r}: unsupported activation layout {buf['layout']!r}", stage=_STAGE)
     addr, size = buf["addr"], buf["size_bytes"]
     raw = bytes(memory[addr : addr + size])
-    return unpack_activation_planes(raw, tuple(buf["shape"]), dtype, plane_channels)
+    # A buffer stored wider than its tensor (a `depth_to_space` padded up to
+    # a whole channel tile -- see the manifest's `logical_shape`) is decoded
+    # at its LOGICAL shape: `unpack_activation_planes` then drops the extra
+    # lanes exactly as it already drops the padding lanes of any tensor whose
+    # channel count is not a multiple of the plane width. Both shapes span
+    # the same whole planes, so `size` is right for either.
+    shape = tuple(buf.get("logical_shape") or buf["shape"])
+    return unpack_activation_planes(raw, shape, dtype, plane_channels)
 
 
 def prepare_memory_image(

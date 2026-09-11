@@ -944,11 +944,18 @@ def _lower_depth_to_space(
       * an `out_channels` that is not a whole number of activation-plane
         channel tiles. The engine moves whole `T`-byte beats and has no
         hardware to gather byte lanes out of one, so a sub-tile
-        `out_channels` (the luma-only `1` and the RGB `3` of a real
-        super-resolution model, notably) is `ERR_BAD_GEOMETRY` on the
-        device; padding the producing convolution's output channels up to
-        a multiple of `T` is a graph-level change, so it is named as such
-        rather than attempted behind the caller's back.
+        `out_channels` is `ERR_BAD_GEOMETRY` on the device. The luma-only
+        `1` and the RGB `3` of a real super-resolution model are handled
+        before this point, by `passes.depth_to_space_pad`, which pads the
+        producing convolution's output channels up to a whole tile with
+        dummy (zero-weight) channels -- the padding costs no bytes and is
+        dropped again by `layout.unpack_activation_planes`, the same
+        boundary that already hides the padding lanes of every other
+        tensor whose channel count is not a multiple of `T`. Reaching here
+        still sub-tile means that pass could not find a producer to widen
+        (a shuffle straight off a graph INPUT, most obviously -- widening
+        it would change the graph's own input shape), and the honest
+        answer is to say so.
     """
     x_id = op.inputs[0]
     y_id = op.outputs[0]
@@ -985,11 +992,13 @@ def _lower_depth_to_space(
             f"depth_to_space out_channels {out_channels} is not a multiple of the activation "
             f"plane width {plane_channels}: the engine moves whole {plane_channels}-byte channel "
             "tiles and cannot gather byte lanes out of one, so the hardware refuses this geometry "
-            "with ERR_BAD_GEOMETRY. Pad the producing convolution's output channels up to "
-            f"{-(-out_channels // plane_channels) * plane_channels} "
+            "with ERR_BAD_GEOMETRY. passes.depth_to_space_pad pads such a shuffle up to "
+            f"{-(-out_channels // plane_channels) * plane_channels} output channels "
             f"(in_channels {x.shape[3]} -> "
-            f"{-(-out_channels // plane_channels) * plane_channels * attrs.factor ** 2}) "
-            "and drop the padding channels on the host",
+            f"{-(-out_channels // plane_channels) * plane_channels * attrs.factor ** 2}) by giving "
+            "the producing convolution dummy zero-weight output channels; reaching the lowering "
+            "unpadded means no such producer was found, so the padding has to be applied to the "
+            "graph before it gets here",
             op_id=op.id, stage=_STAGE, unit=unit.name, constraint=_DEPTH_TO_SPACE_TILE_CONSTRAINT,
         )
     if x.shape[0] != unit.batch:
@@ -1040,6 +1049,11 @@ def _lower_depth_to_space(
         role="output" if y_id in graph.outputs else "intermediate",
         layout=activation_layout,
         shape=y.shape,
+        # The one opcode whose output tensor may have been WIDENED to suit
+        # the hardware's channel-tile granularity (see the docstring):
+        # `shape` is what the instruction writes, `logical_shape` what the
+        # value actually is, and a reader needs the second one.
+        logical_shape=y.logical_shape,
         dtype=y.dtype,
         gir_tensor=y_id,
     )
