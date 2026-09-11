@@ -505,6 +505,29 @@ class UpsampleOp(Op):
 
 
 @dataclass
+class DepthToSpaceOp(Op):
+    """`OPCODE_DEPTH_TO_SPACE` (ISA v2.2): sub-pixel convolution's
+    pixel-shuffle step. Trades channels for spatial resolution --
+    `in_channels = factor**2 * out_channels`, output frame `factor` times
+    larger in both dimensions -- and is the only op in the elementwise
+    family that is not channel-preserving.
+
+    PLANE-MAJOR channel grouping (`cin = (dy*factor + dx)*out_channels + c`),
+    not PyTorch `nn.PixelShuffle`'s channel-major interleave; see
+    `cnn_accel_model.depth_to_space` for why, and for the compile-time
+    permutation a PyTorch-ordered graph needs first.
+
+    Only `factor = 2` is implemented in v1 hardware
+    (`cnn_accel_cmd_proc.chk_dts_geom_q`), which additionally requires
+    `out_channels` to be a whole number of activation-plane tiles -- the
+    hardware moves whole `T`-byte channel tiles and has nothing that can
+    gather byte lanes out of one. `Model.depth_to_space` enforces both up
+    front rather than letting a malformed descriptor reach the DUT."""
+
+    factor: int = 2
+
+
+@dataclass
 class CopyOp(Op):
     """`OPCODE_COPY`: opaque byte copy, `xfer_bytes` long. Never
     interprets its payload as activation elements (no pack/unpack at
@@ -927,6 +950,40 @@ class Model:
             quant=x.quant,
         )
         op = UpsampleOp(name=out_t.name, inputs=[x], output=out_t, factor=2)
+        out_t.producer = op
+        self._register_op(op)
+        return out_t
+
+    def depth_to_space(self, x: Tensor, *, factor: int = 2, name: str | None = None) -> Tensor:
+        """`OPCODE_DEPTH_TO_SPACE`: pixel-shuffle `x` by `factor`, turning
+        `factor**2 * C` channels into a `factor`-times-larger frame of `C`.
+
+        Unlike `upsample2x` the output channel count is *derived*, not
+        copied: `C_out = C_in / factor**2`. Both hardware preconditions are
+        checked here (see `DepthToSpaceOp`) so a bad shape fails in the
+        test builder, where the message is readable, rather than as an
+        `ERR_BAD_GEOMETRY` from the DUT."""
+        if factor != 2:
+            raise ValueError(f"depth_to_space: v1 hardware implements factor 2 only, got {factor}")
+        if x.channels % (factor * factor) != 0:
+            raise ValueError(
+                f"depth_to_space: in_channels {x.channels} is not a multiple of factor**2 = {factor * factor}"
+            )
+        out_channels = x.channels // (factor * factor)
+        if out_channels % PLANE_CHANNELS != 0:
+            raise ValueError(
+                f"depth_to_space: out_channels {out_channels} must be a whole number of "
+                f"{PLANE_CHANNELS}-channel activation-plane tiles -- the engine moves whole "
+                "tiles and cannot gather byte lanes within one. Pad the channel count."
+            )
+        out_t = Tensor(
+            name=name or self._auto_name("depth_to_space"),
+            height=x.height * factor,
+            width=x.width * factor,
+            channels=out_channels,
+            quant=x.quant,
+        )
+        op = DepthToSpaceOp(name=out_t.name, inputs=[x], output=out_t, factor=factor)
         out_t.producer = op
         self._register_op(op)
         return out_t
@@ -1363,6 +1420,7 @@ __all__ = [
     "PoolOp",
     "AddOp",
     "UpsampleOp",
+    "DepthToSpaceOp",
     "CopyOp",
     "ActOp",
     "RowCopyOp",

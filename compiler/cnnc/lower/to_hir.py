@@ -44,8 +44,10 @@ import dataclasses
 
 from cnnc.errors import CapabilityError
 from cnnc.gir.ir import (
+    PLANE_MAJOR,
     AddAttrs,
     ConcatAttrs,
+    DepthToSpaceAttrs,
     FusedConvAttrs,
     Graph,
     Op,
@@ -905,6 +907,159 @@ def _lower_upsample(
     return hir_op, y_buf
 
 
+#: The first ISA version with `OPCODE_DEPTH_TO_SPACE` and its W10
+#: `dts_factor` byte.
+_DEPTH_TO_SPACE_ISA_VERSION = "2.2"
+
+_DEPTH_TO_SPACE_FACTOR_CONSTRAINT = "depth_to_space.factor"
+_DEPTH_TO_SPACE_ORDER_CONSTRAINT = "depth_to_space.channel_order"
+_DEPTH_TO_SPACE_TILE_CONSTRAINT = "depth_to_space.out_channels"
+
+
+def _lower_depth_to_space(
+    op: Op, graph: Graph, unit: Unit, *, space_name: str, align: int,
+    activation_layout: str, plane_channels: int, hw_factor: int,
+) -> tuple[HirOp, Buffer]:
+    """A GIR `depth_to_space` -> one `depth_to_space` `HirOp` + its output
+    buffer.
+
+    Unlike `_lower_upsample`, the descriptor needs BOTH channel counts:
+    this is the only opcode in the elementwise family whose output
+    channel count differs from its input's, so `out_channels` cannot be
+    implied by the geometry the way UPSAMPLE's is (and the hardware's
+    defensive geometry re-check reads it -- see the DEPTH_TO_SPACE block
+    in `cnn_accel_elementwise.vhd`).
+
+    Three things are refused here rather than encoded into an instruction
+    that would quietly compute something else:
+
+      * a factor the hardware does not implement (`dts_factor` IS an ISA
+        field, so this is a hardware-capability check, not an encoding
+        one);
+      * a CHANNEL-major grouping -- the hardware only does plane-major,
+        and `passes.depth_to_space_channels` is what turns the other one
+        into it. Reaching here still channel-major means that pass could
+        not find a permutable producer, and the honest answer is to say
+        so, not to emit the plane-major opcode against channel-major data;
+      * an `out_channels` that is not a whole number of activation-plane
+        channel tiles. The engine moves whole `T`-byte beats and has no
+        hardware to gather byte lanes out of one, so a sub-tile
+        `out_channels` is `ERR_BAD_GEOMETRY` on the device. The luma-only
+        `1` and the RGB `3` of a real super-resolution model are handled
+        before this point, by `passes.depth_to_space_pad`, which pads the
+        producing convolution's output channels up to a whole tile with
+        dummy (zero-weight) channels -- the padding costs no bytes and is
+        dropped again by `layout.unpack_activation_planes`, the same
+        boundary that already hides the padding lanes of every other
+        tensor whose channel count is not a multiple of `T`. Reaching here
+        still sub-tile means that pass could not find a producer to widen
+        (a shuffle straight off a graph INPUT, most obviously -- widening
+        it would change the graph's own input shape), and the honest
+        answer is to say so.
+    """
+    x_id = op.inputs[0]
+    y_id = op.outputs[0]
+    x, y = graph.tensor(x_id), graph.tensor(y_id)
+    attrs: DepthToSpaceAttrs = op.attrs
+
+    if not _isa_at_least(unit.isa_version, _DEPTH_TO_SPACE_ISA_VERSION):
+        raise CapabilityError(
+            f"depth-to-space needs the ISA v{_DEPTH_TO_SPACE_ISA_VERSION} DEPTH_TO_SPACE opcode; "
+            f"unit {unit.name!r} is isa_version {unit.isa_version}",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="depth_to_space",
+        )
+    if attrs.factor != hw_factor:
+        raise CapabilityError(
+            f"depth_to_space factor {attrs.factor} != {hw_factor}: OPCODE_DEPTH_TO_SPACE implements "
+            f"exactly factor {hw_factor} in v1 hardware (cnn_accel_cmd_proc rejects any other "
+            "dts_factor with ERR_BAD_GEOMETRY)",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint=_DEPTH_TO_SPACE_FACTOR_CONSTRAINT,
+        )
+    if attrs.channel_order != PLANE_MAJOR:
+        raise CapabilityError(
+            f"depth_to_space channel_order {attrs.channel_order!r}: OPCODE_DEPTH_TO_SPACE groups "
+            f"input channels PLANE-major (cin = (dy*r + dx)*out_channels + c) and has no other "
+            "mode. A channel-major (nn.PixelShuffle) grouping is turned into the plane-major one "
+            "by permuting the producing convolution's output-channel rows at compile time "
+            "(passes.depth_to_space_channels); reaching the lowering still channel-major means no "
+            "such producer was found, so the permutation has to be applied to the graph before it "
+            "gets here",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint=_DEPTH_TO_SPACE_ORDER_CONSTRAINT,
+        )
+    out_channels = y.shape[3]
+    if out_channels % plane_channels:
+        raise CapabilityError(
+            f"depth_to_space out_channels {out_channels} is not a multiple of the activation "
+            f"plane width {plane_channels}: the engine moves whole {plane_channels}-byte channel "
+            "tiles and cannot gather byte lanes out of one, so the hardware refuses this geometry "
+            "with ERR_BAD_GEOMETRY. passes.depth_to_space_pad pads such a shuffle up to "
+            f"{-(-out_channels // plane_channels) * plane_channels} output channels "
+            f"(in_channels {x.shape[3]} -> "
+            f"{-(-out_channels // plane_channels) * plane_channels * attrs.factor ** 2}) by giving "
+            "the producing convolution dummy zero-weight output channels; reaching the lowering "
+            "unpadded means no such producer was found, so the padding has to be applied to the "
+            "graph before it gets here",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint=_DEPTH_TO_SPACE_TILE_CONSTRAINT,
+        )
+    if x.shape[0] != unit.batch:
+        raise CapabilityError(
+            f"batch {x.shape[0]} != unit batch {unit.batch}",
+            op_id=op.id, stage=_STAGE, unit=unit.name, constraint="batch",
+        )
+    for role, actual in (("input", x.dtype), ("output", y.dtype)):
+        want = unit.dtypes.get(role)
+        if want is not None and actual != want:
+            raise CapabilityError(
+                f"{role} dtype {actual!r} != required {want!r}",
+                op_id=op.id, stage=_STAGE, unit=unit.name, constraint=f"dtypes.{role}",
+            )
+
+    params = {
+        "in_width": x.shape[2],
+        "in_height": x.shape[1],
+        "in_channels": x.shape[3],
+        "out_channels": out_channels,
+        "dts_factor": attrs.factor,
+    }
+    # Input geometry goes in the ISA fields; the OUTPUT is what has to fit
+    # in memory and in any downstream op. Both are checked, exactly as in
+    # `_lower_upsample` -- and here the two differ in the channel axis as
+    # well as the spatial ones.
+    _check_constraints(op, unit, {name: params[name] for name in _ADD_ENV_FIELDS})
+    _check_constraints(
+        op, unit,
+        {"in_width": y.shape[2], "in_height": y.shape[1], "in_channels": y.shape[3]},
+    )
+
+    hir_op = HirOp(
+        id=y_id,  # placeholder; renumbered by the caller once all ops are known
+        unit=unit.name,
+        kind="depth_to_space",
+        params=params,
+        reads=(f"%{x_id}",),
+        writes=(f"%{y_id}",),
+        deps=(),
+        gir_op=op.id,
+    )
+    y_buf = Buffer(
+        id=f"%{y_id}",
+        space=space_name,
+        size_bytes=activation_bytes(y.shape, plane_channels, _dtype_bytes(y.dtype)),
+        align=align,
+        role="output" if y_id in graph.outputs else "intermediate",
+        layout=activation_layout,
+        shape=y.shape,
+        # The one opcode whose output tensor may have been WIDENED to suit
+        # the hardware's channel-tile granularity (see the docstring):
+        # `shape` is what the instruction writes, `logical_shape` what the
+        # value actually is, and a reader needs the second one.
+        logical_shape=y.logical_shape,
+        dtype=y.dtype,
+        gir_tensor=y_id,
+    )
+    return hir_op, y_buf
+
+
 # ---------------------------------------------------------------------------
 # Buffer views: `concat` and `slice` (doc/tosa_compiler_plan.md §7).
 #
@@ -1195,7 +1350,10 @@ def to_hir(graph: Graph, target: Target) -> HirModule:
     tiling = conv_unit.internal_tiling
 
     for op in graph.ops:
-        if op.kind not in ("const", "fused_conv", "pool", "add", "table", "upsample", "concat", "slice"):
+        if op.kind not in (
+            "const", "fused_conv", "pool", "add", "table", "upsample", "depth_to_space",
+            "concat", "slice",
+        ):
             reason = _UNFUSED_REASON.get(op.kind, "the accelerator has no addressable instruction for this op kind")
             raise CapabilityError(
                 f"no unit implements {op.kind} standalone; not fused because {reason}",
@@ -1208,12 +1366,19 @@ def to_hir(graph: Graph, target: Target) -> HirModule:
     # kind.
     compute_ops = [
         op for op in graph.ops
-        if op.kind in ("fused_conv", "pool", "add", "table", "upsample", "concat", "slice")
+        if op.kind in (
+            "fused_conv", "pool", "add", "table", "upsample", "depth_to_space", "concat", "slice"
+        )
     ]
     pool_unit = select_unit(target, "max_pool2d") if any(op.kind == "pool" for op in compute_ops) else None
     add_unit = select_unit(target, "add") if any(op.kind == "add" for op in compute_ops) else None
     table_unit = select_unit(target, "table") if any(op.kind == "table" for op in compute_ops) else None
     upsample_unit = select_unit(target, "upsample") if any(op.kind == "upsample" for op in compute_ops) else None
+    dts_unit = (
+        select_unit(target, "depth_to_space")
+        if any(op.kind == "depth_to_space" for op in compute_ops)
+        else None
+    )
 
     weight_of: dict[str, str] = {}
     # ACT LUT operands are consts too, but their byte image is not their
@@ -1317,6 +1482,13 @@ def to_hir(graph: Graph, target: Target) -> HirModule:
                 op, graph, upsample_unit, space_name=space_name, align=space.align,
                 activation_layout=activation_layout, plane_channels=plane_channels,
                 hw_factor=upsample_unit.upsample_factor,
+            )
+            scale_buf, note = None, None
+        elif op.kind == "depth_to_space":
+            hir_op, y_buf = _lower_depth_to_space(
+                op, graph, dts_unit, space_name=space_name, align=space.align,
+                activation_layout=activation_layout, plane_channels=plane_channels,
+                hw_factor=dts_unit.depth_to_space_factor,
             )
             scale_buf, note = None, None
         elif op.kind == "table":

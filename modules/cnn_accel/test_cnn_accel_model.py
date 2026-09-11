@@ -36,7 +36,9 @@ from cnn_accel_model import (
     OPCODE_COPY,
     OPCODE_LOAD,
     OPCODE_UPSAMPLE,
+    OPCODE_DEPTH_TO_SPACE,
     UPSAMPLE_FACTOR,
+    DEPTH_TO_SPACE_FACTOR,
     OFF_BIAS_ADDR,
     OFF_CLAMP_MAX,
     OFF_CLAMP_MIN,
@@ -79,6 +81,7 @@ from cnn_accel_model import (
     build_memory_image,
     conv2d,
     decode_instruction,
+    depth_to_space,
     dwconv2d,
     elementwise_add,
     encode_instruction,
@@ -652,7 +655,7 @@ def test_isa_layout_self_consistent() -> None:
     assert offset == cnn_accel_constants.INSTR_WORD_BYTES
     assert all(occupied), "instruction word has unaccounted-for byte(s)"
 
-    assert cnn_accel_constants.isa_reserved_ranges() == [(3, 3), (42, 43)]
+    assert cnn_accel_constants.isa_reserved_ranges() == [(3, 3), (43, 43)]
 
     # Every non-reserved field name is unique and does not collide with the
     # `RESERVED` sentinel.
@@ -2796,6 +2799,110 @@ def test_upsample_nearest_rejects_an_input_that_is_not_its_declared_geometry() -
     desc = LayerDesc(opcode=OPCODE_UPSAMPLE, in_width=2, in_height=2, in_channels=2)
     with pytest.raises(ValueError, match="input length"):
         upsample_nearest([1, 2, 3], desc)
+
+
+def test_depth_to_space_regroups_factor_squared_planes_into_one_pixel() -> None:
+    # factor=2, out_channels=1: 4 input channels/pixel (one per (dy,dx)
+    # plane, plane-major so they are contiguous), 1x1 -> 2x2 output.
+    # HWC input, 2x2 pixels x 4 channels: pixel (0,0) planes [1,2,3,4],
+    # pixel (0,1) planes [5,6,7,8], (1,0) [9,10,11,12], (1,1) [13,14,15,16].
+    desc = LayerDesc(opcode=OPCODE_DEPTH_TO_SPACE, in_width=2, in_height=2, in_channels=4, out_channels=1, dts_factor=2)
+    out = depth_to_space(list(range(1, 17)), desc, factor=2)
+    # Output is 4x4x1. Pixel (0,0)'s 2x2 block comes from input pixel
+    # (0,0)'s four planes, in (dy,dx) = (0,0),(0,1),(1,0),(1,1) order.
+    assert out == [
+        1, 2, 5, 6,
+        3, 4, 7, 8,
+        9, 10, 13, 14,
+        11, 12, 15, 16,
+    ]
+
+
+def test_depth_to_space_preserves_multi_channel_planes_contiguously() -> None:
+    # factor=2, out_channels=2: 8 input channels/pixel, grouped as 4
+    # contiguous 2-channel planes.
+    desc = LayerDesc(opcode=OPCODE_DEPTH_TO_SPACE, in_width=1, in_height=1, in_channels=8, out_channels=2, dts_factor=2)
+    out = depth_to_space([10, 11, 20, 21, 30, 31, 40, 41], desc, factor=2)
+    # 1x1 -> 2x2, each output pixel's 2 channels = one input plane.
+    assert out == [10, 11, 20, 21, 30, 31, 40, 41]
+
+
+def test_depth_to_space_rejects_in_channels_not_matching_factor_squared_times_out_channels() -> None:
+    desc = LayerDesc(opcode=OPCODE_DEPTH_TO_SPACE, in_width=1, in_height=1, in_channels=5, out_channels=1, dts_factor=2)
+    with pytest.raises(ValueError, match="in_channels"):
+        depth_to_space([0, 0, 0, 0, 0], desc, factor=2)
+
+
+def test_depth_to_space_rejects_an_input_that_is_not_its_declared_geometry() -> None:
+    desc = LayerDesc(opcode=OPCODE_DEPTH_TO_SPACE, in_width=1, in_height=1, in_channels=4, out_channels=1, dts_factor=2)
+    with pytest.raises(ValueError, match="input length"):
+        depth_to_space([1, 2, 3], desc, factor=2)
+
+
+def test_depth_to_space_rejects_factor_below_two() -> None:
+    desc = LayerDesc(opcode=OPCODE_DEPTH_TO_SPACE, in_width=1, in_height=1, in_channels=1, out_channels=1, dts_factor=1)
+    with pytest.raises(ValueError, match="factor"):
+        depth_to_space([1], desc, factor=1)
+
+
+def test_depth_to_space_matches_pytorch_pixel_shuffle_after_plane_major_permutation() -> None:
+    """The crux design assumption: plane-major grouping, once the
+    channel-major -> plane-major permutation a real compiler frontend
+    would apply is undone, reproduces PyTorch's `nn.PixelShuffle`
+    bit-exactly. Verified without a torch dependency here by directly
+    constructing the channel-major reference via nested-loop indexing
+    (PixelShuffle's own definition), not by importing torch."""
+    for factor in (2, 3):
+        for c in (1, 3):
+            h, w = 3, 4
+            in_c = c * factor * factor
+
+            def channel_major_pixel_shuffle(x_chw, c=c, h=h, w=w, factor=factor):
+                # x_chw: flat, channel-major, shape (in_c, h, w).
+                out = [0] * (c * h * factor * w * factor)
+                for ch in range(c):
+                    for dy in range(factor):
+                        for dx in range(factor):
+                            cin = ch * factor * factor + dy * factor + dx
+                            for y in range(h):
+                                for x in range(w):
+                                    src = (cin * h + y) * w + x
+                                    oy, ox = y * factor + dy, x * factor + dx
+                                    dst = (ch * (h * factor) + oy) * (w * factor) + ox
+                                    out[dst] = x_chw[src]
+                return out
+
+            x_chw = list(range(in_c * h * w))
+            ref_chw = channel_major_pixel_shuffle(x_chw)
+            # ref_chw is channel-major CHW; convert to HWC for comparison.
+            ref_hwc = [0] * len(ref_chw)
+            oh, ow = h * factor, w * factor
+            for ch in range(c):
+                for y in range(oh):
+                    for x in range(ow):
+                        ref_hwc[(y * ow + x) * c + ch] = ref_chw[(ch * oh + y) * ow + x]
+
+            # Build the channel-major -> plane-major permutation and
+            # permute x_chw (CHW) into x_pm (HWC, plane-major channels).
+            perm_pm_to_cm = [0] * in_c
+            for ch in range(c):
+                for dy in range(factor):
+                    for dx in range(factor):
+                        cm = ch * factor * factor + dy * factor + dx
+                        pm = (dy * factor + dx) * c + ch
+                        perm_pm_to_cm[pm] = cm
+            x_pm = [0] * (h * w * in_c)
+            for y in range(h):
+                for x in range(w):
+                    for pm_idx, cm_idx in enumerate(perm_pm_to_cm):
+                        x_pm[(y * w + x) * in_c + pm_idx] = x_chw[(cm_idx * h + y) * w + x]
+
+            desc = LayerDesc(
+                opcode=OPCODE_DEPTH_TO_SPACE, in_width=w, in_height=h,
+                in_channels=in_c, out_channels=c, dts_factor=factor,
+            )
+            out = depth_to_space(x_pm, desc, factor=factor)
+            assert out == ref_hwc, f"factor={factor} c={c}"
 
 
 def test_act_lut_is_indexed_by_the_unsigned_byte_value() -> None:

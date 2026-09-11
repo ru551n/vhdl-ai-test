@@ -276,6 +276,14 @@ class Unit:
     #: factor rather than encoding it into an instruction that would
     #: silently do this one.
     upsample_factor: int | None = None
+    #: The upscale factor `r` this unit's `depth_to_space` capability
+    #: implements, or `None` for a unit that has no such capability.
+    #: Unlike `upsample_factor` the ISA *does* have a field for this one
+    #: (v2.2 W10 byte 42 `dts_factor`), but v1 hardware still implements
+    #: exactly one value (`cnn_accel_cmd_proc` rejects any other with
+    #: `ERR_BAD_GEOMETRY`), so it stays a capability statement that
+    #: `lower.to_hir` checks against rather than a free parameter.
+    depth_to_space_factor: int | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -286,6 +294,13 @@ class Unit:
             raise TargetError(
                 f"Unit {self.name!r}: 'upsample' in ops and upsample_factor must be given together "
                 f"(ops={self.ops}, upsample_factor={self.upsample_factor})"
+            )
+        if self.depth_to_space_factor is not None and self.depth_to_space_factor < 2:
+            raise TargetError("Unit.depth_to_space_factor must be >= 2 when present")
+        if ("depth_to_space" in self.ops) != (self.depth_to_space_factor is not None):
+            raise TargetError(
+                f"Unit {self.name!r}: 'depth_to_space' in ops and depth_to_space_factor must be "
+                f"given together (ops={self.ops}, depth_to_space_factor={self.depth_to_space_factor})"
             )
         if not self.ops:
             raise TargetError("Unit.ops must be non-empty")
@@ -315,6 +330,7 @@ class Unit:
             "isa_version": self.isa_version,
             "partial_sum_io": self.partial_sum_io,
             "upsample_factor": self.upsample_factor,
+            "depth_to_space_factor": self.depth_to_space_factor,
         }
 
     @classmethod
@@ -342,6 +358,7 @@ class Unit:
             # Absent from a target JSON written before the capability
             # existed, which is exactly a unit that does not have it.
             upsample_factor=data.get("upsample_factor"),
+            depth_to_space_factor=data.get("depth_to_space_factor"),
         )
 
 

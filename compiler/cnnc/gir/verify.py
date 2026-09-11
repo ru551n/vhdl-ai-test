@@ -8,11 +8,13 @@ from __future__ import annotations
 
 from cnnc.errors import VerifyError
 from cnnc.gir.ir import (
+    CHANNEL_ORDERS,
     DTYPES,
     AddAttrs,
     ClampAttrs,
     ConcatAttrs,
     ConvAttrs,
+    DepthToSpaceAttrs,
     FusedConvAttrs,
     Graph,
     Op,
@@ -22,6 +24,7 @@ from cnnc.gir.ir import (
     Tensor,
     UpsampleAttrs,
     conv2d_output_shape,
+    depth_to_space_output_shape,
     dtype_range,
     pool2d_output_shape,
     upsample_output_shape,
@@ -76,6 +79,8 @@ def verify(graph: Graph) -> None:
             _verify_table(graph, op)
         elif op.kind == "upsample":
             _verify_upsample(graph, op)
+        elif op.kind == "depth_to_space":
+            _verify_depth_to_space(graph, op)
         elif op.kind == "concat":
             _verify_concat(graph, op)
         elif op.kind == "slice":
@@ -345,6 +350,34 @@ def _verify_upsample(graph: Graph, op: Op) -> None:
     expected = upsample_output_shape(x.shape, attrs.factor)
     if out.shape != expected:
         _fail(op.id, f"upsample output shape {out.shape} != computed {expected}")
+
+
+def _verify_depth_to_space(graph: Graph, op: Op) -> None:
+    x = graph.tensors[op.inputs[0]]
+    out = graph.tensors[op.outputs[0]]
+    attrs: DepthToSpaceAttrs = op.attrs
+    if len(x.shape) != 4:
+        _fail(op.id, f"depth_to_space input rank {len(x.shape)} != 4")
+    if x.shape[0] != 1:
+        _fail(op.id, f"depth_to_space input batch {x.shape[0]} != 1")
+    if out.dtype != x.dtype:
+        _fail(op.id, f"depth_to_space output dtype {out.dtype} != input dtype {x.dtype}")
+    if attrs.factor < 2:
+        _fail(op.id, f"depth_to_space factor {attrs.factor} must be >= 2")
+    if attrs.channel_order not in CHANNEL_ORDERS:
+        _fail(op.id, f"depth_to_space channel_order {attrs.channel_order!r} not in {CHANNEL_ORDERS}")
+    if x.shape[3] % (attrs.factor * attrs.factor):
+        # Checked here rather than left to `depth_to_space_output_shape`
+        # so the diagnostic is a GIR verify failure naming the op, not a
+        # ValueError from a shape helper.
+        _fail(
+            op.id,
+            f"depth_to_space input channels {x.shape[3]} is not divisible by factor**2 = "
+            f"{attrs.factor}**2",
+        )
+    expected = depth_to_space_output_shape(x.shape, attrs.factor)
+    if out.shape != expected:
+        _fail(op.id, f"depth_to_space output shape {out.shape} != computed {expected}")
 
 
 def _verify_concat(graph: Graph, op: Op) -> None:

@@ -16,6 +16,7 @@ import numpy as np
 
 from cnnc.errors import CompilerError
 from cnnc.gir.ir import (
+    CHANNEL_MAJOR,
     AddAttrs,
     ClampAttrs,
     ConvAttrs,
@@ -191,6 +192,34 @@ def _upsample_int64(x: np.ndarray, attrs) -> np.ndarray:
     return np.repeat(np.repeat(x.astype(np.int64), f, axis=1), f, axis=2)
 
 
+def _depth_to_space_int64(x: np.ndarray, attrs) -> np.ndarray:
+    """Pixel shuffle, NHWC, in whichever of the two channel groupings
+    `attrs.channel_order` names:
+
+        plane_major:   out[0, yi*r+dy, xi*r+dx, c] = in[0, yi, xi, (dy*r+dx)*out_c + c]
+        channel_major: out[0, yi*r+dy, xi*r+dx, c] = in[0, yi, xi, c*r*r + dy*r + dx]
+
+    Both are pure gathers, written here as a reshape/transpose/reshape --
+    which is not a coincidence: it is the same rank-6 identity a TOSA
+    exporter writes out as ops, and what `frontend.tosa_import` matches
+    against by evaluation.
+    """
+    r = attrs.factor
+    _n, h, w, cin = x.shape
+    out_c = cin // (r * r)
+    v = x.astype(np.int64)
+    if attrs.channel_order == CHANNEL_MAJOR:
+        # [1, H, W, out_c, r, r]: the (dy, dx) axes are the FASTEST
+        # varying inside each output channel.
+        v = v.reshape(1, h, w, out_c, r, r)
+        v = np.transpose(v, (0, 1, 4, 2, 5, 3))  # [1, H, r, W, r, out_c]
+    else:
+        # [1, H, W, r, r, out_c]: (dy, dx) select whole out_c-wide planes.
+        v = v.reshape(1, h, w, r, r, out_c)
+        v = np.transpose(v, (0, 1, 3, 2, 4, 5))  # [1, H, r, W, r, out_c]
+    return np.ascontiguousarray(v).reshape(1, h * r, w * r, out_c)
+
+
 def evaluate_all(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Execute every op in `graph` and return every tensor, keyed by tensor
     id (no `%`), cast to its declared GIR dtype's numpy type."""
@@ -230,6 +259,8 @@ def evaluate_all(graph: Graph, inputs: dict[str, np.ndarray]) -> dict[str, np.nd
             result = _table_int64(x, table)
         elif op.kind == "upsample":
             result = _upsample_int64(values[op.inputs[0]], op.attrs)
+        elif op.kind == "depth_to_space":
+            result = _depth_to_space_int64(values[op.inputs[0]], op.attrs)
         elif op.kind == "concat":
             result = np.concatenate([values[i] for i in op.inputs], axis=op.attrs.axis)
         elif op.kind == "slice":

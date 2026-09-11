@@ -143,7 +143,7 @@ def test_isa_v12_per_channel_is_discovered_from_constants(cnn_accel_constants):
     # value the RTL reports in CSR.HW_INFO2), cross-checked against the
     # W-field ladder -- so it tracks the accelerator's real revision
     # instead of stopping at the last field the ladder knew about.
-    assert unit.isa_version == "2.1"
+    assert unit.isa_version == "2.2"
     assert unit.epilogue.rescale.per_channel is True
     expected = next(f for f in cnn_accel_constants.isa_field_offsets() if f.name == "scale_addr")
     assert target.isa.fields["scale_addr"] == (expected.offset_bytes, expected.width_bytes, expected.signed)

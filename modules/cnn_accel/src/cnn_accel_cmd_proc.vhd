@@ -287,7 +287,8 @@ entity cnn_accel_cmd_proc is
     s_pool_out_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
 
     --# {{}}
-    -- 'cnn_accel_elementwise' (ADD / UPSAMPLE / COPY / ACT).
+    -- 'cnn_accel_elementwise' (ADD / UPSAMPLE / COPY / ACT /
+    -- DEPTH_TO_SPACE).
     ew_start : out std_ulogic := '0';
     ew_opcode : out std_ulogic_vector(7 downto 0) := (others => '0');
     ew_src0_addr : out unsigned(31 downto 0) := (others => '0');
@@ -298,6 +299,11 @@ entity cnn_accel_cmd_proc is
     ew_in_width : out unsigned(15 downto 0) := (others => '0');
     ew_in_height : out unsigned(15 downto 0) := (others => '0');
     ew_in_channels : out unsigned(15 downto 0) := (others => '0');
+    -- DEPTH_TO_SPACE only: the OUTPUT channel count and the upscale
+    -- factor. Every other elementwise opcode is channel-preserving and
+    -- has no use for either.
+    ew_out_channels : out unsigned(15 downto 0) := (others => '0');
+    ew_dts_factor : out unsigned(7 downto 0) := (others => '0');
     ew_requant_scale : out signed(31 downto 0) := (others => '0');
     ew_requant_shift : out unsigned(7 downto 0) := (others => '0');
     ew_done : in std_ulogic;
@@ -359,7 +365,8 @@ architecture a of cnn_accel_cmd_proc is
     cls_conv,      -- CONV2D / FC: conv_core, OT loop
     cls_pool,      -- POOL_MAX / POOL_AVG: window_gen + pool bank
     cls_xfer,      -- LOAD / STORE / LOADW: pure move, no engine
-    cls_elem,      -- ADD / UPSAMPLE / COPY / ACT: elementwise
+    cls_elem,      -- ADD / UPSAMPLE / COPY / ACT / DEPTH_TO_SPACE:
+                   -- elementwise
     cls_bad        -- anything else, including DWCONV2D
   );
 
@@ -412,6 +419,35 @@ architecture a of cnn_accel_cmd_proc is
   signal op_is_copy_q : std_ulogic := '0';
   signal op_is_v12_q : std_ulogic := '0';
   signal op_is_upsample_q : std_ulogic := '0';
+  signal op_is_dts_q : std_ulogic := '0';
+
+  -- DEPTH_TO_SPACE's whole descriptor-level geometry contract, reduced to
+  -- one registered bit in 'st_precheck' exactly like 'chk_conv_geom_q'
+  -- above it (see that signal's comment on why every wide compare is
+  -- decoded once, registered, rather than chained inside 'st_validate2').
+  -- All four terms must hold, or the command is rejected with
+  -- 'ERR_BAD_GEOMETRY' before the engine is ever started:
+  --
+  --  * 'dts_factor = 2'. v1 hardware implements only r = 2 (the field
+  --    itself is 8 bits wide so a future r = 3/4 needs no ISA revision,
+  --    only this bound relaxed -- same shape as the 'kernel_h/kernel_w <=
+  --    g_max_kernel_size' bounds in 'chk_conv_geom_q').
+  --  * 'in_channels = 4 * out_channels', i.e. 'factor**2 * out_channels'
+  --    exactly, the golden model's own precondition
+  --    ('cnn_accel_model.depth_to_space' raises on anything else). Checked
+  --    in 18 bits, not 16, so a large 'out_channels' whose quadruple does
+  --    not fit the field is rejected rather than compared modulo 2**16.
+  --  * 'out_channels /= 0'.
+  --  * 'in_channels' a whole multiple of 4*T = 32, equivalently
+  --    'out_channels' a whole multiple of T. THIS one is a hardware
+  --    requirement the golden model does not have: the engine moves whole
+  --    T-byte channel tiles and never gathers byte lanes within one, which
+  --    is only the same permutation the model computes when each of the
+  --    'factor**2' input planes is a whole number of tiles. An
+  --    'out_channels' of, say, 1 is perfectly legal to the model and would
+  --    silently produce wrong bytes here, so it is rejected instead --
+  --    padding 'out_channels' up to a tile boundary is the compiler's job.
+  signal chk_dts_geom_q : std_ulogic := '0';
 
   -- Source/destination extents ('base + length'), computed in
   -- 'st_range_sum' and only COMPARED in 'st_range'/'st_range_dst'.
@@ -838,7 +874,8 @@ architecture a of cnn_accel_cmd_proc is
       or opcode = c_opcode_loadw then
       return cls_xfer;
     elsif opcode = c_opcode_add or opcode = c_opcode_upsample
-      or opcode = c_opcode_copy or opcode = c_opcode_act then
+      or opcode = c_opcode_copy or opcode = c_opcode_act
+      or opcode = c_opcode_depth_to_space then
       return cls_elem;
     else
       -- Includes DWCONV2D, which is allocated but rejected (section 5.2).
@@ -1017,6 +1054,7 @@ begin
           op_is_copy_q <= to_sl(desc_q.opcode = c_opcode_copy);
           op_is_v12_q <= to_sl(is_v12_opcode(desc_q.opcode));
           op_is_upsample_q <= to_sl(desc_q.opcode = c_opcode_upsample);
+          op_is_dts_q <= to_sl(desc_q.opcode = c_opcode_depth_to_space);
 
           padded_w_q <= resize(desc_q.in_width, 18);
           padded_h_q <= resize(desc_q.in_height, 18);
@@ -1028,7 +1066,7 @@ begin
           end if;
 
           chk_reserved_bad_q <=
-            to_sl(desc_q.reserved_w0 /= x"00" or desc_q.reserved_w10 /= x"0000");
+            to_sl(desc_q.reserved_w0 /= x"00" or desc_q.reserved_w10 /= x"00");
           chk_xfer_nz_q <= to_sl(desc_q.xfer_bytes /= 0);
 
           chk_al_in_q <= to_sl(is_aligned(desc_q.in_addr));
@@ -1054,6 +1092,14 @@ begin
             and desc_q.pool_stride_h /= 0 and desc_q.pool_stride_w /= 0
             and desc_q.pool_kernel_h <= g_max_pool_kernel_size
             and desc_q.pool_kernel_w <= g_max_pool_kernel_size
+          );
+          -- See the declaration for what each term is and why.
+          chk_dts_geom_q <= to_sl(
+            desc_q.dts_factor = 2
+            and desc_q.out_channels /= 0
+            and resize(desc_q.in_channels, 18)
+                = shift_left(resize(desc_q.out_channels, 18), 2)
+            and desc_q.in_channels(c_word_shift + 1 downto 0) = 0
           );
 
           state <= st_validate;
@@ -1171,6 +1217,14 @@ begin
             if chk_dims_nz_q = '0' then
               v_err := c_err_bad_geometry;
             end if;
+          end if;
+
+          -- DEPTH_TO_SPACE's own contract, already reduced to one bit in
+          -- 'st_precheck' -- so this adds a single 1-bit term to this
+          -- state's chain, not a second geometry comparison network.
+          if v_err = c_err_none and op_is_dts_q = '1'
+            and chk_dts_geom_q = '0' then
+            v_err := c_err_bad_geometry;
           end if;
 
           if v_err = c_err_none and v_cls = cls_xfer and chk_xfer_nz_q = '0' then
@@ -1463,7 +1517,8 @@ begin
           if cls_q = cls_xfer or cls_q = cls_elem then
             v_len := desc_q.xfer_bytes;
             if cls_q = cls_elem
-              and (op_is_add_q = '1' or op_is_upsample_q = '1') then
+              and (op_is_add_q = '1' or op_is_upsample_q = '1'
+                   or op_is_dts_q = '1') then
               v_len := in_total_bytes_q;
             end if;
           else
@@ -1481,6 +1536,11 @@ begin
             elsif op_is_upsample_q = '1' then
               -- Nearest-2x2 quadruples the pixel count (section 5.2).
               v_len := shift_left(in_total_bytes_q, 2);
+            elsif op_is_dts_q = '1' then
+              -- DEPTH_TO_SPACE is a pure permutation of the SAME bytes:
+              -- it quadruples the pixel count and quarters the channel
+              -- count, so input and output occupy identical byte counts.
+              v_len := in_total_bytes_q;
             end if;
           else
             v_len := out_total_bytes_q;
@@ -2416,6 +2476,8 @@ begin
       ew_in_width <= desc_q.in_width;
       ew_in_height <= desc_q.in_height;
       ew_in_channels <= desc_q.in_channels;
+      ew_out_channels <= desc_q.out_channels;
+      ew_dts_factor <= desc_q.dts_factor;
       ew_requant_scale <= desc_q.requant_scale;
       ew_requant_shift <= desc_q.requant_shift;
     end if;

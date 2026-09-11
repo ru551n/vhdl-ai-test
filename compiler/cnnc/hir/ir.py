@@ -39,6 +39,16 @@ class Buffer:
     layout: str
     shape: tuple[int, ...]
     dtype: str
+    #: The logical shape of the tensor this buffer holds, when it differs
+    #: from `shape` because a pass widened the tensor to suit the
+    #: hardware's storage granularity -- see `gir.ir.Tensor.logical_shape`,
+    #: which is where this is copied from. `None` means they are the same.
+    #: `shape` says what gets WRITTEN (and matches the instruction's
+    #: descriptor); `logical_shape` says what the value IS, and is what a
+    #: reader should hand `lower.layout.unpack_activation_planes`. Both
+    #: always imply the same `size_bytes`: a widened channel count occupies
+    #: the same whole planes the true one already did.
+    logical_shape: tuple[int, ...] | None = None
     addr: int | None = None
     data: bytes | None = None  # const/program payload
     gir_tensor: str | None = None

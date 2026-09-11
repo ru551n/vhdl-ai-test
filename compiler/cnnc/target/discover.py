@@ -303,7 +303,12 @@ def _elementwise_unit(
     (an ISA v1.x accelerator), which is what makes `tosa.add`/`tosa.table`
     refuse cleanly there instead of emitting an undefined opcode."""
     ops = tuple(
-        name for opcode, name in (("ADD", "add"), ("ACT", "table"), ("UPSAMPLE", "upsample"))
+        name for opcode, name in (
+            ("ADD", "add"),
+            ("ACT", "table"),
+            ("UPSAMPLE", "upsample"),
+            ("DEPTH_TO_SPACE", "depth_to_space"),
+        )
         if opcode in constants.OPCODES
     )
     if not ops:
@@ -357,6 +362,14 @@ def _elementwise_unit(
         # hard-coded a second copy of that number could disagree with the
         # thing it is compiling for.
         upsample_factor=getattr(model, "UPSAMPLE_FACTOR", None) if "upsample" in ops else None,
+        # Same rule, same reason as `upsample_factor` above: v1 hardware
+        # implements exactly one `dts_factor`, and `cnn_accel_model` is
+        # where that number lives. The ISA *has* a field for it, so a
+        # later hardware can widen this without an ISA change -- which is
+        # precisely why the compiler must not keep its own copy of the 2.
+        depth_to_space_factor=(
+            getattr(model, "DEPTH_TO_SPACE_FACTOR", None) if "depth_to_space" in ops else None
+        ),
     )
 
 

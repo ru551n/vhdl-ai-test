@@ -34,6 +34,25 @@ class Tensor:
     shape: tuple[int, ...]
     dtype: str
     values: tuple[int, ...] | None = None  # row-major constant data; None if not compile-time constant
+    #: The shape the SOURCE graph declared for this tensor, when a pass has
+    #: had to widen `shape` to suit the hardware's storage granularity.
+    #: `None` (the normal case) means `shape` is both -- nothing was
+    #: widened. Today the only producer is
+    #: `passes.depth_to_space_pad.PadDepthToSpaceChannelsPass`, which pads a
+    #: pixel shuffle's output channel count up to a whole activation channel
+    #: tile because `OPCODE_DEPTH_TO_SPACE` moves nothing smaller; the extra
+    #: channels are dummies computed from zero weights.
+    #:
+    #: `shape` stays the authority on what the hardware WRITES (and so on
+    #: what the instruction's descriptor says and how many bytes the buffer
+    #: holds); `logical_shape` is the authority on what the tensor's VALUE
+    #: is. `lower.layout.unpack_activation_planes` is the boundary between
+    #: the two, exactly as it already is for the padding lanes of any
+    #: ordinary tensor whose channel count is not a multiple of the plane
+    #: width -- a C=3 RGB input, say. Carried to the program manifest via
+    #: `hir.ir.Buffer.logical_shape` so a caller reading a result back gets
+    #: its real channels rather than the padding.
+    logical_shape: tuple[int, ...] | None = None
 
     @property
     def numel(self) -> int:
@@ -142,6 +161,60 @@ class UpsampleAttrs:
     factor: int
 
 
+#: `DepthToSpaceAttrs.channel_order`: which input channel produces which
+#: output sub-position. The two orders are the same *shape* function and
+#: different *index* functions, so they cannot be told apart from the
+#: tensor shapes -- only by evaluating the mapping, which is exactly what
+#: `frontend.tosa_import._match_depth_to_space_chains` does.
+PLANE_MAJOR = "plane_major"
+CHANNEL_MAJOR = "channel_major"
+CHANNEL_ORDERS = (PLANE_MAJOR, CHANNEL_MAJOR)
+
+
+@dataclasses.dataclass(frozen=True)
+class DepthToSpaceAttrs:
+    """Sub-pixel convolution's pixel-shuffle step on an NHWC tensor:
+    `factor**2` input channels are traded for a `factor`x larger frame in
+    both spatial dimensions, so `in_channels = factor**2 * out_channels`.
+
+    Like `UpsampleAttrs` this is a pure index permutation -- no
+    arithmetic, nothing to requantize -- and like it, TOSA has no op for
+    it: an exporter spells it as `reshape -> transpose -> reshape` over a
+    rank-6 intermediate, which `frontend.tosa_import` recognises by
+    *evaluating* the chain's index mapping.
+
+    `channel_order` is the part that has no analogue in `upsample`, and
+    it is the whole reason this attribute is not just a factor:
+
+      * `plane_major` (`cin = (dy*factor + dx)*out_channels + c`) is what
+        `OPCODE_DEPTH_TO_SPACE` implements -- `factor**2` back-to-back
+        contiguous `out_channels`-wide planes, so the engine only ever
+        moves whole channel tiles (`cnn_accel_model.depth_to_space`).
+      * `channel_major` (`cin = c*factor**2 + dy*factor + dx`) is what
+        PyTorch's `nn.PixelShuffle` means, and therefore what a real
+        exported graph almost always contains. The hardware cannot do it;
+        `passes.depth_to_space_channels.PermuteDepthToSpaceChannelsPass`
+        rewrites it into the plane-major one by permuting the *producing
+        convolution's* output-channel rows at compile time, which is free
+        (it only relabels which weight row makes which channel).
+
+    Carrying the order explicitly, rather than normalising it away in the
+    frontend, is what lets that rewrite be a separate, verifiable,
+    semantics-preserving pass -- and lets `lower.to_hir` refuse a
+    channel-major op by name if the rewrite could not be applied, instead
+    of silently emitting an instruction that computes the other one.
+    """
+
+    factor: int
+    channel_order: str = PLANE_MAJOR
+
+    def __post_init__(self) -> None:
+        if self.channel_order not in CHANNEL_ORDERS:
+            raise ValueError(
+                f"DepthToSpaceAttrs.channel_order {self.channel_order!r} not in {CHANNEL_ORDERS}"
+            )
+
+
 @dataclasses.dataclass(frozen=True)
 class ConcatAttrs:
     """TOSA `CONCAT` along one axis.
@@ -178,14 +251,14 @@ class FusedConvAttrs:
 
 Attrs = Union[
     ConvAttrs, RescaleParams, ClampAttrs, PoolAttrs, AddAttrs, UpsampleAttrs,
-    ConcatAttrs, SliceAttrs, FusedConvAttrs, None,
+    DepthToSpaceAttrs, ConcatAttrs, SliceAttrs, FusedConvAttrs, None,
 ]
 
 
 @dataclasses.dataclass(frozen=True)
 class Op:
     id: str  # f"%{outputs[0]}", i.e. the MLIR SSA name of its first output
-    kind: str  # const | conv2d | rescale | clamp | pool | add | table | upsample | concat | slice | fused_conv
+    kind: str  # const | conv2d | rescale | clamp | pool | add | table | upsample | depth_to_space | concat | slice | fused_conv
     inputs: tuple[str, ...]
     outputs: tuple[str, ...]
     attrs: Attrs = None
@@ -248,6 +321,24 @@ def upsample_output_shape(
     spatial dimensions scaled by `factor`, batch and channels untouched."""
     n, h, w, c = in_shape
     return (n, h * factor, w * factor, c)
+
+
+def depth_to_space_output_shape(
+    in_shape: tuple[int, int, int, int], factor: int
+) -> tuple[int, int, int, int]:
+    """Depth-to-space output shape, NHWC `[N, H, W, C]`: both spatial
+    dimensions scaled by `factor`, channels divided by `factor**2`. The
+    exact inverse trade of `upsample_output_shape`, which is why the
+    channel count must divide evenly -- a caller that has not checked
+    gets a `ValueError` rather than a silently floored channel count."""
+    n, h, w, c = in_shape
+    if factor < 1:
+        raise ValueError(f"depth_to_space factor {factor} must be >= 1")
+    if c % (factor * factor):
+        raise ValueError(
+            f"depth_to_space in_channels {c} is not divisible by factor**2 = {factor}**2"
+        )
+    return (n, h * factor, w * factor, c // (factor * factor))
 
 
 def pool2d_output_shape(

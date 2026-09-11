@@ -521,6 +521,132 @@ def upsample4x_text() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Depth-to-space (pixel-shuffle / sub-pixel convolution) fixtures.
+#
+# `reshape -> transpose -> reshape` over a rank-6 intermediate, which is
+# what an exporter emits for `nn.PixelShuffle(r)`: split the channel axis
+# into three, interleave the two new `r` axes with H and W, fold back
+# down. Written out op by op, like the upsample chain above and for the
+# same reason -- the point is that the compiler RECOGNISES the chain.
+#
+# Two channel groupings, and the difference between them is the whole
+# reason both fixtures exist:
+#
+#   plane-major    [1, H, W, r, r, out_c], perms (0, 1, 3, 2, 4, 5)
+#   channel-major  [1, H, W, out_c, r, r], perms (0, 1, 4, 2, 5, 3)
+#
+# Both land on `[1, H, r, W, r, out_c]` and fold to the same shape; they
+# are different FUNCTIONS of the same input. Plane-major is what the
+# hardware does; channel-major is what `nn.PixelShuffle` means, and needs
+# the producing convolution's weight rows permuted first
+# (`passes.depth_to_space_channels`).
+# ---------------------------------------------------------------------------
+
+
+def depth_to_space_chain_lines(
+    source: str,
+    shape: tuple[int, int, int, int],
+    factor: int,
+    prefix: str,
+    *,
+    channel_major: bool,
+) -> tuple[list[str], tuple[int, int, int, int]]:
+    """The three ops that spell a depth-to-space of an NHWC `shape`."""
+    n, h, w, cin = shape
+    assert cin % (factor * factor) == 0
+    out_c = cin // (factor * factor)
+    mid = (
+        (n, h, w, out_c, factor, factor) if channel_major else (n, h, w, factor, factor, out_c)
+    )
+    perms = (0, 1, 4, 2, 5, 3) if channel_major else (0, 1, 3, 2, 4, 5)
+    permuted = tuple(mid[p] for p in perms)
+    out_shape = (n, h * factor, w * factor, out_c)
+    ty = lambda dims: "tensor<" + "x".join(str(d) for d in dims) + "xi8>"  # noqa: E731
+    lines = [
+        _shape_const(f"%{prefix}s0", list(mid)),
+        _shape_const(f"%{prefix}s1", list(out_shape)),
+        f'    %{prefix}0 = "tosa.reshape"({source}, %{prefix}s0) : '
+        f"({ty(shape)}, !tosa.shape<6>) -> {ty(mid)}",
+        f'    %{prefix}1 = "tosa.transpose"(%{prefix}0) '
+        f"<{{perms = array<i32: {', '.join(str(p) for p in perms)}>}}> : "
+        f"({ty(mid)}) -> {ty(permuted)}",
+        f'    %{prefix}out = "tosa.reshape"(%{prefix}1, %{prefix}s1) : '
+        f"({ty(permuted)}, !tosa.shape<4>) -> {ty(out_shape)}",
+    ]
+    return lines, out_shape
+
+
+def depth_to_space2x_text() -> str:
+    """A bare plane-major 2x pixel shuffle of `1x3x5x32` straight off the
+    graph input: no convolution, so no permutation is involved and the
+    chain must lower on its own. Non-square, odd spatial dims so a
+    transposed match cannot pass by symmetry."""
+    in_shape = (1, 3, 5, 32)
+    lines, out_shape = depth_to_space_chain_lines(
+        "%arg0", in_shape, 2, "d", channel_major=False
+    )
+    return _module_text(in_shape, out_shape, lines, "%dout")
+
+
+def espcn_tail_text() -> str:
+    """ESPCN's tail, and the reason the permutation pass exists: a 3x3
+    convolution producing `r**2 * out_c` channels, ReLU, then a
+    CHANNEL-major (`nn.PixelShuffle`) 2x shuffle down to 8 channels.
+
+    8 output channels because the hardware moves whole activation-plane
+    channel tiles and refuses an `out_channels` that is not a multiple of
+    T=8 -- a real luma-only ESPCN's `out_channels = 1` is exactly the case
+    `lower.to_hir` rejects by name."""
+    in_shape = (1, 4, 6, 4)
+    counter = _ValueCounter()
+    lines: list[str] = []
+    conv, conv_shape = _conv_layer_lines(
+        "%arg0", in_shape, 32, counter, lines, weight_seed=901, bias_seed=902,
+        # shift 34 chosen the same way as the M9 fixtures' quantization
+        # (see this module's docstring): for input seeds 1-4 the conv's
+        # clamped int8 output has >100 distinct values with only ~1.5% of
+        # taps saturating, so the shuffle is permuting real data rather
+        # than a near-constant tensor.
+        mult=1073741824, shift=34,
+    )
+    chain, out_shape = depth_to_space_chain_lines(conv, conv_shape, 2, "d", channel_major=True)
+    lines += chain
+    return _module_text(in_shape, out_shape, lines, "%dout")
+
+
+def espcn_luma_text() -> str:
+    """A REAL luma-only ESPCN tail: a 3x3 convolution producing
+    `r**2 * 1 = 4` channels, ReLU, then a CHANNEL-major
+    (`nn.PixelShuffle`) 2x shuffle down to ONE output channel.
+
+    `espcn_tail` above uses 8 output channels, which is already a whole
+    activation channel tile; this one uses the count an actual
+    super-resolution model has, and which the hardware cannot address
+    directly -- `OPCODE_DEPTH_TO_SPACE` moves whole T=8-byte tiles, so a
+    1-channel output would be one BYTE LANE of a tile. It is
+    `passes.depth_to_space_pad` that makes this compile, by giving the
+    convolution `4 * (8 - 1) = 28` dummy zero-weight output channels so
+    the shuffle produces a whole 8-lane tile of which the graph's real
+    single channel is lane 0. The stored tensor is 8 channels wide; the
+    tensor's VALUE is still 1 channel, and `Tensor.logical_shape` ->
+    manifest `logical_shape` -> `unpack_activation_planes` is what keeps
+    those two facts apart.
+
+    Same conv quantization as `espcn_tail` (see there for how `shift` was
+    chosen), so the shuffle is permuting real data."""
+    in_shape = (1, 4, 6, 4)
+    counter = _ValueCounter()
+    lines: list[str] = []
+    conv, conv_shape = _conv_layer_lines(
+        "%arg0", in_shape, 4, counter, lines, weight_seed=903, bias_seed=904,
+        mult=1073741824, shift=34,
+    )
+    chain, out_shape = depth_to_space_chain_lines(conv, conv_shape, 2, "d", channel_major=True)
+    lines += chain
+    return _module_text(in_shape, out_shape, lines, "%dout")
+
+
+# ---------------------------------------------------------------------------
 # M14 `tosa.concat` / `tosa.slice` fixtures: the buffer-view lowering.
 #
 # Both are shaped like YOLOv8n's C2f block, which is where they actually
@@ -701,6 +827,9 @@ def main() -> None:
     (FIXTURES_DIR / "concat_two_convs.mlir").write_text(concat_two_convs_text())
     (FIXTURES_DIR / "slice_concat_c2f.mlir").write_text(slice_concat_c2f_text())
     (FIXTURES_DIR / "concat_equal_halves.mlir").write_text(concat_equal_halves_text())
+    (FIXTURES_DIR / "depth_to_space2x.mlir").write_text(depth_to_space2x_text())
+    (FIXTURES_DIR / "espcn_tail.mlir").write_text(espcn_tail_text())
+    (FIXTURES_DIR / "espcn_luma.mlir").write_text(espcn_luma_text())
 
 
 if __name__ == "__main__":

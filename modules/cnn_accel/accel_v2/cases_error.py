@@ -74,11 +74,23 @@ def _build_single_conv(model: Model) -> None:
     model.output(y)
 
 
+def _build_single_dts(model: Model) -> None:
+    """The `DEPTH_TO_SPACE` equivalent of `_build_single_conv`: one
+    well-formed pixel-shuffle, DDR in -> DDR out, as the program's first
+    and only real instruction -- so `_error_case` can mutate exactly one
+    of ITS descriptor fields. A conv-fed graph would put the conv at
+    `descs[0]` and mutate the wrong instruction."""
+    x = model.input(_H, _W, 4 * _C, name="x")
+    y = model.depth_to_space(x, name="y")
+    model.output(y)
+
+
 def _error_case(
     name: str,
     seed: int,
     err_code: int,
     overrides: dict[str, object] | "object" = None,
+    build=_build_single_conv,
 ) -> TbCase:
     """One malformed-first-descriptor case: build the smallest well-formed
     program (`_build_single_conv`), then splice `overrides` into its
@@ -98,7 +110,7 @@ def _error_case(
     """
     case = build_case(
         name,
-        _build_single_conv,
+        build,
         seed=seed,
         expect_error=True,
         expect_err_code=err_code,
@@ -215,6 +227,43 @@ def case_err_bad_geometry() -> TbCase:
     return _error_case("err_bad_geometry", seed=108, err_code=isa.ERR_BAD_GEOMETRY, overrides={"kernel_h": 0})
 
 
+def case_err_dts_bad_factor() -> TbCase:
+    """`ERR_BAD_GEOMETRY` (0x7) from `DEPTH_TO_SPACE`'s own contract:
+    `dts_factor = 3`, which the ISA field can encode but v1 hardware does
+    not implement (`cnn_accel_cmd_proc.chk_dts_geom_q`).
+
+    This is the FIRST case to reach a geometry rejection through the
+    `cls_elem` path -- `case_err_bad_geometry` above goes through
+    `cls_conv` -- and the point of it is that an unimplemented factor is
+    refused outright rather than silently executed as factor 2, which
+    would write a plausible-looking wrong tensor."""
+    return _error_case(
+        "err_dts_bad_factor",
+        seed=109,
+        err_code=isa.ERR_BAD_GEOMETRY,
+        overrides={"dts_factor": 3},
+        build=_build_single_dts,
+    )
+
+
+def case_err_dts_bad_channels() -> TbCase:
+    """`ERR_BAD_GEOMETRY` (0x7): `out_channels` mutated to 9, breaking
+    `in_channels == factor**2 * out_channels` (32 != 36).
+
+    `out_channels` is mutated rather than `in_channels` deliberately: it
+    is the one field of this descriptor that no length or address
+    derives from, so the ONLY check that can fire is the geometry one --
+    mutating `in_channels` would also change `in_total_bytes` and leave
+    it ambiguous whether the DUT rejected the shape or the range."""
+    return _error_case(
+        "err_dts_bad_channels",
+        seed=110,
+        err_code=isa.ERR_BAD_GEOMETRY,
+        overrides={"out_channels": 9},
+        build=_build_single_dts,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Not attempted, deliberately, and why.
 # ---------------------------------------------------------------------------
@@ -250,6 +299,8 @@ ALL_CASES = (
     case_err_ddr_range,
     case_err_bad_reserved,
     case_err_bad_geometry,
+    case_err_dts_bad_factor,
+    case_err_dts_bad_channels,
 )
 
 

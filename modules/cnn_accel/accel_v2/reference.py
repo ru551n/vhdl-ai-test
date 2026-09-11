@@ -79,6 +79,7 @@ from accel_v2.model import (
     PoolOp,
     RowCopyOp,
     Tensor,
+    DepthToSpaceOp,
     UpsampleOp,
 )
 from accel_v2.planner import (
@@ -197,6 +198,25 @@ def _exec_upsample(op: UpsampleOp, input_values: list[int]) -> list[int]:
         in_channels=x.channels,
     )
     return golden.upsample_nearest(input_values, desc, op.factor)
+
+
+def _exec_depth_to_space(op: DepthToSpaceOp, input_values: list[int]) -> list[int]:
+    """Pixel-shuffle, via `cnn_accel_model.depth_to_space`.
+
+    `out_channels` is the OUTPUT tensor's channel count, which is what the
+    descriptor's own `out_channels` field carries -- the golden model reads
+    it off the `LayerDesc`, so it must be filled in here even though every
+    other elementwise op leaves it at zero."""
+    x = op.inputs[0]
+    desc = golden.LayerDesc(
+        opcode=golden.OPCODE_DEPTH_TO_SPACE,
+        in_width=x.width,
+        in_height=x.height,
+        in_channels=x.channels,
+        out_channels=op.output.channels,
+        dts_factor=op.factor,
+    )
+    return golden.depth_to_space(input_values, desc, op.factor)
 
 
 def _exec_act(op: ActOp, input_values: list[int]) -> list[int]:
@@ -496,6 +516,8 @@ def run_reference(planned: PlannedProgram, image: MemoryImage) -> ExecutionResul
             values = _exec_add(op, input_values[0], input_values[1])
         elif isinstance(op, UpsampleOp):
             values = _exec_upsample(op, input_values[0])
+        elif isinstance(op, DepthToSpaceOp):
+            values = _exec_depth_to_space(op, input_values[0])
         elif isinstance(op, ActOp):
             values = _exec_act(op, input_values[0])
             # The 256-entry LUT is refetched from DDR for every `ACT`

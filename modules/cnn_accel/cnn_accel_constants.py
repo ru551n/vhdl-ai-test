@@ -153,7 +153,12 @@ ACCUM_WIDTH = 32
 # (POOL_* now honour FLAG_PAD_EN and the pad_top/bottom/left/right
 # fields). Both were reserved-must-be-0 before, so every v2.0 program is
 # still a valid, bit-identical v2.1 program.
-ISA_VERSION = 0x0201
+# v2.2 (2026-09): adds the DEPTH_TO_SPACE opcode (0x17) and its W10
+# 'dts_factor' byte, for sub-pixel-convolution (ESPCN-style) upscaling.
+# The opcode was previously unassigned and the byte previously
+# reserved-must-be-0, so every v2.1 program is still a valid,
+# bit-identical v2.2 program.
+ISA_VERSION = 0x0202
 
 # ISA v1.2 (doc/tosa_compiler_plan.md section 5, extension 2 / HW milestone
 # H2): per-channel requantization table in DDR at `scale_addr`, one entry
@@ -275,6 +280,14 @@ OPCODES: dict[str, int] = {
     "UPSAMPLE": 0x14,
     "COPY": 0x15,
     "ACT": 0x16,
+    # ISA v2.2 (doc/cnn_accel_top_v2_arch.md section 5, ESPCN/sub-pixel-
+    # convolution support): depth-to-space (aka pixel-shuffle). Local-
+    # tensor-to-local-tensor, same engine family as UPSAMPLE/ADD/COPY/ACT
+    # (0x13-0x16) -- grouped contiguously with them rather than placed in
+    # the 0x06-0x0F range that comment reserves for a genuinely new
+    # *compute-core* (systolic-array) opcode family, since this op runs
+    # entirely in `cnn_accel_elementwise`, not the PE array.
+    "DEPTH_TO_SPACE": 0x17,
 }
 
 # ---------------------------------------------------------------------------
@@ -413,7 +426,20 @@ ISA_LAYOUT: tuple[IsaField, ...] = (
     # point first (4915955) and convolution followed; no encoding
     # changed in between, so the version stays 0x0201.
     IsaField("pad_value", 1, signed=True),
-    IsaField(RESERVED, 2),  # W10 bytes 42-43
+    # W10 byte 42 (ISA v2.2): DEPTH_TO_SPACE's upscale factor r. Unsigned,
+    # reserved-must-be-0 in every earlier revision, and 0 is not a legal
+    # factor for this opcode (r >= 2 always), so an old program -- which
+    # never issues DEPTH_TO_SPACE and therefore never reads this byte --
+    # cannot have a stale nonzero value misread as a real factor. Unlike
+    # UPSAMPLE (`cnn_accel_elementwise.vhd`'s hardcoded factor-2, no ISA
+    # bit spent on it -- see that opcode's own comment), DEPTH_TO_SPACE
+    # gets a real field from the start: v1 hardware only implements
+    # `factor = 2` (validated in `cnn_accel_cmd_proc`), but the field
+    # already carries 3/4 for whenever the RTL grows to support them, so
+    # that growth is not another ISA revision.
+    IsaField("dts_factor", 1),
+    IsaField(RESERVED, 1),  # W10 byte 43
+
     IsaField("pool_kernel_h", 1),
     IsaField("pool_kernel_w", 1),
     IsaField("pool_stride_h", 1),

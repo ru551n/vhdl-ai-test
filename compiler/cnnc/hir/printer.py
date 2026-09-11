@@ -105,6 +105,7 @@ def _buffer_to_json(buf: Buffer) -> dict:
         "role": buf.role,
         "layout": buf.layout,
         "shape": list(buf.shape),
+        "logical_shape": None if buf.logical_shape is None else list(buf.logical_shape),
         "dtype": buf.dtype,
         "addr": buf.addr,
         "data": _data_to_json(buf.data),
