@@ -4,7 +4,6 @@ resolutions the state machine depends on (current addressing, QPI lanes)."""
 from __future__ import annotations
 
 import pytest
-
 from flash_model.commands import (
     COMMAND_TABLE,
     COMMANDS,

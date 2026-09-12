@@ -7,10 +7,9 @@ contract-typed return value is asserted for dtype here."""
 
 from __future__ import annotations
 
+import flash_model_bridge as bridge
 import numpy as np
 import pytest
-
-import flash_model_bridge as bridge
 from flash_model.directive import Action, unpack
 
 

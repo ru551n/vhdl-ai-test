@@ -8,10 +8,10 @@ device stops talking) as much as they cover the resulting bytes."""
 from __future__ import annotations
 
 import pytest
-
 from flash_model import profiles
 from flash_model.device import FlashDevice
 from flash_model.directive import Action
+
 from tests.harness import Host, frame
 
 KIB = 1024

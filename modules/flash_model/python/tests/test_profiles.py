@@ -4,7 +4,6 @@ usable without further code."""
 from __future__ import annotations
 
 import pytest
-
 from flash_model import profiles
 from flash_model.device import FlashDevice
 from flash_model.timing import BUSY_KEYS, LIMIT_KEYS

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-
 from flash_model.protection import Protection
 
 MIB = 1024 * 1024
