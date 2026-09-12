@@ -82,8 +82,26 @@ package body flash_model_pkg is
       p_block_bytes => block_bytes,
       p_addr_bytes => addr_bytes,
       p_jedec_id => jedec_id,
-      p_profile => new_string_ptr(profile)
+      p_profile => new_string_ptr(profile),
+      p_state => new_integer_vector_ptr(length => c_state_length, value => -1)
     );
+  end function;
+
+  impure function get_instance_id(flash : flash_model_t) return integer is
+  begin
+    return get(flash.p_state, c_state_instance_id);
+  end function;
+
+  procedure set_instance_id(flash : flash_model_t; instance_id : natural) is
+  begin
+    set(flash.p_state, c_state_instance_id, instance_id);
+  end procedure;
+
+  impure function now_seconds return real is
+    constant c_whole_seconds : integer := now / 1 sec;
+    constant c_remainder_ns : integer := (now - c_whole_seconds * 1 sec) / 1 ns;
+  begin
+    return real(c_whole_seconds) + real(c_remainder_ns) * 1.0e-9;
   end function;
 
   impure function as_sync(flash : flash_model_t) return sync_handle_t is

@@ -9,6 +9,8 @@ use vunit_lib.integer_array_pkg.all;
 use vunit_lib.sync_pkg.all;
 use vunit_lib.vc_pkg.all;
 
+use work.qspi_pkg.all;
+
 -- Control surface for the QSPI NOR flash verification component
 -- (flash_model.vhd). Everything a testbench needs in order to drive the model
 -- lives here; a testbench never mentions Python, and never touches the flash
@@ -45,7 +47,9 @@ package flash_model_pkg is
   -- phase" and "byte to drive now".
   type flash_action_t is (receive, transmit, ignore_rest);
 
-  subtype lane_count_t is positive range 1 to 4;  -- 1, 2 or 4; 3 is never valid
+  -- lane_count_t comes from qspi_pkg: the directive's lane count IS a QSPI lane
+  -- count, and declaring a second one here would clash for any file that uses
+  -- both packages.
 
   type flash_directive_t is record
     action : flash_action_t;
@@ -124,6 +128,12 @@ package flash_model_pkg is
   type flash_model_t is record
     -- All private. Use the accessors and procedures below.
     p_std_cfg : std_cfg_t;
+    -- A one-slot mutable cell holding the Python model's instance id. The
+    -- handle itself is a constant generic, but the id is not known until the
+    -- VC's init process calls flash_create() at time 0, and three processes
+    -- inside the VC need it afterwards. This is the same escape hatch VUnit's
+    -- own VCs use for post-elaboration state (axi_stream_pkg's p_config).
+    p_state : integer_vector_ptr_t;
     p_size_bytes : positive;
     p_page_bytes : positive;
     p_sector_bytes : positive;
@@ -150,6 +160,23 @@ package flash_model_pkg is
     id : id_t := null_id;
     unexpected_msg_type_policy : unexpected_msg_type_policy_t := fail
   ) return flash_model_t;
+
+  -- Slot indices within p_state.
+  constant c_state_instance_id : natural := 0;
+  constant c_state_length : natural := 1;
+
+  -- The Python model instance this VC talks to. Only valid after the VC's init
+  -- process has run; -1 before that.
+  impure function get_instance_id(flash : flash_model_t) return integer;
+  procedure set_instance_id(flash : flash_model_t; instance_id : natural);
+
+  -- `now` as a real number of seconds, for the model's deadline arithmetic.
+  --
+  -- Split into whole seconds plus a nanosecond remainder on purpose: `now / 1 ns`
+  -- alone overflows VHDL's 32-bit integer past about 2.1 s of simulated time,
+  -- which a chip-erase test reaches easily. Resolution is 1 ns, which is ample
+  -- against busy deadlines measured in microseconds and up.
+  impure function now_seconds return real;
 
   impure function as_sync(flash : flash_model_t) return sync_handle_t;
   impure function get_logger(flash : flash_model_t) return logger_t;
