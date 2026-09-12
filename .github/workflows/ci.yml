@@ -52,6 +52,33 @@ jobs:
           python -m pytest -q
           modules/cnn_accel/test_cnn_accel_model.py
 
+  flash-model:
+    name: Flash model (pytest)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        # A separate job from the golden model's on purpose: that one stays
+        # pure-stdlib so no third-party numerics sit in the trust path the RTL
+        # is checked against, and installing numpy next to it would let an
+        # accidental numpy import there pass unnoticed. The flash model's
+        # bridge exchanges integer_array_t values as NumPy arrays, so this
+        # suite does need numpy.
+        run: python -m pip install --upgrade pip pytest numpy
+
+      - name: Run flash model test suite
+        # The QSPI flash verification component keeps its whole device model
+        # in Python (modules/flash_model/python); this exercises it without a
+        # simulator. tests/ is a package, so pytest puts
+        # modules/flash_model/python on sys.path, which is how `flash_model`
+        # and `flash_model_bridge` import.
+        run: python -m pytest -q modules/flash_model/python/tests
+
   simulate:
     name: Simulate (${{ matrix.simulator }})
     runs-on: ubuntu-24.04

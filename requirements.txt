@@ -20,8 +20,7 @@
 # `add_vhdl_builtins()`.
 #
 # Also used by the flash_model verification component, which keeps its whole
-# device model in Python. shared/Vunit.md's "Python FFI" section still
-# describes this fork's previous python_execute/python_call API.
+# device model in Python. See shared/Vunit.md's "Python FFI" section.
 #
 # Headless waveform recording (`--wave`) is not supported by this VUnit, and
 # is not needed.
