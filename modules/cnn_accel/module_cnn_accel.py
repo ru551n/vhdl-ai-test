@@ -3053,9 +3053,17 @@ class Module(BaseModule):
             # after `top_level_bridge.set_test_case` -- see
             # `TbCase.generics`'s own docstring for why that split is
             # drawn where it is.
+            generics = case.generics()
             tb.add_config(
                 name=case.name,
-                generics={**case.generics(), "g_case_name": case.name},
+                generics={**generics, "g_case_name": case.name},
+                # NVC's default 64m heap cannot hold the modelled DDR of the
+                # larger (8 MiB) cases: 'memory_t' keeps about 8 heap bytes
+                # per DDR byte, and 'allocate' resizes (copies) it, so those
+                # died with "out of memory" in 'allocate' before the DUT ran.
+                # Scaled from g_ddr_bytes so the 2 MiB cases keep exactly the
+                # default; ignored by every other simulator.
+                sim_options={"nvc.heap_size": f"{max(64, 32 * generics['g_ddr_bytes'] // 2**20)}m"},
             )
 
     def _setup_cnn_accel_bias_requant(self, library) -> None:

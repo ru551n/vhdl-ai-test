@@ -19,11 +19,12 @@
 # Standard, not opt-in: run.py always calls `add_python()` right after
 # `add_vhdl_builtins()`.
 #
-# This fork diverged from the one carrying PR #1101 (the headless `--wave`
-# flag: vcd on GHDL, fst on NVC) rather than building on top of it, so
-# pinning this commit means headless waveform recording (and vunit-mcp's
-# waveform support) is unavailable until the two are reconciled upstream --
-# a known, accepted gap, not an oversight.
+# Also used by the flash_model verification component, which keeps its whole
+# device model in Python. shared/Vunit.md's "Python FFI" section still
+# describes this fork's previous python_execute/python_call API.
+#
+# Headless waveform recording (`--wave`) is not supported by this VUnit, and
+# is not needed.
 vunit-hdl @ git+https://github.com/ru551n/vunit.git@771df499cad358161414431eed2682c080608662
 
 # tsfpga fork carrying the Yosys+GHDL netlist-build support
