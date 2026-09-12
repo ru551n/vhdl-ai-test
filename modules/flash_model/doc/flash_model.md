@@ -117,9 +117,15 @@ returned `integer_array_t`; `deallocate` it when you are done.
 
 ```vhdl
 flash_set_timing_enable(net, c_flash, true);          -- the global switch
-flash_set_timing(net, c_flash, "sector_erase", 45 ms);-- override one duration
+flash_set_timing(net, c_flash, "tSE", 45 ms);         -- override one duration
 flash_wait_until_ready(net, c_flash);                 -- block until not busy
 ```
+
+Durations are named the way the part's datasheet names them: `tPP` (page
+program), `tSE` (sector erase), `tBE32` / `tBE64` (block erase), `tCE` (chip
+erase), `tW` (status write), `tRST`, `tRES1` / `tRES2` (reset and deep
+power-down). Passing an unknown name raises in Python and lists the valid
+ones, so a typo tells you what it should have been.
 
 With timing enabled, a program or erase holds write-in-progress for its
 duration; every command except a status read is ignored while it runs, and
