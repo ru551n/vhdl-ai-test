@@ -136,49 +136,6 @@ begin
     variable weight_load_bytes_slv : register_t := (others => '0');
     variable local_bytes_slv : register_t := (others => '0');
 
-    -- Every counter 'check_result' judges a completed job by, packed
-    -- into ONE little-endian byte vector in a fixed order that
-    -- 'top_level_bridge._COUNTER_ORDER' mirrors exactly -- 4 bytes per
-    -- value, status bits included as 0/1 counters. Identical to
-    -- 'tb_cnn_accel_top's own helper of the same name, including the
-    -- order; python_pkg's 'call' takes at most 10 arguments and its
-    -- 'arg'/'kwarg' have no unsigned overload, so 22 named 32-bit
-    -- kwargs cannot be passed as such. ADD, REORDER OR REMOVE NOTHING
-    -- HERE without making the identical edit to '_COUNTER_ORDER'.
-    --
-    -- The last three (axi_aw_count/axi_wr_lo_addr/axi_wr_hi_addr) are
-    -- hard 0: there is no passive AXI monitor in this testbench (see the
-    -- entity header -- it only exercises the queue/relocation protocol,
-    -- not the residency invariants 'tb_cnn_accel_top' already covers),
-    -- and 0 disables the write-range check ('TbCase.check_live' only
-    -- runs it when 'axi_aw_count' > 0).
-    impure function counter_bytes return integer_vector is
-    begin
-      return
-        to_bytes(u_unsigned(status_slv)) &
-        to_bytes(status.busy) &
-        to_bytes(status.done) &
-        to_bytes(status.error) &
-        to_bytes(resize(status.err_code, 32)) &
-        to_bytes(resize(status.err_pc_low, 32)) &
-        to_bytes(u_unsigned(hw_info_slv)) &
-        to_bytes(u_unsigned(hw_info2_slv)) &
-        to_bytes(u_unsigned(hw_info3_slv)) &
-        to_bytes(u_unsigned(cmd_count_slv)) &
-        to_bytes(u_unsigned(cycle_count_slv)) &
-        to_bytes(u_unsigned(compute_cycles_slv)) &
-        to_bytes(u_unsigned(stall_cycles_slv)) &
-        to_bytes(u_unsigned(ddr_rd_bytes_slv)) &
-        to_bytes(u_unsigned(ddr_wr_bytes_slv)) &
-        to_bytes(u_unsigned(tensor_load_count_slv)) &
-        to_bytes(u_unsigned(tensor_store_count_slv)) &
-        to_bytes(u_unsigned(weight_load_bytes_slv)) &
-        to_bytes(u_unsigned(local_bytes_slv)) &
-        to_bytes(to_unsigned(0, 32)) &
-        to_bytes(u_unsigned'(x"00000000")) &
-        to_bytes(u_unsigned'(x"00000000"));
-    end function;
-
     variable start_time : time;
     variable elapsed_cycles : natural := 0;
 
@@ -251,8 +208,34 @@ begin
       call(
         "check_result",
         arg(export_data),
-        arg(counter_bytes),
-        kwarg("export_base", base),
+        kwarg("export_base", base) &
+        kwarg_unsigned("status", u_unsigned(status_slv)) &
+        kwarg("busy", status.busy) &
+        kwarg("done", status.done) &
+        kwarg("error", status.error) &
+        kwarg_unsigned("err_code", status.err_code) &
+        kwarg_unsigned("err_pc_low", status.err_pc_low) &
+        kwarg_unsigned("hw_info", u_unsigned(hw_info_slv)) &
+        kwarg_unsigned("hw_info2", u_unsigned(hw_info2_slv)) &
+        kwarg_unsigned("hw_info3", u_unsigned(hw_info3_slv)) &
+        kwarg_unsigned("cmd_count", u_unsigned(cmd_count_slv)) &
+        kwarg_unsigned("cycle_count", u_unsigned(cycle_count_slv)) &
+        kwarg_unsigned("compute_cycles", u_unsigned(compute_cycles_slv)) &
+        kwarg_unsigned("stall_cycles", u_unsigned(stall_cycles_slv)) &
+        kwarg_unsigned("ddr_rd_bytes", u_unsigned(ddr_rd_bytes_slv)) &
+        kwarg_unsigned("ddr_wr_bytes", u_unsigned(ddr_wr_bytes_slv)) &
+        kwarg_unsigned("tensor_load_count", u_unsigned(tensor_load_count_slv)) &
+        kwarg_unsigned("tensor_store_count", u_unsigned(tensor_store_count_slv)) &
+        kwarg_unsigned("weight_load_bytes", u_unsigned(weight_load_bytes_slv)) &
+        kwarg_unsigned("local_bytes", u_unsigned(local_bytes_slv)) &
+        -- No passive AXI monitor in this testbench (see the entity
+        -- header: this file only exercises the queue/relocation
+        -- protocol, not the residency invariants 'tb_cnn_accel_top'
+        -- already covers) -- 0 disables the write-range check
+        -- ('TbCase.check_live' only runs it when 'axi_aw_count' > 0).
+        kwarg("axi_aw_count", 0) &
+        kwarg_unsigned("axi_wr_lo_addr", u_unsigned'(x"00000000")) &
+        kwarg_unsigned("axi_wr_hi_addr", u_unsigned'(x"00000000")) &
         kwarg("busy_after_done", busy_after_done)
       );
     end procedure;

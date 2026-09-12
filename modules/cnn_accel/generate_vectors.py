@@ -55,8 +55,8 @@ class ConvCoreCase:
     """One case directory's content, read back by `read_case_from_dir`
     into a shape `test/python_bridge/conv_core_bridge.py` hands to VHDL
     live over python_pkg's `call` -- see that module's own docstring and
-    `shared/Vunit.md`'s "Python FFI" section for why
-    no VHDL testbench reads a `.txt` vector file itself any more. `desc`
+    `shared/Vunit.md`'s "Python FFI" section for why no VHDL testbench
+    reads a `.txt` vector file itself any more. `desc`
     holds every `LayerDesc` field (`dataclasses.fields` name -> int
     value) except `tile_channels`/`pe_rows`, which are D10 host-compiler-
     time packing parameters, not ISA fields, and get their own dataclass

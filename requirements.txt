@@ -24,7 +24,7 @@
 # pinning this commit means headless waveform recording (and vunit-mcp's
 # waveform support) is unavailable until the two are reconciled upstream --
 # a known, accepted gap, not an oversight.
-vunit-hdl @ git+https://github.com/ru551n/vunit.git@84c7e41df983ff2dae6239da09472f4d5a25925f
+vunit-hdl @ git+https://github.com/ru551n/vunit.git@771df499cad358161414431eed2682c080608662
 
 # tsfpga fork carrying the Yosys+GHDL netlist-build support
 # (`tsfpga.yosys.project`, `BuildProjectList`) that upstream has not released.

@@ -62,10 +62,11 @@ use cnn_accel.cnn_accel_tb_util_pkg.all;
 --      procedures, poll STATUS to DONE/ERROR.
 --   6. Read every counter register plus the exported DDR region and hand
 --      them straight to 'top_level_bridge.check_result' (one 'call'),
---      which verifies the run via 'TbCase.check_live'. The counters go
---      over as ONE packed little-endian byte vector: python_pkg's 'call'
---      takes at most 10 arguments and has no unsigned overload, so 22
---      named 32-bit kwargs cannot be passed as such.
+--      which verifies the run via 'TbCase.check_live'. Every counter
+--      travels under its own name: the kwargs are combined with '&' into
+--      one keyword argument group, which python_pkg passes as
+--      '**dict(...)' and which is therefore not bound by 'call's limit
+--      of 10 arguments.
 --
 -- Byte/beat traffic totals (DDR_RD_BYTES, DDR_WR_BYTES, ...) are trusted
 -- straight from the DUT's own CSR counters -- the module's internal
@@ -254,49 +255,6 @@ begin
     variable weight_load_bytes_slv : register_t := (others => '0');
     variable local_bytes_slv : register_t := (others => '0');
 
-    -- Every counter 'check_result' judges the run by, packed into ONE
-    -- little-endian byte vector in a fixed order that
-    -- 'top_level_bridge._COUNTER_ORDER' mirrors exactly -- 4 bytes per
-    -- value, status bits included as 0/1 counters.
-    --
-    -- Why not 22 named kwargs like before: python_pkg's 'call' takes at
-    -- most 10 arguments in total, and its 'arg'/'kwarg' have no unsigned
-    -- overload (a 32-bit counter does not fit a VHDL 'integer' either),
-    -- so the names live in the two matching orders instead of at the
-    -- call site. ADD, REORDER OR REMOVE NOTHING HERE without making the
-    -- identical edit to '_COUNTER_ORDER'.
-    impure function counter_bytes return integer_vector is
-    begin
-      return
-        to_bytes(u_unsigned(status_slv)) &
-        to_bytes(status.busy) &
-        to_bytes(status.done) &
-        to_bytes(status.error) &
-        -- Resized to 32 bits like every other value here: packing
-        -- 'status.err_code'/'err_pc_low' at their native (4-bit/16-bit)
-        -- field widths would hand Python a 1-byte/2-byte value where it
-        -- unpacks 4 -- the same corruption the old per-kwarg path hit,
-        -- caught by 'err_bad_geometry' (real, nonzero values).
-        to_bytes(resize(status.err_code, 32)) &
-        to_bytes(resize(status.err_pc_low, 32)) &
-        to_bytes(u_unsigned(hw_info_slv)) &
-        to_bytes(u_unsigned(hw_info2_slv)) &
-        to_bytes(u_unsigned(hw_info3_slv)) &
-        to_bytes(u_unsigned(cmd_count_slv)) &
-        to_bytes(u_unsigned(cycle_count_slv)) &
-        to_bytes(u_unsigned(compute_cycles_slv)) &
-        to_bytes(u_unsigned(stall_cycles_slv)) &
-        to_bytes(u_unsigned(ddr_rd_bytes_slv)) &
-        to_bytes(u_unsigned(ddr_wr_bytes_slv)) &
-        to_bytes(u_unsigned(tensor_load_count_slv)) &
-        to_bytes(u_unsigned(tensor_store_count_slv)) &
-        to_bytes(u_unsigned(weight_load_bytes_slv)) &
-        to_bytes(u_unsigned(local_bytes_slv)) &
-        to_bytes(to_unsigned(axi_aw_count, 32)) &
-        to_bytes(axi_wr_lo_addr) &
-        to_bytes(axi_wr_hi_addr);
-    end function;
-
     variable start_time : time;
     variable elapsed_cycles : natural := 0;
 
@@ -456,16 +414,40 @@ begin
       -- this step. No 'check_true' wrapper: 'check_result' raises on
       -- failure, and 'call' already reports an uncaught Python exception
       -- to VHDL as a FAILURE with the full traceback, which says more
-      -- than any message this call site could write. The procedure form
-      -- of 'call' ignores the (meaningless) return value.
+      -- than any message this call site could write. 'check_result'
+      -- returns nothing, so this is the procedure form of 'call'.
       --------------------------------------------------------------------
       export_data := ffi_export_bytes(memory, export_base, export_bytes);
 
       call(
         "check_result",
         arg(export_data),
-        arg(counter_bytes),
-        kwarg("export_base", export_base)
+        kwarg("export_base", export_base) &
+        kwarg_unsigned("status", u_unsigned(status_slv)) &
+        kwarg("busy", status.busy) &
+        kwarg("done", status.done) &
+        kwarg("error", status.error) &
+        -- Passed at their native (4-bit/16-bit) field widths, with no
+        -- resize: 'kwarg_unsigned' renders an 'unsigned' of any width as
+        -- an exact Python integer.
+        kwarg_unsigned("err_code", status.err_code) &
+        kwarg_unsigned("err_pc_low", status.err_pc_low) &
+        kwarg_unsigned("hw_info", u_unsigned(hw_info_slv)) &
+        kwarg_unsigned("hw_info2", u_unsigned(hw_info2_slv)) &
+        kwarg_unsigned("hw_info3", u_unsigned(hw_info3_slv)) &
+        kwarg_unsigned("cmd_count", u_unsigned(cmd_count_slv)) &
+        kwarg_unsigned("cycle_count", u_unsigned(cycle_count_slv)) &
+        kwarg_unsigned("compute_cycles", u_unsigned(compute_cycles_slv)) &
+        kwarg_unsigned("stall_cycles", u_unsigned(stall_cycles_slv)) &
+        kwarg_unsigned("ddr_rd_bytes", u_unsigned(ddr_rd_bytes_slv)) &
+        kwarg_unsigned("ddr_wr_bytes", u_unsigned(ddr_wr_bytes_slv)) &
+        kwarg_unsigned("tensor_load_count", u_unsigned(tensor_load_count_slv)) &
+        kwarg_unsigned("tensor_store_count", u_unsigned(tensor_store_count_slv)) &
+        kwarg_unsigned("weight_load_bytes", u_unsigned(weight_load_bytes_slv)) &
+        kwarg_unsigned("local_bytes", u_unsigned(local_bytes_slv)) &
+        kwarg("axi_aw_count", axi_aw_count) &
+        kwarg_unsigned("axi_wr_lo_addr", axi_wr_lo_addr) &
+        kwarg_unsigned("axi_wr_hi_addr", axi_wr_hi_addr)
       );
 
       --------------------------------------------------------------------

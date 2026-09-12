@@ -127,93 +127,81 @@ def get_program_data(index):
     return np.frombuffer(_CASE.compiled_region_bytes(int(index)), dtype=np.uint8)
 
 
-# The counter values `check_result` receives, in the exact order
-# `tb_cnn_accel_top.vhd`/`tb_cnn_accel_streaming.vhd`'s own
-# `counter_bytes` helper concatenates them -- 4 little-endian bytes each,
-# status bits included as 0/1 counters. The two orders are the ONLY thing
-# keeping a value attached to its name, so neither side may be edited
-# alone.
-#
-# Why a packed vector instead of the 22 named keyword arguments this used
-# to take: python_pkg's `call` accepts at most 10 arguments in total, and
-# its `arg`/`kwarg` have no unsigned overload -- a 32-bit counter does not
-# fit VHDL's signed `integer` either -- so wide values cross as byte lists.
-_COUNTER_ORDER = (
-    "status",
-    "busy",
-    "done",
-    "error",
-    "err_code",
-    "err_pc_low",
-    "hw_info",
-    "hw_info2",
-    "hw_info3",
-    "cmd_count",
-    "cycle_count",
-    "compute_cycles",
-    "stall_cycles",
-    "ddr_rd_bytes",
-    "ddr_wr_bytes",
-    "tensor_load_count",
-    "tensor_store_count",
-    "weight_load_bytes",
-    "local_bytes",
-    "axi_aw_count",
-    "axi_wr_lo_addr",
-    "axi_wr_hi_addr",
-)
-
-_COUNTER_BYTES = 4
-
-
-def _decode_counters(packed) -> dict[str, int]:
-    """Unpack `counter_bytes`'s little-endian byte vector back into the
-    `counters` dict `TbCase.check_live` expects. Length is checked rather
-    than trusted: a VHDL-side edit that adds or drops a counter without
-    the matching `_COUNTER_ORDER` edit must fail loudly here, not silently
-    shift every value after it onto the wrong name."""
-    values = [int(v) for v in packed]
-    expected = _COUNTER_BYTES * len(_COUNTER_ORDER)
-    if len(values) != expected:
-        raise ValueError(
-            f"top_level_bridge.check_result: got {len(values)} counter bytes, "
-            f"expected {expected} ({len(_COUNTER_ORDER)} counters x {_COUNTER_BYTES} "
-            "bytes). The VHDL 'counter_bytes' helper and '_COUNTER_ORDER' have "
-            "drifted apart -- they must be edited together."
-        )
-    return {
-        name: int.from_bytes(
-            bytes(values[_COUNTER_BYTES * i : _COUNTER_BYTES * (i + 1)]), "little"
-        )
-        for i, name in enumerate(_COUNTER_ORDER)
-    }
-
-
-def check_result(export_bytes, counters, export_base, busy_after_done=False):
+def check_result(
+    export_bytes,
+    export_base,
+    status,
+    busy,
+    done,
+    error,
+    err_code,
+    err_pc_low,
+    hw_info,
+    hw_info2,
+    hw_info3,
+    cmd_count,
+    cycle_count,
+    compute_cycles,
+    stall_cycles,
+    ddr_rd_bytes,
+    ddr_wr_bytes,
+    tensor_load_count,
+    tensor_store_count,
+    weight_load_bytes,
+    local_bytes,
+    axi_aw_count,
+    axi_wr_lo_addr,
+    axi_wr_hi_addr,
+    busy_after_done=False,
+):
     """Called from tb_cnn_accel_top's main process right after
     STATUS.DONE/STATUS.ERROR. `export_bytes` is the raw exported DDR
     region as a VUnit integer_array_t of UNSIGNED byte values (0..255),
     read straight out of the simulator's `memory_t` model via
-    `read_word`. `counters` is every counter register/passive-monitor
-    value packed into one little-endian byte vector (see
-    `_COUNTER_ORDER`), decoded here into the exact same dict
-    `TbCase.check_live` has always expected. `busy_after_done` (default
-    False, so tb_cnn_accel_top's own calls -- which never pass it -- are
-    unaffected) is passed straight through to `TbCase.check_live`, for
-    tb_cnn_accel_streaming's queued-pair case.
+    `read_word`. Every other argument is one counter register/passive-
+    monitor value, read straight out of the DUT/testbench -- the exact
+    same set `TbCase.check_live` expects. VHDL passes them as one
+    python_pkg keyword argument group (`kwarg(...) & kwarg(...)`, which
+    crosses as `**dict(...)`), so their number is not bound by `call`'s
+    limit of 10 arguments; a wide register arrives as an exact Python
+    `int` via `kwarg_unsigned` and a status bit as a `bool` via
+    `kwarg`. `busy_after_done` (default False, so tb_cnn_accel_top's own
+    calls -- which never pass it -- are unaffected) is passed straight
+    through to `TbCase.check_live`, for tb_cnn_accel_streaming's
+    queued-pair case.
 
     Raises on failure (via `TbCase.check_live`) rather than returning a
     pass/fail bool: `call` already reports an uncaught exception to VHDL
     as a FAILURE with the full Python traceback, so there is nothing for
-    a `check_true` at the call site to add. VHDL invokes this through
-    python_pkg's `procedure call`, which ignores the result, so the
-    `return 0` below is vestigial."""
+    a `check_true` at the call site to add. Nothing is returned: VHDL
+    invokes this through python_pkg's `procedure call`, which expects no
+    result."""
     _require_test_case("check_result")
 
+    counters = {
+        "status": int(status),
+        "busy": int(busy),
+        "done": int(done),
+        "error": int(error),
+        "err_code": int(err_code),
+        "err_pc_low": int(err_pc_low),
+        "hw_info": int(hw_info),
+        "hw_info2": int(hw_info2),
+        "hw_info3": int(hw_info3),
+        "cmd_count": int(cmd_count),
+        "cycle_count": int(cycle_count),
+        "compute_cycles": int(compute_cycles),
+        "stall_cycles": int(stall_cycles),
+        "ddr_rd_bytes": int(ddr_rd_bytes),
+        "ddr_wr_bytes": int(ddr_wr_bytes),
+        "tensor_load_count": int(tensor_load_count),
+        "tensor_store_count": int(tensor_store_count),
+        "weight_load_bytes": int(weight_load_bytes),
+        "local_bytes": int(local_bytes),
+        "axi_aw_count": int(axi_aw_count),
+        "axi_wr_lo_addr": int(axi_wr_lo_addr),
+        "axi_wr_hi_addr": int(axi_wr_hi_addr),
+    }
     _CASE.check_live(
-        _decode_counters(counters),
-        int(export_base),
-        [int(b) for b in export_bytes],
-        bool(busy_after_done),
+        counters, int(export_base), [int(b) for b in export_bytes], bool(busy_after_done)
     )
-    return 0
