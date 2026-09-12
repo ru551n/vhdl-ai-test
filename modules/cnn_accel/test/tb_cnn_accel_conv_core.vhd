@@ -7,6 +7,8 @@ use std.textio.all;
 library vunit_lib;
 context vunit_lib.vunit_context;
 use vunit_lib.queue_pkg.all;
+use vunit_lib.python_pkg.all;
+use vunit_lib.integer_array_pkg.all;
 
 library osvvm;
 use osvvm.RandomPkg.all;
@@ -22,10 +24,13 @@ use cnn_accel.cnn_accel_isa_pkg.all;
 -- ("M6b", see cnn_accel_conv_core.vhd's own header comment): drives the
 -- REAL composed DUT (cnn_accel_window_gen -> cnn_accel_pe_array ->
 -- cnn_accel_bias_requant, weight_buffer feeding pe_array) with the same
--- generated vector cases (written into this config's 'output_path' by
--- generate_vectors.py from cnn_accel_model.py) that every other RTL-facing
+-- generated vector cases (generate_vectors.py from cnn_accel_model.py,
+-- fetched live over VUnit's Python FFI by test/python_bridge/
+-- conv_core_bridge.py -- see that module's own docstring and
+-- shared/Vunit.md's "python_call and python_execute" section; no VHDL
+-- file I/O happens in this testbench at all) that every other RTL-facing
 -- consumer of that golden model uses, and compares its 'm_out' stream
--- against 'expected.txt' byte-for-byte -- no VHDL re-derivation of the
+-- against the expected bytes byte-for-byte -- no VHDL re-derivation of the
 -- conv math anywhere in this file (unlike tb_cnn_accel_pe_array.vhd's own
 -- independent 'golden_beat_partial'). This is deliberately the same
 -- cross-language contract tb_cnn_accel_pe_array_from_vectors.vhd already
@@ -37,8 +42,8 @@ use cnn_accel.cnn_accel_isa_pkg.all;
 -- testbench stays green.
 --
 -- Scope (matches cnn_accel_conv_core.vhd's own excluded-scope list): only
--- 'CONV2D'/'FC' vector cases are run (the ones with a 'weights_packed.txt'
--- -- 'DWCONV2D'/'POOL_MAX'/'POOL_AVG' need cnn_accel_pool or a different
+-- 'CONV2D'/'FC' vector cases are run (the ones with packed weights --
+-- 'DWCONV2D'/'POOL_MAX'/'POOL_AVG' need cnn_accel_pool or a different
 -- weight layout not implemented by pack_weights_for_hw, see that
 -- function's own docstring), and only cases whose 'out_channels <=
 -- g_pe_rows' (every generated CONV2D/FC case already satisfies this --
@@ -50,9 +55,12 @@ use cnn_accel.cnn_accel_isa_pkg.all;
 -- Tests: 'test_bitexact_backpressure'/'test_bitexact_full_throughput' both
 -- run 'run_all_cases' -- the fixed, checked-in-name set of hand-authored
 -- 'generate_vectors.py' cases (module_cnn_accel.py's per-'g_pe_rows'
--- config). 'test_bitexact_compiler_cases' (M10, doc/tosa_compiler_plan.md
--- ~line 613) instead runs 'run_compiler_cases', which reads
--- 'vectors_root & "/cases.txt"' and runs whatever it lists -- that root is
+-- config), selected by name (conv_core_bridge.py's 'select_hand_case').
+-- 'test_bitexact_compiler_cases' (M10, doc/tosa_compiler_plan.md ~line
+-- 613) instead runs 'run_compiler_cases', which reads 'vectors_root &
+-- "/cases.txt"' (the one file this testbench still reads directly -- a
+-- plain manifest of case names, not vector data) and selects each case by
+-- directory (conv_core_bridge.py's 'select_dir_case') -- that root is
 -- populated by module_cnn_accel.py's compiler-vectors pre_config hook,
 -- which compiles real TOSA fixtures with 'cnnc' and writes their per-layer
 -- vectors via 'cnnc.backend.cnn_accel_v1.vectors.write_conv_core_vectors'
@@ -64,24 +72,23 @@ use cnn_accel.cnn_accel_isa_pkg.all;
 --
 -- Weight/bias preload: this testbench IS the "future cnn_accel_axi_read_
 -- dma instance" cnn_accel_conv_core.vhd's own header comment anticipates
--- for driving 'fill_start'/'fill_is_bias'/'s_weight' -- 'weights_
--- packed.txt' is streamed one int8 lane per fill beat (cnn_accel_weight_
--- buffer.vhd's own contract: one lane per accepted beat, auto-advancing),
--- in the exact flat order cnn_accel_model.pack_weights_for_hw already
--- wrote it (that function's docstring: this is precisely the order
--- 'weight_rd_addr' walks), so no reordering happens on this side either.
--- 'bias.txt' (LOGICAL, unpadded, 'out_channels' int32 values -- see doc/
--- cnn_accel_test_vectors.md) is zero-padded up to 'g_pe_rows' lanes here before
--- streaming (D11 -- no packed-bias vector file exists for these cases, so
--- this is the one place this testbench does its own trivial,
--- shape-only, zero-padding, not conv math).
--- ISA v1.2 (H2): a case with FLAG_PER_CHANNEL_EN additionally streams
--- 'scale_table_packed.txt' (already padded to 'g_pe_rows' entries, two
--- records per entry) one entry per 'fill_is_scale' beat right after the
--- bias -- the same tile-load phase, into the weight_buffer's scale region.
+-- for driving 'fill_start'/'fill_is_bias'/'s_weight' -- the packed weights
+-- are streamed one int8 lane per fill beat (cnn_accel_weight_buffer.vhd's
+-- own contract: one lane per accepted beat, auto-advancing), in the exact
+-- flat order cnn_accel_model.pack_weights_for_hw already produced it (that
+-- function's docstring: this is precisely the order 'weight_rd_addr'
+-- walks), so no reordering happens on this side either. The bias (LOGICAL,
+-- unpadded, 'out_channels' int32 values) is zero-padded up to 'g_pe_rows'
+-- lanes here before streaming (D11 -- no packed-bias vector exists for
+-- these cases, so this is the one place this testbench does its own
+-- trivial, shape-only, zero-padding, not conv math).
+-- ISA v1.2 (H2): a case with FLAG_PER_CHANNEL_EN additionally streams its
+-- scale table (already padded to 'g_pe_rows' entries, two records per
+-- entry) one entry per 'fill_is_scale' beat right after the bias -- the
+-- same tile-load phase, into the weight_buffer's scale region.
 --
 -- Fill sessions: every case pulses 'fill_start' once before streaming its
--- own weight/bias set (see run_case), which is what makes
+-- own weight/bias set (see run_selected_case), which is what makes
 -- cnn_accel_weight_buffer's "new fill session" (write pointers reset to
 -- 0) actually fire between cases -- single-buffered now, so there is no
 -- bank to alternate any more; each case's fill fully overwrites the
@@ -96,13 +103,15 @@ entity tb_cnn_accel_conv_core is
     stall_probability_percent_in : natural := 20;
     stall_probability_percent_out : natural := 20;
     -- VUnit's own per-test-config output directory, filled in by VUnit
-    -- itself. module_cnn_accel.py's pre_config hook for each config runs
-    -- generate_vectors.generate_conv_core_cases() into it right before
-    -- the simulation starts, so every case run below is a fresh
-    -- subdirectory of this -- nothing is read from the repository and no
-    -- vector is ever checked in. Generated at THIS config's 'g_pe_rows'
-    -- (run_case checks every case's desc.txt 'pe_rows' record against
-    -- it).
+    -- itself. Only 'test_bitexact_compiler_cases' still uses it: module_
+    -- cnn_accel.py's '_compiler_vectors_pre_config' hook writes that
+    -- config's compiler-generated vectors here before simulation starts
+    -- ('run_compiler_cases' reads 'cases.txt' from it and selects each
+    -- case by directory). The hand-authored cases 'run_all_cases' selects
+    -- by name need no directory at all -- conv_core_bridge.py builds them
+    -- into its own private scratch directory, at THIS config's
+    -- 'g_pe_rows' (run_selected_case checks every selected case's
+    -- 'pe_rows' field against it either way).
     output_path : string;
     -- THE single scaling knob (flow_status.md S1-S7). Default is the
     -- shipped 8; module_cnn_accel.py adds a second config at the
@@ -211,11 +220,6 @@ architecture tb of tb_cnn_accel_conv_core is
   -- tb_cnn_accel_pe_array.vhd's identical 'expected_q' idiom.
   constant expected_q : queue_t := new_queue;
 
-  -- One flat integer per vector-file line -- generate_vectors.py's own
-  -- '_write_int_lines' format (doc/cnn_accel_test_vectors.md), narrowed on
-  -- assignment into int8/int32 subtypes by the reader's caller.
-  type flat_int_arr_t is array (natural range <>) of integer;
-
   function to_sl(cond : boolean) return std_ulogic is
   begin
     if cond then
@@ -225,70 +229,35 @@ architecture tb of tb_cnn_accel_conv_core is
   end function;
 
   ------------------------------------------------------------------------
-  -- Vector-file reader: one signed decimal integer per line, no header --
-  -- same idiom as tb_cnn_accel_pe_array_from_vectors.vhd's identical
-  -- helper.
+  -- 'desc_fields' index constants: fixed positions in the flat array
+  -- test/python_bridge/conv_core_bridge.py's 'get_desc_fields()' returns
+  -- (that module's own '_DESC_FIELD_ORDER', plus 'tile_channels'/
+  -- 'pe_rows' appended after it) -- named indices instead of magic
+  -- numbers at each 'get(desc_fields, N)' call site below.
   ------------------------------------------------------------------------
 
-  procedure read_int_file(file_name : string; data : out flat_int_arr_t) is
-    file f : text;
-    variable l : line;
-    variable v : integer;
-    variable status : file_open_status;
-  begin
-    file_open(status, f, file_name, read_mode);
-    assert status = open_ok
-      report "tb_cnn_accel_conv_core: could not open '" & file_name & "'"
-      severity failure;
-    for i in data'range loop
-      assert not endfile(f)
-        report "tb_cnn_accel_conv_core: unexpected EOF in '" & file_name & "'"
-        severity failure;
-      readline(f, l);
-      read(l, v);
-      data(i) := v;
-    end loop;
-    file_close(f);
-  end procedure;
-
-  ------------------------------------------------------------------------
-  -- 'desc.txt' field reader: one '<field> <value>' pair per line
-  -- (doc/cnn_accel_test_vectors.md), lowercase keys matching 'LayerDesc'
-  -- dataclass field names exactly. Looked up by name (not positionally)
-  -- so field reordering in a future generate_vectors.py change cannot
-  -- silently misread a value -- scans the whole file per call, which is
-  -- fine for a ~26-line file called a dozen times per case.
-  ------------------------------------------------------------------------
-
-  impure function get_desc_field(case_dir : string; field_name : string) return integer is
-    file f : text;
-    variable l : line;
-    variable status : file_open_status;
-    variable key_buf : string(1 to field_name'length);
-    variable value : integer;
-    variable found : boolean := false;
-  begin
-    file_open(status, f, case_dir & "/desc.txt", read_mode);
-    assert status = open_ok
-      report "tb_cnn_accel_conv_core: could not open '" & case_dir & "/desc.txt'"
-      severity failure;
-    while not endfile(f) loop
-      readline(f, l);
-      if l'length >= field_name'length then
-        read(l, key_buf);
-        if key_buf = field_name then
-          read(l, value);
-          found := true;
-        end if;
-      end if;
-    end loop;
-    file_close(f);
-    assert found
-      report "tb_cnn_accel_conv_core: field '" & field_name & "' not found in '" &
-        case_dir & "/desc.txt'"
-      severity failure;
-    return value;
-  end function;
+  constant c_df_opcode : natural := 0;
+  constant c_df_flags : natural := 1;
+  constant c_df_in_width : natural := 2;
+  constant c_df_in_height : natural := 3;
+  constant c_df_in_channels : natural := 4;
+  constant c_df_out_channels : natural := 5;
+  constant c_df_kernel_h : natural := 6;
+  constant c_df_kernel_w : natural := 7;
+  constant c_df_stride_h : natural := 8;
+  constant c_df_stride_w : natural := 9;
+  constant c_df_pad_top : natural := 10;
+  constant c_df_pad_bottom : natural := 11;
+  constant c_df_pad_left : natural := 12;
+  constant c_df_pad_right : natural := 13;
+  constant c_df_pad_value : natural := 14;
+  constant c_df_requant_scale : natural := 15;
+  constant c_df_requant_shift : natural := 16;
+  constant c_df_output_offset : natural := 17;
+  constant c_df_clamp_min : natural := 18;
+  constant c_df_clamp_max : natural := 19;
+  constant c_df_tile_channels : natural := 20;
+  constant c_df_pe_rows : natural := 21;
 
 begin
 
@@ -393,6 +362,7 @@ begin
   ------------------------------------------------------------------------
   main : process
     variable rnd : RandomPType;
+    variable discard : integer;
 
     procedure do_reset is
     begin
@@ -414,34 +384,40 @@ begin
       check_true(is_empty(expected_q), "m_out scoreboard queue did not drain in time");
     end procedure;
 
-    -- Runs one checked-in vector case end to end: preload weight_buffer
-    -- (weights then bias) after a fresh 'fill_start' pulse, configure and
-    -- start the DUT, push every pixel's expected output, stream every
-    -- input beat with randomized backpressure, then drain and check. See
-    -- this file's own header comment for the full rationale of each step.
-    procedure run_case(case_dir : string) is
-      variable opcode : integer := get_desc_field(case_dir, "opcode");
-      variable flags : integer := get_desc_field(case_dir, "flags");
-      variable v_in_width : integer := get_desc_field(case_dir, "in_width");
-      variable v_in_height : integer := get_desc_field(case_dir, "in_height");
-      variable v_in_channels : integer := get_desc_field(case_dir, "in_channels");
-      variable v_out_channels : integer := get_desc_field(case_dir, "out_channels");
-      variable v_kernel_h : integer := get_desc_field(case_dir, "kernel_h");
-      variable v_kernel_w : integer := get_desc_field(case_dir, "kernel_w");
-      variable v_stride_h : integer := get_desc_field(case_dir, "stride_h");
-      variable v_stride_w : integer := get_desc_field(case_dir, "stride_w");
-      variable v_pad_top : integer := get_desc_field(case_dir, "pad_top");
-      variable v_pad_bottom : integer := get_desc_field(case_dir, "pad_bottom");
-      variable v_pad_left : integer := get_desc_field(case_dir, "pad_left");
-      variable v_pad_right : integer := get_desc_field(case_dir, "pad_right");
-      variable v_pad_value : integer := get_desc_field(case_dir, "pad_value");
-      variable v_requant_scale : integer := get_desc_field(case_dir, "requant_scale");
-      variable v_requant_shift : integer := get_desc_field(case_dir, "requant_shift");
-      variable v_output_offset : integer := get_desc_field(case_dir, "output_offset");
-      variable v_clamp_min : integer := get_desc_field(case_dir, "clamp_min");
-      variable v_clamp_max : integer := get_desc_field(case_dir, "clamp_max");
-      variable v_pe_rows : integer := get_desc_field(case_dir, "pe_rows");
-      variable v_tile_channels : integer := get_desc_field(case_dir, "tile_channels");
+    -- Runs the currently-selected case (test/python_bridge/
+    -- conv_core_bridge.py's 'select_hand_case'/'select_dir_case' --
+    -- see 'run_hand_case'/'run_dir_case' below) end to end: preload
+    -- weight_buffer (weights then bias) after a fresh 'fill_start' pulse,
+    -- configure and start the DUT, push every pixel's expected output,
+    -- stream every input beat with randomized backpressure, then drain
+    -- and check. See this file's own header comment for the full
+    -- rationale of each step. 'case_label' names the case in every
+    -- assertion message only -- selection already happened before this
+    -- is called.
+    procedure run_selected_case(case_label : string) is
+      variable desc_fields : integer_array_t := python_call("get_desc_fields");
+      variable opcode : integer := get(desc_fields, c_df_opcode);
+      variable flags : integer := get(desc_fields, c_df_flags);
+      variable v_in_width : integer := get(desc_fields, c_df_in_width);
+      variable v_in_height : integer := get(desc_fields, c_df_in_height);
+      variable v_in_channels : integer := get(desc_fields, c_df_in_channels);
+      variable v_out_channels : integer := get(desc_fields, c_df_out_channels);
+      variable v_kernel_h : integer := get(desc_fields, c_df_kernel_h);
+      variable v_kernel_w : integer := get(desc_fields, c_df_kernel_w);
+      variable v_stride_h : integer := get(desc_fields, c_df_stride_h);
+      variable v_stride_w : integer := get(desc_fields, c_df_stride_w);
+      variable v_pad_top : integer := get(desc_fields, c_df_pad_top);
+      variable v_pad_bottom : integer := get(desc_fields, c_df_pad_bottom);
+      variable v_pad_left : integer := get(desc_fields, c_df_pad_left);
+      variable v_pad_right : integer := get(desc_fields, c_df_pad_right);
+      variable v_pad_value : integer := get(desc_fields, c_df_pad_value);
+      variable v_requant_scale : integer := get(desc_fields, c_df_requant_scale);
+      variable v_requant_shift : integer := get(desc_fields, c_df_requant_shift);
+      variable v_output_offset : integer := get(desc_fields, c_df_output_offset);
+      variable v_clamp_min : integer := get(desc_fields, c_df_clamp_min);
+      variable v_clamp_max : integer := get(desc_fields, c_df_clamp_max);
+      variable v_pe_rows : integer := get(desc_fields, c_df_pe_rows);
+      variable v_tile_channels : integer := get(desc_fields, c_df_tile_channels);
 
       variable v_n_tiles : positive := (v_in_channels + c_tile_channels - 1) / c_tile_channels;
       variable v_out_width : positive :=
@@ -455,54 +431,55 @@ begin
       -- flags bit 5 = FLAG_PER_CHANNEL_EN (ISA v1.2, H2).
       variable v_per_channel_en : boolean := (flags / 32) mod 2 = 1;
 
-      variable weights_flat : flat_int_arr_t(0 to v_n_weight_vals - 1);
-      variable bias_flat : flat_int_arr_t(0 to v_out_channels - 1);
-      -- 'scale_table_packed.txt' (doc/cnn_accel_test_vectors.md): two
-      -- records (multiplier, shift) per PADDED entry, 'c_pe_rows' entries
-      -- for the single output-channel tile run_case supports. Only read
+      variable weights_flat : integer_array_t;
+      variable bias_flat : integer_array_t;
+      -- 'scale_table_packed' (doc/cnn_accel_test_vectors.md): two records
+      -- (multiplier, shift) per PADDED entry, 'c_pe_rows' entries for the
+      -- single output-channel tile this procedure supports. Only fetched
       -- when 'v_per_channel_en'.
-      variable scale_flat : flat_int_arr_t(0 to 2 * c_pe_rows - 1);
-      variable input_flat : flat_int_arr_t(0 to v_in_width * v_in_height * v_in_channels - 1);
-      variable expected_flat : flat_int_arr_t(0 to v_num_pixels * v_out_channels - 1);
+      variable scale_flat : integer_array_t;
+      variable input_flat : integer_array_t;
+      variable expected_flat : integer_array_t;
 
       variable tile_data : std_ulogic_vector(8 * c_tile_channels - 1 downto 0);
       variable expected_bytes : std_ulogic_vector(8 * c_pe_rows - 1 downto 0);
       variable ic : natural;
     begin
       assert opcode = c_opcode_conv2d or opcode = c_opcode_fc
-        report "tb_cnn_accel_conv_core: run_case only supports CONV2D/FC vector cases " &
-          "(pack_weights_for_hw's own ratified scope), got opcode=" & integer'image(opcode) &
-          " from '" & case_dir & "'"
+        report "tb_cnn_accel_conv_core: run_selected_case only supports CONV2D/FC vector " &
+          "cases (pack_weights_for_hw's own ratified scope), got opcode=" &
+          integer'image(opcode) & " from '" & case_label & "'"
         severity failure;
 
       assert v_out_channels <= c_pe_rows
-        report "tb_cnn_accel_conv_core: run_case only supports a single output-channel " &
-          "tile (out_channels <= g_pe_rows) -- layer-level output-channel tiling is a " &
-          "future milestone, see cnn_accel_conv_core.vhd's own entity-level comment; " &
-          "got out_channels=" & integer'image(v_out_channels) & " from '" & case_dir & "'"
+        report "tb_cnn_accel_conv_core: run_selected_case only supports a single " &
+          "output-channel tile (out_channels <= g_pe_rows) -- layer-level output-channel " &
+          "tiling is a future milestone, see cnn_accel_conv_core.vhd's own entity-level " &
+          "comment; got out_channels=" & integer'image(v_out_channels) & " from '" &
+          case_label & "'"
         severity failure;
 
-      -- 'weights_packed.txt' is only meaningful for the packing point it
-      -- was generated at (D10: rows of 'pe_rows*tile_channels' lanes) --
-      -- a mismatch here would not be a datapath defect but a wrong
-      -- 'vectors_root' for this 'g_pe_rows', so fail loudly and by name.
+      -- 'weights_packed' is only meaningful for the packing point it was
+      -- generated at (D10: rows of 'pe_rows*tile_channels' lanes) -- a
+      -- mismatch here would not be a datapath defect but a wrong
+      -- 'g_pe_rows'/case pairing, so fail loudly and by name.
       assert v_pe_rows = c_pe_rows
-        report "tb_cnn_accel_conv_core: '" & case_dir & "/desc.txt' was packed at pe_rows=" &
+        report "tb_cnn_accel_conv_core: '" & case_label & "' was packed at pe_rows=" &
           integer'image(v_pe_rows) & " but this testbench runs at g_pe_rows=" &
-          integer'image(c_pe_rows) & " -- wrong vectors_root for this config"
+          integer'image(c_pe_rows) & " -- wrong case/config pairing"
         severity failure;
       assert v_tile_channels = c_tile_channels
-        report "tb_cnn_accel_conv_core: '" & case_dir & "/desc.txt' was packed at tile_channels=" &
+        report "tb_cnn_accel_conv_core: '" & case_label & "' was packed at tile_channels=" &
           integer'image(v_tile_channels) & " but this testbench runs at tile_channels=" &
           integer'image(c_tile_channels)
         severity failure;
 
-      read_int_file(case_dir & "/weights_packed.txt", weights_flat);
-      read_int_file(case_dir & "/bias.txt", bias_flat);
-      read_int_file(case_dir & "/input.txt", input_flat);
-      read_int_file(case_dir & "/expected.txt", expected_flat);
+      weights_flat := python_call("get_weights_packed_flat");
+      bias_flat := python_call("get_bias_flat");
+      input_flat := python_call("get_input_flat");
+      expected_flat := python_call("get_expected_flat");
       if v_per_channel_en then
-        read_int_file(case_dir & "/scale_table_packed.txt", scale_flat);
+        scale_flat := python_call("get_scale_table_packed_flat");
       end if;
 
       -- Start a new fill session (write pointers reset to 0) before
@@ -520,7 +497,7 @@ begin
       -- function's docstring: exactly the order 'weight_rd_addr' walks).
       fill_is_bias <= '0';
       for i in 0 to v_n_weight_vals - 1 loop
-        s_weight_m2s.data(7 downto 0) <= std_ulogic_vector(to_signed(weights_flat(i), 8));
+        s_weight_m2s.data(7 downto 0) <= std_ulogic_vector(to_signed(get(weights_flat, i), 8));
         s_weight_m2s.data(axi_stream_data_sz - 1 downto 8) <= (others => '0');
         s_weight_m2s.valid <= '1';
         wait until rising_edge(clk) and s_weight_s2m.ready = '1';
@@ -534,7 +511,7 @@ begin
       fill_is_bias <= '1';
       for i in 0 to c_pe_rows - 1 loop
         if i < v_out_channels then
-          s_weight_m2s.data(31 downto 0) <= std_ulogic_vector(to_signed(bias_flat(i), 32));
+          s_weight_m2s.data(31 downto 0) <= std_ulogic_vector(to_signed(get(bias_flat, i), 32));
         else
           s_weight_m2s.data(31 downto 0) <= (others => '0');
         end if;
@@ -555,9 +532,9 @@ begin
         fill_is_scale <= '1';
         for i in 0 to c_pe_rows - 1 loop
           s_weight_m2s.data(c_scale_entry_mult_width - 1 downto 0) <=
-            std_ulogic_vector(to_signed(scale_flat(2 * i), c_scale_entry_mult_width));
+            std_ulogic_vector(to_signed(get(scale_flat, 2 * i), c_scale_entry_mult_width));
           s_weight_m2s.data(c_scale_entry_width - 1 downto c_scale_entry_mult_width) <=
-            std_ulogic_vector(to_unsigned(scale_flat(2 * i + 1), c_scale_entry_shift_width));
+            std_ulogic_vector(to_unsigned(get(scale_flat, 2 * i + 1), c_scale_entry_shift_width));
           s_weight_m2s.data(axi_stream_data_sz - 1 downto c_scale_entry_width) <= (others => '0');
           s_weight_m2s.valid <= '1';
           wait until rising_edge(clk) and s_weight_s2m.ready = '1';
@@ -606,7 +583,7 @@ begin
         expected_bytes := (others => '0');
         for oc in 0 to v_out_channels - 1 loop
           expected_bytes(8 * (oc + 1) - 1 downto 8 * oc) :=
-            std_ulogic_vector(to_signed(expected_flat(p * v_out_channels + oc), 8));
+            std_ulogic_vector(to_signed(get(expected_flat, p * v_out_channels + oc), 8));
         end loop;
         push(expected_q, expected_bytes);
         push(expected_q, to_sl(p = v_num_pixels - 1));
@@ -625,7 +602,7 @@ begin
               if ic < v_in_channels then
                 tile_data(8 * (c + 1) - 1 downto 8 * c) :=
                   std_ulogic_vector(to_signed(
-                    input_flat((row * v_in_width + col) * v_in_channels + ic), 8
+                    get(input_flat, (row * v_in_width + col) * v_in_channels + ic), 8
                   ));
               end if;
             end loop;
@@ -648,6 +625,27 @@ begin
       s_stream_m2s.valid <= '0';
 
       drain_and_check(20000);
+    end procedure;
+
+    -- Selects one of generate_vectors.py's hand-authored cases by name
+    -- (test/python_bridge/conv_core_bridge.py's own case registry, built
+    -- once per simulation process at this config's 'g_pe_rows') and runs
+    -- it -- for 'run_all_cases' below.
+    procedure run_hand_case(name : string) is
+    begin
+      discard := python_call(
+        "select_hand_case", arg => string'(name), kwargs => kw("pe_rows", c_pe_rows)
+      );
+      run_selected_case(name);
+    end procedure;
+
+    -- Selects a case already written to 'case_dir' on disk (module_cnn_
+    -- accel.py's '_compiler_vectors_pre_config', unchanged) and runs it --
+    -- for 'run_compiler_cases' below.
+    procedure run_dir_case(case_dir : string) is
+    begin
+      discard := python_call("select_dir_case", arg => string'(case_dir));
+      run_selected_case(case_dir);
     end procedure;
 
     -- Reads 'vectors_root & "/cases.txt"' (one case name per line) and
@@ -674,7 +672,7 @@ begin
         readline(f, l);
         if l'length > 0 then
           n_cases := n_cases + 1;
-          run_case(vectors_root & "/" & l.all);
+          run_dir_case(vectors_root & "/" & l.all);
         end if;
       end loop;
       file_close(f);
@@ -692,36 +690,37 @@ begin
     -- differ between them.
     procedure run_all_cases is
     begin
-      run_case(vectors_root & "/conv1x1_c4_o4");
-      run_case(vectors_root & "/conv3x3_s1_c3_o8_pad1");
-      run_case(vectors_root & "/conv3x3_s2_c8_o8_pad1");
-      run_case(vectors_root & "/conv3x3_s1_extremes");
-      run_case(vectors_root & "/conv3x3_asymmetric_pad");
-      run_case(vectors_root & "/conv3x3_negative_requant_scale");
-      run_case(vectors_root & "/fc_in6_out4");
-      run_case(vectors_root & "/conv3x3_c20_o6_multitile");
+      run_hand_case("conv1x1_c4_o4");
+      run_hand_case("conv3x3_s1_c3_o8_pad1");
+      run_hand_case("conv3x3_s2_c8_o8_pad1");
+      run_hand_case("conv3x3_s1_extremes");
+      run_hand_case("conv3x3_asymmetric_pad");
+      run_hand_case("conv3x3_negative_requant_scale");
+      run_hand_case("fc_in6_out4");
+      run_hand_case("conv3x3_c20_o6_multitile");
       -- ISA v2.1 'pad_value' on the CONV path: a padded tap takes the
       -- input tensor's quantization zero-point, not 0. Both cases use
       -- all-negative input against positive weights so the difference
       -- survives requantization instead of being clipped away -- see
       -- generate_vectors.py's own comment, and note that a case which
       -- does NOT do that passes against a 'cfg_pad_value' tied to zero.
-      run_case(vectors_root & "/conv3x3_pad_zero_point");
-      run_case(vectors_root & "/conv3x3_pad_value_asymmetric");
+      run_hand_case("conv3x3_pad_zero_point");
+      run_hand_case("conv3x3_pad_value_asymmetric");
       -- The one case that drives EVERY lane of a 16-row array (out_channels
       -- = 16, the target backbone's layer 1). It only exists in the scaled
       -- vector root -- at g_pe_rows=8 it would be two output-channel
       -- tiles, which this composition cannot be driven with standalone
-      -- (run_case's own out_channels <= g_pe_rows assert), so it is
-      -- gated on the generic rather than on the root's contents.
+      -- (run_selected_case's own out_channels <= g_pe_rows assert), so it
+      -- is gated on the generic rather than on the case set's contents.
       if c_pe_rows >= 16 then
-        run_case(vectors_root & "/conv3x3_c8_o16");
+        run_hand_case("conv3x3_c8_o16");
       end if;
     end procedure;
 
   begin
     test_runner_setup(runner, runner_cfg);
     rnd.InitSeed(get_string_seed(runner_cfg));
+    python_execute(file_name => tb_path(runner_cfg) & "python_bridge/conv_core_bridge.py");
 
     do_reset;
     wait until rising_edge(clk);

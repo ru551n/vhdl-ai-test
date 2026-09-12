@@ -3110,40 +3110,24 @@ class Module(BaseModule):
     def _setup_cnn_accel_pe_array_from_vectors(self, library) -> None:
         # Cross-language (Python packer -> real RTL) bit-exactness guard for
         # the D10 weight-lane-order defect, see
-        # tb_cnn_accel_pe_array_from_vectors.vhd's own header comment.
-        # The vectors are generated into VUnit's own per-test 'output_path'
-        # by the pre_config hook right before simulation (the testbench
-        # reads '<output_path>/pe_array_xlang_check'); nothing is checked
-        # in and nothing is read from the repository.
-        tb = library.test_bench("tb_cnn_accel_pe_array_from_vectors")
-
-        def pre_config(output_path: str) -> bool:
-            generate_vectors.generate_pe_array_xlang_case(
-                generate_vectors.hw_packing(Path(output_path))
-            )
-            return True
-
-        for test in tb.get_tests():
-            self.add_vunit_config(test=test, pre_config=pre_config)
+        # tb_cnn_accel_pe_array_from_vectors.vhd's own header comment. The
+        # case is fetched live over VUnit's Python FFI by test/python_bridge/
+        # conv_core_bridge.py -- no pre_config hook, no vector file, nothing
+        # read from or written to the repository.
+        library.test_bench("tb_cnn_accel_pe_array_from_vectors")
 
     def _setup_cnn_accel_conv_core(self, library) -> None:
         # Cross-language (Python golden model -> composed RTL) bit-exactness
         # guard for the full window_gen -> pe_array -> bias_requant
         # composition, see tb_cnn_accel_conv_core.vhd's own header comment.
-        # Vectors are generated into VUnit's own per-config 'output_path'
-        # by each config's pre_config hook right before simulation, at that
-        # config's `g_pe_rows` packing point; nothing is checked in and
-        # nothing is read from the repository.
+        # 'run_all_cases' fetches its hand-authored vectors live over
+        # VUnit's Python FFI (test/python_bridge/conv_core_bridge.py), at
+        # each config's own `g_pe_rows` packing point -- no pre_config hook
+        # needed for those, nothing checked in, nothing read from the
+        # repository. Only 'test_bitexact_compiler_cases' still needs one
+        # (below): its vectors come from actually compiling TOSA fixtures,
+        # which the bridge does not do on its own.
         tb = library.test_bench("tb_cnn_accel_conv_core")
-
-        def make_pre_config(pe_rows: int):
-            def pre_config(output_path: str) -> bool:
-                generate_vectors.generate_conv_core_cases(
-                    generate_vectors.hw_packing(Path(output_path), pe_rows=pe_rows)
-                )
-                return True
-
-            return pre_config
 
         for test in tb.get_tests():
             if test.name == "test_bitexact_compiler_cases":
@@ -3178,7 +3162,7 @@ class Module(BaseModule):
             # root, packed at that many lanes per weight row; the scaled
             # one carries the extra 16-output-channel case that only
             # exists there. The testbench cross-checks each case's
-            # desc.txt `pe_rows` against its generic, so a root/generic
+            # desc field `pe_rows` against its generic, so a config/case
             # mix-up here fails by name rather than as a data mismatch.
             # The default is deliberately not renamed: its test names are
             # unchanged, the scaled config is the one that grows a
@@ -3192,7 +3176,6 @@ class Module(BaseModule):
                         "stall_probability_percent_out": stall,
                         "g_pe_rows": pe_rows,
                     },
-                    pre_config=make_pre_config(pe_rows),
                 )
 
     def _setup_cnn_accel_tensor_mem(self, library) -> None:
