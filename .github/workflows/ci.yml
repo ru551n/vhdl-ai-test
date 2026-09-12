@@ -58,7 +58,7 @@ jobs:
     container:
       # Pinned, never a floating tag: the toolchain version is part of the
       # reproducibility contract.
-      image: ru551n/hdl-docker:1.2.0
+      image: ru551n/hdl-docker:1.3.0
       # The image's final stage ends with `USER hdl`, so anything that needs
       # apt-get (installing git/python below) must run as root.
       options: --user root
@@ -79,23 +79,37 @@ jobs:
       # hdl-modules submodule (and pip needs it for the git-pinned
       # requirements).
       #
-      # python3-dev, build-essential (not just python3/python3-venv): every
-      # cnn_accel testbench now uses VUnit's Python FFI (python_execute/
-      # python_call, add_vhdl_builtins(python=True), shared/Vunit.md's
-      # "Python FFI" section) -- the simulator embeds a Python interpreter
-      # at run time, which needs (a) the bare, unversioned libpythonX.Y.so
-      # symlink, which Ubuntu only ships in the *-dev package (python3/
-      # python3-venv alone give the venv a working interpreter but not
-      # that symlink), and (b) a C compiler (cc/gcc/clang) to build its
-      # small bridge library the first time it runs. Without either,
-      # simulation fails ("Failed to find the shared Python library" /
-      # "needs a C compiler ... Install one or set the CC environment
-      # variable") even though everything imports and runs fine outside
-      # the simulator.
+      # python3-dev (not just python3/python3-venv): every cnn_accel testbench
+      # and the flash_model verification component use VUnit's Python FFI
+      # (python_execute/python_call, add_vhdl_builtins(python=True), see
+      # shared/Vunit.md's "Python FFI" section). The simulator embeds a Python
+      # interpreter at run time, which needs the bare, unversioned
+      # libpythonX.Y.so symlink -- Ubuntu ships that only in the *-dev package,
+      # so python3/python3-venv alone give the venv a working interpreter but
+      # not that symlink -- plus Python.h, since the bridge compiles its small
+      # shared library the FIRST TIME IT RUNS rather than at install time.
+      # Without either, simulation fails ("Failed to find the shared Python
+      # library" / "needs a C compiler ... Install one or set the CC
+      # environment variable") even though everything imports and runs fine
+      # outside the simulator.
+      #
+      # `python3-dev`, not `python3.12-dev`, and that is load-bearing: the
+      # bridge must build against the interpreter that actually runs, and the
+      # venv below is created by `python3 -m venv`, so its INCLUDEPY resolves
+      # to the SYSTEM interpreter's headers. `python3-dev` tracks the same
+      # distro default as `python3`, so the two match by construction and keep
+      # matching when the base image moves to a new Ubuntu.
+      #
+      # The C compiler is no longer installed here: hdl-docker >= 1.3.0 ships
+      # gcc + libc6-dev, because compiling at run time is a property of the
+      # tooling rather than of this project. (That also replaces
+      # build-essential, which pulled in g++/make/dpkg-dev that nothing here
+      # used.)
       - name: Install git and Python
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git python3 python3-venv python3-dev build-essential
+          apt-get install -y --no-install-recommends \
+            git python3 python3-venv python3-dev
           rm -rf /var/lib/apt/lists/*
 
       - uses: actions/checkout@v5
@@ -118,6 +132,38 @@ jobs:
           /opt/venv/bin/pip install --upgrade pip
           /opt/venv/bin/pip install -r requirements.txt
 
+      # Fail here, with a readable message, rather than inside GHDL's
+      # elaboration output. The bridge builds its shared library lazily, so a
+      # missing header or compiler otherwise surfaces as every python_call
+      # testbench failing to elaborate -- which looks like an HDL problem and
+      # is not one.
+      - name: Check the Python bridge can be built
+        run: |
+          /opt/venv/bin/python - <<'PY'
+          import shutil, sys, sysconfig
+          from pathlib import Path
+
+          include = Path(sysconfig.get_paths()["include"])
+          header = include / "Python.h"
+          compiler = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
+
+          problems = []
+          if not header.exists():
+              problems.append(f"missing {header} -- install python3-dev")
+          if not sysconfig.get_config_var("Py_ENABLE_SHARED"):
+              problems.append("this CPython is not built shared; the bridge needs libpython")
+          if sysconfig.get_config_var("Py_GIL_DISABLED"):
+              problems.append("free-threaded CPython is unsupported by the bridge")
+          if compiler is None:
+              problems.append("no C compiler on PATH -- the image should ship gcc")
+
+          if problems:
+              sys.exit("Python bridge prerequisites missing:\n  " + "\n  ".join(problems))
+
+          print(f"bridge prerequisites OK: Python {sysconfig.get_python_version()}, "
+                f"headers {include}, compiler {compiler}")
+          PY
+
       - name: Run VUnit regression
         env:
           VUNIT_SIMULATOR: ${{ matrix.simulator }}
@@ -127,7 +173,7 @@ jobs:
     name: Synthesize (Yosys + GHDL, Artix-7)
     runs-on: ubuntu-24.04
     container:
-      image: ru551n/hdl-docker:1.2.0
+      image: ru551n/hdl-docker:1.3.0
       options: --user root
     env:
       # Where hdl-docker installs the ghdl-yosys-plugin. Consumed by
