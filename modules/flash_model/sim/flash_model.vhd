@@ -98,6 +98,13 @@ architecture a of flash_model is
   signal t_clqv : time := 0 ns;
   signal t_shqz : time := 0 ns;
 
+  -- The other half of get_timing_limits: the entries that describe what the
+  -- CONTROLLER must do. They are handed to the protocol checker rather than
+  -- used here, in picoseconds exactly as the FFI delivers them, and
+  -- `limits_valid` tells the checker when they stopped being the default.
+  signal limits_ps : integer_vector(0 to c_tl_first_delay - 1) := (others => 0);
+  signal limits_valid : boolean := false;
+
 begin
 
   ------------------------------------------------------------------------------
@@ -112,6 +119,7 @@ begin
     variable v_discard : integer;
     variable v_data : integer_array_t;
     variable v_limits : integer_array_t;
+    variable v_limits_ps : integer_vector(0 to c_tl_first_delay - 1);
     variable v_address : natural;
     variable v_num_bytes : natural;
     variable v_value : natural;
@@ -151,6 +159,17 @@ begin
     );
     t_clqv <= get(v_limits, c_tl_clqv) * 1 ps;
     t_shqz <= get(v_limits, c_tl_shqz) * 1 ps;
+
+    -- Everything below c_tl_first_delay is a check on DUT-driven pins, so it
+    -- goes to the protocol checker instead. Split by the named boundary rather
+    -- than by a literal count: adding a limit to the contract then moves it to
+    -- the right side of the fence on its own.
+    for index in v_limits_ps'range loop
+      v_limits_ps(index) := get(v_limits, index);
+    end loop;
+    limits_ps <= v_limits_ps;
+    limits_valid <= true;
+
     deallocate(v_limits);
 
     initialized <= true;
@@ -281,6 +300,26 @@ begin
       delete(v_msg);
     end loop;
   end process;
+
+  ------------------------------------------------------------------------------
+  -- Pin-level protocol checking
+  ------------------------------------------------------------------------------
+
+  -- Passive: it watches the controller-driven pins and reports through this
+  -- VC's own checker. It is deliberately not given t_clqv/t_shqz -- those are
+  -- this VC's output delays, and asserting on them would make the VC fail on
+  -- its own output. See the checker's header.
+  protocol_checker_inst : entity work.flash_model_protocol_checker
+    generic map (
+      g_checker => c_checker,
+      g_enable => g_protocol_checks
+    )
+    port map (
+      m2s => m2s,
+      limits_valid => limits_valid,
+      limits_ps => limits_ps
+    );
+
 
   ------------------------------------------------------------------------------
   -- Busy timer
