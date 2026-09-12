@@ -328,6 +328,41 @@ class Module(BaseModule):
             default_value="0" * 32,
         )
 
+        # ISA v2.3 streaming-inference interface (doc/cnn_accel_top_v2_arch.md
+        # section 6a): the compiled program is unchanged run to run; only
+        # these two registers move. Every descriptor whose compiled address
+        # falls inside the graph's designated input/output tensor is tagged
+        # (accel_v2.program.emit_program) to add the corresponding register's
+        # value at dispatch -- default 0 relocates nothing, so a program
+        # compiled before v2.3 (or simply not using this interface) behaves
+        # identically with both left at their reset value.
+        input_addr = regs.append_register(
+            name="input_addr",
+            mode=REGISTER_MODES["r_w"],
+            description="Graph input tensor's DDR base address for the job about to "
+            "start (STATUS.BUSY='0') or about to be queued (STATUS.BUSY='1', see "
+            "CTRL.START). Added to every descriptor's `in_addr` tagged `reloc_input`.",
+        )
+        input_addr.append_bit_vector(
+            name="addr",
+            description="Byte address, full register width.",
+            width=32,
+            default_value="0" * 32,
+        )
+
+        output_addr = regs.append_register(
+            name="output_addr",
+            mode=REGISTER_MODES["r_w"],
+            description="Graph output tensor's DDR base address, same deal as "
+            "INPUT_ADDR. Added to every descriptor's `out_addr` tagged `reloc_output`.",
+        )
+        output_addr.append_bit_vector(
+            name="addr",
+            description="Byte address, full register width.",
+            width=32,
+            default_value="0" * 32,
+        )
+
         status = regs.append_register(
             name="status",
             mode=REGISTER_MODES["r_wpulse"],
@@ -372,11 +407,23 @@ class Module(BaseModule):
             width=4,
             default_value="0000",
         )
+        # ISA v2.3: bit 8 (the low bit of what was an 8-bit-wide
+        # `reserved1`) is now `QUEUED` -- a job's INPUT_ADDR/OUTPUT_ADDR
+        # are latched waiting for the currently-running one to finish
+        # (section 6a). `reserved1` shrinks to 7 bits so `err_pc_low`
+        # still lands on bits [31:16] unchanged.
+        status.append_bit(
+            name="queued",
+            description="A job is latched waiting for the current one to finish "
+            "(set by CTRL.START written while BUSY='1'; cleared the instant that "
+            "job is dispatched).",
+            default_value="0",
+        )
         status.append_bit_vector(
             name="reserved1",
             description="Unused, reads '0'. Padding so `err_pc_low` lands on bits [31:16].",
-            width=8,
-            default_value="00000000",
+            width=7,
+            default_value="0000000",
         )
         status.append_bit_vector(
             name="err_pc_low",
@@ -2885,6 +2932,10 @@ class Module(BaseModule):
         self._setup_cnn_accel_conv_core(library)
         self._setup_cnn_accel_tensor_mem(library)
         self._setup_cnn_accel_top(library)
+        # ISA v2.3 streaming-inference interface (INPUT_ADDR/OUTPUT_ADDR
+        # relocation + the one-deep job queue): the only testbench that
+        # actually exercises either -- see the entity header.
+        library.test_bench("tb_cnn_accel_streaming")
 
     def _setup_cnn_accel_window_gen(self, library) -> None:
         """Run the whole window-generator suite at BOTH shipped tap-assembly
@@ -2914,18 +2965,22 @@ class Module(BaseModule):
         """The rev-2 top-level integration testbench (arch doc section 11).
 
         `tb_cnn_accel_top` is the project's ONE top-level testbench and it
-        is completely generic: it loads a DDR image from CSV, starts the
-        DUT through the CSR, waits for DONE/ERROR, then exports the CSR
-        counters plus a byte region of the DDR model back to CSV. Every
-        decision about what to run, and all numerical verification, lives
-        in `accel_v2/cases.py` + `accel_v2/tbcase.py`, so one VUnit config
-        per case is the whole registration -- adding a test never touches
-        VHDL.
+        is completely generic: it writes the compiler's own output (the
+        descriptor chain and weight/bias/scale/LUT tables) and the
+        graph's input tensors, then reads back the CSR counters plus the
+        exported DDR region, entirely live over VUnit's Python FFI
+        (`python_call`/`python_execute`) -- no file is read or written
+        anywhere. It starts the DUT through the CSR and waits for
+        DONE/ERROR. Every decision about what to run, and all numerical
+        verification, lives in `accel_v2/cases.py` + `accel_v2/tbcase.py`,
+        so one VUnit config per case is the whole registration -- adding
+        a test never touches VHDL.
 
-        `pre_config` writes that case's `mem_image.csv` into VUnit's own
-        per-config `output_path`; `post_check` reads `result.csv` (the
-        bytes the DUT itself wrote over AXI) and `counters.csv` back out
-        of it. Nothing is checked into the repository.
+        `check_live` (called from `test/python_bridge/top_level_bridge.py`,
+        itself called from VHDL via `python_call`, right after
+        `STATUS.DONE`/`STATUS.ERROR`) does the verification; there is no
+        `pre_config`/`post_check` hook at all -- both directions of the
+        run go through the live FFI path.
         """
         # Imported here rather than at module scope: `accel_v2` is only
         # needed to register these configs, and `module_cnn_accel.py` is
@@ -2980,21 +3035,27 @@ class Module(BaseModule):
         ):
             # VUnit's own `add_config` rather than tsfpga's
             # `add_vunit_config` helper: the helper always appends every
-            # generic to the config name, and these configs carry ten of
-            # them, which would bury the one identifier that matters (the
-            # case name) in a 200-character test name. The case name is
-            # already the reproducible handle -- `cases.py` maps it to its
-            # seed and geometry -- so the generics add nothing here.
+            # generic to the config name, and these configs carry a dozen
+            # of them, which would bury the one identifier that matters
+            # (the case name) in a 200-character test name. The case name
+            # is already the reproducible handle -- `cases.py` maps it to
+            # its seed and geometry -- so the generics add nothing here.
             #
-            # `case.pre_config`/`case.post_check` are bound methods of that
-            # one case object, so each config carries its own state; a
-            # closure over the loop variable would instead run every hook
-            # against the last case built.
+            # No `pre_config`/`post_check` hook: writing DDR and verifying
+            # the run both happen entirely inside the simulation, over
+            # `python_call` (see `top_level_bridge.py`). Leaving both
+            # unset is VUnit's own "nothing to run" default, not a gap.
+            #
+            # `g_case_name` is the only per-case generic: the testbench
+            # fetches everything else about the case (program base
+            # address, export/input DDR windows, expect_error, the
+            # compiled-region layout) live, via `python_call`, right
+            # after `top_level_bridge.set_test_case` -- see
+            # `TbCase.generics`'s own docstring for why that split is
+            # drawn where it is.
             tb.add_config(
                 name=case.name,
-                generics=case.generics(),
-                pre_config=case.pre_config,
-                post_check=case.post_check,
+                generics={**case.generics(), "g_case_name": case.name},
             )
 
     def _setup_cnn_accel_bias_requant(self, library) -> None:
@@ -3039,40 +3100,24 @@ class Module(BaseModule):
     def _setup_cnn_accel_pe_array_from_vectors(self, library) -> None:
         # Cross-language (Python packer -> real RTL) bit-exactness guard for
         # the D10 weight-lane-order defect, see
-        # tb_cnn_accel_pe_array_from_vectors.vhd's own header comment.
-        # The vectors are generated into VUnit's own per-test 'output_path'
-        # by the pre_config hook right before simulation (the testbench
-        # reads '<output_path>/pe_array_xlang_check'); nothing is checked
-        # in and nothing is read from the repository.
-        tb = library.test_bench("tb_cnn_accel_pe_array_from_vectors")
-
-        def pre_config(output_path: str) -> bool:
-            generate_vectors.generate_pe_array_xlang_case(
-                generate_vectors.hw_packing(Path(output_path))
-            )
-            return True
-
-        for test in tb.get_tests():
-            self.add_vunit_config(test=test, pre_config=pre_config)
+        # tb_cnn_accel_pe_array_from_vectors.vhd's own header comment. The
+        # case is fetched live over VUnit's Python FFI by test/python_bridge/
+        # conv_core_bridge.py -- no pre_config hook, no vector file, nothing
+        # read from or written to the repository.
+        library.test_bench("tb_cnn_accel_pe_array_from_vectors")
 
     def _setup_cnn_accel_conv_core(self, library) -> None:
         # Cross-language (Python golden model -> composed RTL) bit-exactness
         # guard for the full window_gen -> pe_array -> bias_requant
         # composition, see tb_cnn_accel_conv_core.vhd's own header comment.
-        # Vectors are generated into VUnit's own per-config 'output_path'
-        # by each config's pre_config hook right before simulation, at that
-        # config's `g_pe_rows` packing point; nothing is checked in and
-        # nothing is read from the repository.
+        # 'run_all_cases' fetches its hand-authored vectors live over
+        # VUnit's Python FFI (test/python_bridge/conv_core_bridge.py), at
+        # each config's own `g_pe_rows` packing point -- no pre_config hook
+        # needed for those, nothing checked in, nothing read from the
+        # repository. Only 'test_bitexact_compiler_cases' still needs one
+        # (below): its vectors come from actually compiling TOSA fixtures,
+        # which the bridge does not do on its own.
         tb = library.test_bench("tb_cnn_accel_conv_core")
-
-        def make_pre_config(pe_rows: int):
-            def pre_config(output_path: str) -> bool:
-                generate_vectors.generate_conv_core_cases(
-                    generate_vectors.hw_packing(Path(output_path), pe_rows=pe_rows)
-                )
-                return True
-
-            return pre_config
 
         for test in tb.get_tests():
             if test.name == "test_bitexact_compiler_cases":
@@ -3107,7 +3152,7 @@ class Module(BaseModule):
             # root, packed at that many lanes per weight row; the scaled
             # one carries the extra 16-output-channel case that only
             # exists there. The testbench cross-checks each case's
-            # desc.txt `pe_rows` against its generic, so a root/generic
+            # desc field `pe_rows` against its generic, so a config/case
             # mix-up here fails by name rather than as a data mismatch.
             # The default is deliberately not renamed: its test names are
             # unchanged, the scaled config is the one that grows a
@@ -3121,7 +3166,6 @@ class Module(BaseModule):
                         "stall_probability_percent_out": stall,
                         "g_pe_rows": pe_rows,
                     },
-                    pre_config=make_pre_config(pe_rows),
                 )
 
     def _setup_cnn_accel_tensor_mem(self, library) -> None:

@@ -92,22 +92,9 @@ def _require_no_data_movement(case: TbCase) -> None:
 
 def _with_extra_check(case: TbCase, extra) -> TbCase:
     """Run `extra(case)` (raising `CheckFailure` on disagreement) in
-    addition to the standard `post_check`.
-
-    Bound to the instance rather than subclassing `TbCase`: VUnit only
-    ever calls `case.post_check`, and this keeps every case in this file a
-    plain `build_case` result."""
-    base = case.post_check
-
-    def post_check(output_path: str) -> bool:
-        try:
-            extra(case)
-        except CheckFailure as exc:
-            print(f"\npost_check FAILED for case '{case.name}':\n{exc}\n")
-            return False
-        return base(output_path)
-
-    case.post_check = post_check  # type: ignore[method-assign]
+    addition to `TbCase.check_live`'s standard checks: set as the case's
+    `extra_check`, which `check_live` runs first."""
+    case.extra_check = extra
     return case
 
 

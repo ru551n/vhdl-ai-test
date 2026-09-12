@@ -104,6 +104,11 @@ package cnn_accel_v2_pkg is
   constant c_err_bad_geometry    : err_code_t := x"7";
   constant c_err_axi             : err_code_t := x"8";
   constant c_err_timeout         : err_code_t := x"9";
+  -- ISA v2.3: CTRL.START written (in cnn_accel_csr) while BUSY=1 and a
+  -- job is already queued (spec section 6a). Unlike every code above,
+  -- this one names a bad host write, not a bad program -- the job
+  -- already running is unaffected by it.
+  constant c_err_queue_full      : err_code_t := x"A";
 
   -- Reported to the host in HW_INFO2.ISA_VERSION. Derived from the same
   -- generated constant 'cnn_accel_csr' drives that register from, so the
@@ -173,10 +178,22 @@ package cnn_accel_v2_pkg is
     -- byte) is not a legal factor, so a stale byte can never be misread
     -- as a real one.
     dts_factor      : unsigned(7 downto 0);
-    -- W0 byte 3 and W10 byte 43: must be zero (section 5.1). The W10 gap
-    -- shrank from three bytes to two when v2.1 claimed byte 41 for
-    -- 'pad_value', and from two to ONE when v2.2 claimed byte 42 for
-    -- 'dts_factor' -- byte 43 is all that is left of it.
+    -- ISA v2.3, W0 byte 3 bits [1:0]: relocate 'in_addr'/'out_addr' by
+    -- the CSR's latched INPUT_ADDR/OUTPUT_ADDR (spec section 6a) when
+    -- this descriptor's space is DDR. 'cnn_accel_cmd_proc' is the only
+    -- consumer; '0' (the value every earlier revision left in these
+    -- then-reserved bits) relocates nothing, reproducing the exact
+    -- address every existing program already compiles.
+    reloc_input     : std_ulogic;
+    reloc_output    : std_ulogic;
+    -- W0 byte 3 and W10 byte 43: must be zero (section 5.1) -- except,
+    -- since v2.3, bits [1:0] of 'reserved_w0' (duplicated above as
+    -- 'reloc_input'/'reloc_output' for readability at every call site
+    -- that only cares about one bit; only bits [7:2] are actually
+    -- policed as reserved now). The W10 gap shrank from three bytes to
+    -- two when v2.1 claimed byte 41 for 'pad_value', and from two to
+    -- ONE when v2.2 claimed byte 42 for 'dts_factor' -- byte 43 is all
+    -- that is left of it.
     reserved_w0     : std_ulogic_vector(7 downto 0);
     reserved_w10    : std_ulogic_vector(7 downto 0);
   end record;
@@ -269,6 +286,8 @@ package body cnn_accel_v2_pkg is
       space_dst       => (others => '0'),
       space_wgt       => (others => '0'),
       xfer_bytes      => (others => '0'),
+      reloc_input     => '0',
+      reloc_output    => '0',
       reserved_w0     => (others => '0'),
       pad_value       => (others => '0'),
       dts_factor      => (others => '0'),
@@ -352,6 +371,8 @@ package body cnn_accel_v2_pkg is
     -- v2.2 the second for 'dts_factor' -- exactly the revisit this
     -- comment used to predict, twice over).
     result.reserved_w0     := field(c_off_spaces + 1, 8);
+    result.reloc_input     := result.reserved_w0(0);
+    result.reloc_output    := result.reserved_w0(1);
     result.reserved_w10    := field(c_off_dts_factor + 1, 8);
 
     return result;

@@ -69,6 +69,15 @@ entity cnn_accel_csr is
     -- next START, i.e. a running program must not have its base address
     -- changed under it.
     program_base_addr : out std_ulogic_vector(g_axi_addr_width - 1 downto 0) := (others => '0');
+    -- ISA v2.3 streaming-inference interface (spec section 6a): latched
+    -- the same way as 'program_base_addr' above, except which source gets
+    -- latched depends on WHICH start this is -- see 'input_output_addr_
+    -- latch' below. A host write to INPUT_ADDR/OUTPUT_ADDR while BUSY='0'
+    -- takes effect on the next START, exactly like PROGRAM_BASE_ADDR;
+    -- while BUSY='1' it instead queues (or, if a job is already queued,
+    -- is rejected with ERR_QUEUE_FULL -- see CTRL.START's own comment).
+    input_addr : out std_ulogic_vector(g_axi_addr_width - 1 downto 0) := (others => '0');
+    output_addr : out std_ulogic_vector(g_axi_addr_width - 1 downto 0) := (others => '0');
     -- Pulses exactly one cycle AFTER the accepted CTRL.START write, so that
     -- 'program_base_addr' above (registered, captured on that same write)
     -- is already stable when the consumer samples it. Handing 'start' out
@@ -112,22 +121,49 @@ architecture a of cnn_accel_csr is
   signal err_code_q : unsigned(3 downto 0) := (others => '0');
   signal err_pc_low_q : unsigned(15 downto 0) := (others => '0');
   signal program_base_addr_q : unsigned(g_axi_addr_width - 1 downto 0) := (others => '0');
+  signal input_addr_q : unsigned(g_axi_addr_width - 1 downto 0) := (others => '0');
+  signal output_addr_q : unsigned(g_axi_addr_width - 1 downto 0) := (others => '0');
+
+  -- ISA v2.3 one-deep job queue (spec section 6a): CTRL.START written
+  -- while BUSY='1' latches the bus-side INPUT_ADDR/OUTPUT_ADDR here
+  -- instead of taking effect immediately, and 'auto_dispatch_i' below
+  -- replays them the instant the running job's 'seq_done' fires.
+  signal queued_q : std_ulogic := '0';
+  signal queued_input_addr_q : unsigned(g_axi_addr_width - 1 downto 0) := (others => '0');
+  signal queued_output_addr_q : unsigned(g_axi_addr_width - 1 downto 0) := (others => '0');
 
   signal start_i : std_ulogic;
   signal start_q : std_ulogic := '0';
   signal soft_reset_pulse_i : std_ulogic;
+
+  -- CTRL.START written while already BUSY: latch it as the queued job
+  -- ('queue_i') if the one-deep queue is empty, or reject it with
+  -- ERR_QUEUE_FULL ('queue_full_error_i') if it is already full. Neither
+  -- touches the job currently running.
+  signal queue_i : std_ulogic;
+  signal queue_full_error_i : std_ulogic;
+  -- The running job's own completion, when a job was waiting: re-dispatch
+  -- immediately, no second CTRL.START write needed.
+  signal auto_dispatch_i : std_ulogic;
 
 begin
 
   start <= start_q;
   soft_reset_pulse <= soft_reset_pulse_i;
   program_base_addr <= std_ulogic_vector(program_base_addr_q);
+  input_addr <= std_ulogic_vector(input_addr_q);
+  output_addr <= std_ulogic_vector(output_addr_q);
 
   -- CTRL.START/CTRL.ABORT: both are already exactly one-cycle-wide thanks
   -- to the register file's 'r_wpulse' storage (see the entity-level
-  -- comment), so no extra pulse-shaping is needed here. START additionally
-  -- only takes effect while not already BUSY; ABORT is unconditional.
-  start_i <= regs_down.ctrl.start and not busy_q;
+  -- comment), so no extra pulse-shaping is needed here. A START write
+  -- takes effect immediately while not BUSY; while BUSY, it queues
+  -- ('queue_i') or is rejected ('queue_full_error_i') instead -- see the
+  -- signal declarations above. ABORT is unconditional.
+  start_i <= (regs_down.ctrl.start and not busy_q) or auto_dispatch_i;
+  queue_i <= regs_down.ctrl.start and busy_q and not queued_q;
+  queue_full_error_i <= regs_down.ctrl.start and busy_q and queued_q;
+  auto_dispatch_i <= seq_done and queued_q;
   soft_reset_pulse_i <= regs_down.ctrl.abort;
 
   ------------------------------------------------------------------------
@@ -145,11 +181,22 @@ begin
         err_code_q <= (others => '0');
         err_pc_low_q <= (others => '0');
       else
-        if start_i = '1' then
-          busy_q <= '1';
-        end if;
+        -- Order matters here (unlike before ISA v2.3): 'auto_dispatch_i'
+        -- makes 'start_i' and 'seq_done' both '1' in the exact same
+        -- cycle (the running job finishes and the queued one starts at
+        -- once), and the LAST assignment below wins for that cycle. If
+        -- the 'seq_done' clear ran last, BUSY would read '0' for the one
+        -- cycle it takes 'start_q' to reach 'cnn_accel_cmd_proc', then
+        -- never be set again for the job that is, in fact, now running.
+        -- Putting 'start_i' last instead means a real completion with no
+        -- queued job (the only case these two ever coincided in before
+        -- v2.3) is unaffected, and a same-cycle auto-dispatch correctly
+        -- leaves BUSY set. ABORT still wins over either: it stays last.
         if seq_done = '1' or seq_error = '1' then
           busy_q <= '0';
+        end if;
+        if start_i = '1' then
+          busy_q <= '1';
         end if;
         if soft_reset_pulse_i = '1' then
           busy_q <= '0';
@@ -175,11 +222,21 @@ begin
         -- pending, a later 'seq_error' must not overwrite the diagnostic the
         -- host has not read yet, since the first failure is the one that
         -- explains the run and any later one may well be a consequence of it.
-        if seq_error = '1' then
+        -- 'queue_full_error_i' (ISA v2.3) joins the same set-wins path: it
+        -- names a bad host write, not a bad program, so it carries no
+        -- faulting PC (ERR_PC_LOW reads 0) and 'seq_error' wins if the two
+        -- ever coincide -- a real program fault is the more useful of the
+        -- two diagnoses to keep.
+        if seq_error = '1' or queue_full_error_i = '1' then
           error_sticky_q <= '1';
           if error_sticky_q = '0' then
-            err_code_q <= unsigned(err_code);
-            err_pc_low_q <= unsigned(err_pc(15 downto 0));
+            if seq_error = '1' then
+              err_code_q <= unsigned(err_code);
+              err_pc_low_q <= unsigned(err_pc(15 downto 0));
+            else
+              err_code_q <= unsigned(c_err_queue_full);
+              err_pc_low_q <= (others => '0');
+            end if;
           end if;
         elsif reg_was_written.status = '1' and regs_down.status.error = '1' then
           error_sticky_q <= '0';
@@ -204,6 +261,59 @@ begin
       elsif start_i = '1' then
         program_base_addr_q <=
           unsigned(regs_down.program_base_addr.addr(g_axi_addr_width - 1 downto 0));
+      end if;
+    end if;
+  end process;
+
+  ------------------------------------------------------------------------
+  -- ISA v2.3 one-deep job queue (spec section 6a). Unlike PROGRAM_BASE_
+  -- ADDR, INPUT_ADDR/OUTPUT_ADDR can be latched from two different
+  -- sources at 'start_i': the live bus registers (a normal, not-BUSY
+  -- START) or the queued pair (an auto-dispatch, 'auto_dispatch_i').
+  -- 'queued_q' is cleared on 'soft_reset_pulse_i' too -- an ABORT drops
+  -- the whole pipeline, not just the job currently running, so a queued
+  -- job left behind can never auto-dispatch into a STATUS.QUEUED that
+  -- would otherwise never clear.
+  ------------------------------------------------------------------------
+
+  queue_tracking : process(clk)
+  begin
+    if rising_edge(clk) then
+      if reset = '1' then
+        queued_q <= '0';
+        queued_input_addr_q <= (others => '0');
+        queued_output_addr_q <= (others => '0');
+      else
+        if queue_i = '1' then
+          queued_q <= '1';
+          queued_input_addr_q <=
+            unsigned(regs_down.input_addr.addr(g_axi_addr_width - 1 downto 0));
+          queued_output_addr_q <=
+            unsigned(regs_down.output_addr.addr(g_axi_addr_width - 1 downto 0));
+        elsif auto_dispatch_i = '1' then
+          queued_q <= '0';
+        end if;
+        if soft_reset_pulse_i = '1' then
+          queued_q <= '0';
+        end if;
+      end if;
+    end if;
+  end process;
+
+  input_output_addr_latch : process(clk)
+  begin
+    if rising_edge(clk) then
+      if reset = '1' then
+        input_addr_q <= (others => '0');
+        output_addr_q <= (others => '0');
+      elsif start_i = '1' then
+        if auto_dispatch_i = '1' then
+          input_addr_q <= queued_input_addr_q;
+          output_addr_q <= queued_output_addr_q;
+        else
+          input_addr_q <= unsigned(regs_down.input_addr.addr(g_axi_addr_width - 1 downto 0));
+          output_addr_q <= unsigned(regs_down.output_addr.addr(g_axi_addr_width - 1 downto 0));
+        end if;
       end if;
     end if;
   end process;
@@ -236,6 +346,7 @@ begin
   regs_up.status.error <= error_sticky_q;
   regs_up.status.reserved0 <= (others => '0');
   regs_up.status.err_code <= err_code_q;
+  regs_up.status.queued <= queued_q;
   regs_up.status.reserved1 <= (others => '0');
   regs_up.status.err_pc_low <= err_pc_low_q;
 

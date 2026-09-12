@@ -470,6 +470,42 @@ def _compute_desc(
     raise TypeError(f"program: unhandled op type {type(op)!r}")
 
 
+def _tag_relocatable_operands(descs: list[isa.DescV2], planned: PlannedProgram) -> None:
+    """ISA v2.3 streaming-inference interface (spec section 6a): mark
+    every descriptor operand whose compiled address falls inside the
+    graph's designated input/output tensor window, so `cnn_accel_csr`'s
+    INPUT_ADDR/OUTPUT_ADDR relocate it at dispatch time (`cnn_accel_
+    cmd_proc` only relocates a `SPACE_DDR` operand that also sets
+    `reloc_input`/`reloc_output`).
+
+    Address-range matching -- not "is this operand syntactically the
+    tensor" -- is what makes this correct for both a tiled program's
+    several row-copy planes reading the input, and an aliased/CONCAT
+    output's several producer descriptors, without special-casing
+    either: every one of them just happens to write somewhere inside
+    the same tensor's DDR window. Only `space_src0`/`space_dst` are
+    checked (never `space_src1`/`space_wgt`) -- a graph input consumed
+    as `ADD`'s second operand would not be relocatable; no catalogue
+    case does this today."""
+    input_windows = [
+        (planned.tensor_ddr_addr[t.name], planned.tensor_ddr_addr[t.name] + t.size_bytes)
+        for t in planned.model.inputs
+    ]
+    output_windows = [
+        (planned.tensor_ddr_addr[t.name], planned.tensor_ddr_addr[t.name] + t.size_bytes)
+        for t in planned.model.outputs
+    ]
+    for desc in descs:
+        if desc.space_src0 == isa.SPACE_DDR and any(
+            lo <= desc.in_addr < hi for lo, hi in input_windows
+        ):
+            desc.reloc_input = True
+        if desc.space_dst == isa.SPACE_DDR and any(
+            lo <= desc.out_addr < hi for lo, hi in output_windows
+        ):
+            desc.reloc_output = True
+
+
 def emit_program(planned: PlannedProgram) -> ProgramImage:
     """Lower `planned` into a `ProgramImage`: a chained `DescV2` list and
     the `MemoryImage` a testbench loads to run it. Allocates DDR space
@@ -523,6 +559,8 @@ def emit_program(planned: PlannedProgram) -> ProgramImage:
             descs.append(_compute_desc(step, next_addrs[0], weight_allocations, lut_addrs))
         cursor += count
     descs.append(isa.DescV2(opcode=isa.OPCODE_HALT))
+
+    _tag_relocatable_operands(descs, planned)
 
     for addr, desc in zip(addrs, descs):
         image.write_bytes(addr, isa.encode_desc(desc))

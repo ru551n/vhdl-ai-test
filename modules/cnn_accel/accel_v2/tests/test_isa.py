@@ -16,10 +16,10 @@ from accel_v2 import isa
 
 
 def test_isa_version_and_word_size() -> None:
-    # v2.2 adds the DEPTH_TO_SPACE opcode and its W10 'dts_factor' byte;
-    # both were unassigned/reserved-must-be-0 in v2.1, so the word size is
-    # unchanged and every v2.1 program is still valid.
-    assert isa.ISA_VERSION == 0x0202
+    # v2.3 adds the reloc_input/reloc_output bits (W0 byte 3, bits [1:0]);
+    # both were part of reserved_w0 (always 0) in v2.2, so the word size
+    # is unchanged and every v2.2 program is still valid.
+    assert isa.ISA_VERSION == 0x0203
     assert isa.INSTR_WORD_BYTES == 64
 
 
@@ -40,6 +40,40 @@ def test_pad_value_round_trips_signed() -> None:
     # Default-zero: a descriptor that never mentions pad_value encodes the
     # byte as 0, i.e. exactly the v2.0 reserved-zero word.
     assert isa.encode_desc(isa.DescV2())[41] == 0
+
+
+def test_reloc_flags_and_reserved_w0_round_trip() -> None:
+    for reloc_input, reloc_output, reserved_w0 in (
+        (False, False, 0),
+        (True, False, 0),
+        (False, True, 0),
+        (True, True, 0),
+        (False, False, 0x3F),
+        (True, True, 0x3F),
+    ):
+        d = isa.DescV2(reloc_input=reloc_input, reloc_output=reloc_output, reserved_w0=reserved_w0)
+        got = isa.decode_desc(isa.encode_desc(d))
+        assert got.reloc_input == reloc_input
+        assert got.reloc_output == reloc_output
+        assert got.reserved_w0 == reserved_w0
+    # Default-zero: a descriptor that never mentions either bit encodes
+    # W0 byte 3 as 0, i.e. exactly the v2.2 reserved-zero byte.
+    assert isa.encode_desc(isa.DescV2())[3] == 0
+    # The two bits occupy the low end of the byte; reserved_w0 is packed
+    # above them, not overlapping.
+    assert isa.encode_desc(isa.DescV2(reloc_input=True))[3] == 0b01
+    assert isa.encode_desc(isa.DescV2(reloc_output=True))[3] == 0b10
+    assert isa.encode_desc(isa.DescV2(reserved_w0=1))[3] == 0b00000100
+
+
+def test_reserved_w0_still_triggers_bad_reserved_at_its_new_bit_position() -> None:
+    # cases_error.case_err_bad_reserved overrides reserved_w0=1 to provoke
+    # ERR_BAD_RESERVED; under the v2.3 packing that must still land on a
+    # bit RTL actually treats as reserved (bit 2 of the raw byte), not on
+    # one of the two now-meaningful reloc bits (bits 0-1).
+    raw_byte = isa.encode_desc(isa.DescV2(reserved_w0=1))[3]
+    assert raw_byte & 0b11 == 0, "reserved_w0=1 must not set either reloc bit"
+    assert raw_byte & 0b11111100 != 0, "reserved_w0=1 must still set a bit RTL checks as reserved"
 
 
 def test_space_tags() -> None:
@@ -95,6 +129,7 @@ def test_error_codes() -> None:
     assert isa.ERR_BAD_GEOMETRY == 7
     assert isa.ERR_AXI == 8
     assert isa.ERR_TIMEOUT == 9
+    assert isa.ERR_QUEUE_FULL == 0xA
 
 
 def test_flag_convenience_properties() -> None:
@@ -162,6 +197,8 @@ def _full_desc() -> isa.DescV2:
         clamp_max=127,
         scale_addr=0x5000,
         xfer_bytes=0x800,
+        reloc_input=True,
+        reloc_output=True,
     )
 
 
@@ -262,6 +299,8 @@ def test_v12_compatible_descriptor_encodes_byte_identical_to_golden_model() -> N
     d.space_dst = isa.SPACE_DDR
     d.space_wgt = isa.SPACE_DDR
     d.xfer_bytes = 0
+    d.reloc_input = False
+    d.reloc_output = False
 
     layer = _layer_desc_equivalent_of(d)
     assert isa.encode_desc(d) == model.encode_instruction(layer)

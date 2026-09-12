@@ -49,6 +49,66 @@ from cnn_accel_model import (
     unpack_scale_table_from_hw,
 )
 
+
+@dataclasses.dataclass(frozen=True)
+class ConvCoreCase:
+    """One case directory's content, read back by `read_case_from_dir`
+    into a shape `test/python_bridge/conv_core_bridge.py` hands to VHDL
+    live over `python_call` -- see that module's own docstring and
+    `shared/Vunit.md`'s "python_call and python_execute" section for why
+    no VHDL testbench reads a `.txt` vector file itself any more. `desc`
+    holds every `LayerDesc` field (`dataclasses.fields` name -> int
+    value) except `tile_channels`/`pe_rows`, which are D10 host-compiler-
+    time packing parameters, not ISA fields, and get their own dataclass
+    fields here. `scale_table_packed`/`raw_accum` are `None` unless the
+    case actually has one (`FLAG_PER_CHANNEL_EN` / the one
+    `pe_array_xlang_check` case respectively)."""
+
+    desc: dict[str, int]
+    tile_channels: int
+    pe_rows: int
+    weights_packed: list[int]
+    bias: list[int]
+    input: list[int]
+    expected: list[int]
+    scale_table_packed: list[int] | None = None
+    raw_accum: list[int] | None = None
+
+
+def read_case_from_dir(case_dir: Path) -> ConvCoreCase:
+    """The exact inverse of `_write_desc`/`_write_int_lines`: reads one
+    case directory (this module's own output, or `cnnc.backend.
+    cnn_accel_v1.vectors.write_conv_core_vectors`'s -- both write the
+    identical shape, doc/cnn_accel_test_vectors.md) back into a
+    `ConvCoreCase`. The one and only reader of a `.txt` vector file left
+    in this codebase (`conv_core_bridge.py` calls this, never a VHDL
+    testbench)."""
+
+    def read_int_lines(path: Path) -> list[int]:
+        return [int(line) for line in path.read_text().splitlines() if line]
+
+    desc: dict[str, int] = {}
+    for line in (case_dir / "desc.txt").read_text().splitlines():
+        if not line:
+            continue
+        key, value = line.split(" ", 1)
+        desc[key] = int(value)
+
+    scale_path = case_dir / "scale_table_packed.txt"
+    accum_path = case_dir / "pe_array_raw_accum.txt"
+    return ConvCoreCase(
+        desc=desc,
+        tile_channels=desc.pop("tile_channels"),
+        pe_rows=desc.pop("pe_rows"),
+        weights_packed=read_int_lines(case_dir / "weights_packed.txt"),
+        bias=read_int_lines(case_dir / "bias.txt"),
+        input=read_int_lines(case_dir / "input.txt"),
+        expected=read_int_lines(case_dir / "expected.txt"),
+        scale_table_packed=read_int_lines(scale_path) if scale_path.is_file() else None,
+        raw_accum=read_int_lines(accum_path) if accum_path.is_file() else None,
+    )
+
+
 class HwPacking(NamedTuple):
     """One vector root's accelerator-native packing point (D10,
     doc/cnn_accel_tiled_dataflow_proposal.md section 4): the tile/lane

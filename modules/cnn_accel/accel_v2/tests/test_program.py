@@ -97,6 +97,77 @@ def test_determinism_same_seed_identical_image_bytes() -> None:
     assert build(21) != build(22)
 
 
+def test_reloc_tags_exactly_the_input_and_output_operands() -> None:
+    """ISA v2.3 (spec section 6a): `_single_conv_model` has one graph
+    input and one graph output, each read/written by exactly one
+    descriptor, so exactly one descriptor's `space_src0` operand and
+    exactly one descriptor's `space_dst` operand should end up tagged --
+    everything else (weights, the program's own descriptor addresses)
+    must be untouched."""
+    planned = Planner().plan(_single_conv_model())
+    pi = emit_program(planned)
+
+    in_addr = planned.tensor_ddr_addr[planned.model.inputs[0].name]
+    out_addr = planned.tensor_ddr_addr[planned.model.outputs[0].name]
+
+    reloc_input_descs = [d for d in pi.descs if d.reloc_input]
+    reloc_output_descs = [d for d in pi.descs if d.reloc_output]
+    assert len(reloc_input_descs) == 1
+    assert len(reloc_output_descs) == 1
+    assert reloc_input_descs[0].in_addr == in_addr
+    assert reloc_output_descs[0].out_addr == out_addr
+    # Neither tag ever fires on a non-DDR operand or the wrong address.
+    for d in pi.descs:
+        if d.reloc_input:
+            assert d.space_src0 == isa.SPACE_DDR
+        if d.reloc_output:
+            assert d.space_dst == isa.SPACE_DDR
+
+
+def test_reloc_tags_every_plane_of_a_tiled_input() -> None:
+    """The design's whole point: address-range matching, not "is this
+    operand syntactically the tensor", so a tiled program's several
+    row-copy planes -- reading successive slices of one graph input --
+    all get tagged, not just a first/only one."""
+    from accel_v2 import cases_tiling
+
+    for case in cases_tiling.all_cases():
+        if not case.model.inputs:
+            continue
+        in_lo = case.planned.tensor_ddr_addr[case.model.inputs[0].name]
+        in_hi = in_lo + case.model.inputs[0].size_bytes
+        reloc_input_descs = [d for d in case.program.descs if d.reloc_input]
+        if not reloc_input_descs:
+            continue
+        # However many descriptors touch the input, every one of them
+        # must land inside the input's own window -- never outside it.
+        for d in reloc_input_descs:
+            assert in_lo <= d.in_addr < in_hi
+        return
+    raise AssertionError("no cases_tiling case had a reloc_input descriptor to check")
+
+
+def test_reloc_flags_default_false_reproduce_prior_addresses() -> None:
+    """Backward compatibility, stated as a test rather than only as a
+    byte-count argument: a descriptor from any program built before ISA
+    v2.3 always encodes with `reloc_input=reloc_output=False`, which
+    `_tag_relocatable_operands` never touches unless the descriptor's
+    OWN address happens to fall in a graph input/output window -- an
+    ordinary weight/bias/scale/LUT/program descriptor never does."""
+    planned = Planner().plan(_single_conv_model())
+    pi = emit_program(planned)
+    non_io_descs = [
+        d
+        for d in pi.descs
+        if d is not next(x for x in pi.descs if x.reloc_input)
+        and d is not next(x for x in pi.descs if x.reloc_output)
+    ]
+    assert non_io_descs, "expected at least the closing HALT to be untagged"
+    for d in non_io_descs:
+        assert d.reloc_input is False
+        assert d.reloc_output is False
+
+
 def test_ddr_only_program_matches_golden_run_program() -> None:
     """The strongest cross-check available: run the emitted descriptor
     chain through `cnn_accel_model.run_program` (a completely separate,

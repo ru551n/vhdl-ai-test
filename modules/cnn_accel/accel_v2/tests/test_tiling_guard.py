@@ -87,7 +87,29 @@ _CATALOGUES = (cases, cases_concat_split, cases_conv_pad, cases_error, cases_poo
 #:   `tensor_ddr_addr`, `traffic`, `steps`, `descs` and `program_addr` is
 #:   byte-identical. Nothing in the untiled path moved; the new opcode
 #:   only added rows.
-_RATIFIED_DIGEST = "32db8b488fd0d88825b70071fb0af6a8c79a45b8b3aeb702b098bb14b84f003a"
+#: * this digest (ISA v2.3 streaming-inference interface -- INPUT_ADDR/
+#:   OUTPUT_ADDR relocation, `program.py`'s `_tag_relocatable_operands`
+#:   -- on top of the previous ratification): dump taken via a clean
+#:   worktree at the prior commit vs. the working tree under test, same
+#:   68 cases both sides. `local_placements`, `ddr_placements`,
+#:   `pinned_placements`, `tensor_ddr_addr`, `traffic`, `steps` and
+#:   `program_addr` identical in every case -- this change allocates no
+#:   address and moves no placement, exactly as the feature design
+#:   intends. `descs` differs in exactly 127 descriptors across the
+#:   catalogue, every one of them at byte offset 3 only (the new
+#:   `reloc_input`/`reloc_output` bits) and every value accounted for:
+#:   54 descriptors gain `reloc_input` alone (0->1), 59 gain
+#:   `reloc_output` alone (0->2), 13 single-op cases (one descriptor
+#:   both reads the graph input and writes the graph output) gain both
+#:   (0->3), and `cases_error.err_bad_reserved`'s deliberately-corrupted
+#:   descriptor moves from 1->7 -- its own `reserved_w0=1` override
+#:   re-encodes to bit 2 under the new packing (still inside the
+#:   `reserved_w0(7 downto 2)` range `cnn_accel_cmd_proc` actually
+#:   checks, per `test_isa.test_reserved_w0_still_triggers_bad_reserved_
+#:   at_its_new_bit_position`) combined with that case also being a
+#:   single-op shape, so both reloc bits set too. No other byte of any
+#:   descriptor, and no other field of any case, changed.
+_RATIFIED_DIGEST = "91c382bacfb4a2e5ff0846630e6bc97f3d08d031f7febd60fd59775060980c14"
 
 #: The number of cases the digest covers, asserted separately so that
 #: *deleting* a case cannot silently keep the digest meaningful.

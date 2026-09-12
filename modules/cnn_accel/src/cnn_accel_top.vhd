@@ -155,6 +155,9 @@ architecture a of cnn_accel_top is
   ------------------------------------------------------------------------
 
   signal program_base_addr : std_ulogic_vector(g_axi_addr_width - 1 downto 0);
+  -- ISA v2.3 streaming-inference interface (spec section 6a).
+  signal input_addr : std_ulogic_vector(g_axi_addr_width - 1 downto 0);
+  signal output_addr : std_ulogic_vector(g_axi_addr_width - 1 downto 0);
   signal start : std_ulogic := '0';
   signal seq_done : std_ulogic := '0';
   signal seq_error : std_ulogic := '0';
@@ -501,6 +504,8 @@ begin
       s_axi_lite_s2m => s_axi_lite_s2m,
 
       program_base_addr => program_base_addr,
+      input_addr => input_addr,
+      output_addr => output_addr,
       start => start,
       soft_reset_pulse => soft_reset_pulse,
 
@@ -536,6 +541,8 @@ begin
 
       start => start,
       program_base_addr => program_base_addr,
+      input_addr => input_addr,
+      output_addr => output_addr,
       soft_reset_pulse => soft_reset_pulse,
       seq_done => seq_done,
       seq_error => seq_error,

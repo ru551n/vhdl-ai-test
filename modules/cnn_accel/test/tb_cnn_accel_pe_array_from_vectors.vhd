@@ -2,10 +2,10 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
-use std.textio.all;
-
 library vunit_lib;
 context vunit_lib.vunit_context;
+use vunit_lib.python_pkg.all;
+use vunit_lib.integer_array_pkg.all;
 
 library math;
 use math.math_pkg.all;
@@ -21,9 +21,11 @@ use cnn_accel.cnn_accel_pkg.all;
 -- construction, THIS testbench drives the real cnn_accel_pe_array with a
 -- packed weight image and expected accumulator results that both come
 -- straight out of cnn_accel_model.py (via generate_vectors.py's
--- pe_array_xlang_check case) -- exercising the actual Python-packer ->
--- RTL-reader contract end to end, not two independently-written models
--- that happen to agree.
+-- pe_array_xlang_check case, fetched live over VUnit's Python FFI by
+-- test/python_bridge/conv_core_bridge.py -- no vector file is ever
+-- written to or read from disk by this testbench) -- exercising the
+-- actual Python-packer -> RTL-reader contract end to end, not two
+-- independently-written models that happen to agree.
 --
 -- Kept deliberately minimal: a single pointwise (1x1 kernel) CONV2D shape
 -- (module_cnn_accel.py's own reference hardware point, g_pe_rows=
@@ -45,19 +47,11 @@ use cnn_accel.cnn_accel_pkg.all;
 -- point); if that case's shape ever changes, these must change with it.
 entity tb_cnn_accel_pe_array_from_vectors is
   generic (
-    -- VUnit's own per-test output directory, filled in by VUnit itself.
-    -- module_cnn_accel.py's pre_config hook runs generate_vectors.
-    -- generate_pe_array_xlang_case() into it right before the simulation
-    -- starts, so the case is read from '<output_path>/pe_array_xlang_check'
-    -- -- nothing is read from the repository, no vector is checked in.
-    output_path : string;
     runner_cfg : string
   );
 end entity tb_cnn_accel_pe_array_from_vectors;
 
 architecture tb of tb_cnn_accel_pe_array_from_vectors is
-
-  constant vectors_path : string := output_path & "/pe_array_xlang_check";
 
   -- Must match generate_vectors.py's pe_array_xlang_check case
   -- (HW_TILE_CHANNELS/HW_PE_ROWS) and desc.txt exactly -- see this file's
@@ -115,16 +109,6 @@ architecture tb of tb_cnn_accel_pe_array_from_vectors is
   type window_row_t is array (0 to c_window_len - 1) of integer range -128 to 127;
   type accum_int_arr_t is array (0 to c_pe_rows - 1) of integer;
 
-  -- Flat integer buffers read straight from the vector files (plain
-  -- 'integer', unconstrained by the int8/int32 subtypes above -- narrowed
-  -- on assignment into weight_mem_s/window_row_t/accum_int_arr_t, which
-  -- range-checks each value).
-  type flat_int_arr_t is array (natural range <>) of integer;
-
-  constant c_num_weight_values : positive := c_num_tiles * c_weight_lanes;
-  constant c_num_input_values : positive := c_num_pixels * c_in_c;
-  constant c_num_accum_values : positive := c_num_pixels * c_pe_rows;
-
   function to_sl(cond : boolean) return std_ulogic is
   begin
     if cond then
@@ -132,33 +116,6 @@ architecture tb of tb_cnn_accel_pe_array_from_vectors is
     end if;
     return '0';
   end function;
-
-  ------------------------------------------------------------------------
-  -- Vector-file reader: one signed decimal integer per line, no header --
-  -- exactly generate_vectors.py's own '_write_int_lines' format (see
-  -- doc/cnn_accel_test_vectors.md).
-  ------------------------------------------------------------------------
-
-  procedure read_int_file(file_name : string; data : out flat_int_arr_t) is
-    file f : text;
-    variable l : line;
-    variable v : integer;
-    variable status : file_open_status;
-  begin
-    file_open(status, f, file_name, read_mode);
-    assert status = open_ok
-      report "tb_cnn_accel_pe_array_from_vectors: could not open '" & file_name & "'"
-      severity failure;
-    for i in data'range loop
-      assert not endfile(f)
-        report "tb_cnn_accel_pe_array_from_vectors: unexpected EOF in '" & file_name & "'"
-        severity failure;
-      readline(f, l);
-      read(l, v);
-      data(i) := v;
-    end loop;
-    file_close(f);
-  end procedure;
 
   -- Packs one weight row (c_weight_lanes int8 lanes) into 'weight_rd_data's
   -- own bit layout (lane l at bits 8*(l+1)-1 downto 8*l) -- same layout as
@@ -253,9 +210,10 @@ begin
 
   ------------------------------------------------------------------------
   main : process
-    variable weights_flat : flat_int_arr_t(0 to c_num_weight_values - 1);
-    variable input_flat : flat_int_arr_t(0 to c_num_input_values - 1);
-    variable accum_flat : flat_int_arr_t(0 to c_num_accum_values - 1);
+    variable weights_flat : integer_array_t;
+    variable input_flat : integer_array_t;
+    variable accum_flat : integer_array_t;
+    variable discard : integer;
 
     variable window : window_row_t;
     variable expected : accum_int_arr_t;
@@ -271,16 +229,19 @@ begin
     test_runner_setup(runner, runner_cfg);
 
     -- Load this run's whole fixed input from the checked-in vector case
-    -- (generate_vectors.py's pe_array_xlang_check) once, before any
-    -- stimulus -- mirrors tb_cnn_accel_pe_array.vhd's own
+    -- (generate_vectors.py's pe_array_xlang_check, fetched live over
+    -- VUnit's Python FFI -- see this file's header comment) once, before
+    -- any stimulus -- mirrors tb_cnn_accel_pe_array.vhd's own
     -- randomize_weight_mem-before-any-beat idiom.
-    read_int_file(vectors_path & "/weights_packed.txt", weights_flat);
-    read_int_file(vectors_path & "/input.txt", input_flat);
-    read_int_file(vectors_path & "/pe_array_raw_accum.txt", accum_flat);
+    python_execute(file_name => tb_path(runner_cfg) & "python_bridge/conv_core_bridge.py");
+    discard := python_call("select_pe_array_case", arg => c_pe_rows);
+    weights_flat := python_call("get_weights_packed_flat");
+    input_flat := python_call("get_input_flat");
+    accum_flat := python_call("get_raw_accum_flat");
 
     for row in 0 to c_num_tiles - 1 loop
       for lane in 0 to c_weight_lanes - 1 loop
-        weight_mem_s(row)(lane) <= weights_flat(row * c_weight_lanes + lane);
+        weight_mem_s(row)(lane) <= get(weights_flat, row * c_weight_lanes + lane);
       end loop;
     end loop;
 
@@ -299,7 +260,7 @@ begin
           -- covered by tb_cnn_accel_window_gen.vhd).
           for c in 0 to c_tile_channels - 1 loop
             if tile * c_tile_channels + c < c_in_c then
-              window(c) := input_flat(pixel * c_in_c + tile * c_tile_channels + c);
+              window(c) := get(input_flat, pixel * c_in_c + tile * c_tile_channels + c);
             else
               window(c) := 0;
             end if;
@@ -317,7 +278,7 @@ begin
         end loop;
 
         for r in 0 to c_pe_rows - 1 loop
-          expected(r) := accum_flat(pixel * c_pe_rows + r);
+          expected(r) := get(accum_flat, pixel * c_pe_rows + r);
         end loop;
 
         wait until rising_edge(clk) and m_accum_m2s.valid = '1' and m_accum_s2m.ready = '1';

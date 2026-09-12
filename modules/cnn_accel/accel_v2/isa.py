@@ -83,6 +83,12 @@ ERR_BAD_RESERVED = 0x6
 ERR_BAD_GEOMETRY = 0x7
 ERR_AXI = 0x8
 ERR_TIMEOUT = 0x9
+# ISA v2.3: CTRL.START written while BUSY=1 and a job is already queued
+# (section 8's one-deep INPUT_ADDR/OUTPUT_ADDR queue). Raised by
+# cnn_accel_csr, not cnn_accel_cmd_proc -- every other ERR_CODE above
+# names a bad *program*; this one names a bad *host write*, and the
+# job already running is completely unaffected by it.
+ERR_QUEUE_FULL = 0xA
 
 # ---------------------------------------------------------------------------
 # Byte offsets for the 64-byte word (section 5.1), all derived from
@@ -179,12 +185,27 @@ class DescV2:
     # DEPTH_TO_SPACE reads this field. v1 hardware validates `r == 2`
     # only, per `cnn_accel_cmd_proc`.
     dts_factor: int = 0
-    # The `reserved, must be 0` gaps (W0 byte 3, W10 byte 43). A
-    # well-formed program always leaves these zero, and they are exposed
-    # here for exactly one purpose: letting the error-case tests emit a
-    # deliberately malformed program to prove the hardware raises
-    # ERR_BAD_RESERVED instead of executing it. Do not use them to smuggle
-    # data -- `cnn_accel_cmd_proc` rejects any descriptor with either set.
+    # ISA v2.3, W0 byte 3 bits [1:0]: relocate this descriptor's
+    # `in_addr`/`out_addr` by the CSR's latched INPUT_ADDR/OUTPUT_ADDR
+    # (section 6a) when its space is `SPACE_DDR` -- the mechanism behind
+    # the streaming-inference interface (compile the network once, drive
+    # per-frame buffer addresses through two registers instead of
+    # recompiling the descriptor chain). `False` on every field of every
+    # program before v2.3 (the bits were part of `reserved_w0`, always
+    # zero), so relocating nothing reproduces every existing program's
+    # addresses exactly.
+    reloc_input: bool = False
+    reloc_output: bool = False
+    # The `reserved, must be 0` gap remaining after `reloc_input`/
+    # `reloc_output` claimed W0 byte 3 bits [1:0] (W10 byte 43 is
+    # untouched). This is the value of bits [7:2] of that byte, NOT the
+    # raw byte -- `encode_desc`/`decode_desc` shift it so the two concepts
+    # never share a bit position. A well-formed program always leaves it
+    # zero, and it is exposed here for exactly one purpose: letting the
+    # error-case tests emit a deliberately malformed program to prove the
+    # hardware raises ERR_BAD_RESERVED instead of executing it. Do not use
+    # it to smuggle data -- `cnn_accel_cmd_proc` rejects any descriptor
+    # with either reserved gap set.
     reserved_w0: int = 0
     reserved_w10: int = 0
 
@@ -235,7 +256,9 @@ def encode_desc(d: DescV2) -> bytes:
         | ((d.space_dst & _SPACE_MASK) << _SPACE_DST_SHIFT)
         | ((d.space_wgt & _SPACE_MASK) << _SPACE_WGT_SHIFT)
     )
-    buf[_OFF_RESERVED_W0] = d.reserved_w0 & 0xFF
+    buf[_OFF_RESERVED_W0] = (
+        ((d.reserved_w0 & 0x3F) << 2) | (int(d.reloc_input) << 0) | (int(d.reloc_output) << 1)
+    )
     struct.pack_into("<I", buf, _OFF_IN_ADDR, d.in_addr & 0xFFFFFFFF)
     struct.pack_into("<I", buf, _OFF_OUT_ADDR, d.out_addr & 0xFFFFFFFF)
     struct.pack_into("<I", buf, _OFF_WEIGHT_ADDR, d.weight_addr & 0xFFFFFFFF)
@@ -303,7 +326,9 @@ def decode_desc(data: bytes) -> DescV2:
         pad_right=data[_OFF_PAD_RIGHT],
         requant_scale=struct.unpack_from("<i", data, _OFF_REQUANT_SCALE)[0],
         requant_shift=data[_OFF_REQUANT_SHIFT],
-        reserved_w0=data[_OFF_RESERVED_W0],
+        reloc_input=bool(data[_OFF_RESERVED_W0] & 0x1),
+        reloc_output=bool(data[_OFF_RESERVED_W0] & 0x2),
+        reserved_w0=(data[_OFF_RESERVED_W0] >> 2) & 0x3F,
         reserved_w10=int.from_bytes(
             data[_OFF_RESERVED_W10 : _OFF_RESERVED_W10 + _LEN_RESERVED_W10],
             "little",
@@ -343,6 +368,7 @@ __all__ = [
     "ERR_BAD_GEOMETRY",
     "ERR_AXI",
     "ERR_TIMEOUT",
+    "ERR_QUEUE_FULL",
     "DescV2",
     "encode_desc",
     "decode_desc",

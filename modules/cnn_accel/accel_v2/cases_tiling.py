@@ -147,24 +147,12 @@ def _set_timeout(case: TbCase) -> None:
 
 
 def _with_extra_check(case: TbCase, extra) -> TbCase:
-    """Run `extra(case)` (raising `CheckFailure` on disagreement) in
-    addition to the standard `post_check`.
-
-    Bound to the instance rather than subclassing `TbCase`, exactly as
-    `cases_yolo.py` and `cases_concat_split.py` do it: VUnit only ever
-    calls `case.post_check`, and this keeps every case here a plain
-    `case_from_model` result."""
-    base = case.post_check
-
-    def post_check(output_path: str) -> bool:
-        try:
-            extra(case)
-        except (CheckFailure, GeometryError) as exc:
-            print(f"\npost_check FAILED for case '{case.name}':\n{exc}\n")
-            return False
-        return base(output_path)
-
-    case.post_check = post_check
+    """Run `extra(case)` (raising `CheckFailure`/`GeometryError` on
+    disagreement) in addition to `TbCase.check_live`'s standard checks,
+    exactly as `cases_yolo.py` and `cases_concat_split.py` do it: set as
+    the case's `extra_check`, which `check_live` runs first (and knows
+    to catch `GeometryError` alongside `CheckFailure`)."""
+    case.extra_check = extra
     return case
 
 

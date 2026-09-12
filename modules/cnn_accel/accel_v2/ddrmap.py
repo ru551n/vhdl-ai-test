@@ -142,5 +142,16 @@ class DdrMap:
         self._next[region] = end
         return cursor
 
+    def region_bounds(self, region: int) -> tuple[int, int]:
+        """`(base_addr, limit_addr_exclusive)` for `region` -- the fixed
+        address range `alloc(region, ...)` can ever return into,
+        regardless of how much of it is actually used. For callers that
+        need to address a whole region rather than one allocation (e.g.
+        splitting `INPUTS` out of a `MemoryImage` for live FFI seeding)."""
+        if region not in self._next:
+            name = self._REGION_NAMES.get(region, f"0x{region:08x}")
+            raise ValueError(f"{name} is not an allocatable DDR region")
+        return self._base[region], self._region_limit(region)
+
 
 __all__ = ["DdrMap"]
