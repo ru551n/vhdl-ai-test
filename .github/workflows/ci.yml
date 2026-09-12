@@ -167,7 +167,10 @@ jobs:
       - name: Run VUnit regression
         env:
           VUNIT_SIMULATOR: ${{ matrix.simulator }}
-        run: /opt/venv/bin/python run.py --num-threads 4 ${{ matrix.patterns }}
+        # Quoted: unquoted, the shell globbed the matrix's `*` into the names
+        # of the files in the checkout, VUnit matched none of them, and both
+        # simulate jobs passed with "No tests were run!".
+        run: /opt/venv/bin/python run.py --num-threads 4 "${{ matrix.patterns }}"
 
   synthesize:
     name: Synthesize (Yosys + GHDL, Artix-7)
