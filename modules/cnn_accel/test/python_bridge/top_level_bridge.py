@@ -153,6 +153,7 @@ def check_result(
     axi_aw_count,
     axi_wr_lo_addr,
     axi_wr_hi_addr,
+    busy_after_done=False,
 ):
     """Called from tb_cnn_accel_top's main process right after
     STATUS.DONE/STATUS.ERROR. `export_bytes` is the raw exported DDR
@@ -160,7 +161,10 @@ def check_result(
     read straight out of the simulator's `memory_t` model via
     `read_word`. Every other argument is one counter register/passive-
     monitor value, read straight out of the DUT/testbench -- the exact
-    same set `TbCase.check_live` expects.
+    same set `TbCase.check_live` expects. `busy_after_done` (default
+    False, so tb_cnn_accel_top's own calls -- which never pass it -- are
+    unaffected) is passed straight through to `TbCase.check_live`, for
+    tb_cnn_accel_streaming's queued-pair case.
 
     Raises on failure (via `TbCase.check_live`) rather than returning a
     pass/fail bool: `python_call` already reports an uncaught exception
@@ -195,5 +199,7 @@ def check_result(
         "axi_wr_lo_addr": int(axi_wr_lo_addr),
         "axi_wr_hi_addr": int(axi_wr_hi_addr),
     }
-    _CASE.check_live(counters, int(export_base), [int(b) for b in export_bytes])
+    _CASE.check_live(
+        counters, int(export_base), [int(b) for b in export_bytes], bool(busy_after_done)
+    )
     return 0

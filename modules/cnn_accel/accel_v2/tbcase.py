@@ -275,7 +275,13 @@ class TbCase:
 
     # -- checking ---------------------------------------------------------
 
-    def check_live(self, counters: dict[str, int], export_base: int, export_bytes: list[int]) -> None:
+    def check_live(
+        self,
+        counters: dict[str, int],
+        export_base: int,
+        export_bytes: list[int],
+        busy_after_done: bool = False,
+    ) -> None:
         """Verify the run: called from `top_level_bridge.check_result`
         (test/python_bridge/top_level_bridge.py) via a `python_call`,
         right after `STATUS.DONE`/`STATUS.ERROR` fires inside the running
@@ -284,6 +290,13 @@ class TbCase:
         region as plain Python ints (0..255, unsigned byte values -- the
         same convention `MemoryImage.write_bytes` expects), starting at
         `export_base`.
+
+        `busy_after_done`: ISA v2.3's one-deep job queue (spec section
+        6a) auto-dispatches a queued job in the SAME cycle the running
+        one's DONE asserts, so BUSY correctly never reads 0 in between --
+        there is no idle gap, which is the entire point. Every ordinary
+        (non-streaming) config leaves this False, preserving the check
+        that a stuck BUSY bit is always a real DUT bug there.
 
         Raises `CheckFailure`/`GeometryError` on the first disagreement,
         deliberately uncaught: `python_call` already turns an uncaught
@@ -298,7 +311,7 @@ class TbCase:
         # testbench regardless of how the program ends, so check them
         # unconditionally too, before branching on expect_error.
         self._check_hw_info(counters)
-        self._check_status(counters)
+        self._check_status(counters, busy_after_done=busy_after_done)
         if self.expect_error:
             # A rejected program has no meaningful output tensors and no
             # meaningful traffic prediction: the whole point is that the
@@ -309,7 +322,15 @@ class TbCase:
         else:
             exported = MemoryImage()
             exported.write_bytes(export_base, bytes(export_bytes))
-            self._check_outputs_against(exported, "<live python_call, no file>")
+            # ISA v2.3's OUTPUT_ADDR relocation (spec section 6a) moves
+            # where the DUT actually writes a graph output, but
+            # `self.planned.tensor_ddr_addr` is fixed at compile time to
+            # the UNRELOCATED address -- `reloc_delta` is how far the
+            # live run's actual export window sits from that compiled
+            # one, and is 0 (a no-op) for every case that never
+            # relocates, which is every existing config.
+            reloc_delta = export_base - self.export_base
+            self._check_outputs_against(exported, "<live python_call, no file>", reloc_delta)
             self._check_traffic(counters)
 
     def _check_hw_info(self, counters: dict[str, int]) -> None:
@@ -391,7 +412,7 @@ class TbCase:
                 f"max_row_tile_words={expected_max_row_tile_words}"
             )
 
-    def _check_status(self, counters: dict[str, int]) -> None:
+    def _check_status(self, counters: dict[str, int], busy_after_done: bool = False) -> None:
         if self.expect_error:
             if counters["error"] != 1:
                 raise CheckFailure(
@@ -426,7 +447,7 @@ class TbCase:
             )
         if counters["done"] != 1:
             raise CheckFailure(f"program did not reach DONE (status=0x{counters['status']:08x})")
-        if counters["busy"] != 0:
+        if counters["busy"] != 0 and not busy_after_done:
             raise CheckFailure(f"STATUS.BUSY still set after DONE (status=0x{counters['status']:08x})")
 
         # One descriptor retired per planned step, plus the closing HALT
@@ -442,23 +463,30 @@ class TbCase:
                 f"+ HALT)\n{self._program_listing()}"
             )
 
-    def _check_outputs_against(self, exported: "MemoryImage", source_description: str) -> None:
+    def _check_outputs_against(
+        self, exported: "MemoryImage", source_description: str, reloc_delta: int = 0
+    ) -> None:
         """Compare every graph output tensor in `exported` (built by
         `check_live` from the bytes a `python_call` handed over) against
-        `self.expected`."""
+        `self.expected`. `reloc_delta` shifts the compiled output
+        address by however far OUTPUT_ADDR relocation (spec section 6a)
+        moved the live run's actual export window; 0 for every
+        non-relocating case."""
         if self.export_bytes == 0:
             raise CheckFailure(
                 "case exports no bytes, so no output can be verified -- "
                 "either mark a graph output or set expect_error"
             )
 
+        window_base = self.export_base + reloc_delta
+        window_end = window_base + self.export_bytes
         for tensor in self.model.outputs:
-            addr = self.planned.tensor_ddr_addr[tensor.name]
-            if addr < self.export_base or addr + tensor.size_bytes > self.export_base + self.export_bytes:
+            addr = self.planned.tensor_ddr_addr[tensor.name] + reloc_delta
+            if addr < window_base or addr + tensor.size_bytes > window_end:
                 raise CheckFailure(
                     f"output '{tensor.name}' at 0x{addr:08x}+{tensor.size_bytes} lies outside "
-                    f"the exported window [0x{self.export_base:08x}, "
-                    f"0x{self.export_base + self.export_bytes:08x}) -- harness bug, not a DUT bug"
+                    f"the exported window [0x{window_base:08x}, "
+                    f"0x{window_end:08x}) -- harness bug, not a DUT bug"
                 )
             raw = exported.read_bytes(addr, tensor.size_bytes)
             actual = golden.unpack_activation_planes(

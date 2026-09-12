@@ -2934,6 +2934,10 @@ class Module(BaseModule):
         self._setup_cnn_accel_top(library)
         self._setup_cnn_accel_elementwise_pyffi_pilot(library)
         library.test_bench("tb_python_ffi_throughput_pilot")
+        # ISA v2.3 streaming-inference interface (INPUT_ADDR/OUTPUT_ADDR
+        # relocation + the one-deep job queue): the only testbench that
+        # actually exercises either -- see the entity header.
+        library.test_bench("tb_cnn_accel_streaming")
 
     def _setup_cnn_accel_elementwise_pyffi_pilot(self, library) -> None:
         # PILOT ONLY (branch feat/vunit-python-ffi-pilot): needs the

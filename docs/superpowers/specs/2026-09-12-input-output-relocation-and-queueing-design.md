@@ -132,17 +132,45 @@ operand would not be relocatable — no catalogue case does this today.
 - Two new input ports, `input_addr`/`output_addr` (`std_ulogic_vector
   (31 downto 0)`), fed from `cnn_accel_csr`'s latched "in-use"
   registers.
-- Compute `effective_in_addr_q <= desc_q.in_addr + (input_addr when
-  reloc_input_q else (others => '0'));` and the output equivalent,
-  once, at the same resolve point. Every consume site that currently
-  reads `desc_q.in_addr`/`desc_q.out_addr` directly (identified: lines
-  1724, 1792, 1819, 1970, 1973, 2469, 2473 in the current file — tiling
-  offsets like `out_pass_off_q`/`in_pass_off_q` still add on top of the
-  *effective*, already-relocated base) switches to the new registered
-  signal instead.
+- Compute `effective_in_addr <= desc_q.in_addr + unsigned(input_addr)
+  when desc_q.reloc_input = '1' else desc_q.in_addr;` and the output
+  equivalent as **combinational** signals (not registered, despite the
+  file's usual `_q` convention) at the same resolve point. This was a
+  deliberate deviation found during implementation: alignment/DDR-range
+  validation of `in_addr`/`out_addr` runs *before* the "resolve once"
+  block, in the same cycle `desc_q` is latched, so a registered
+  `effective_*_addr` would still be one cycle stale when that
+  validation reads it — the combinational version is what makes the
+  validation see the real, relocated address. Every consume site that
+  read `desc_q.in_addr`/`desc_q.out_addr` directly (alignment checks,
+  range-end checks, request addresses, feed addresses, elementwise
+  addresses — a dozen-odd sites across the file; tiling offsets like
+  `out_pass_off_q`/`in_pass_off_q` still add on top of the *effective*,
+  already-relocated base) switches to the new signal instead.
 - `ERR_BAD_RESERVED` check (`cmd_proc.vhd:1069`) becomes
   `desc_q.reserved_w0(7 downto 2) /= "000000"` instead of comparing the
   whole byte to `x"00"`.
+- **Performance counter snapshot (discovered during implementation, not
+  in the original design pass).** Every run-scoped counter (`CMD_COUNT`,
+  `CYCLE_COUNT`, `COMPUTE_CYCLES`, `STALL_CYCLES`, `DDR_RD_BYTES`,
+  `DDR_WR_BYTES`, `TENSOR_LOAD_COUNT`, `TENSOR_STORE_COUNT`,
+  `WEIGHT_LOAD_BYTES`, `LOCAL_RD_KIB`, `LOCAL_WR_KIB`) is cleared at
+  `START` and free-runs until the next one — a pre-existing contract
+  that assumed a host always reads a completed run's counters before
+  issuing the next `START`. Auto-dispatch breaks that assumption: the
+  queued job's `START` fires within a cycle or two of the completed
+  job's own `DONE`, well before a host polling loop can read anything.
+  Fixed by adding a second bank of `*_snap_q` registers per counter,
+  latched once on `seq_done`/`seq_error` (before that `START` can touch
+  the live ones) and held until the *next* completion — the CSR-facing
+  `counters` record now reads the snapshot bank, not the live one.
+  Four of the eleven counters (`CMD_COUNT`, `TENSOR_LOAD_COUNT`,
+  `TENSOR_STORE_COUNT`, `WEIGHT_LOAD_BYTES`) were previously exempt from
+  the `START` clear entirely (a lifetime-cumulative design with no
+  currently-known consumer relying on that); this pass unifies all
+  eleven onto the same per-run-then-snapshotted model, since nothing in
+  the existing 85-case regression depends on cross-run accumulation and
+  a uniform model is far less surprising.
 
 ### `cnn_accel_csr.vhd`
 
@@ -196,14 +224,19 @@ today).
   redefined `reserved_w0`; `emit_program`'s new post-pass, on a small
   synthetic tiled+aliased case, asserting exactly the expected
   descriptors get tagged.
-- New VUnit-level coverage (`tb_cnn_accel_top` or a small dedicated
-  testbench): one case driving a real two-job queued sequence (write
-  `INPUT_ADDR`/`OUTPUT_ADDR` + `START` for frame A, immediately write a
-  second `INPUT_ADDR`/`OUTPUT_ADDR` + `START` for frame B while busy,
-  observe `STATUS.QUEUED`, wait for frame A's `DONE`+result, wait for
-  frame B's auto-dispatched `DONE`+result); one negative case attempting
-  a third `START` while a job is already queued, expecting
-  `ERR_QUEUE_FULL` without disturbing the running job.
+- New VUnit-level coverage: a dedicated testbench,
+  `test/tb_cnn_accel_streaming.vhd`, since `tb_cnn_accel_top`'s
+  one-job-per-config model has no way to express a queued pair.
+  `relocated_and_queued_pair` starts job A at the compiled (unrelocated)
+  addresses, queues job B behind it with `INPUT_ADDR`/`OUTPUT_ADDR` set
+  to a relocated pair while job A is still `BUSY`, then checks job A's
+  `DONE`+result (with `STATUS.BUSY` still set — auto-dispatch's whole
+  point is no gap) and job B's auto-dispatched `DONE`+result at the
+  relocated addresses. `queue_full_rejected` additionally attempts a
+  third `START` while the queue is already full, expecting
+  `ERR_QUEUE_FULL` without disturbing either the running job A or the
+  already-queued job B, then lets both run to completion to prove
+  neither was corrupted by the rejected write.
 
 ## 9. Explicitly out of scope for this pass
 

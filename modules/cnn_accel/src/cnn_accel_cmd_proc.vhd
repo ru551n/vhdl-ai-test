@@ -869,6 +869,32 @@ architecture a of cnn_accel_cmd_proc is
   signal cnt_local_rd_q : unsigned(41 downto 0) := (others => '0');
   signal cnt_local_wr_q : unsigned(41 downto 0) := (others => '0');
 
+  -- Latched copies of the run-scoped counters above (both the ones
+  -- reset at every START, and 'cnt_cmd_q'/'cnt_load_q'/'cnt_store_q'/
+  -- 'cnt_wgt_bytes_q', which run free across the device's whole
+  -- lifetime and are never reset by START at all), captured the cycle
+  -- a run finishes (seq_done/seq_error) and held until the next one
+  -- finishes. The CSR-facing 'counters' port reads these, not the live
+  -- cnt_*_q signals directly: when auto-dispatch launches the next run
+  -- immediately on completion, a host reading several registers over
+  -- AXI4-Lite (each its own multi-cycle transaction) can straddle into
+  -- that next run's own progress -- the live free-running counters
+  -- would already be moving by the time the read completes, and the
+  -- ones reset at START would already have been cleared. The snapshot
+  -- is immune to both: it is written once, atomically, on the same
+  -- cycle busy_q drops, and does not move again until the next done.
+  signal cnt_cmd_snap_q : unsigned(31 downto 0) := (others => '0');
+  signal cnt_cycle_snap_q : unsigned(31 downto 0) := (others => '0');
+  signal cnt_compute_snap_q : unsigned(31 downto 0) := (others => '0');
+  signal cnt_stall_snap_q : unsigned(31 downto 0) := (others => '0');
+  signal cnt_ddr_rd_snap_q : unsigned(31 downto 0) := (others => '0');
+  signal cnt_ddr_wr_snap_q : unsigned(31 downto 0) := (others => '0');
+  signal cnt_load_snap_q : unsigned(31 downto 0) := (others => '0');
+  signal cnt_store_snap_q : unsigned(31 downto 0) := (others => '0');
+  signal cnt_wgt_bytes_snap_q : unsigned(31 downto 0) := (others => '0');
+  signal cnt_local_rd_snap_q : unsigned(41 downto 0) := (others => '0');
+  signal cnt_local_wr_snap_q : unsigned(41 downto 0) := (others => '0');
+
   ------------------------------------------------------------------------
   -- Helper functions. All pure decode/arithmetic on descriptor fields.
   ------------------------------------------------------------------------
@@ -1955,6 +1981,18 @@ begin
         ew_start <= '0';
         conv_fill_start <= '0';
       end if;
+
+      -- Cleared at START, alongside the sibling per-run counters the
+      -- 'counting' process below resets the same way -- these four
+      -- happen to be driven from this process instead, since they're
+      -- byproducts of retirement/weight-fetch logic already living
+      -- here, not of anything 'counting' itself tracks.
+      if start = '1' or reset = '1' then
+        cnt_cmd_q <= (others => '0');
+        cnt_load_q <= (others => '0');
+        cnt_store_q <= (others => '0');
+        cnt_wgt_bytes_q <= (others => '0');
+      end if;
     end if;
   end process;
 
@@ -2557,7 +2595,10 @@ begin
       end if;
 
       -- Cleared at START, not at reset, so a host can read the previous
-      -- run's counters right up until it launches the next one.
+      -- run's counters right up until it launches the next one (the
+      -- snapshot below is what actually makes that true once auto-
+      -- dispatch removes the gap between "previous run's done" and
+      -- "next run's start").
       if start = '1' or reset = '1' then
         cnt_cycle_q <= (others => '0');
         cnt_compute_q <= (others => '0');
@@ -2567,20 +2608,50 @@ begin
         cnt_local_rd_q <= (others => '0');
         cnt_local_wr_q <= (others => '0');
       end if;
+
+      -- Snapshot the just-finished run's totals before the START above
+      -- (an auto-dispatched next job, possibly in this very cycle's
+      -- neighborhood) can clear them.
+      if seq_done = '1' or seq_error = '1' then
+        cnt_cmd_snap_q <= cnt_cmd_q;
+        cnt_cycle_snap_q <= cnt_cycle_q;
+        cnt_compute_snap_q <= cnt_compute_q;
+        cnt_stall_snap_q <= cnt_stall_q;
+        cnt_ddr_rd_snap_q <= cnt_ddr_rd_q;
+        cnt_ddr_wr_snap_q <= cnt_ddr_wr_q;
+        cnt_load_snap_q <= cnt_load_q;
+        cnt_store_snap_q <= cnt_store_q;
+        cnt_wgt_bytes_snap_q <= cnt_wgt_bytes_q;
+        cnt_local_rd_snap_q <= cnt_local_rd_q;
+        cnt_local_wr_snap_q <= cnt_local_wr_q;
+      end if;
+      if reset = '1' then
+        cnt_cmd_snap_q <= (others => '0');
+        cnt_cycle_snap_q <= (others => '0');
+        cnt_compute_snap_q <= (others => '0');
+        cnt_stall_snap_q <= (others => '0');
+        cnt_ddr_rd_snap_q <= (others => '0');
+        cnt_ddr_wr_snap_q <= (others => '0');
+        cnt_load_snap_q <= (others => '0');
+        cnt_store_snap_q <= (others => '0');
+        cnt_wgt_bytes_snap_q <= (others => '0');
+        cnt_local_rd_snap_q <= (others => '0');
+        cnt_local_wr_snap_q <= (others => '0');
+      end if;
     end if;
   end process;
 
-  counters.cmd_count <= std_ulogic_vector(cnt_cmd_q);
-  counters.cycle_count <= std_ulogic_vector(cnt_cycle_q);
-  counters.compute_cycles <= std_ulogic_vector(cnt_compute_q);
-  counters.stall_cycles <= std_ulogic_vector(cnt_stall_q);
-  counters.ddr_rd_bytes <= std_ulogic_vector(cnt_ddr_rd_q);
-  counters.ddr_wr_bytes <= std_ulogic_vector(cnt_ddr_wr_q);
-  counters.tensor_load_count <= std_ulogic_vector(cnt_load_q);
-  counters.tensor_store_count <= std_ulogic_vector(cnt_store_q);
-  counters.weight_load_bytes <= std_ulogic_vector(cnt_wgt_bytes_q);
-  counters.local_rd_kib <= std_ulogic_vector(cnt_local_rd_q(41 downto 10));
-  counters.local_wr_kib <= std_ulogic_vector(cnt_local_wr_q(41 downto 10));
+  counters.cmd_count <= std_ulogic_vector(cnt_cmd_snap_q);
+  counters.cycle_count <= std_ulogic_vector(cnt_cycle_snap_q);
+  counters.compute_cycles <= std_ulogic_vector(cnt_compute_snap_q);
+  counters.stall_cycles <= std_ulogic_vector(cnt_stall_snap_q);
+  counters.ddr_rd_bytes <= std_ulogic_vector(cnt_ddr_rd_snap_q);
+  counters.ddr_wr_bytes <= std_ulogic_vector(cnt_ddr_wr_snap_q);
+  counters.tensor_load_count <= std_ulogic_vector(cnt_load_snap_q);
+  counters.tensor_store_count <= std_ulogic_vector(cnt_store_snap_q);
+  counters.weight_load_bytes <= std_ulogic_vector(cnt_wgt_bytes_snap_q);
+  counters.local_rd_kib <= std_ulogic_vector(cnt_local_rd_snap_q(41 downto 10));
+  counters.local_wr_kib <= std_ulogic_vector(cnt_local_wr_snap_q(41 downto 10));
 
   err_code <= std_ulogic_vector(err_code_q);
   err_pc <= std_ulogic_vector(err_pc_q);
