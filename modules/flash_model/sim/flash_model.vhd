@@ -5,6 +5,7 @@ use ieee.numeric_std.all;
 library vunit_lib;
 context vunit_lib.vunit_context;
 context vunit_lib.com_context;
+context vunit_lib.python_context;
 use vunit_lib.integer_array_pkg.all;
 use vunit_lib.sync_pkg.all;
 use vunit_lib.vc_pkg.all;
@@ -116,43 +117,50 @@ begin
     variable v_reply : msg_t;
     variable v_msg_type : msg_type_t;
     variable v_id : integer;
-    variable v_discard : integer;
     variable v_data : integer_array_t;
     variable v_limits : integer_array_t;
     variable v_limits_ps : integer_vector(0 to c_tl_first_delay - 1);
     variable v_address : natural;
     variable v_num_bytes : natural;
     variable v_value : natural;
+    variable v_text : string_ptr_t;
+    variable v_format : string_ptr_t;
+    variable v_delay : time;
+    variable v_base : natural;
   begin
-    -- The VC loads its own bridge, so a testbench never mentions Python. Cheap
-    -- to repeat across instances: python_execute just re-runs the module, and
-    -- one interpreter serves the whole simulation.
-    python_execute(file_name => g_python_bridge_path);
+    -- The VC starts Python and loads its own bridge, so a testbench never
+    -- mentions Python. python_setup is harmless to repeat -- the interpreter is
+    -- started once per simulation and never restarted -- so several instances,
+    -- or a testbench that uses Python itself, can all call it. exec_file, by
+    -- contrast, re-runs the bridge file on every call, which is why the bridge
+    -- keeps its instance registry in an imported module (flash_model/registry.py).
+    python_setup;
+    exec_file(g_python_bridge_path);
 
     -- Fail at time 0 on layout drift rather than as an inexplicable wrong byte
     -- somewhere in the middle of a test.
     check_equal(
       c_checker,
-      integer'(python_call("layout_version")), c_layout_version,
+      integer'(call("layout_version")), c_layout_version,
       "flash_model: the Python bridge's FFI layout version does not match "
       & "flash_model_pkg's. Regenerate one side from "
       & "doc/flash_model_ffi_contract.md."
     );
 
-    v_id := python_call(
+    v_id := call(
       "flash_create",
-      kwargs => kw("profile", to_string(g_flash.p_profile))
-        & kw("size_bytes", g_flash.p_size_bytes)
-        & kw("page_bytes", g_flash.p_page_bytes)
-        & kw("sector_bytes", g_flash.p_sector_bytes)
-        & kw("block_bytes", g_flash.p_block_bytes)
-        & kw("addr_bytes", g_flash.p_addr_bytes)
-        & kw("jedec_id", g_flash.p_jedec_id)
+      kwarg("profile", to_string(g_flash.p_profile)),
+      kwarg("size_bytes", g_flash.p_size_bytes),
+      kwarg("page_bytes", g_flash.p_page_bytes),
+      kwarg("sector_bytes", g_flash.p_sector_bytes),
+      kwarg("block_bytes", g_flash.p_block_bytes),
+      kwarg("addr_bytes", g_flash.p_addr_bytes),
+      kwarg("jedec_id", g_flash.p_jedec_id)
     );
     set_instance_id(g_flash, v_id);
 
     -- Output delays are VC-side behaviour, so they are cached here once.
-    v_limits := python_call("get_timing_limits", kwargs => kw("id", v_id));
+    v_limits := call_integer_array("get_timing_limits", kwarg("id", v_id));
     check_equal(
       c_checker, length(v_limits), c_tl_count,
       "flash_model: get_timing_limits returned the wrong number of entries"
@@ -181,10 +189,7 @@ begin
       if v_msg_type = flash_preload_msg then
         v_address := pop(v_msg);
         v_data := pop_integer_array_t_ref(v_msg);
-        v_discard := python_call(
-          "preload", arg => v_data,
-          kwargs => kw("id", v_id) & kw("addr", v_address)
-        );
+        call("preload", arg(v_data), kwarg("id", v_id), kwarg("addr", v_address));
         -- The procedure handed us a copy precisely so we could own it.
         deallocate(v_data);
 
@@ -192,26 +197,33 @@ begin
         v_address := pop(v_msg);
         v_num_bytes := pop(v_msg);
         v_value := pop(v_msg);
-        v_discard := python_call(
+        call(
           "preload_fill",
-          kwargs => kw("id", v_id) & kw("addr", v_address)
-            & kw("num_bytes", v_num_bytes) & kw("value", v_value)
+          kwarg("id", v_id), kwarg("addr", v_address),
+          kwarg("num_bytes", v_num_bytes), kwarg("value", v_value)
         );
 
       elsif v_msg_type = flash_load_image_msg then
-        v_discard := python_call(
+        -- Popped into variables in message order before the call: VHDL leaves
+        -- the evaluation order of actual parameters undefined, so popping
+        -- inside the argument list could hand Python the format as the path.
+        v_text := new_string_ptr(pop_string(v_msg));
+        v_format := new_string_ptr(pop_string(v_msg));
+        v_base := pop(v_msg);
+        call(
           "load_image",
-          kwargs => kw("id", v_id) & kw("path", pop_string(v_msg))
-            & kw("fmt", pop_string(v_msg)) & kw("base", integer'(pop(v_msg)))
+          kwarg("id", v_id), kwarg("path", to_string(v_text)),
+          kwarg("fmt", to_string(v_format)), kwarg("base", v_base)
         );
+        deallocate(v_text);
+        deallocate(v_format);
 
       elsif v_msg_type = flash_read_back_msg then
         v_address := pop(v_msg);
         v_num_bytes := pop(v_msg);
-        v_data := python_call(
+        v_data := call_integer_array(
           "read_back",
-          kwargs => kw("id", v_id) & kw("addr", v_address)
-            & kw("num_bytes", v_num_bytes)
+          kwarg("id", v_id), kwarg("addr", v_address), kwarg("num_bytes", v_num_bytes)
         );
         v_reply := new_msg(flash_read_back_reply_msg);
         -- Ownership passes to the caller, who deallocates it.
@@ -223,48 +235,47 @@ begin
         v_data := pop_integer_array_t_ref(v_msg);
         -- No check_true around this: a mismatch raises in Python and arrives as
         -- a VUnit failure carrying the address, both values and a traceback.
-        v_discard := python_call(
-          "check_content", arg => v_data,
-          kwargs => kw("id", v_id) & kw("addr", v_address)
-        );
+        call("check_content", arg(v_data), kwarg("id", v_id), kwarg("addr", v_address));
         deallocate(v_data);
 
       elsif v_msg_type = flash_check_content_fill_msg then
         v_address := pop(v_msg);
         v_num_bytes := pop(v_msg);
         v_value := pop(v_msg);
-        v_discard := python_call(
+        call(
           "check_content_fill",
-          kwargs => kw("id", v_id) & kw("addr", v_address)
-            & kw("num_bytes", v_num_bytes) & kw("value", v_value)
+          kwarg("id", v_id), kwarg("addr", v_address),
+          kwarg("num_bytes", v_num_bytes), kwarg("value", v_value)
         );
 
       elsif v_msg_type = flash_written_regions_msg then
-        v_data := python_call("written_regions", kwargs => kw("id", v_id));
+        v_data := call_integer_array("written_regions", kwarg("id", v_id));
         v_reply := new_msg(flash_written_regions_reply_msg);
         push_integer_array_t_ref(v_reply, v_data);
         reply(net, v_msg, v_reply);
 
       elsif v_msg_type = flash_set_timing_enable_msg then
-        v_discard := python_call(
-          "set_timing_enable",
-          kwargs => kw("id", v_id) & kw("enable", boolean'(pop(v_msg)))
-        );
+        call("set_timing_enable", kwarg("id", v_id), kwarg("enable", boolean'(pop(v_msg))));
 
       elsif v_msg_type = flash_set_timing_msg then
-        v_discard := python_call(
+        -- Popped in message order first, for the same reason as load_image.
+        -- to_seconds rather than `/ 1 ns`, which overflows a 32-bit integer for
+        -- any override longer than about 2.1 s -- a chip erase, for instance.
+        v_text := new_string_ptr(pop_string(v_msg));
+        v_delay := pop_time(v_msg);
+        call(
           "set_timing",
-          kwargs => kw("id", v_id) & kw("name", pop_string(v_msg))
-            & kw("seconds", real(pop_time(v_msg) / 1 ns) * 1.0e-9)
+          kwarg("id", v_id), kwarg("name", to_string(v_text)), kwarg("seconds", to_seconds(v_delay))
         );
+        deallocate(v_text);
 
       elsif v_msg_type = flash_set_protection_msg then
         v_address := pop(v_msg);
         v_num_bytes := pop(v_msg);
-        v_discard := python_call(
+        call(
           "set_protection",
-          kwargs => kw("id", v_id) & kw("addr", v_address)
-            & kw("num_bytes", v_num_bytes) & kw("locked", boolean'(pop(v_msg)))
+          kwarg("id", v_id), kwarg("addr", v_address),
+          kwarg("num_bytes", v_num_bytes), kwarg("locked", boolean'(pop(v_msg)))
         );
 
       elsif v_msg_type = flash_wait_until_ready_msg then
@@ -279,7 +290,7 @@ begin
         reply(net, v_msg, v_reply);
 
       elsif v_msg_type = flash_reset_msg then
-        v_discard := python_call("flash_reset", kwargs => kw("id", v_id));
+        call("flash_reset", kwarg("id", v_id));
         v_reply := new_msg;
         reply(net, v_msg, v_reply);
 
@@ -287,9 +298,7 @@ begin
         v_reply := new_msg(flash_get_stat_reply_msg);
         push(
           v_reply,
-          integer'(python_call(
-            "get_stat", kwargs => kw("id", v_id) & kw("name", pop_string(v_msg))
-          ))
+          integer'(call("get_stat", kwarg("id", v_id), kwarg("name", pop_string(v_msg))))
         );
         reply(net, v_msg, v_reply);
 
@@ -357,14 +366,11 @@ begin
     impure function next_directive(byte_in : integer; pass_now : boolean) return flash_directive_t is
     begin
       if pass_now then
-        return decode_directive(python_call(
-          "xfer",
-          kwargs => kw("id", v_id) & kw("byte_in", byte_in) & kw("now_s", now_seconds)
-        ));
+        return decode_directive(integer'(call(
+          "xfer", kwarg("id", v_id), kwarg("byte_in", byte_in), kwarg("now_s", now_seconds)
+        )));
       end if;
-      return decode_directive(python_call(
-        "xfer", kwargs => kw("id", v_id) & kw("byte_in", byte_in)
-      ));
+      return decode_directive(integer'(call("xfer", kwarg("id", v_id), kwarg("byte_in", byte_in))));
     end function;
 
     procedure release_io is
@@ -386,9 +392,9 @@ begin
       end if;
 
       v_bits_since_byte := 0;
-      v_directive := decode_directive(python_call(
-        "cs_assert", kwargs => kw("id", v_id) & kw("now_s", now_seconds)
-      ));
+      v_directive := decode_directive(integer'(call(
+        "cs_assert", kwarg("id", v_id), kwarg("now_s", now_seconds)
+      )));
 
       -- One iteration per action the model asks for, until it deselects.
       while m2s.cs_n = '0' loop
@@ -459,10 +465,9 @@ begin
       -- Trailing partial byte reporting is not decoration: a real part aborts a
       -- page program or status write whose clock count is not a multiple of 8,
       -- and the model cannot reject a malformed write without knowing this.
-      v_busy_seconds := python_call(
+      v_busy_seconds := call(
         "cs_deassert",
-        kwargs => kw("id", v_id) & kw("trailing_bits", v_bits_since_byte)
-          & kw("now_s", now_seconds)
+        kwarg("id", v_id), kwarg("trailing_bits", v_bits_since_byte), kwarg("now_s", now_seconds)
       );
 
       if v_busy_seconds > 0.0 then

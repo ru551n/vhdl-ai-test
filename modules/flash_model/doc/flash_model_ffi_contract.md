@@ -9,15 +9,21 @@ a change here is a change to both, guarded at run time by `layout_version()`.
 
 ## Call shapes
 
-The VUnit bridge allows **zero or one positional scalar argument** (or any
-number of positional `integer_array_t`), one return value per call. Everything
-else goes through `kw()`. Every function below therefore takes `id` via `kw`.
+The VHDL side uses VUnit's upstream `python_pkg` API: `call(identifier,
+arg(...), kwarg(...), ...)` with up to 10 arguments and one return value per
+call, converted strictly to the VHDL type of the context (`call_integer_array`
+for an `integer_array_t`). Every function below takes its instance `id` as a
+keyword argument, and `integer_array_t` data as its one positional argument.
+
+String arguments reach Python verbatim inside double quotes, so they must not
+contain a quote or a backslash. The profile names, timing names and file paths
+passed here do not.
 
 | function | args | returns |
 |---|---|---|
 | `layout_version()` | — | `int` |
 | `flash_create(...)` | kw: `profile`, `size_bytes`, `page_bytes`, `sector_bytes`, `block_bytes`, `addr_bytes`, `jedec_id` | `int` instance id |
-| `flash_reset(id)` | kw: `id` | `0` |
+| `flash_reset(id)` | kw: `id` | — |
 | `cs_assert(id, now_s)` | kw: `id`, `now_s` | `int` packed directive |
 | `xfer(id, byte_in, now_s)` | kw: `id`, `byte_in`, optional `now_s` | `int` packed directive |
 | `cs_deassert(id, trailing_bits, now_s)` | kw: `id`, `trailing_bits`, `now_s` | `real` busy seconds |
@@ -81,25 +87,25 @@ output.
 
 | function | args | returns |
 |---|---|---|
-| `preload(data, id, addr)` | positional `int32[]` data; kw `id`, `addr` | `0` |
-| `preload_fill(id, addr, num_bytes, value)` | kw | `0` |
-| `load_image(id, path, fmt, base)` | kw | `0` |
+| `preload(data, id, addr)` | positional `int32[]` data; kw `id`, `addr` | — |
+| `preload_fill(id, addr, num_bytes, value)` | kw | — |
+| `load_image(id, path, fmt, base)` | kw | — |
 | `read_back(id, addr, num_bytes)` | kw | `int32[]` |
-| `check_content(expected, id, addr)` | positional `int32[]`; kw `id`, `addr` | `0` |
-| `check_content_fill(id, addr, num_bytes, value)` | kw | `0` |
+| `check_content(expected, id, addr)` | positional `int32[]`; kw `id`, `addr` | — |
+| `check_content_fill(id, addr, num_bytes, value)` | kw | — |
 | `written_regions(id)` | kw | `int32[]` flat `[addr, len, ...]` |
-| `set_timing_enable(id, enable)` | kw | `0` |
-| `set_timing(id, name, seconds)` | kw | `0` |
-| `set_protection(id, addr, num_bytes, locked)` | kw | `0` |
+| `set_timing_enable(id, enable)` | kw | — |
+| `set_timing(id, name, seconds)` | kw | — |
+| `set_protection(id, addr, num_bytes, locked)` | kw | — |
 | `get_stat(id, name)` | kw | `int` |
 
-Every side-effecting call returns `0` because the bridge has no
-"takes arguments, returns nothing" form.
+Side-effecting calls use the procedure form of `call`, which discards whatever
+the function returns.
 
 ## Error policy
 
 Python **raises**; it never returns a status code. The bridge turns an uncaught
-exception into a VUnit FAILURE carrying the full traceback. VHDL never wraps a
-`python_call` in `check_true`. Pin-level timing violations are the exception:
+exception into a failure on the `vunit_lib:python` logger carrying the full
+traceback. VHDL never wraps a `call` in `check_true`. Pin-level timing violations are the exception:
 those are detected in VHDL and reported through the VC's own `checker_t`, so
 negative tests can `mock`/`unmock` the logger.

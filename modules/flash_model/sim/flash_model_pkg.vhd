@@ -170,12 +170,17 @@ package flash_model_pkg is
   impure function get_instance_id(flash : flash_model_t) return integer;
   procedure set_instance_id(flash : flash_model_t; instance_id : natural);
 
-  -- `now` as a real number of seconds, for the model's deadline arithmetic.
+  -- A time as a real number of seconds, for the model's deadline arithmetic and
+  -- for busy-time overrides handed to Python.
   --
-  -- Split into whole seconds plus a nanosecond remainder on purpose: `now / 1 ns`
-  -- alone overflows VHDL's 32-bit integer past about 2.1 s of simulated time,
-  -- which a chip-erase test reaches easily. Resolution is 1 ns, which is ample
-  -- against busy deadlines measured in microseconds and up.
+  -- Split into whole seconds plus a nanosecond remainder on purpose: `value /
+  -- 1 ns` alone overflows VHDL's 32-bit integer past about 2.1 s, which both a
+  -- chip-erase test's simulated time and a chip-erase busy-time override reach
+  -- easily. Resolution is 1 ns, which is ample against busy deadlines measured
+  -- in microseconds and up.
+  function to_seconds(value : time) return real;
+
+  -- `now` in seconds; see to_seconds.
   impure function now_seconds return real;
 
   impure function as_sync(flash : flash_model_t) return sync_handle_t;

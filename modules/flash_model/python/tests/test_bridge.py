@@ -69,10 +69,10 @@ def test_bad_override_name_and_geometry_are_rejected() -> None:
         lambda i: bridge.set_protection(id=i, addr=0, num_bytes=16, locked=1),
     ],
 )
-def test_side_effecting_calls_return_zero(fid: int, call) -> None:
-    # The bridge has no "takes arguments, returns nothing" form, so every
-    # setter returns 0 for a throwaway VHDL variable.
-    assert call(fid) == 0
+def test_side_effecting_calls_return_none(fid: int, call) -> None:
+    # The VHDL side calls these through the procedure form of `call`, which
+    # discards the result, so they return nothing rather than a placeholder.
+    assert call(fid) is None
 
 
 @pytest.mark.parametrize(
@@ -116,13 +116,13 @@ def test_preload_rejects_non_byte_values(fid: int) -> None:
 
 def test_check_content_raises_at_the_first_bad_byte(fid: int) -> None:
     bridge.preload([0xDE, 0xAD], id=fid, addr=0x10)
-    assert bridge.check_content([0xDE, 0xAD], id=fid, addr=0x10) == 0
+    assert bridge.check_content([0xDE, 0xAD], id=fid, addr=0x10) is None
     with pytest.raises(AssertionError, match="0x00000011"):
         bridge.check_content([0xDE, 0xBE], id=fid, addr=0x10)
 
 
 def test_check_content_fill_does_not_build_the_expectation(fid: int) -> None:
-    assert bridge.check_content_fill(id=fid, addr=0, num_bytes=1 << 20, value=0xFF) == 0
+    assert bridge.check_content_fill(id=fid, addr=0, num_bytes=1 << 20, value=0xFF) is None
     bridge.preload([0x00], id=fid, addr=0x8_0000)
     with pytest.raises(AssertionError, match="0x00080000"):
         bridge.check_content_fill(id=fid, addr=0, num_bytes=1 << 20, value=0xFF)
@@ -138,7 +138,7 @@ def test_written_regions_is_a_flat_addr_len_array(fid: int) -> None:
 def test_load_image(fid: int, tmp_path) -> None:
     path = tmp_path / "image.bin"
     path.write_bytes(bytes(range(4)))
-    assert bridge.load_image(id=fid, path=str(path), fmt="bin", base=0x200) == 0
+    assert bridge.load_image(id=fid, path=str(path), fmt="bin", base=0x200) is None
     assert list(bridge.read_back(id=fid, addr=0x200, num_bytes=4)) == [0, 1, 2, 3]
 
 
@@ -158,7 +158,7 @@ def test_flash_reset_keeps_the_array_but_drops_the_mode(fid: int) -> None:
     bridge.preload([0x5A], id=fid, addr=0)
     transaction(fid, [0xB7])  # EN4B
     assert bridge.get_stat(id=fid, name="addr_bytes") == 4
-    assert bridge.flash_reset(id=fid) == 0
+    assert bridge.flash_reset(id=fid) is None
     assert bridge.get_stat(id=fid, name="addr_bytes") == 3
     assert list(bridge.read_back(id=fid, addr=0, num_bytes=1)) == [0x5A]
 

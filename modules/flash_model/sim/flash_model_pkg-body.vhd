@@ -97,11 +97,16 @@ package body flash_model_pkg is
     set(flash.p_state, c_state_instance_id, instance_id);
   end procedure;
 
-  impure function now_seconds return real is
-    constant c_whole_seconds : integer := now / 1 sec;
-    constant c_remainder_ns : integer := (now - c_whole_seconds * 1 sec) / 1 ns;
+  function to_seconds(value : time) return real is
+    constant c_whole_seconds : integer := value / 1 sec;
+    constant c_remainder_ns : integer := (value - c_whole_seconds * 1 sec) / 1 ns;
   begin
     return real(c_whole_seconds) + real(c_remainder_ns) * 1.0e-9;
+  end function;
+
+  impure function now_seconds return real is
+  begin
+    return to_seconds(now);
   end function;
 
   impure function as_sync(flash : flash_model_t) return sync_handle_t is

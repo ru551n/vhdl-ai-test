@@ -1,23 +1,28 @@
 """The only module the VHDL verification component calls.
 
-`sim/flash_model.vhd` loads this file once per test process with
-`python_execute`, then reaches the device model exclusively through the
-functions below. Every function here does three things and nothing else:
-unpack arguments, look up an instance, delegate. All device behaviour lives
-in the `flash_model` package -- if a change ever seems to belong in this
-file, it belongs in `flash_model/device.py` instead.
+`sim/flash_model.vhd` loads this file once per component with `exec_file`,
+then reaches the device model exclusively through the functions below. Every
+function here does three things and nothing else: unpack arguments, look up an
+instance, delegate. All device behaviour lives in the `flash_model` package --
+if a change ever seems to belong in this file, it belongs in
+`flash_model/device.py` instead.
 
-Conventions, from `shared/Vunit.md` section 7 and
-`doc/flash_model_ffi_contract.md`:
+Conventions, from `doc/flash_model_ffi_contract.md` (the VHDL side uses VUnit's
+upstream `python_pkg` API):
 
-* one `python_call` carries at most one positional scalar (or any number of
-  `integer_array_t`) and returns exactly one value, so every function takes
-  its instance `id` through `kw()` and pure side-effecting calls return `0`;
+* the VHDL side calls `call(identifier, arg(...), kwarg(...))`, so every
+  function takes its instance `id` as a keyword argument, and array data as its
+  one positional argument;
+* side-effecting functions return `None`: the VHDL side uses the procedure
+  form of `call`, which discards the result;
 * functions the contract types as `int32[]` return
-  `np.array(..., dtype=np.int32)`, never a Python list;
-* errors are raised, never encoded in a return value. `python_call` turns an
-  uncaught exception into a VUnit FAILURE carrying the full traceback, which
-  localizes a bug far better than a status code the VHDL side has to check.
+  `np.array(..., dtype=np.int32)`, never a Python list. Results are converted
+  strictly on the VHDL side, so an `int` must never come back where the
+  contract says `real`;
+* errors are raised, never encoded in a return value. The bridge turns an
+  uncaught exception into a failure on the `vunit_lib:python` logger carrying
+  the full traceback, which localizes a bug far better than a status code the
+  VHDL side has to check.
 
 The instance handle is spelled `id` throughout, shadowing the builtin,
 because that is the keyword name the contract and the VHDL side use; a
@@ -27,9 +32,9 @@ call.
 Module-level state is per simulator process (one per VUnit test config), so
 nothing leaks between tests. The instance registry deliberately lives in
 `flash_model.registry` rather than here: every VC loads this file with
-`python_execute`, which RE-RUNS it, so a registry defined at this module's
-level would be wiped by the second component's load and both would be handed
-the same id. See that module's docstring.
+`exec_file`, which RE-RUNS it, so a registry defined at this module's level
+would be wiped by the second component's load and both would be handed the
+same id. See that module's docstring.
 """
 
 from __future__ import annotations
@@ -97,11 +102,10 @@ def flash_create(
     return registry.add(FlashDevice(built))
 
 
-def flash_reset(id: int) -> int:
+def flash_reset(id: int) -> None:
     """Power-on reset of the volatile state. The array is untouched -- a
     reset is not an erase."""
     _device(id).reset_state()
-    return 0
 
 
 # -- the wire ----------------------------------------------------------------
@@ -130,33 +134,28 @@ def get_timing_limits(id: int) -> np.ndarray:
 # -- control plane -------------------------------------------------------------
 
 
-def preload(data, id: int, addr: int) -> int:
+def preload(data, id: int, addr: int) -> None:
     _device(id).preload(int(addr), _bytes(data))
-    return 0
 
 
-def preload_fill(id: int, addr: int, num_bytes: int, value: int) -> int:
+def preload_fill(id: int, addr: int, num_bytes: int, value: int) -> None:
     _device(id).preload_fill(int(addr), int(num_bytes), int(value))
-    return 0
 
 
-def load_image(id: int, path: str, fmt: str | None = None, base: int = 0) -> int:
+def load_image(id: int, path: str, fmt: str | None = None, base: int = 0) -> None:
     _device(id).load_image(str(path), fmt, int(base))
-    return 0
 
 
 def read_back(id: int, addr: int, num_bytes: int) -> np.ndarray:
     return _int32(_device(id).read_back(int(addr), int(num_bytes)))
 
 
-def check_content(expected, id: int, addr: int) -> int:
+def check_content(expected, id: int, addr: int) -> None:
     _device(id).check_content(int(addr), _bytes(expected))
-    return 0
 
 
-def check_content_fill(id: int, addr: int, num_bytes: int, value: int) -> int:
+def check_content_fill(id: int, addr: int, num_bytes: int, value: int) -> None:
     _device(id).check_content_fill(int(addr), int(num_bytes), int(value))
-    return 0
 
 
 def written_regions(id: int) -> np.ndarray:
@@ -168,23 +167,20 @@ def written_regions(id: int) -> np.ndarray:
     return _int32(flat)
 
 
-def set_timing_enable(id: int, enable: bool | int) -> int:
+def set_timing_enable(id: int, enable: bool | int) -> None:
     """`enable = 0` collapses every busy time to zero, for the majority of
     tests that care about protocol rather than milliseconds."""
     _device(id).set_timing_enable(bool(enable))
-    return 0
 
 
-def set_timing(id: int, name: str, seconds: float) -> int:
+def set_timing(id: int, name: str, seconds: float) -> None:
     _device(id).set_timing(str(name), float(seconds))
-    return 0
 
 
-def set_protection(id: int, addr: int, num_bytes: int, locked: bool | int) -> int:
+def set_protection(id: int, addr: int, num_bytes: int, locked: bool | int) -> None:
     """Lock or unlock a region. A program or erase touching a locked region
     is silently ignored, exactly as on silicon."""
     _device(id).set_protection(int(addr), int(num_bytes), bool(locked))
-    return 0
 
 
 def get_stat(id: int, name: str) -> int:

@@ -4,8 +4,8 @@ This deliberately does NOT live in `flash_model_bridge.py`, and the reason is
 subtle enough to be worth spelling out.
 
 Every flash_model verification component loads the bridge itself, by calling
-`python_execute` from its own init process, so that a testbench never has to
-know the model is Python. `python_execute` *runs the file's module-level code*
+`exec_file` from its own init process, so that a testbench never has to
+know the model is Python. `exec_file` *runs the file's module-level code*
 — so with two VC instances in one testbench the bridge file is executed twice,
 and a registry defined at the bridge's module level would be reset to empty by
 the second execution. Both components would then be handed id 1 and would
