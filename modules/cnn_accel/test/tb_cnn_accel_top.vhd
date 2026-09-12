@@ -26,6 +26,7 @@ use cnn_accel.cnn_accel_regs_pkg.all;
 use cnn_accel.cnn_accel_register_record_pkg.all;
 use cnn_accel.cnn_accel_register_read_write_pkg.all;
 use cnn_accel.cnn_accel_python_ffi_pkg.all;
+use cnn_accel.cnn_accel_tb_util_pkg.all;
 
 -- VUnit-5 testbench for cnn_accel_top -- the project's ONE AND ONLY
 -- top-level testbench, specified by
@@ -163,18 +164,10 @@ architecture tb of tb_cnn_accel_top is
 
   constant c_stall_probability : real := real(stall_probability_percent) / 100.0;
 
-  -- A response latency only makes sense together with stalling: with
-  -- 'stall_probability_percent' = 0 the BFM must be as fast as it can be,
-  -- so that the cheap no-stall configs stay cheap.
-  function response_latency return time is
-  begin
-    if stall_probability_percent = 0 then
-      return 0 ns;
-    end if;
-    return 3 * c_clk_period;
-  end function;
-
-  constant c_max_response_latency : time := response_latency;
+  -- See cnn_accel_tb_util_pkg.axi_response_latency: a response latency
+  -- only makes sense together with stalling.
+  constant c_max_response_latency : time :=
+    axi_response_latency(stall_probability_percent, c_clk_period);
 
   constant c_axi_read_slave : axi_slave_t := new_axi_slave(
     memory => memory,
@@ -204,55 +197,6 @@ architecture tb of tb_cnn_accel_top is
   -- signed 'integer'.
   signal axi_wr_lo_addr : u_unsigned(31 downto 0) := (others => '0');
   signal axi_wr_hi_addr : u_unsigned(31 downto 0) := (others => '0');
-
-  ------------------------------------------------------------------------
-  -- Number-to-string helpers for diagnostic messages ('describe_status'
-  -- below). Not used for anything read or written by the testbench --
-  -- every value that used to round-trip through a CSV file now travels
-  -- over 'python_call' instead.
-  ------------------------------------------------------------------------
-
-  -- Decimal rendering of an unsigned of any width. Deliberately not
-  -- 'to_string(to_integer(...))': every counter register is a full
-  -- 32-bit unsigned and values at or above 2**31 do not fit VHDL's
-  -- signed 'integer'. Long division by 10 has no such limit.
-  function to_dec(value : u_unsigned) return string is
-    variable rest : u_unsigned(value'length - 1 downto 0) := value;
-    -- 'value'length' decimal digits is always enough: 2**n - 1 has at
-    -- most ceil(n * log10(2)) + 1 <= n digits for every n >= 1.
-    variable digits : string(1 to value'length) := (others => '0');
-    variable idx : natural := value'length;
-  begin
-    if rest = 0 then
-      return "0";
-    end if;
-    while rest /= 0 loop
-      digits(idx) := character'val(character'pos('0') + to_integer(rest mod 10));
-      idx := idx - 1;
-      rest := rest / 10;
-    end loop;
-    return digits(idx + 1 to digits'high);
-  end function;
-
-  function to_dec(value : std_ulogic) return string is
-  begin
-    if value = '1' then
-      return "1";
-    end if;
-    return "0";
-  end function;
-
-  -- Lower case, zero padded, exactly 'num_digits' hex digits.
-  function to_hex(value : u_unsigned; num_digits : positive) return string is
-    constant c_nibbles : string(1 to 16) := "0123456789abcdef";
-    constant padded : u_unsigned(4 * num_digits - 1 downto 0) := resize(value, 4 * num_digits);
-    variable result : string(1 to num_digits);
-  begin
-    for i in 0 to num_digits - 1 loop
-      result(num_digits - i) := c_nibbles(to_integer(padded(4 * i + 3 downto 4 * i)) + 1);
-    end loop;
-    return result;
-  end function;
 
 begin
 
@@ -314,19 +258,6 @@ begin
 
     variable start_time : time;
     variable elapsed_cycles : natural := 0;
-
-    -- Renders the last STATUS read both raw and field-by-field. Used by
-    -- the timeout and the unexpected-error messages, which both have to
-    -- be diagnosable straight from the log.
-    impure function describe_status return string is
-    begin
-      return "STATUS=0x" & to_hex(u_unsigned(status_slv), 8)
-        & " (busy=" & to_string(status.busy)
-        & ", done=" & to_string(status.done)
-        & ", error=" & to_string(status.error)
-        & ", err_code=" & to_dec(status.err_code)
-        & ", err_pc_low=" & to_dec(status.err_pc_low) & ")";
-    end function;
 
   begin
     test_runner_setup(runner, runner_cfg);
@@ -448,7 +379,7 @@ begin
         if elapsed_cycles > g_timeout_cycles then
           check_failed(
             "tb_cnn_accel_top: neither DONE nor ERROR arrived within g_timeout_cycles = "
-            & to_string(g_timeout_cycles) & " cycles after CTRL.START. Last " & describe_status
+            & to_string(g_timeout_cycles) & " cycles after CTRL.START. Last " & describe_status(status_slv, status)
             & ". The DUT is contractually required never to hang (arch doc section 9), so this"
             & " is a DUT bug rather than a test-tuning problem."
           );
@@ -535,13 +466,13 @@ begin
         check_equal(
           status.error,
           '1',
-          "the case expects STATUS.ERROR, so the program must end with it set. " & describe_status
+          "the case expects STATUS.ERROR, so the program must end with it set. " & describe_status(status_slv, status)
         );
       else
         check_equal(
           status.error,
           '0',
-          "the program must not end with STATUS.ERROR set. " & describe_status
+          "the program must not end with STATUS.ERROR set. " & describe_status(status_slv, status)
         );
       end if;
 
