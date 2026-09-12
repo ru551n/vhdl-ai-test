@@ -2932,20 +2932,10 @@ class Module(BaseModule):
         self._setup_cnn_accel_conv_core(library)
         self._setup_cnn_accel_tensor_mem(library)
         self._setup_cnn_accel_top(library)
-        self._setup_cnn_accel_elementwise_pyffi_pilot(library)
-        library.test_bench("tb_python_ffi_throughput_pilot")
         # ISA v2.3 streaming-inference interface (INPUT_ADDR/OUTPUT_ADDR
         # relocation + the one-deep job queue): the only testbench that
         # actually exercises either -- see the entity header.
         library.test_bench("tb_cnn_accel_streaming")
-
-    def _setup_cnn_accel_elementwise_pyffi_pilot(self, library) -> None:
-        # PILOT ONLY (branch feat/vunit-python-ffi-pilot): needs the
-        # venv-pyffi install of ru551n/vunit@feature/python-ffi and
-        # run.py's `add_vhdl_builtins(python=True)` -- not part of the
-        # project's normal shared venv/requirements.txt yet. See
-        # tb_cnn_accel_elementwise_pyffi_pilot.vhd's header.
-        library.test_bench("tb_cnn_accel_elementwise_pyffi_pilot")
 
     def _setup_cnn_accel_window_gen(self, library) -> None:
         """Run the whole window-generator suite at BOTH shipped tap-assembly

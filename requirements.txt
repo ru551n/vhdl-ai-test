@@ -13,11 +13,17 @@
 # Install:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 #     (or)  uv venv && uv pip install -r requirements.txt
 
-# VUnit 5.0.0.dev12 + PR #1101 (the headless `--wave` flag: vcd on GHDL, fst
-# on NVC). The testbenches and vunit-mcp's waveform support are developed
-# against this fork; stock 5.0.0.dev12 (VUnit/vunit@bbbe9ca, the parent of
-# this commit) has no `--wave` and can only record through the viewer flags.
-vunit-hdl @ git+https://github.com/ru551n/vunit.git@6304bcf2c80b239077d44aeb52e37c8924047a68
+# VUnit 5.0.0.dev12 + the VHDL-to-Python bridge (`python_execute`/
+# `python_call`, `add_vhdl_builtins(python=True)`) every cnn_accel
+# testbench uses live -- see shared/Vunit.md's "Python FFI" section.
+# Standard, not opt-in: run.py always passes `python=True`.
+#
+# This fork diverged from the one carrying PR #1101 (the headless `--wave`
+# flag: vcd on GHDL, fst on NVC) rather than building on top of it, so
+# pinning this commit means headless waveform recording (and vunit-mcp's
+# waveform support) is unavailable until the two are reconciled upstream --
+# a known, accepted gap, not an oversight.
+vunit-hdl @ git+https://github.com/ru551n/vunit.git@189c56419dcaef29bc020df329f418acd3f8acae
 
 # tsfpga fork carrying the Yosys+GHDL netlist-build support
 # (`tsfpga.yosys.project`, `BuildProjectList`) that upstream has not released.
