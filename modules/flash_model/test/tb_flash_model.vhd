@@ -58,6 +58,29 @@ architecture tb of tb_flash_model is
   signal qspi_b_m2s : qspi_m2s_t := qspi_m2s_init;
   signal qspi_b_s2m : qspi_s2m_t := qspi_s2m_init;
 
+  -- Two more buses whose masters deliberately violate the device's 30 ns
+  -- tSHSL, to prove the protocol checker both fires when it should and stays
+  -- quiet when it is switched off. Without the second of these, an inert
+  -- checker and a clean bus are indistinguishable -- "no violations logged"
+  -- is not by itself evidence that anything is being checked.
+  constant c_cs_deselect_too_short : delay_length := 5 ns;
+
+  constant c_master_bad : qspi_master_t := new_qspi_master(
+    sck_period => 20 ns, cs_deselect_time => c_cs_deselect_too_short
+  );
+  constant c_flash_checked : flash_model_t := new_flash_model(profile => "generic_16mib");
+
+  signal qspi_bad_m2s : qspi_m2s_t := qspi_m2s_init;
+  signal qspi_bad_s2m : qspi_s2m_t := qspi_s2m_init;
+
+  constant c_master_bad_b : qspi_master_t := new_qspi_master(
+    sck_period => 20 ns, cs_deselect_time => c_cs_deselect_too_short
+  );
+  constant c_flash_unchecked : flash_model_t := new_flash_model(profile => "generic_16mib");
+
+  signal qspi_unchecked_m2s : qspi_m2s_t := qspi_m2s_init;
+  signal qspi_unchecked_s2m : qspi_s2m_t := qspi_s2m_init;
+
   -- A byte array of `length` filled with `first`, `first+1`, ... so a
   -- misordered or off-by-one transfer shows up as a wrong value rather than as
   -- a coincidentally-equal one.
@@ -157,6 +180,28 @@ begin
       s2m => qspi_b_s2m
     );
 
+  qspi_master_bad_inst : entity flash_model.qspi_master
+    generic map (g_qspi_master => c_master_bad)
+    port map (qspi_m2s => qspi_bad_m2s, qspi_s2m => qspi_bad_s2m);
+
+  flash_model_checked_inst : entity flash_model.flash_model
+    generic map (
+      g_flash => c_flash_checked,
+      g_protocol_checks => true
+    )
+    port map (m2s => qspi_bad_m2s, s2m => qspi_bad_s2m);
+
+  qspi_master_bad_b_inst : entity flash_model.qspi_master
+    generic map (g_qspi_master => c_master_bad_b)
+    port map (qspi_m2s => qspi_unchecked_m2s, qspi_s2m => qspi_unchecked_s2m);
+
+  flash_model_unchecked_inst : entity flash_model.flash_model
+    generic map (
+      g_flash => c_flash_unchecked,
+      g_protocol_checks => false
+    )
+    port map (m2s => qspi_unchecked_m2s, s2m => qspi_unchecked_s2m);
+
   ------------------------------------------------------------------------------
   -- Tests
   ------------------------------------------------------------------------------
@@ -178,6 +223,8 @@ begin
       -- previous test's array, status bits and mode state leak into this one.
       flash_reset(net, c_flash);
       flash_reset(net, c_flash_b);
+      flash_reset(net, c_flash_checked);
+      flash_reset(net, c_flash_unchecked);
       -- Most tests do not care how long an erase takes; the ones that do turn
       -- this back on themselves.
       flash_set_timing_enable(net, c_flash, false);
@@ -527,6 +574,39 @@ begin
         poll_until_ready(net);
         flash_check_content_fill(net, c_flash, 16#015000#, 2, 16#FF#);
         flash_check_content(net, c_flash_b, 16#015000#, bytes_of((16#33#, 16#44#)));
+
+      elsif run("test_protocol_violation_is_reported") then
+        -- c_master_bad deselects CS for 5 ns against a device whose tSHSL is
+        -- 30 ns. Two back-to-back transactions are needed: the violation is in
+        -- the GAP between commands, so a single transaction cannot show it.
+        mock(get_logger(c_flash_checked), error);
+        qspi_flash_read_id(net, c_master_bad, v_got, 3);
+        deallocate(v_got);
+        qspi_flash_read_id(net, c_master_bad, v_got, 3);
+        deallocate(v_got);
+        -- 20 ns, not the 5 ns configured: the master floors the CS-high gap at
+        -- one SCK period, so that is the shortest gap it can actually produce
+        -- at this bus speed. Still well under the device's 30 ns tSHSL, which
+        -- is all this test needs.
+        check_only_log(
+          get_logger(c_flash_checked),
+          "flash_model protocol: CS high time between commands 20 ns is shorter "
+          & "than the 30 ns minimum",
+          error
+        );
+        unmock(get_logger(c_flash_checked));
+
+      elsif run("test_protocol_checks_can_be_switched_off") then
+        -- The same illegal traffic against a VC with g_protocol_checks => false
+        -- must produce nothing at all. This is what makes "no violations
+        -- logged" in the other tests mean something.
+        mock(get_logger(c_flash_unchecked), error);
+        qspi_flash_read_id(net, c_master_bad_b, v_got, 3);
+        deallocate(v_got);
+        qspi_flash_read_id(net, c_master_bad_b, v_got, 3);
+        deallocate(v_got);
+        check_no_log;
+        unmock(get_logger(c_flash_unchecked));
 
       elsif run("test_commands_are_ignored_while_busy") then
         flash_set_timing_enable(net, c_flash, true);
