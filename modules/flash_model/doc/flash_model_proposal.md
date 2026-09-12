@@ -96,7 +96,33 @@ regardless of image size: literals cross as bytes, uniform fills cross as a
 length, and image files do not cross at all — Python opens them. Intel HEX and
 S-record are themselves sparse formats, so a scattered image stays scattered.
 
-## 5. Known costs
+## 5. The `python_execute` trap
+
+Worth writing down, because it cost a real bug and the house guidance in
+`shared/Vunit.md` §7 does not currently warn about it.
+
+That section says calling `python_execute` more than once "is wasted work, not
+an error, since it just re-executes the module". True for a single testbench
+loading one bridge. Not true here. This VC loads its own bridge, by design, so
+that a testbench never has to know the model is Python — which means two
+instances execute the bridge file twice, and **re-executing a module resets its
+globals**. The bridge's instance registry was defined at its module level, so
+the second component's load wiped the first's registration and both were handed
+id 1. Instance A read instance B's array, and three unrelated tests broke as
+collateral.
+
+The fix is the distinction between *executing* and *importing*. `python_execute`
+re-runs a file; `import` resolves through `sys.modules`, which the simulator's
+single embedded interpreter keeps for the whole simulation. So any state that
+must outlive a reload belongs in an imported module — here,
+`flash_model/registry.py` — and never at the bridge's own module level.
+
+The rule for any future FFI-backed VC in this repo: **a bridge file that a VC
+loads itself must be idempotent.** Treat its module body as something that can
+run any number of times, and put every piece of surviving state behind an
+import.
+
+## 6. Known costs
 
 One FFI call per byte on the read path. No allocation, but still a CPython call
 — roughly 10 µs of host time for 20 ns of simulated time at x4/100 MHz.
