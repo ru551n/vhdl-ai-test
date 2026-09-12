@@ -79,19 +79,23 @@ jobs:
       # hdl-modules submodule (and pip needs it for the git-pinned
       # requirements).
       #
-      # python3-dev (not just python3/python3-venv): every cnn_accel
-      # testbench now uses VUnit's Python FFI (python_execute/python_call,
-      # add_vhdl_builtins(python=True), shared/Vunit.md's "Python FFI"
-      # section) -- the simulator embeds a Python interpreter at run time,
-      # which needs the bare, unversioned libpythonX.Y.so symlink. Ubuntu
-      # only ships that in the *-dev package; python3/python3-venv alone
-      # give the venv a working interpreter but not that symlink, so
-      # simulation fails with "Failed to find the shared Python library"
-      # even though everything imports and runs fine outside the simulator.
+      # python3-dev, build-essential (not just python3/python3-venv): every
+      # cnn_accel testbench now uses VUnit's Python FFI (python_execute/
+      # python_call, add_vhdl_builtins(python=True), shared/Vunit.md's
+      # "Python FFI" section) -- the simulator embeds a Python interpreter
+      # at run time, which needs (a) the bare, unversioned libpythonX.Y.so
+      # symlink, which Ubuntu only ships in the *-dev package (python3/
+      # python3-venv alone give the venv a working interpreter but not
+      # that symlink), and (b) a C compiler (cc/gcc/clang) to build its
+      # small bridge library the first time it runs. Without either,
+      # simulation fails ("Failed to find the shared Python library" /
+      # "needs a C compiler ... Install one or set the CC environment
+      # variable") even though everything imports and runs fine outside
+      # the simulator.
       - name: Install git and Python
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git python3 python3-venv python3-dev
+          apt-get install -y --no-install-recommends git python3 python3-venv python3-dev build-essential
           rm -rf /var/lib/apt/lists/*
 
       - uses: actions/checkout@v5
