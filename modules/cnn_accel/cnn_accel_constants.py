@@ -158,7 +158,14 @@ ACCUM_WIDTH = 32
 # The opcode was previously unassigned and the byte previously
 # reserved-must-be-0, so every v2.1 program is still a valid,
 # bit-identical v2.2 program.
-ISA_VERSION = 0x0202
+# v2.3 (2026-09): adds the streaming-inference interface -- CSR
+# INPUT_ADDR/OUTPUT_ADDR registers plus a one-deep job queue (section 6a),
+# and the two W0-byte-3 'reloc_input'/'reloc_output' bits (accel_v2.isa.
+# DescV2) that opt a descriptor's DDR address into being relocated by
+# them. Both bits were previously part of 'reserved_w0' (always 0), so
+# every v2.2 program is still a valid, bit-identical v2.3 program that
+# relocates nothing.
+ISA_VERSION = 0x0203
 
 # ISA v1.2 (doc/tosa_compiler_plan.md section 5, extension 2 / HW milestone
 # H2): per-channel requantization table in DDR at `scale_addr`, one entry

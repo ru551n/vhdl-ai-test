@@ -118,6 +118,14 @@ entity cnn_accel_cmd_proc is
     -- Run control from 'cnn_accel_csr'.
     start : in std_ulogic;
     program_base_addr : in std_ulogic_vector(31 downto 0);
+    -- ISA v2.3 streaming-inference relocation (spec section 6a): added to
+    -- a descriptor's 'in_addr'/'out_addr' when it sets 'reloc_input'/
+    -- 'reloc_output' (see 'effective_in_addr'/'effective_out_addr'
+    -- below). 'cnn_accel_csr' latches these once at dispatch, exactly
+    -- like 'program_base_addr' -- a mid-run bus write to either register
+    -- never affects the command already in flight.
+    input_addr : in std_ulogic_vector(31 downto 0) := (others => '0');
+    output_addr : in std_ulogic_vector(31 downto 0) := (others => '0');
     soft_reset_pulse : in std_ulogic;
     seq_done : out std_ulogic := '0';
     seq_error : out std_ulogic := '0';
@@ -477,7 +485,8 @@ architecture a of cnn_accel_cmd_proc is
   signal padded_w_q : unsigned(17 downto 0) := (others => '0');
   signal padded_h_q : unsigned(17 downto 0) := (others => '0');
 
-  -- 'reserved_w0 /= 0 or reserved_w10 /= 0'.
+  -- 'reserved_w0(7 downto 2) /= 0 or reserved_w10 /= 0' (bits [1:0] of
+  -- 'reserved_w0' are 'reloc_input'/'reloc_output' since ISA v2.3).
   signal chk_reserved_bad_q : std_ulogic := '0';
   -- 'xfer_bytes /= 0'.
   signal chk_xfer_nz_q : std_ulogic := '0';
@@ -666,6 +675,19 @@ architecture a of cnn_accel_cmd_proc is
   signal dst_is_weight_q : std_ulogic := '0';
   signal side_is_ddr_q : std_ulogic := '0';   -- src1 / weights / LUT
   signal side_is_local_q : std_ulogic := '0'; -- ... in LOCAL_TENSOR
+
+  -- ISA v2.3 streaming-inference relocation (spec section 6a):
+  -- 'desc_q.in_addr'/'out_addr' plus the CSR's latched INPUT_ADDR/
+  -- OUTPUT_ADDR, but only when this descriptor opted in
+  -- ('desc_q.reloc_input'/'reloc_output'). Purely combinational (see the
+  -- concurrent assignment near 'src_req_eff'): 'desc_q' is already
+  -- registered and stable for the command's whole life, so every site
+  -- that used to read 'desc_q.in_addr'/'out_addr' directly -- including
+  -- ones that validate BEFORE the later "resolve once" space-decode
+  -- block runs, such as the alignment/DDR-range checks -- can read this
+  -- instead and see the address the DUT will actually use.
+  signal effective_in_addr : unsigned(31 downto 0);
+  signal effective_out_addr : unsigned(31 downto 0);
   signal engine_conv_q : std_ulogic := '0';
   signal engine_pool_q : std_ulogic := '0';
   signal engine_elem_q : std_ulogic := '0';
@@ -1065,12 +1087,15 @@ begin
               + desc_q.pad_top + desc_q.pad_bottom;
           end if;
 
+          -- ISA v2.3: bits [1:0] of 'reserved_w0' are 'reloc_input'/
+          -- 'reloc_output' now, not reserved -- only bits [7:2] are
+          -- still policed here.
           chk_reserved_bad_q <=
-            to_sl(desc_q.reserved_w0 /= x"00" or desc_q.reserved_w10 /= x"00");
+            to_sl(desc_q.reserved_w0(7 downto 2) /= "000000" or desc_q.reserved_w10 /= x"00");
           chk_xfer_nz_q <= to_sl(desc_q.xfer_bytes /= 0);
 
-          chk_al_in_q <= to_sl(is_aligned(desc_q.in_addr));
-          chk_al_out_q <= to_sl(is_aligned(desc_q.out_addr));
+          chk_al_in_q <= to_sl(is_aligned(effective_in_addr));
+          chk_al_out_q <= to_sl(is_aligned(effective_out_addr));
           chk_al_wgt_q <= to_sl(is_aligned(desc_q.weight_addr));
           chk_al_bias_q <= to_sl(is_aligned(desc_q.bias_addr));
           chk_al_scale_q <= to_sl(is_aligned(desc_q.scale_addr));
@@ -1237,6 +1262,7 @@ begin
           if desc_q.space_src0 = c_space_ddr then
             src0_is_ddr_q <= '1';
           end if;
+
           dst_is_ddr_q <= '0';
           dst_is_weight_q <= '0';
           if desc_q.space_dst = c_space_ddr then
@@ -1524,7 +1550,7 @@ begin
           else
             v_len := in_total_bytes_q;
           end if;
-          src_end_q <= resize(desc_q.in_addr, 33) + v_len;
+          src_end_q <= resize(effective_in_addr, 33) + v_len;
 
           -- Destination extent.
           if cls_q = cls_xfer then
@@ -1545,7 +1571,7 @@ begin
           else
             v_len := out_total_bytes_q;
           end if;
-          dst_end_q <= resize(desc_q.out_addr, 33) + v_len;
+          dst_end_q <= resize(effective_out_addr, 33) + v_len;
 
           -- Third and last 'wgt_tile_bytes' product. Landing it here is
           -- still three states ahead of 'st_wgt_setup', the first reader.
@@ -1721,7 +1747,7 @@ begin
             pass_last_q <= '0';
           end if;
 
-          dst_req_q.req.addr <= desc_q.out_addr + out_pass_off_q;
+          dst_req_q.req.addr <= effective_out_addr + out_pass_off_q;
           dst_req_q.req.length <= out_plane_bytes_q;
           dst_req_q.valid <= '1';
           state <= st_pass_req_dst;
@@ -1789,7 +1815,7 @@ begin
         -- space tags (section 5.2).
         when st_xfer_req_src =>
           if src_req_q.valid = '0' then
-            src_req_q.req.addr <= desc_q.in_addr;
+            src_req_q.req.addr <= effective_in_addr;
             src_req_q.req.length <= desc_q.xfer_bytes;
             src_req_q.valid <= '1';
           elsif src_req_ready = '1' then
@@ -1816,7 +1842,7 @@ begin
             cnt_wgt_bytes_q <= cnt_wgt_bytes_q + desc_q.xfer_bytes;
             state <= st_xfer_run;
           elsif dst_req_q.valid = '0' then
-            dst_req_q.req.addr <= desc_q.out_addr;
+            dst_req_q.req.addr <= effective_out_addr;
             dst_req_q.req.length <= desc_q.xfer_bytes;
             dst_req_q.valid <= '1';
           elsif dst_req_ready = '1' then
@@ -1949,8 +1975,8 @@ begin
           if feed_kick = '1' then
             feed_row_q <= (others => '0');
             feed_tile_q <= (others => '0');
-            feed_addr_q <= desc_q.in_addr;
-            feed_row_base_q <= desc_q.in_addr;
+            feed_addr_q <= effective_in_addr;
+            feed_row_base_q <= effective_in_addr;
             if engine_conv_q = '1' and n_tiles_q > 1 then
               feed_split_q <= '1';
             else
@@ -1967,10 +1993,10 @@ begin
               feed_req_q.req.addr <= feed_addr_q;
               feed_req_q.req.length <= in_row_bytes_q;
             elsif engine_pool_q = '1' then
-              feed_req_q.req.addr <= desc_q.in_addr + in_pass_off_q;
+              feed_req_q.req.addr <= effective_in_addr + in_pass_off_q;
               feed_req_q.req.length <= in_plane_bytes_q;
             else
-              feed_req_q.req.addr <= desc_q.in_addr;
+              feed_req_q.req.addr <= effective_in_addr;
               feed_req_q.req.length <= in_total_bytes_q;
             end if;
             feed_req_q.valid <= '1';
@@ -2185,6 +2211,17 @@ begin
   -- itself, the ifmap feeder drives the conv/pool classes, and the main FSM
   -- drives the LOAD/STORE/LOADW move class. Exactly one of the three can be
   -- active for a given command.
+  -- ISA v2.3 relocation (spec section 6a): see the signal declarations
+  -- above. A descriptor that never sets 'reloc_input'/'reloc_output'
+  -- (every pre-v2.3 program) adds zero, reproducing its compiled address
+  -- exactly.
+  effective_in_addr <=
+    desc_q.in_addr + unsigned(input_addr) when desc_q.reloc_input = '1'
+    else desc_q.in_addr;
+  effective_out_addr <=
+    desc_q.out_addr + unsigned(output_addr) when desc_q.reloc_output = '1'
+    else desc_q.out_addr;
+
   src_req_eff <=
     ew_src0_req_m2s when engine_elem_q = '1'
     else feed_req_q when (engine_conv_q or engine_pool_q) = '1'
@@ -2466,11 +2503,11 @@ begin
       pool_cfg_requant_shift <= std_ulogic_vector(desc_q.requant_shift);
 
       ew_opcode <= desc_q.opcode;
-      ew_src0_addr <= desc_q.in_addr;
+      ew_src0_addr <= effective_in_addr;
       -- W15 is a union: 'src1_addr' for ADD, a byte count for everything else
       -- (section 5.1, which is authoritative over section 5.2's prose).
       ew_src1_addr <= desc_q.xfer_bytes;
-      ew_dst_addr <= desc_q.out_addr;
+      ew_dst_addr <= effective_out_addr;
       ew_lut_addr <= desc_q.weight_addr;
       ew_xfer_bytes <= desc_q.xfer_bytes;
       ew_in_width <= desc_q.in_width;

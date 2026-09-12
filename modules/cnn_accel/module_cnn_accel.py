@@ -328,6 +328,41 @@ class Module(BaseModule):
             default_value="0" * 32,
         )
 
+        # ISA v2.3 streaming-inference interface (doc/cnn_accel_top_v2_arch.md
+        # section 6a): the compiled program is unchanged run to run; only
+        # these two registers move. Every descriptor whose compiled address
+        # falls inside the graph's designated input/output tensor is tagged
+        # (accel_v2.program.emit_program) to add the corresponding register's
+        # value at dispatch -- default 0 relocates nothing, so a program
+        # compiled before v2.3 (or simply not using this interface) behaves
+        # identically with both left at their reset value.
+        input_addr = regs.append_register(
+            name="input_addr",
+            mode=REGISTER_MODES["r_w"],
+            description="Graph input tensor's DDR base address for the job about to "
+            "start (STATUS.BUSY='0') or about to be queued (STATUS.BUSY='1', see "
+            "CTRL.START). Added to every descriptor's `in_addr` tagged `reloc_input`.",
+        )
+        input_addr.append_bit_vector(
+            name="addr",
+            description="Byte address, full register width.",
+            width=32,
+            default_value="0" * 32,
+        )
+
+        output_addr = regs.append_register(
+            name="output_addr",
+            mode=REGISTER_MODES["r_w"],
+            description="Graph output tensor's DDR base address, same deal as "
+            "INPUT_ADDR. Added to every descriptor's `out_addr` tagged `reloc_output`.",
+        )
+        output_addr.append_bit_vector(
+            name="addr",
+            description="Byte address, full register width.",
+            width=32,
+            default_value="0" * 32,
+        )
+
         status = regs.append_register(
             name="status",
             mode=REGISTER_MODES["r_wpulse"],
@@ -372,11 +407,23 @@ class Module(BaseModule):
             width=4,
             default_value="0000",
         )
+        # ISA v2.3: bit 8 (the low bit of what was an 8-bit-wide
+        # `reserved1`) is now `QUEUED` -- a job's INPUT_ADDR/OUTPUT_ADDR
+        # are latched waiting for the currently-running one to finish
+        # (section 6a). `reserved1` shrinks to 7 bits so `err_pc_low`
+        # still lands on bits [31:16] unchanged.
+        status.append_bit(
+            name="queued",
+            description="A job is latched waiting for the current one to finish "
+            "(set by CTRL.START written while BUSY='1'; cleared the instant that "
+            "job is dispatched).",
+            default_value="0",
+        )
         status.append_bit_vector(
             name="reserved1",
             description="Unused, reads '0'. Padding so `err_pc_low` lands on bits [31:16].",
-            width=8,
-            default_value="00000000",
+            width=7,
+            default_value="0000000",
         )
         status.append_bit_vector(
             name="err_pc_low",
