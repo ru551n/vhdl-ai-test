@@ -25,30 +25,23 @@ bridge whose keyword names differ from the contract is a bridge nobody can
 call.
 
 Module-level state is per simulator process (one per VUnit test config), so
-the instance registry never leaks between tests.
+nothing leaks between tests. The instance registry deliberately lives in
+`flash_model.registry` rather than here: every VC loads this file with
+`python_execute`, which RE-RUNS it, so a registry defined at this module's
+level would be wiped by the second component's load and both would be handed
+the same id. See that module's docstring.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from flash_model import profiles
+from flash_model import profiles, registry
 from flash_model.device import FlashDevice
 from flash_model.directive import LAYOUT_VERSION
 
-#: instance id -> device. Ids start at 1 so that 0 is never a valid handle.
-_INSTANCES: dict[int, FlashDevice] = {}
-_NEXT_ID = 1
-
 
 def _device(id: int) -> FlashDevice:
-    key = int(id)
-    device = _INSTANCES.get(key)
-    if device is None:
-        raise KeyError(
-            f"no flash model instance {key}; flash_create() returns the id to use "
-            f"(live ids: {sorted(_INSTANCES)})"
-        )
-    return device
+    return registry.get(id)
 
 
 def _int32(values) -> np.ndarray:
@@ -92,7 +85,6 @@ def flash_create(
 ) -> int:
     """Create a device and return its instance id. Every geometry argument
     is optional and overrides the named profile."""
-    global _NEXT_ID
     built = profiles.build(
         profile,
         size_bytes=size_bytes,
@@ -102,10 +94,7 @@ def flash_create(
         addr_bytes=addr_bytes,
         jedec_id=jedec_id,
     )
-    instance_id = _NEXT_ID
-    _NEXT_ID += 1
-    _INSTANCES[instance_id] = FlashDevice(built)
-    return instance_id
+    return registry.add(FlashDevice(built))
 
 
 def flash_reset(id: int) -> int:

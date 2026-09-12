@@ -46,6 +46,18 @@ architecture tb of tb_flash_model is
   signal qspi_m2s : qspi_m2s_t := qspi_m2s_init;
   signal qspi_s2m : qspi_s2m_t := qspi_s2m_init;
 
+  -- A second, completely independent device on its own bus. Two instances in
+  -- one testbench is the thing that would break if instance state lived in a
+  -- Python module global rather than behind the id the model hands back.
+  constant c_master_b : qspi_master_t := new_qspi_master(sck_period => 20 ns);
+  constant c_flash_b : flash_model_t := new_flash_model(
+    profile => "generic_16mib",
+    jedec_id => 16#C22018#
+  );
+
+  signal qspi_b_m2s : qspi_m2s_t := qspi_m2s_init;
+  signal qspi_b_s2m : qspi_s2m_t := qspi_s2m_init;
+
   -- A byte array of `length` filled with `first`, `first+1`, ... so a
   -- misordered or off-by-one transfer shows up as a wrong value rather than as
   -- a coincidentally-equal one.
@@ -127,6 +139,24 @@ begin
       s2m => qspi_s2m
     );
 
+  qspi_master_b_inst : entity flash_model.qspi_master
+    generic map (
+      g_qspi_master => c_master_b
+    )
+    port map (
+      qspi_m2s => qspi_b_m2s,
+      qspi_s2m => qspi_b_s2m
+    );
+
+  flash_model_b_inst : entity flash_model.flash_model
+    generic map (
+      g_flash => c_flash_b
+    )
+    port map (
+      m2s => qspi_b_m2s,
+      s2m => qspi_b_s2m
+    );
+
   ------------------------------------------------------------------------------
   -- Tests
   ------------------------------------------------------------------------------
@@ -136,6 +166,7 @@ begin
     variable v_expected : integer_array_t;
     variable v_status : natural;
     variable v_regions : integer_array_t;
+    variable v_addr : integer_array_t;
     variable v_count : integer;
     variable v_start : time;
   begin
@@ -146,9 +177,11 @@ begin
       -- namespaces are not reset between test cases, so without this the
       -- previous test's array, status bits and mode state leak into this one.
       flash_reset(net, c_flash);
+      flash_reset(net, c_flash_b);
       -- Most tests do not care how long an erase takes; the ones that do turn
       -- this back on themselves.
       flash_set_timing_enable(net, c_flash, false);
+      flash_set_timing_enable(net, c_flash_b, false);
 
       if run("test_read_jedec_id") then
         qspi_flash_read_id(net, c_master, v_got, 3);
@@ -388,6 +421,112 @@ begin
           now - v_start < 50 us,
           "with timing disabled the erase still took " & to_string(now - v_start)
         );
+
+      elsif run("test_continuous_read_needs_no_opcode") then
+        -- A 0xEB whose mode byte has M5:M4 = 10 arms continuous read (XIP): the
+        -- NEXT transaction carries no opcode at all and starts straight at the
+        -- x4 address phase. The VC cannot know that -- which is exactly why
+        -- cs_assert returns a directive rather than an acknowledgement.
+        v_expected := ramp(8, 16#70#);
+        flash_preload(net, c_flash, 16#013000#, v_expected);
+
+        qspi_flash_quad_io_read(net, c_master, 16#013000#, 8, v_got,
+                                mode_byte => 16#A0#);
+        check_bytes(v_got, v_expected, "the 0xEB that arms continuous read");
+        deallocate(v_got);
+
+        -- No opcode this time: address at x4, then the mode byte, dummy
+        -- cycles, and data at x4. The mode byte is still sent on every
+        -- continuous-read transaction -- that is the only way out of the mode,
+        -- since with no opcode phase there is nothing for 0xFF or 0x66/0x99 to
+        -- be decoded from.
+        v_addr := qspi_flash_address_bytes(16#013000#, 3);
+        append(v_addr, 16#A0#);
+        qspi_transfer(
+          net, c_master,
+          cmd => null_integer_array,
+          data => v_got,
+          addr => v_addr,
+          addr_lanes => 4,
+          dummy_cycles => c_qspi_flash_quad_io_read_dummy,
+          num_read_bytes => 8,
+          read_lanes => 4
+        );
+        check_bytes(v_got, v_expected, "the opcode-less continuous read");
+        deallocate(v_got);
+        deallocate(v_addr);
+
+        -- Leaving continuous read: a mode byte whose M5:M4 is not 10.
+        v_addr := qspi_flash_address_bytes(16#013000#, 3);
+        append(v_addr, 16#00#);
+        qspi_transfer(
+          net, c_master,
+          cmd => null_integer_array,
+          data => v_got,
+          addr => v_addr,
+          addr_lanes => 4,
+          dummy_cycles => c_qspi_flash_quad_io_read_dummy,
+          num_read_bytes => 8,
+          read_lanes => 4
+        );
+        check_bytes(v_got, v_expected, "the transaction that disarms continuous read");
+        deallocate(v_got);
+        deallocate(v_addr);
+
+        -- Back to normal: an ordinary opcode-led read works again.
+        qspi_flash_read(net, c_master, 16#013000#, 8, v_got);
+        check_bytes(v_got, v_expected, "an ordinary read after leaving continuous mode");
+        deallocate(v_got);
+        deallocate(v_expected);
+
+      elsif run("test_partial_byte_aborts_a_page_program") then
+        -- A real part discards a trailing partial byte and abandons a page
+        -- program whose clock count is not a multiple of 8. Three extra clocks
+        -- after the data byte is what proves trailing_bits is plumbed through.
+        qspi_flash_write_enable(net, c_master);
+        qspi_transfer(
+          net, c_master,
+          cmd => bytes_of((0 => 16#02#)),
+          data => v_got,
+          addr => qspi_flash_address_bytes(16#014000#, 3),
+          wr_data => bytes_of((0 => 16#5A#)),
+          dummy_cycles => 3,
+          num_read_bytes => 0
+        );
+        poll_until_ready(net);
+        -- Aborted, so the array is untouched.
+        flash_check_content_fill(net, c_flash, 16#014000#, 1, 16#FF#);
+        flash_get_stat(net, c_flash, "abort_count", v_count);
+        check(v_count > 0, "the truncated program should have been counted as an abort");
+
+      elsif run("test_two_instances_are_independent") then
+        -- Distinct data at the same address in each device, then read both
+        -- back over their own buses.
+        flash_preload(net, c_flash, 16#015000#, bytes_of((16#11#, 16#22#)));
+        flash_preload(net, c_flash_b, 16#015000#, bytes_of((16#33#, 16#44#)));
+
+        qspi_flash_read(net, c_master, 16#015000#, 2, v_got);
+        check_bytes(v_got, bytes_of((16#11#, 16#22#)), "device A");
+        deallocate(v_got);
+
+        qspi_flash_read(net, c_master_b, 16#015000#, 2, v_got);
+        check_bytes(v_got, bytes_of((16#33#, 16#44#)), "device B");
+        deallocate(v_got);
+
+        -- Even their identities differ, which no shared module global could do.
+        qspi_flash_read_id(net, c_master, v_got, 3);
+        check_equal(get(v_got, 0), 16#EF#, "device A manufacturer");
+        deallocate(v_got);
+        qspi_flash_read_id(net, c_master_b, v_got, 3);
+        check_equal(get(v_got, 0), 16#C2#, "device B manufacturer");
+        deallocate(v_got);
+
+        -- Erasing A must leave B alone.
+        qspi_flash_write_enable(net, c_master);
+        qspi_flash_sector_erase(net, c_master, 16#015000#);
+        poll_until_ready(net);
+        flash_check_content_fill(net, c_flash, 16#015000#, 2, 16#FF#);
+        flash_check_content(net, c_flash_b, 16#015000#, bytes_of((16#33#, 16#44#)));
 
       elsif run("test_commands_are_ignored_while_busy") then
         flash_set_timing_enable(net, c_flash, true);
