@@ -4,7 +4,6 @@ agreeing with the profile and the opcode table it was built from."""
 from __future__ import annotations
 
 import pytest
-
 from flash_model import profiles, sfdp
 from flash_model.commands import COMMANDS
 

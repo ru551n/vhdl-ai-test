@@ -10,7 +10,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from flash_model import images, profiles
 from flash_model.device import FlashDevice
 

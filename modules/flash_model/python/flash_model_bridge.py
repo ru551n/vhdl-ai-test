@@ -19,6 +19,11 @@ Conventions, from `shared/Vunit.md` section 7 and
   uncaught exception into a VUnit FAILURE carrying the full traceback, which
   localizes a bug far better than a status code the VHDL side has to check.
 
+The instance handle is spelled `id` throughout, shadowing the builtin,
+because that is the keyword name the contract and the VHDL side use; a
+bridge whose keyword names differ from the contract is a bridge nobody can
+call.
+
 Module-level state is per simulator process (one per VUnit test config), so
 the instance registry never leaks between tests.
 """
@@ -26,7 +31,6 @@ the instance registry never leaks between tests.
 from __future__ import annotations
 
 import numpy as np
-
 from flash_model import profiles
 from flash_model.device import FlashDevice
 from flash_model.directive import LAYOUT_VERSION
@@ -36,7 +40,7 @@ _INSTANCES: dict[int, FlashDevice] = {}
 _NEXT_ID = 1
 
 
-def _device(id: int) -> FlashDevice:  # noqa: A002 - `id` is the contract's name
+def _device(id: int) -> FlashDevice:
     key = int(id)
     device = _INSTANCES.get(key)
     if device is None:
@@ -104,7 +108,7 @@ def flash_create(
     return instance_id
 
 
-def flash_reset(id: int) -> int:  # noqa: A002
+def flash_reset(id: int) -> int:
     """Power-on reset of the volatile state. The array is untouched -- a
     reset is not an erase."""
     _device(id).reset_state()
@@ -114,22 +118,22 @@ def flash_reset(id: int) -> int:  # noqa: A002
 # -- the wire ----------------------------------------------------------------
 
 
-def cs_assert(id: int, now_s: float) -> int:  # noqa: A002
+def cs_assert(id: int, now_s: float) -> int:
     return _device(id).cs_assert(float(now_s))
 
 
-def xfer(id: int, byte_in: int, now_s: float | None = None) -> int:  # noqa: A002
+def xfer(id: int, byte_in: int, now_s: float | None = None) -> int:
     """One byte on the wire. `byte_in` is -1 when the VC clocked a byte
     out rather than in."""
     return _device(id).xfer(int(byte_in), None if now_s is None else float(now_s))
 
 
-def cs_deassert(id: int, trailing_bits: int, now_s: float) -> float:  # noqa: A002
+def cs_deassert(id: int, trailing_bits: int, now_s: float) -> float:
     """Returns the busy time in seconds; 0.0 when nothing went busy."""
     return _device(id).cs_deassert(int(trailing_bits), float(now_s))
 
 
-def get_timing_limits(id: int) -> np.ndarray:  # noqa: A002
+def get_timing_limits(id: int) -> np.ndarray:
     """Pin-level AC limits in picoseconds, in the contract's fixed order."""
     return _int32(_device(id).timing_limits_ps())
 
@@ -137,36 +141,36 @@ def get_timing_limits(id: int) -> np.ndarray:  # noqa: A002
 # -- control plane -------------------------------------------------------------
 
 
-def preload(data, id: int, addr: int) -> int:  # noqa: A002
+def preload(data, id: int, addr: int) -> int:
     _device(id).preload(int(addr), _bytes(data))
     return 0
 
 
-def preload_fill(id: int, addr: int, num_bytes: int, value: int) -> int:  # noqa: A002
+def preload_fill(id: int, addr: int, num_bytes: int, value: int) -> int:
     _device(id).preload_fill(int(addr), int(num_bytes), int(value))
     return 0
 
 
-def load_image(id: int, path: str, fmt: str | None = None, base: int = 0) -> int:  # noqa: A002
+def load_image(id: int, path: str, fmt: str | None = None, base: int = 0) -> int:
     _device(id).load_image(str(path), fmt, int(base))
     return 0
 
 
-def read_back(id: int, addr: int, num_bytes: int) -> np.ndarray:  # noqa: A002
+def read_back(id: int, addr: int, num_bytes: int) -> np.ndarray:
     return _int32(_device(id).read_back(int(addr), int(num_bytes)))
 
 
-def check_content(expected, id: int, addr: int) -> int:  # noqa: A002
+def check_content(expected, id: int, addr: int) -> int:
     _device(id).check_content(int(addr), _bytes(expected))
     return 0
 
 
-def check_content_fill(id: int, addr: int, num_bytes: int, value: int) -> int:  # noqa: A002
+def check_content_fill(id: int, addr: int, num_bytes: int, value: int) -> int:
     _device(id).check_content_fill(int(addr), int(num_bytes), int(value))
     return 0
 
 
-def written_regions(id: int) -> np.ndarray:  # noqa: A002
+def written_regions(id: int) -> np.ndarray:
     """Flat `[addr, len, addr, len, ...]` of everything the device
     programmed or erased, coalesced."""
     flat: list[int] = []
@@ -175,24 +179,24 @@ def written_regions(id: int) -> np.ndarray:  # noqa: A002
     return _int32(flat)
 
 
-def set_timing_enable(id: int, enable: bool | int) -> int:  # noqa: A002
+def set_timing_enable(id: int, enable: bool | int) -> int:
     """`enable = 0` collapses every busy time to zero, for the majority of
     tests that care about protocol rather than milliseconds."""
     _device(id).set_timing_enable(bool(enable))
     return 0
 
 
-def set_timing(id: int, name: str, seconds: float) -> int:  # noqa: A002
+def set_timing(id: int, name: str, seconds: float) -> int:
     _device(id).set_timing(str(name), float(seconds))
     return 0
 
 
-def set_protection(id: int, addr: int, num_bytes: int, locked: bool | int) -> int:  # noqa: A002
+def set_protection(id: int, addr: int, num_bytes: int, locked: bool | int) -> int:
     """Lock or unlock a region. A program or erase touching a locked region
     is silently ignored, exactly as on silicon."""
     _device(id).set_protection(int(addr), int(num_bytes), bool(locked))
     return 0
 
 
-def get_stat(id: int, name: str) -> int:  # noqa: A002
+def get_stat(id: int, name: str) -> int:
     return _device(id).get_stat(str(name))

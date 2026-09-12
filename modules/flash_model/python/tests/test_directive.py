@@ -8,7 +8,6 @@ from __future__ import annotations
 import itertools
 
 import pytest
-
 from flash_model import directive as d
 
 

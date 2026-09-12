@@ -600,7 +600,7 @@ class FlashDevice:
             "sr1": lambda: self.status_byte(0),
             "sr2": lambda: self.status_byte(1),
             "sr3": lambda: self.status_byte(2),
-            "busy_deadline_ps": lambda: int(round(self.timing.deadline() * 1e12)),
+            "busy_deadline_ps": lambda: round(self.timing.deadline() * 1e12),
             "timing_enabled": lambda: int(self.timing.enabled),
             "materialized_pages": lambda: self.array.materialized_pages,
             "run_count": lambda: self.array.run_count,

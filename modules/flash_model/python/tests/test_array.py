@@ -11,7 +11,6 @@ from __future__ import annotations
 import time
 
 import pytest
-
 from flash_model.array import FlashArray
 
 MIB = 1024 * 1024
