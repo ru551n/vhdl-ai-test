@@ -69,12 +69,22 @@ architecture a of flash_model is
   -- engine must not touch the model before this.
   signal initialized : boolean := false;
 
-  -- Pulsed by `pins` with the duration of a program or erase; `busy_timer`
-  -- turns it into elapsed simulation time.
+  -- Set by `pins` to the duration of a program or erase; `busy_timer` turns it
+  -- into elapsed simulation time.
   signal busy_request : time := 0 ns;
-  signal busy_request_event : boolean := false;
+
+  -- Two counters rather than one `busy_active` flag, because each signal then
+  -- has exactly one driver AND the busy state goes true in the same delta that
+  -- `pins` decides it. A single flag set by `busy_timer` would go true one
+  -- delta later, leaving a window in which flash_wait_until_ready could sample
+  -- it still false and return immediately from a device that is about to be
+  -- busy for milliseconds.
+  signal busy_started : natural := 0;
+  signal busy_finished : natural := 0;
+
   -- Only drives flash_wait_until_ready. The model's own write-in-progress bit
-  -- is derived from its deadline, not from this.
+  -- is derived from its deadline and is the authoritative one; a controller
+  -- polling the status register over the bus is always the stronger check.
   signal busy_active : boolean := false;
 
   -- Output delays, fetched from the model at init: clock-to-output-valid and
@@ -239,6 +249,10 @@ begin
         );
 
       elsif v_msg_type = flash_wait_until_ready_msg then
+        -- A convenience, not the source of truth: polling the status register
+        -- over the bus is what a real controller does and what the tests use.
+        -- This still cannot observe a busy period that has not been decided
+        -- yet, so a caller that races the command it just issued should poll.
         if busy_active then
           wait until not busy_active;
         end if;
@@ -275,12 +289,13 @@ begin
   -- Deliberately its own process: see the entity header. This only exists so
   -- flash_wait_until_ready terminates; the model's write-in-progress bit is
   -- derived from a deadline, so nothing here can race a status poll.
+  busy_active <= busy_started /= busy_finished;
+
   busy_timer : process
   begin
-    wait on busy_request_event;
-    busy_active <= true;
+    wait until busy_started /= busy_finished;
     wait for busy_request;
-    busy_active <= false;
+    busy_finished <= busy_started;
   end process;
 
   ------------------------------------------------------------------------------
@@ -422,7 +437,7 @@ begin
           & " s truncated to 0 -- the simulator's time resolution is too coarse"
         );
         busy_request <= v_busy_time;
-        busy_request_event <= not busy_request_event;
+        busy_started <= busy_started + 1;
       end if;
     end loop;
   end process;

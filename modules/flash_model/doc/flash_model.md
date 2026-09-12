@@ -139,6 +139,28 @@ flash_get_stat(net, c_flash, "erase_count", v_count);
 flash_get_stat(net, c_flash, "ignored_command_count", v_count);
 ```
 
-`ignored_command_count` is the useful one for catching a controller that is
-issuing commands the device is quietly dropping — a missing write-enable, or a
-command sent while the part is busy.
+`ignored_command_count` is the one to reach for when a controller is
+misbehaving and you do not yet know why: it counts every command the device
+silently dropped. Real parts drop commands without complaint, so a controller
+bug can otherwise look like a device that simply did nothing.
+
+Once you know commands *are* being dropped, the granular counters say why:
+
+| stat | meaning |
+|---|---|
+| `wel_reject_count` | a program or erase arrived without a write enable |
+| `wip_reject_count` | a command arrived while the device was busy |
+| `protect_reject_count` | a program or erase targeted a locked region |
+| `qe_reject_count` | a quad command arrived with quad-enable clear |
+| `dpd_reject_count` | a command arrived during deep power-down |
+| `unknown_opcode_count` | the opcode is not in the command table |
+| `abort_count` | a command ended on a non-multiple of 8 clocks |
+
+Plus the ordinary activity counters: `cmd_count`, `program_count`,
+`erase_count`, `chip_erase_count`, `wrsr_count`, `reset_count`,
+`bytes_read`, `bytes_programmed`, `bytes_erased`, and `materialized_pages`
+— the last being a direct measure of how much the sparse array has actually
+allocated.
+
+Current device state is readable the same way: `wip`, `wel`, `qpi`,
+`addr_bytes`, `continuous_read`, `timing_enabled`, `sr1`/`sr2`/`sr3`.
