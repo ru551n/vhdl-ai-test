@@ -98,13 +98,10 @@ S-record are themselves sparse formats, so a scattered image stays scattered.
 
 ## 5. The `exec_file` trap
 
-Worth writing down, because it cost a real bug and the house guidance in
-`shared/Vunit.md` §7 does not currently warn about it.
-
-That section (written for this fork's previous API, where the operation was
-called `python_execute`) says calling it more than once "is wasted work, not
-an error, since it just re-executes the module". True for a single testbench
-loading one bridge. Not true here. This VC loads its own bridge, by design, so
+Worth writing down, because it cost a real bug. `shared/Vunit.md` §7 used to
+say that calling it more than once "is wasted work, not an error, since it
+just re-executes the module" -- true for a single testbench loading one
+bridge, and not true here. §7 now warns about exactly this. This VC loads its own bridge, by design, so
 that a testbench never has to know the model is Python — which means two
 instances execute the bridge file twice, and **re-executing a module resets its
 globals**. The bridge's instance registry was defined at its module level, so
