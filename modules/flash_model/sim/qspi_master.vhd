@@ -71,6 +71,7 @@ begin
   main : process
 
     variable v_sck_period : delay_length := sck_period(g_qspi_master);
+    constant c_cs_deselect_time : delay_length := cs_deselect_time(g_qspi_master);
 
     -- One SCK cycle. 'sample' is the resolved bus immediately before the
     -- rising edge, which is what the far end presented for this beat.
@@ -190,7 +191,11 @@ begin
       m2s.io.enable <= (others => '0');
       wait for v_sck_period / 2;
       m2s.cs_n <= '1';
-      wait for v_sck_period;
+      -- The CS-high gap is the device's tSHSL, not one bus period. Waiting only
+      -- v_sck_period here violated the JEDEC baseline profile's 30 ns tSHSL at
+      -- the default 20 ns bus speed -- a real bug, found by the flash VC's own
+      -- protocol checker, and invisible on the wire until something checked it.
+      wait for maximum(v_sck_period, c_cs_deselect_time);
     end procedure;
 
     -- Pop one byte phase, in the order qspi_master_pkg pushed it.

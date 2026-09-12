@@ -59,15 +59,31 @@ package qspi_master_pkg is
     -- Private. Use the accessors below.
     p_std_cfg : std_cfg_t;
     p_sck_period : delay_length;
+    -- Minimum CS-high time between two transactions. A real device specifies
+    -- this as tSHSL and ignores a command that arrives too soon after the
+    -- previous one, so a master that deselects for less than tSHSL is a bug
+    -- even though nothing on the bus looks wrong. It is NOT derived from the
+    -- SCK period: tSHSL is a property of the device, not of the bus speed, and
+    -- tying the two makes a fast bus silently violate a slow part.
+    p_cs_deselect_time : delay_length;
   end record;
 
   constant c_qspi_default_sck_period : delay_length := 20 ns;
 
+  -- Comfortably above the tSHSL of the JEDEC baseline profile (30 ns). Chosen
+  -- as a default that does not violate a typical part rather than as the
+  -- fastest legal value; a test that wants to probe the limit sets it down.
+  constant c_qspi_default_cs_deselect_time : delay_length := 50 ns;
+
   impure function new_qspi_master(
     sck_period : delay_length := c_qspi_default_sck_period;
+    cs_deselect_time : delay_length := c_qspi_default_cs_deselect_time;
     id : id_t := null_id;
     unexpected_msg_type_policy : unexpected_msg_type_policy_t := fail
   ) return qspi_master_t;
+
+  -- The configured minimum CS-high time between transactions.
+  impure function cs_deselect_time(qspi_master : qspi_master_t) return delay_length;
 
   impure function get_id(qspi_master : qspi_master_t) return id_t;
   impure function get_actor(qspi_master : qspi_master_t) return actor_t;
@@ -180,6 +196,7 @@ package body qspi_master_pkg is
 
   impure function new_qspi_master(
     sck_period : delay_length := c_qspi_default_sck_period;
+    cs_deselect_time : delay_length := c_qspi_default_cs_deselect_time;
     id : id_t := null_id;
     unexpected_msg_type_policy : unexpected_msg_type_policy_t := fail
   ) return qspi_master_t is
@@ -191,8 +208,14 @@ package body qspi_master_pkg is
         vc_name => "qspi_master",
         unexpected_msg_type_policy => unexpected_msg_type_policy
       ),
-      p_sck_period => sck_period
+      p_sck_period => sck_period,
+      p_cs_deselect_time => cs_deselect_time
     );
+  end function;
+
+  impure function cs_deselect_time(qspi_master : qspi_master_t) return delay_length is
+  begin
+    return qspi_master.p_cs_deselect_time;
   end function;
 
   impure function get_id(qspi_master : qspi_master_t) return id_t is
