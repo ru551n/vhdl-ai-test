@@ -1,13 +1,12 @@
 """VUnit python_bridge entry point for tb_cnn_accel_top: writes DDR and
-verifies each run entirely live, over VUnit's Python FFI (`python_call`),
-from inside the running simulation. No file is read or written anywhere
-in this path -- not `mem_image.csv` going in, nor `result.csv`/
+verifies each run entirely live, over VUnit's Python FFI (python_pkg's
+`call`), from inside the running simulation. No file is read or written
+anywhere in this path -- not `mem_image.csv` going in, nor `result.csv`/
 `counters.csv` coming out.
 
 Loaded into the simulator's embedded Python interpreter via
-`python_execute(file_name => ...)`, once, before the run starts (so the
-`_CASE` lookup below is populated before any other function here is
-called). Named like a small object's public interface: `set_test_case`
+`exec_file(...)`, once, before the run starts (so the `_CASE` lookup
+below is populated before any other function here is called). Named like a small object's public interface: `set_test_case`
 picks the object, everything else is a `get_*` reading one fact off it,
 except `check_result`, the one call that judges rather than reports."""
 
@@ -45,7 +44,7 @@ _CATALOGUES = (
 )
 
 # Set by `set_test_case`, called once from VHDL right after
-# `python_execute`-ing this file, naming which case's pre-built `TbCase`
+# `exec_file`-ing this file, naming which case's pre-built `TbCase`
 # object every `get_*`/`check_result` call below reads from. One case per
 # simulation process (VUnit forks a fresh process per config), so a
 # single module-level variable is enough -- no session/threading concern.
@@ -62,9 +61,9 @@ def set_test_case(name):
     if name not in by_name:
         raise KeyError(f"top_level_bridge.set_test_case: no case named {name!r}")
     _CASE = by_name[name]
-    # Called as VHDL's 'integer'-returning python_call overload (there is
-    # no argument-taking, return-nothing overload) -- the return value
-    # itself carries no meaning, only the call (and its exception path).
+    # VHDL calls this through python_pkg's `procedure call`, which
+    # ignores the result -- the return value below is vestigial and
+    # carries no meaning, only the call (and its exception path) does.
     return 0
 
 
@@ -114,7 +113,7 @@ def get_program_regions():
     """`[addr0, len0, addr1, len1, ...]` -- the selected case's compiled
     program layout (`TbCase.compiled_regions`: the descriptor chain and
     the weight/bias/scale/LUT tables, the input window excluded),
-    flattened so one `python_call` hands the whole layout over at once.
+    flattened so one `call` hands the whole layout over at once.
     VHDL loops over `length(bounds) / 2` regions, calling
     `get_program_data(index)` for each one's content."""
     _require_test_case("get_program_regions")
@@ -128,78 +127,93 @@ def get_program_data(index):
     return np.frombuffer(_CASE.compiled_region_bytes(int(index)), dtype=np.uint8)
 
 
-def check_result(
-    export_bytes,
-    export_base,
-    status,
-    busy,
-    done,
-    error,
-    err_code,
-    err_pc_low,
-    hw_info,
-    hw_info2,
-    hw_info3,
-    cmd_count,
-    cycle_count,
-    compute_cycles,
-    stall_cycles,
-    ddr_rd_bytes,
-    ddr_wr_bytes,
-    tensor_load_count,
-    tensor_store_count,
-    weight_load_bytes,
-    local_bytes,
-    axi_aw_count,
-    axi_wr_lo_addr,
-    axi_wr_hi_addr,
-    busy_after_done=False,
-):
+# The counter values `check_result` receives, in the exact order
+# `tb_cnn_accel_top.vhd`/`tb_cnn_accel_streaming.vhd`'s own
+# `counter_bytes` helper concatenates them -- 4 little-endian bytes each,
+# status bits included as 0/1 counters. The two orders are the ONLY thing
+# keeping a value attached to its name, so neither side may be edited
+# alone.
+#
+# Why a packed vector instead of the 22 named keyword arguments this used
+# to take: python_pkg's `call` accepts at most 10 arguments in total, and
+# its `arg`/`kwarg` have no unsigned overload -- a 32-bit counter does not
+# fit VHDL's signed `integer` either -- so wide values cross as byte lists.
+_COUNTER_ORDER = (
+    "status",
+    "busy",
+    "done",
+    "error",
+    "err_code",
+    "err_pc_low",
+    "hw_info",
+    "hw_info2",
+    "hw_info3",
+    "cmd_count",
+    "cycle_count",
+    "compute_cycles",
+    "stall_cycles",
+    "ddr_rd_bytes",
+    "ddr_wr_bytes",
+    "tensor_load_count",
+    "tensor_store_count",
+    "weight_load_bytes",
+    "local_bytes",
+    "axi_aw_count",
+    "axi_wr_lo_addr",
+    "axi_wr_hi_addr",
+)
+
+_COUNTER_BYTES = 4
+
+
+def _decode_counters(packed) -> dict[str, int]:
+    """Unpack `counter_bytes`'s little-endian byte vector back into the
+    `counters` dict `TbCase.check_live` expects. Length is checked rather
+    than trusted: a VHDL-side edit that adds or drops a counter without
+    the matching `_COUNTER_ORDER` edit must fail loudly here, not silently
+    shift every value after it onto the wrong name."""
+    values = [int(v) for v in packed]
+    expected = _COUNTER_BYTES * len(_COUNTER_ORDER)
+    if len(values) != expected:
+        raise ValueError(
+            f"top_level_bridge.check_result: got {len(values)} counter bytes, "
+            f"expected {expected} ({len(_COUNTER_ORDER)} counters x {_COUNTER_BYTES} "
+            "bytes). The VHDL 'counter_bytes' helper and '_COUNTER_ORDER' have "
+            "drifted apart -- they must be edited together."
+        )
+    return {
+        name: int.from_bytes(
+            bytes(values[_COUNTER_BYTES * i : _COUNTER_BYTES * (i + 1)]), "little"
+        )
+        for i, name in enumerate(_COUNTER_ORDER)
+    }
+
+
+def check_result(export_bytes, counters, export_base, busy_after_done=False):
     """Called from tb_cnn_accel_top's main process right after
     STATUS.DONE/STATUS.ERROR. `export_bytes` is the raw exported DDR
     region as a VUnit integer_array_t of UNSIGNED byte values (0..255),
     read straight out of the simulator's `memory_t` model via
-    `read_word`. Every other argument is one counter register/passive-
-    monitor value, read straight out of the DUT/testbench -- the exact
-    same set `TbCase.check_live` expects. `busy_after_done` (default
+    `read_word`. `counters` is every counter register/passive-monitor
+    value packed into one little-endian byte vector (see
+    `_COUNTER_ORDER`), decoded here into the exact same dict
+    `TbCase.check_live` has always expected. `busy_after_done` (default
     False, so tb_cnn_accel_top's own calls -- which never pass it -- are
     unaffected) is passed straight through to `TbCase.check_live`, for
     tb_cnn_accel_streaming's queued-pair case.
 
     Raises on failure (via `TbCase.check_live`) rather than returning a
-    pass/fail bool: `python_call` already reports an uncaught exception
-    to VHDL as a FAILURE with the full Python traceback, so there is
-    nothing for a `check_true` at the call site to add. The return value
-    below only satisfies `python_call`'s integer-returning overload
-    (there is no argument-taking, return-nothing one) and carries no
-    meaning of its own."""
+    pass/fail bool: `call` already reports an uncaught exception to VHDL
+    as a FAILURE with the full Python traceback, so there is nothing for
+    a `check_true` at the call site to add. VHDL invokes this through
+    python_pkg's `procedure call`, which ignores the result, so the
+    `return 0` below is vestigial."""
     _require_test_case("check_result")
 
-    counters = {
-        "status": int(status),
-        "busy": int(busy),
-        "done": int(done),
-        "error": int(error),
-        "err_code": int(err_code),
-        "err_pc_low": int(err_pc_low),
-        "hw_info": int(hw_info),
-        "hw_info2": int(hw_info2),
-        "hw_info3": int(hw_info3),
-        "cmd_count": int(cmd_count),
-        "cycle_count": int(cycle_count),
-        "compute_cycles": int(compute_cycles),
-        "stall_cycles": int(stall_cycles),
-        "ddr_rd_bytes": int(ddr_rd_bytes),
-        "ddr_wr_bytes": int(ddr_wr_bytes),
-        "tensor_load_count": int(tensor_load_count),
-        "tensor_store_count": int(tensor_store_count),
-        "weight_load_bytes": int(weight_load_bytes),
-        "local_bytes": int(local_bytes),
-        "axi_aw_count": int(axi_aw_count),
-        "axi_wr_lo_addr": int(axi_wr_lo_addr),
-        "axi_wr_hi_addr": int(axi_wr_hi_addr),
-    }
     _CASE.check_live(
-        counters, int(export_base), [int(b) for b in export_bytes], bool(busy_after_done)
+        _decode_counters(counters),
+        int(export_base),
+        [int(b) for b in export_bytes],
+        bool(busy_after_done),
     )
     return 0

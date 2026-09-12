@@ -2969,7 +2969,7 @@ class Module(BaseModule):
         descriptor chain and weight/bias/scale/LUT tables) and the
         graph's input tensors, then reads back the CSR counters plus the
         exported DDR region, entirely live over VUnit's Python FFI
-        (`python_call`/`python_execute`) -- no file is read or written
+        (python_pkg's `call`/`exec_file`) -- no file is read or written
         anywhere. It starts the DUT through the CSR and waits for
         DONE/ERROR. Every decision about what to run, and all numerical
         verification, lives in `accel_v2/cases.py` + `accel_v2/tbcase.py`,
@@ -2977,7 +2977,7 @@ class Module(BaseModule):
         a test never touches VHDL.
 
         `check_live` (called from `test/python_bridge/top_level_bridge.py`,
-        itself called from VHDL via `python_call`, right after
+        itself called from VHDL via `call`, right after
         `STATUS.DONE`/`STATUS.ERROR`) does the verification; there is no
         `pre_config`/`post_check` hook at all -- both directions of the
         run go through the live FFI path.
@@ -3043,13 +3043,13 @@ class Module(BaseModule):
             #
             # No `pre_config`/`post_check` hook: writing DDR and verifying
             # the run both happen entirely inside the simulation, over
-            # `python_call` (see `top_level_bridge.py`). Leaving both
+            # `call` (see `top_level_bridge.py`). Leaving both
             # unset is VUnit's own "nothing to run" default, not a gap.
             #
             # `g_case_name` is the only per-case generic: the testbench
             # fetches everything else about the case (program base
             # address, export/input DDR windows, expect_error, the
-            # compiled-region layout) live, via `python_call`, right
+            # compiled-region layout) live, via `call`, right
             # after `top_level_bridge.set_test_case` -- see
             # `TbCase.generics`'s own docstring for why that split is
             # drawn where it is.

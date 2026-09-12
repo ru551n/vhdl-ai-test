@@ -3,8 +3,7 @@ tb_cnn_accel_pe_array_from_vectors -- the last two cnn_accel testbenches
 that read pre-generated vector files (`desc.txt`/`weights_packed.txt`/
 `bias.txt`/`input.txt`/`expected.txt`, doc/cnn_accel_test_vectors.md) via
 VHDL's own `file_open`/`read_int_file`. See `shared/Vunit.md`'s
-"python_call and python_execute" section for the general pattern this
-follows.
+"Python FFI" section for the general pattern this follows.
 
 `generate_vectors.py`'s own case-authoring functions
 (`generate_conv_core_cases`/`generate_pe_array_xlang_case`) are

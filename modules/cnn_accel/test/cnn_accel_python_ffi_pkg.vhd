@@ -3,15 +3,22 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 library vunit_lib;
-use vunit_lib.python_pkg.all;
+context vunit_lib.python_context;
 use vunit_lib.integer_array_pkg.all;
 use vunit_lib.memory_pkg.all;
 use vunit_lib.check_pkg.all;
 
 -- Reusable helpers for a testbench that writes/reads DDR through VUnit's
--- Python FFI ('python_call') instead of CSV files, so that writing the
--- byte-at-a-time 'write_word'/'read_word' loop is a one-line call at
+-- Python FFI (python_pkg's 'call') instead of CSV files, so that writing
+-- the byte-at-a-time 'write_word'/'read_word' loop is a one-line call at
 -- every call site rather than duplicated per testbench.
+--
+-- 'to_bytes' serves the other direction: python_pkg's 'arg'/'kwarg' have
+-- no unsigned/std_ulogic overload (deliberately -- they would make a
+-- string literal argument ambiguous), and a 32-bit counter does not fit
+-- VHDL's signed 'integer' anyway, so a wide value crosses to Python as a
+-- little-endian list of byte values that the receiving function
+-- reassembles with int.from_bytes(bytes(value), "little").
 --
 -- Both directions work in whole bytes over a byte-addressed 'memory_t',
 -- matching the convention 'accel_v2.memimage.MemoryImage' and every
@@ -32,7 +39,7 @@ package cnn_accel_python_ffi_pkg is
 
   -- The inverse: read 'num_bytes' bytes out of 'memory' starting at
   -- 'base_addr' into a VUnit 'integer_array_t' of unsigned bytes, ready
-  -- to hand to a 'python_call' as its argument.
+  -- to hand to a 'call' as its argument.
   impure function ffi_export_bytes(
     memory : memory_t;
     base_addr : natural;
@@ -52,6 +59,19 @@ package cnn_accel_python_ffi_pkg is
     num_bytes : natural
   );
 
+  -- 'value' as a little-endian list of ((value'length + 7) / 8) byte
+  -- values (0..255), ready for python_pkg's 'arg'/'kwarg' -- which have
+  -- no unsigned overload, and could not carry a full 32-bit counter in a
+  -- VHDL 'integer' even if they did. The Python side reassembles it with
+  -- int.from_bytes(bytes(value), "little").
+  function to_bytes(value : unsigned) return integer_vector;
+
+  -- The same, for a single status bit: 4 bytes holding 0 or 1, so a
+  -- std_ulogic flag can be concatenated straight into a counter vector
+  -- alongside the real 32-bit counters instead of being special-cased at
+  -- every call site ('arg'/'kwarg' have no std_ulogic overload either).
+  function to_bytes(value : std_ulogic) return integer_vector;
+
 end package;
 
 package body cnn_accel_python_ffi_pkg is
@@ -68,10 +88,10 @@ package body cnn_accel_python_ffi_pkg is
       return;
     end if;
 
-    data := python_call(function_name);
+    data := call(function_name);
     check_equal(
       length(data), num_bytes,
-      "ffi_write_bytes: python_call(""" & function_name & """) returned "
+      "ffi_write_bytes: call(""" & function_name & """) returned "
       & to_string(length(data)) & " bytes, expected " & to_string(num_bytes)
     );
 
@@ -116,10 +136,10 @@ package body cnn_accel_python_ffi_pkg is
       return;
     end if;
 
-    data := python_call(function_name, arg => index);
+    data := call(function_name, arg(index));
     check_equal(
       length(data), num_bytes,
-      "ffi_write_indexed_bytes: python_call(""" & function_name & """, " & to_string(index)
+      "ffi_write_indexed_bytes: call(""" & function_name & """, " & to_string(index)
       & ") returned " & to_string(length(data)) & " bytes, expected " & to_string(num_bytes)
     );
 
@@ -131,5 +151,28 @@ package body cnn_accel_python_ffi_pkg is
       );
     end loop;
   end procedure;
+
+  function to_bytes(value : unsigned) return integer_vector is
+    constant num_bytes : positive := (value'length + 7) / 8;
+    alias normalized : unsigned(value'length - 1 downto 0) is value;
+    variable result : integer_vector(0 to num_bytes - 1) := (others => 0);
+  begin
+    -- Per set bit rather than per byte: it needs no guard for the bits of
+    -- the last byte that a non-multiple-of-8 'value' does not have.
+    for idx in 0 to normalized'length - 1 loop
+      if normalized(idx) = '1' then
+        result(idx / 8) := result(idx / 8) + 2 ** (idx mod 8);
+      end if;
+    end loop;
+    return result;
+  end function;
+
+  function to_bytes(value : std_ulogic) return integer_vector is
+  begin
+    if value = '1' then
+      return integer_vector'(1, 0, 0, 0);
+    end if;
+    return integer_vector'(0, 0, 0, 0);
+  end function;
 
 end package body;

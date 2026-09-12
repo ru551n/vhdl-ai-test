@@ -7,7 +7,7 @@ context vunit_lib.vunit_context;
 context vunit_lib.com_context;
 use vunit_lib.memory_pkg.all;
 use vunit_lib.axi_slave_pkg.all;
-use vunit_lib.python_pkg.all;
+context vunit_lib.python_context;
 use vunit_lib.integer_array_pkg.all;
 
 library axi;
@@ -38,7 +38,7 @@ use cnn_accel.cnn_accel_tb_util_pkg.all;
 -- DUT-internal signal (no external names, no hierarchical references, no
 -- forcing). Every numerical claim about a run -- and every byte that goes
 -- INTO DDR, not just what comes out -- is made in Python, live, over
--- VUnit's Python FFI ('python_call'/'python_execute'). No file is read or
+-- VUnit's Python FFI (python_pkg's 'call'/'exec_file'). No file is read or
 -- written anywhere in this testbench: adding a test adds a Python
 -- function (see accel_v2/cases*.py and test/python_bridge/
 -- top_level_bridge.py) and never a line of VHDL.
@@ -52,7 +52,7 @@ use cnn_accel.cnn_accel_tb_util_pkg.all;
 --      windows, whether it expects an error).
 --   3. Write the compiler's own output (descriptor chain, weight/bias/
 --      scale/LUT tables) region by region, then the graph's own input
---      tensors, each via one 'python_call' per region (see
+--      tensors, each via one 'call' per region (see
 --      'cnn_accel_python_ffi_pkg.vhd's 'ffi_write_indexed_bytes'/
 --      'ffi_write_bytes').
 --   4. Serve the DUT's single AXI4 master port from that same 'memory_t'
@@ -61,8 +61,11 @@ use cnn_accel.cnn_accel_tb_util_pkg.all;
 --      axi_lite_master) using exclusively the GENERATED register
 --      procedures, poll STATUS to DONE/ERROR.
 --   6. Read every counter register plus the exported DDR region and hand
---      them straight to 'top_level_bridge.check_result' (one
---      'python_call'), which verifies the run via 'TbCase.check_live'.
+--      them straight to 'top_level_bridge.check_result' (one 'call'),
+--      which verifies the run via 'TbCase.check_live'. The counters go
+--      over as ONE packed little-endian byte vector: python_pkg's 'call'
+--      takes at most 10 arguments and has no unsigned overload, so 22
+--      named 32-bit kwargs cannot be passed as such.
 --
 -- Byte/beat traffic totals (DDR_RD_BYTES, DDR_WR_BYTES, ...) are trusted
 -- straight from the DUT's own CSR counters -- the module's internal
@@ -210,11 +213,6 @@ begin
     -- The exported region, read one byte per 'read_word' call and
     -- handed to Python directly (see 'ffi_export_bytes').
     variable export_data : integer_array_t;
-    -- Discards a 'python_call''s return value: several Python-side calls
-    -- below have nothing meaningful to report back, so only the call
-    -- itself (and its exception-to-VHDL-failure path) matters.
-    variable discard : integer;
-
     -- Per-case values, fetched live from the selected 'TbCase' right
     -- after 'set_test_case' -- the case already knows all of this, so it
     -- is never duplicated into a generic (see top_level_bridge.py's
@@ -256,21 +254,64 @@ begin
     variable weight_load_bytes_slv : register_t := (others => '0');
     variable local_bytes_slv : register_t := (others => '0');
 
+    -- Every counter 'check_result' judges the run by, packed into ONE
+    -- little-endian byte vector in a fixed order that
+    -- 'top_level_bridge._COUNTER_ORDER' mirrors exactly -- 4 bytes per
+    -- value, status bits included as 0/1 counters.
+    --
+    -- Why not 22 named kwargs like before: python_pkg's 'call' takes at
+    -- most 10 arguments in total, and its 'arg'/'kwarg' have no unsigned
+    -- overload (a 32-bit counter does not fit a VHDL 'integer' either),
+    -- so the names live in the two matching orders instead of at the
+    -- call site. ADD, REORDER OR REMOVE NOTHING HERE without making the
+    -- identical edit to '_COUNTER_ORDER'.
+    impure function counter_bytes return integer_vector is
+    begin
+      return
+        to_bytes(u_unsigned(status_slv)) &
+        to_bytes(status.busy) &
+        to_bytes(status.done) &
+        to_bytes(status.error) &
+        -- Resized to 32 bits like every other value here: packing
+        -- 'status.err_code'/'err_pc_low' at their native (4-bit/16-bit)
+        -- field widths would hand Python a 1-byte/2-byte value where it
+        -- unpacks 4 -- the same corruption the old per-kwarg path hit,
+        -- caught by 'err_bad_geometry' (real, nonzero values).
+        to_bytes(resize(status.err_code, 32)) &
+        to_bytes(resize(status.err_pc_low, 32)) &
+        to_bytes(u_unsigned(hw_info_slv)) &
+        to_bytes(u_unsigned(hw_info2_slv)) &
+        to_bytes(u_unsigned(hw_info3_slv)) &
+        to_bytes(u_unsigned(cmd_count_slv)) &
+        to_bytes(u_unsigned(cycle_count_slv)) &
+        to_bytes(u_unsigned(compute_cycles_slv)) &
+        to_bytes(u_unsigned(stall_cycles_slv)) &
+        to_bytes(u_unsigned(ddr_rd_bytes_slv)) &
+        to_bytes(u_unsigned(ddr_wr_bytes_slv)) &
+        to_bytes(u_unsigned(tensor_load_count_slv)) &
+        to_bytes(u_unsigned(tensor_store_count_slv)) &
+        to_bytes(u_unsigned(weight_load_bytes_slv)) &
+        to_bytes(u_unsigned(local_bytes_slv)) &
+        to_bytes(to_unsigned(axi_aw_count, 32)) &
+        to_bytes(axi_wr_lo_addr) &
+        to_bytes(axi_wr_hi_addr);
+    end function;
+
     variable start_time : time;
     variable elapsed_cycles : natural := 0;
 
   begin
     test_runner_setup(runner, runner_cfg);
 
-    python_execute(file_name => tb_path(runner_cfg) & "python_bridge/top_level_bridge.py");
-    discard := python_call("set_test_case", arg => g_case_name);
+    exec_file(tb_path(runner_cfg) & "python_bridge/top_level_bridge.py");
+    call("set_test_case", arg(g_case_name));
 
-    program_addr := python_call("get_program_start_address");
-    expect_error := python_call("get_expect_error");
-    region := python_call("get_output_region");
+    program_addr := call("get_program_start_address");
+    expect_error := call("get_expect_error");
+    region := call("get_output_region");
     export_base := get(region, 0);
     export_bytes := get(region, 1);
-    region := python_call("get_input_region");
+    region := call("get_input_region");
     inputs_base := get(region, 0);
     inputs_bytes := get(region, 1);
 
@@ -318,7 +359,7 @@ begin
     -- top_level_bridge.py for why this is regions rather than one flat
     -- span: 'DdrMap' places each region at a fixed, far-apart base
     -- regardless of how much of it any one case fills.
-    compiled_bounds := python_call("get_program_regions");
+    compiled_bounds := call("get_program_regions");
     num_compiled_regions := length(compiled_bounds) / 2;
     for r in 0 to num_compiled_regions - 1 loop
       ffi_write_indexed_bytes(
@@ -329,7 +370,7 @@ begin
     end loop;
     info(
       "tb_cnn_accel_top: wrote " & to_string(num_compiled_regions)
-      & " compiled region(s) via python_call(""get_program_data"")"
+      & " compiled region(s) via call(""get_program_data"")"
     );
 
     -- The graph's own input tensors: a separate region, written the same
@@ -337,7 +378,7 @@ begin
     ffi_write_bytes(memory, "get_input_data", inputs_base, inputs_bytes);
     info(
       "tb_cnn_accel_top: wrote " & to_string(inputs_bytes)
-      & " input bytes via python_call(""get_input_data"")"
+      & " input bytes via call(""get_input_data"")"
     );
 
     ----------------------------------------------------------------------
@@ -410,51 +451,22 @@ begin
 
       --------------------------------------------------------------------
       -- Every counter, plus the exported DDR region, handed straight to
-      -- 'top_level_bridge.check_result' (one python_call), which runs
+      -- 'top_level_bridge.check_result' (one 'call'), which runs
       -- 'TbCase.check_live' -- no file is read or written anywhere in
       -- this step. No 'check_true' wrapper: 'check_result' raises on
-      -- failure, and 'python_call' already reports an uncaught Python
-      -- exception to VHDL as a FAILURE with the full traceback, which
-      -- says more than any message this call site could write. The
-      -- return value is discarded for the same reason it is above.
+      -- failure, and 'call' already reports an uncaught Python exception
+      -- to VHDL as a FAILURE with the full traceback, which says more
+      -- than any message this call site could write. The procedure form
+      -- of 'call' ignores the (meaningless) return value.
       --------------------------------------------------------------------
       export_data := ffi_export_bytes(memory, export_base, export_bytes);
 
-      discard :=
-        python_call(
-          "check_result",
-          arg => export_data,
-          kwargs =>
-            kw("export_base", export_base) &
-            kw("status", u_unsigned(status_slv)) &
-            kw("busy", status.busy) &
-            kw("done", status.done) &
-            kw("error", status.error) &
-            -- Resized to 32 bits like every other kwarg below: passing
-            -- 'status.err_code'/'err_pc_low' at their native (4-bit/
-            -- 16-bit) field widths corrupted the values on the Python
-            -- side -- invisible for every case that only ever exercises
-            -- err_code=0/err_pc_low=0, caught by 'err_bad_geometry'
-            -- (real, nonzero values) once every case ran the live path.
-            kw("err_code", resize(status.err_code, 32)) &
-            kw("err_pc_low", resize(status.err_pc_low, 32)) &
-            kw("hw_info", u_unsigned(hw_info_slv)) &
-            kw("hw_info2", u_unsigned(hw_info2_slv)) &
-            kw("hw_info3", u_unsigned(hw_info3_slv)) &
-            kw("cmd_count", u_unsigned(cmd_count_slv)) &
-            kw("cycle_count", u_unsigned(cycle_count_slv)) &
-            kw("compute_cycles", u_unsigned(compute_cycles_slv)) &
-            kw("stall_cycles", u_unsigned(stall_cycles_slv)) &
-            kw("ddr_rd_bytes", u_unsigned(ddr_rd_bytes_slv)) &
-            kw("ddr_wr_bytes", u_unsigned(ddr_wr_bytes_slv)) &
-            kw("tensor_load_count", u_unsigned(tensor_load_count_slv)) &
-            kw("tensor_store_count", u_unsigned(tensor_store_count_slv)) &
-            kw("weight_load_bytes", u_unsigned(weight_load_bytes_slv)) &
-            kw("local_bytes", u_unsigned(local_bytes_slv)) &
-            kw("axi_aw_count", axi_aw_count) &
-            kw("axi_wr_lo_addr", axi_wr_lo_addr) &
-            kw("axi_wr_hi_addr", axi_wr_hi_addr)
-        );
+      call(
+        "check_result",
+        arg(export_data),
+        arg(counter_bytes),
+        kwarg("export_base", export_base)
+      );
 
       --------------------------------------------------------------------
       -- The one and only pass/fail claim this testbench itself makes

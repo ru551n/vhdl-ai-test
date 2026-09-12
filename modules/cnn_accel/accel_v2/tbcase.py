@@ -3,7 +3,7 @@
 `tb_cnn_accel_top` is deliberately dumb: it writes a DDR image, pokes
 `PROGRAM_BASE_ADDR` + `CTRL.START`, waits for `DONE`/`ERROR`, then reads
 back the CSR counters and a byte region -- all of it live, over VUnit's
-Python FFI (`python_call`/`python_execute`, bridged through
+Python FFI (python_pkg's `call`/`exec_file`, bridged through
 `test/python_bridge/top_level_bridge.py`). No file is read or written
 anywhere in this path. Every decision about *what* to run and *whether
 the result is right* lives here, so adding a test adds a Python function
@@ -173,7 +173,7 @@ class TbCase:
         `get_input_region`/`get_expect_error`), so it is not duplicated
         into a generic here either: only values that affect DUT/testbench
         ELABORATION (generics feeding a `generic map`, fixed before any
-        `python_call` is even possible) belong in this dict."""
+        `call` into Python is even possible) belong in this dict."""
         # Sized from THIS case's own map, not from the class constant: a
         # tiled case plans against `DdrMap(scale=N)` (one descriptor per
         # plane per row copy runs the default 60 KiB PROGRAM region out),
@@ -283,7 +283,7 @@ class TbCase:
         busy_after_done: bool = False,
     ) -> None:
         """Verify the run: called from `top_level_bridge.check_result`
-        (test/python_bridge/top_level_bridge.py) via a `python_call`,
+        (test/python_bridge/top_level_bridge.py) via one `call`,
         right after `STATUS.DONE`/`STATUS.ERROR` fires inside the running
         simulation -- no `result.csv`/`counters.csv` file is read or
         written anywhere in this path. `export_bytes` is the raw exported
@@ -299,7 +299,7 @@ class TbCase:
         that a stuck BUSY bit is always a real DUT bug there.
 
         Raises `CheckFailure`/`GeometryError` on the first disagreement,
-        deliberately uncaught: `python_call` already turns an uncaught
+        deliberately uncaught: `call` already turns an uncaught
         Python exception into a VUnit FAILURE with the full traceback
         (see `cnn_accel_python_ffi_pkg.vhd`'s callers), which is a
         better error report than a bool plus a hand-written `check_true`
@@ -330,7 +330,7 @@ class TbCase:
             # one, and is 0 (a no-op) for every case that never
             # relocates, which is every existing config.
             reloc_delta = export_base - self.export_base
-            self._check_outputs_against(exported, "<live python_call, no file>", reloc_delta)
+            self._check_outputs_against(exported, "<live call, no file>", reloc_delta)
             self._check_traffic(counters)
 
     def _check_hw_info(self, counters: dict[str, int]) -> None:
@@ -467,7 +467,7 @@ class TbCase:
         self, exported: "MemoryImage", source_description: str, reloc_delta: int = 0
     ) -> None:
         """Compare every graph output tensor in `exported` (built by
-        `check_live` from the bytes a `python_call` handed over) against
+        `check_live` from the bytes a `call` handed over) against
         `self.expected`. `reloc_delta` shifts the compiled output
         address by however far OUTPUT_ADDR relocation (spec section 6a)
         moved the live run's actual export window; 0 for every

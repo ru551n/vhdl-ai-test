@@ -7,7 +7,7 @@ context vunit_lib.vunit_context;
 context vunit_lib.com_context;
 use vunit_lib.memory_pkg.all;
 use vunit_lib.axi_slave_pkg.all;
-use vunit_lib.python_pkg.all;
+context vunit_lib.python_context;
 use vunit_lib.integer_array_pkg.all;
 
 library axi;
@@ -110,7 +110,6 @@ begin
   ------------------------------------------------------------------------
   main : process
     variable ddr : buffer_t;
-    variable discard : integer;
     variable region : integer_array_t;
     variable program_addr : natural;
     variable export_base : natural;
@@ -136,6 +135,49 @@ begin
     variable tensor_store_count_slv : register_t := (others => '0');
     variable weight_load_bytes_slv : register_t := (others => '0');
     variable local_bytes_slv : register_t := (others => '0');
+
+    -- Every counter 'check_result' judges a completed job by, packed
+    -- into ONE little-endian byte vector in a fixed order that
+    -- 'top_level_bridge._COUNTER_ORDER' mirrors exactly -- 4 bytes per
+    -- value, status bits included as 0/1 counters. Identical to
+    -- 'tb_cnn_accel_top's own helper of the same name, including the
+    -- order; python_pkg's 'call' takes at most 10 arguments and its
+    -- 'arg'/'kwarg' have no unsigned overload, so 22 named 32-bit
+    -- kwargs cannot be passed as such. ADD, REORDER OR REMOVE NOTHING
+    -- HERE without making the identical edit to '_COUNTER_ORDER'.
+    --
+    -- The last three (axi_aw_count/axi_wr_lo_addr/axi_wr_hi_addr) are
+    -- hard 0: there is no passive AXI monitor in this testbench (see the
+    -- entity header -- it only exercises the queue/relocation protocol,
+    -- not the residency invariants 'tb_cnn_accel_top' already covers),
+    -- and 0 disables the write-range check ('TbCase.check_live' only
+    -- runs it when 'axi_aw_count' > 0).
+    impure function counter_bytes return integer_vector is
+    begin
+      return
+        to_bytes(u_unsigned(status_slv)) &
+        to_bytes(status.busy) &
+        to_bytes(status.done) &
+        to_bytes(status.error) &
+        to_bytes(resize(status.err_code, 32)) &
+        to_bytes(resize(status.err_pc_low, 32)) &
+        to_bytes(u_unsigned(hw_info_slv)) &
+        to_bytes(u_unsigned(hw_info2_slv)) &
+        to_bytes(u_unsigned(hw_info3_slv)) &
+        to_bytes(u_unsigned(cmd_count_slv)) &
+        to_bytes(u_unsigned(cycle_count_slv)) &
+        to_bytes(u_unsigned(compute_cycles_slv)) &
+        to_bytes(u_unsigned(stall_cycles_slv)) &
+        to_bytes(u_unsigned(ddr_rd_bytes_slv)) &
+        to_bytes(u_unsigned(ddr_wr_bytes_slv)) &
+        to_bytes(u_unsigned(tensor_load_count_slv)) &
+        to_bytes(u_unsigned(tensor_store_count_slv)) &
+        to_bytes(u_unsigned(weight_load_bytes_slv)) &
+        to_bytes(u_unsigned(local_bytes_slv)) &
+        to_bytes(to_unsigned(0, 32)) &
+        to_bytes(u_unsigned'(x"00000000")) &
+        to_bytes(u_unsigned'(x"00000000"));
+    end function;
 
     variable start_time : time;
     variable elapsed_cycles : natural := 0;
@@ -206,54 +248,26 @@ begin
 
       export_data := ffi_export_bytes(memory, base, bytes);
 
-      discard :=
-        python_call(
-          "check_result",
-          arg => export_data,
-          kwargs =>
-            kw("export_base", base) &
-            kw("status", u_unsigned(status_slv)) &
-            kw("busy", status.busy) &
-            kw("done", status.done) &
-            kw("error", status.error) &
-            kw("err_code", resize(status.err_code, 32)) &
-            kw("err_pc_low", resize(status.err_pc_low, 32)) &
-            kw("hw_info", u_unsigned(hw_info_slv)) &
-            kw("hw_info2", u_unsigned(hw_info2_slv)) &
-            kw("hw_info3", u_unsigned(hw_info3_slv)) &
-            kw("cmd_count", u_unsigned(cmd_count_slv)) &
-            kw("cycle_count", u_unsigned(cycle_count_slv)) &
-            kw("compute_cycles", u_unsigned(compute_cycles_slv)) &
-            kw("stall_cycles", u_unsigned(stall_cycles_slv)) &
-            kw("ddr_rd_bytes", u_unsigned(ddr_rd_bytes_slv)) &
-            kw("ddr_wr_bytes", u_unsigned(ddr_wr_bytes_slv)) &
-            kw("tensor_load_count", u_unsigned(tensor_load_count_slv)) &
-            kw("tensor_store_count", u_unsigned(tensor_store_count_slv)) &
-            kw("weight_load_bytes", u_unsigned(weight_load_bytes_slv)) &
-            kw("local_bytes", u_unsigned(local_bytes_slv)) &
-            -- No passive AXI monitor in this testbench (see the entity
-            -- header: this file only exercises the queue/relocation
-            -- protocol, not the residency invariants 'tb_cnn_accel_top'
-            -- already covers) -- 0 disables the write-range check
-            -- ('TbCase.check_live' only runs it when 'axi_aw_count' > 0).
-            kw("axi_aw_count", 0) &
-            kw("axi_wr_lo_addr", u_unsigned'(x"00000000")) &
-            kw("axi_wr_hi_addr", u_unsigned'(x"00000000")) &
-            kw("busy_after_done", busy_after_done)
-        );
+      call(
+        "check_result",
+        arg(export_data),
+        arg(counter_bytes),
+        kwarg("export_base", base),
+        kwarg("busy_after_done", busy_after_done)
+      );
     end procedure;
 
   begin
     test_runner_setup(runner, runner_cfg);
 
-    python_execute(file_name => tb_path(runner_cfg) & "python_bridge/top_level_bridge.py");
-    discard := python_call("set_test_case", arg => string'("single_conv"));
+    exec_file(tb_path(runner_cfg) & "python_bridge/top_level_bridge.py");
+    call("set_test_case", arg(string'("single_conv")));
 
-    program_addr := python_call("get_program_start_address");
-    region := python_call("get_output_region");
+    program_addr := call("get_program_start_address");
+    region := call("get_output_region");
     export_base := get(region, 0);
     export_bytes := get(region, 1);
-    region := python_call("get_input_region");
+    region := call("get_input_region");
     inputs_base := get(region, 0);
     inputs_bytes := get(region, 1);
 
@@ -265,7 +279,7 @@ begin
     ddr := allocate(memory, num_bytes => 16#0020_0000#, name => "ddr", permissions => read_and_write);
     check_equal(base_address(ddr), 0, "the DDR allocation must start at address 0");
 
-    compiled_bounds := python_call("get_program_regions");
+    compiled_bounds := call("get_program_regions");
     num_compiled_regions := length(compiled_bounds) / 2;
     for r in 0 to num_compiled_regions - 1 loop
       ffi_write_indexed_bytes(

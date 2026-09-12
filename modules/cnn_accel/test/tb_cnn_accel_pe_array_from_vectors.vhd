@@ -4,7 +4,7 @@ use ieee.numeric_std.all;
 
 library vunit_lib;
 context vunit_lib.vunit_context;
-use vunit_lib.python_pkg.all;
+context vunit_lib.python_context;
 use vunit_lib.integer_array_pkg.all;
 
 library math;
@@ -213,7 +213,6 @@ begin
     variable weights_flat : integer_array_t;
     variable input_flat : integer_array_t;
     variable accum_flat : integer_array_t;
-    variable discard : integer;
 
     variable window : window_row_t;
     variable expected : accum_int_arr_t;
@@ -233,11 +232,11 @@ begin
     -- VUnit's Python FFI -- see this file's header comment) once, before
     -- any stimulus -- mirrors tb_cnn_accel_pe_array.vhd's own
     -- randomize_weight_mem-before-any-beat idiom.
-    python_execute(file_name => tb_path(runner_cfg) & "python_bridge/conv_core_bridge.py");
-    discard := python_call("select_pe_array_case", arg => c_pe_rows);
-    weights_flat := python_call("get_weights_packed_flat");
-    input_flat := python_call("get_input_flat");
-    accum_flat := python_call("get_raw_accum_flat");
+    exec_file(tb_path(runner_cfg) & "python_bridge/conv_core_bridge.py");
+    call("select_pe_array_case", arg(c_pe_rows));
+    weights_flat := call("get_weights_packed_flat");
+    input_flat := call("get_input_flat");
+    accum_flat := call("get_raw_accum_flat");
 
     for row in 0 to c_num_tiles - 1 loop
       for lane in 0 to c_weight_lanes - 1 loop

@@ -7,7 +7,7 @@ use std.textio.all;
 library vunit_lib;
 context vunit_lib.vunit_context;
 use vunit_lib.queue_pkg.all;
-use vunit_lib.python_pkg.all;
+context vunit_lib.python_context;
 use vunit_lib.integer_array_pkg.all;
 
 library osvvm;
@@ -27,7 +27,7 @@ use cnn_accel.cnn_accel_isa_pkg.all;
 -- generated vector cases (generate_vectors.py from cnn_accel_model.py,
 -- fetched live over VUnit's Python FFI by test/python_bridge/
 -- conv_core_bridge.py -- see that module's own docstring and
--- shared/Vunit.md's "python_call and python_execute" section; no VHDL
+-- shared/Vunit.md's "Python FFI" section; no VHDL
 -- file I/O happens in this testbench at all) that every other RTL-facing
 -- consumer of that golden model uses, and compares its 'm_out' stream
 -- against the expected bytes byte-for-byte -- no VHDL re-derivation of the
@@ -362,7 +362,6 @@ begin
   ------------------------------------------------------------------------
   main : process
     variable rnd : RandomPType;
-    variable discard : integer;
 
     procedure do_reset is
     begin
@@ -395,7 +394,7 @@ begin
     -- assertion message only -- selection already happened before this
     -- is called.
     procedure run_selected_case(case_label : string) is
-      variable desc_fields : integer_array_t := python_call("get_desc_fields");
+      variable desc_fields : integer_array_t := call("get_desc_fields");
       variable opcode : integer := get(desc_fields, c_df_opcode);
       variable flags : integer := get(desc_fields, c_df_flags);
       variable v_in_width : integer := get(desc_fields, c_df_in_width);
@@ -474,12 +473,12 @@ begin
           integer'image(c_tile_channels)
         severity failure;
 
-      weights_flat := python_call("get_weights_packed_flat");
-      bias_flat := python_call("get_bias_flat");
-      input_flat := python_call("get_input_flat");
-      expected_flat := python_call("get_expected_flat");
+      weights_flat := call("get_weights_packed_flat");
+      bias_flat := call("get_bias_flat");
+      input_flat := call("get_input_flat");
+      expected_flat := call("get_expected_flat");
       if v_per_channel_en then
-        scale_flat := python_call("get_scale_table_packed_flat");
+        scale_flat := call("get_scale_table_packed_flat");
       end if;
 
       -- Start a new fill session (write pointers reset to 0) before
@@ -633,9 +632,7 @@ begin
     -- it -- for 'run_all_cases' below.
     procedure run_hand_case(name : string) is
     begin
-      discard := python_call(
-        "select_hand_case", arg => string'(name), kwargs => kw("pe_rows", c_pe_rows)
-      );
+      call("select_hand_case", arg(name), kwarg("pe_rows", c_pe_rows));
       run_selected_case(name);
     end procedure;
 
@@ -644,7 +641,7 @@ begin
     -- for 'run_compiler_cases' below.
     procedure run_dir_case(case_dir : string) is
     begin
-      discard := python_call("select_dir_case", arg => string'(case_dir));
+      call("select_dir_case", arg(case_dir));
       run_selected_case(case_dir);
     end procedure;
 
@@ -720,7 +717,7 @@ begin
   begin
     test_runner_setup(runner, runner_cfg);
     rnd.InitSeed(get_string_seed(runner_cfg));
-    python_execute(file_name => tb_path(runner_cfg) & "python_bridge/conv_core_bridge.py");
+    exec_file(tb_path(runner_cfg) & "python_bridge/conv_core_bridge.py");
 
     do_reset;
     wait until rising_edge(clk);
