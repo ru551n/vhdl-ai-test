@@ -29,14 +29,23 @@ else goes through `kw()`. Every function below therefore takes `id` via `kw`.
 
 Little-end-first bit packing into a non-negative 32-bit integer:
 
-| field | width | shift | values |
-|---|---|---|---|
-| `action` | 2 | 0 | 0 = receive, 1 = transmit, 2 = ignore_rest |
-| `lanes` | 3 | 2 | 1, 2 or 4 — applies to **this** action |
-| `pre_dummy_cycles` | 6 | 5 | 0..63 SCK cycles, IOs Hi-Z, **before** this action |
-| `byte_out` | 8 | 11 | valid when `action = transmit` |
-| `flags` | 4 | 19 | bit 0 = `volatile` (pass `now_s` on the next `xfer`) |
-| `n_bytes` | 10 | 23 | reserved for chunking; always 1 in the MVP |
+| field | width | shift | bits | values |
+|---|---|---|---|---|
+| `action` | 2 | 0 | 0-1 | 0 = receive, 1 = transmit, 2 = ignore_rest |
+| `lanes` | 3 | 2 | 2-4 | 1, 2 or 4 — applies to **this** action |
+| `pre_dummy_cycles` | 6 | 5 | 5-10 | 0..63 SCK cycles, IOs Hi-Z, **before** this action |
+| `byte_out` | 8 | 11 | 11-18 | valid when `action = transmit` |
+| `flags` | 2 | 19 | 19-20 | bit 0 = `volatile` (pass `now_s` on the next `xfer`) |
+| `n_bytes` | 9 | 21 | 21-29 | reserved for chunking; always 1 in the MVP |
+
+**The layout must fit in 30 bits, and this is not cosmetic.** VHDL's `integer`
+is *signed* 32-bit, so any packed value at or above 2**31 is not representable
+and the bridge cannot carry it. The widths above occupy bits 0..29, giving a
+maximum packed value of 2**30 - 1. An earlier revision of this table gave
+`flags` 4 bits and `n_bytes` 10 bits at shift 23, occupying bits 0..32 — that
+overflows a signed 32-bit integer as soon as `n_bytes` is used for real, and
+survived only because the MVP always sets `n_bytes` to 1. Any future widening
+must keep the total at or under 30 bits.
 
 Every field describes the same, next action — one tense throughout.
 

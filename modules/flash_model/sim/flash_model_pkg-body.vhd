@@ -22,8 +22,10 @@ package body flash_model_pkg is
     constant c_num_bytes : natural := extract_field(packed, c_dir_num_bytes_shift, c_dir_num_bytes_width);
     variable v_result : flash_directive_t;
   begin
-    assert packed >= 0
-      report "flash_model_pkg.decode_directive: negative packed directive " & to_string(packed)
+    assert packed >= 0 and packed <= c_dir_packed_max
+      report "flash_model_pkg.decode_directive: packed directive " & to_string(packed)
+        & " is outside 0 .. " & to_string(c_dir_packed_max)
+        & " -- FFI layout drift, or a field overflowed its width"
       severity failure;
 
     assert c_action <= flash_action_t'pos(flash_action_t'high)
