@@ -80,9 +80,16 @@ package flash_model_pkg is
   constant c_dir_byte_out_shift : natural := 11;
   constant c_dir_byte_out_width : natural := 8;
   constant c_dir_flags_shift : natural := 19;
-  constant c_dir_flags_width : natural := 4;
-  constant c_dir_num_bytes_shift : natural := 23;
-  constant c_dir_num_bytes_width : natural := 10;
+  constant c_dir_flags_width : natural := 2;
+  constant c_dir_num_bytes_shift : natural := 21;
+  constant c_dir_num_bytes_width : natural := 9;
+
+  -- The packed layout occupies bits 0..29, so the largest directive is
+  -- 2**30 - 1. That ceiling is load-bearing, not cosmetic: VHDL's `integer` is
+  -- SIGNED 32-bit, so a layout reaching bit 31 or beyond cannot be carried
+  -- across the bridge at all. Any future widening must keep the total at or
+  -- under 30 bits.
+  constant c_dir_packed_max : natural := 2 ** 30 - 1;
 
   constant c_dir_flag_volatile : natural := 0;  -- bit index within the flags field
 
