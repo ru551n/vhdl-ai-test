@@ -22,9 +22,21 @@
 # Also used by the flash_model verification component, which keeps its whole
 # device model in Python. See shared/Vunit.md's "Python FFI" section.
 #
+# Pinned to ru551n/vunit's own master (not a feature branch): master already
+# carries the python_pkg work reconciled with real upstream VUnit, so this is
+# the one lineage actually intended to keep tracking upstream rather than
+# permanently diverge from it. Its arg/kwarg/eval/call overloads take
+# std_logic/std_logic_vector, not this project's usual std_ulogic/
+# std_ulogic_vector default (HouseStyle.md) -- a deliberate exception at this
+# one FFI boundary, per that same doc's "genuine resolution/external-
+# interoperability boundary" carve-out; a std_ulogic value passes through
+# these calls untouched (same base type, no explicit cast needed at the call
+# site), which is why no call site in this repo needed to change when this
+# was last repinned.
+#
 # Headless waveform recording (`--wave`) is not supported by this VUnit, and
 # is not needed.
-vunit-hdl @ git+https://github.com/ru551n/vunit.git@771df499cad358161414431eed2682c080608662
+vunit-hdl @ git+https://github.com/ru551n/vunit.git@cda4e4e887c934eabe159e08291807efcb6a10d0
 
 # tsfpga fork carrying the Yosys+GHDL netlist-build support
 # (`tsfpga.yosys.project`, `BuildProjectList`) that upstream has not released.
