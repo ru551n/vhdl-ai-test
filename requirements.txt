@@ -19,9 +19,6 @@
 # Standard, not opt-in: run.py always calls `add_python()` right after
 # `add_vhdl_builtins()`.
 #
-# Also used by the flash_model verification component, which keeps its whole
-# device model in Python. See shared/Vunit.md's "Python FFI" section.
-#
 # Pinned to ru551n/vunit's own master (not a feature branch): master already
 # carries the python_pkg work reconciled with real upstream VUnit, so this is
 # the one lineage actually intended to keep tracking upstream rather than
