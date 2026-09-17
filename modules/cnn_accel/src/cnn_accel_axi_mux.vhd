@@ -101,7 +101,7 @@ architecture a of cnn_accel_axi_mux is
   signal read_s2m : axi_read_s2m_t;
   signal write_m2s : axi_write_m2s_t := axi_write_m2s_init;
   signal write_s2m : axi_write_s2m_t;
-  SIGNAL demo_count : natural range 0 to 7;   
+  signal demo_count : natural range 0 to 7;
 
 begin
 
