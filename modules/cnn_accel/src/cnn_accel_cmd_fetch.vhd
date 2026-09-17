@@ -1,14 +1,14 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
-use cnn_accel.cnn_accel_v2_pkg.all;
-use cnn_accel.cnn_accel_isa_pkg.c_instr_word_bytes;
+  use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_v2_pkg.all;
+  use cnn_accel.cnn_accel_isa_pkg.c_instr_word_bytes;
 
 library axi_stream;
-use axi_stream.axi_stream_pkg.all;
+  use axi_stream.axi_stream_pkg.all;
 
 -- ISA v2.0 descriptor fetch unit (doc/cnn_accel_top_v2_arch.md section 2.1,
 -- "cnn_accel_cmd_fetch"). Issues one 'dma_req_m2s_t' read job of exactly
@@ -79,47 +79,46 @@ entity cnn_accel_cmd_fetch is
     g_axi_data_width : positive := 64;
     -- Watchdog bound, in clock cycles, from 'start' being accepted until
     -- 'instr_dma_done' must arrive. '0' (default) disables the watchdog.
-    g_timeout_cycles : natural := 0
-  );
+    g_timeout_cycles : natural := 0);
   port (
-    clk : in std_ulogic;
+    clk                : in  std_ulogic;
     -- Synchronous active-high reset ('reset_internal' at the IP top level).
-    reset : in std_ulogic := '0';
+    reset              : in  std_ulogic := '0';
 
     --# {{}}
     -- Begin a fetch of the descriptor at byte address 'addr'. Sampled
     -- only while idle; re-startable immediately after a fetch's 'PRESENT'
     -- has been acknowledged, for chained descriptors.
-    start : in std_ulogic;
-    addr : in unsigned(31 downto 0);
+    start              : in  std_ulogic;
+    addr               : in  unsigned(31 downto 0);
 
     --# {{}}
     -- Request port to this entity's instruction-fetch 'cnn_accel_axi_read_dma'
     -- instance (owned one level up -- see entity-level comment).
-    instr_req_m2s : out dma_req_m2s_t :=
+    instr_req_m2s      : out dma_req_m2s_t :=
       (valid => '0', req => (addr => (others => '0'), length => (others => '0')));
-    instr_req_s2m : in dma_req_s2m_t;
+    instr_req_s2m      : in  dma_req_s2m_t;
     -- AXI4-Stream instruction bytes from that same DMA instance.
-    s_instr_stream_m2s : in axi_stream_m2s_t;
+    s_instr_stream_m2s : in  axi_stream_m2s_t;
     s_instr_stream_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
     -- That DMA instance's own 'dma_done'/'resp_error' pulses (not carried
     -- on the stream -- see entity-level comment).
-    instr_dma_done : in std_ulogic;
-    instr_resp_error : in std_ulogic;
+    instr_dma_done     : in  std_ulogic;
+    instr_resp_error   : in  std_ulogic;
 
     --# {{}}
     -- Decoded descriptor output handshake.
-    desc : out desc_v2_t := desc_v2_init;
+    desc               : out desc_v2_t := desc_v2_init;
     -- The descriptor's own fetch address ("PC"), stable while 'desc_valid'.
-    pc : out unsigned(31 downto 0) := (others => '0');
-    desc_valid : out std_ulogic := '0';
-    desc_ready : in std_ulogic;
+    pc                 : out unsigned(31 downto 0) := (others => '0');
+    desc_valid         : out std_ulogic := '0';
+    desc_ready         : in  std_ulogic;
 
     --# {{}}
     -- One-cycle error pulse; 'error_code' is 'c_err_axi' or 'c_err_timeout'
     -- and is only meaningful on the same cycle as 'error'.
-    error : out std_ulogic := '0';
-    error_code : out err_code_t := c_err_none
+    error              : out std_ulogic := '0';
+    error_code         : out err_code_t := c_err_none
   );
 end entity cnn_accel_cmd_fetch;
 
@@ -131,6 +130,7 @@ architecture a of cnn_accel_cmd_fetch is
   constant c_word_bits : positive := 8 * c_instr_word_bytes;
 
   type state_t is (s_idle, s_req, s_collect, s_present, s_error);
+
   signal state_q : state_t := s_idle;
 
   signal pc_q : unsigned(31 downto 0) := (others => '0');
@@ -158,27 +158,36 @@ begin
   -- branch below).
   ------------------------------------------------------------------------
 
-  desc <= decode_desc_v2(word_q) when state_q = s_present else desc_v2_init;
-  desc_valid <= '1' when state_q = s_present else '0';
+  desc <= decode_desc_v2(word_q) when state_q = s_present else
+          desc_v2_init;
+  desc_valid <= '1' when state_q = s_present else
+                '0';
   pc <= pc_q;
 
-  error <= '1' when state_q = s_error else '0';
-  error_code <= error_code_q when state_q = s_error else c_err_none;
+  error <= '1' when state_q = s_error else
+           '0';
+  error_code <= error_code_q when state_q = s_error else
+                c_err_none;
 
-  instr_req_m2s.valid <= '1' when state_q = s_req else '0';
+  instr_req_m2s.valid <= '1' when state_q = s_req else
+                         '0';
   instr_req_m2s.req.addr <= pc_q;
   instr_req_m2s.req.length <= to_unsigned(c_instr_word_bytes, 32);
 
-  s_instr_stream_s2m.ready <= '1' when state_q = s_collect else '0';
+  s_instr_stream_s2m.ready <= '1' when state_q = s_collect else
+                              '0';
 
   ------------------------------------------------------------------------
   -- FSM: state, beat assembly, watchdog.
   ------------------------------------------------------------------------
 
-  fsm : process(clk)
+  fsm : process (clk)
+
     variable word_next : std_ulogic_vector(c_word_bits - 1 downto 0);
     variable timed_out : boolean;
+
   begin
+
     if rising_edge(clk) then
       if reset = '1' then
         state_q <= s_idle;
@@ -191,6 +200,7 @@ begin
 
         case state_q is
           when s_idle =>
+
             if start = '1' then
               pc_q <= addr;
               beat_count_q <= 0;
@@ -198,8 +208,8 @@ begin
               timeout_count_q <= 0;
               state_q <= s_req;
             end if;
-
           when s_req =>
+
             if timed_out then
               error_code_q <= c_err_timeout;
               state_q <= s_error;
@@ -213,8 +223,8 @@ begin
                 timeout_count_q <= timeout_count_q + 1;
               end if;
             end if;
-
           when s_collect =>
+
             if timed_out then
               error_code_q <= c_err_timeout;
               state_q <= s_error;
@@ -232,11 +242,13 @@ begin
                 -- low bits.
                 word_next := word_q;
                 for beat in 0 to c_beats_per_word - 1 loop
+
                   if beat_count_q = beat then
                     word_next(c_bits_per_beat * (beat + 1) - 1 downto c_bits_per_beat * beat) :=
                       s_instr_stream_m2s.data(c_bits_per_beat - 1 downto 0);
                   end if;
                 end loop;
+
                 word_q <= word_next;
 
                 if beat_count_q < c_beats_per_word - 1 then
@@ -253,18 +265,18 @@ begin
                 end if;
               end if;
             end if;
-
           when s_present =>
+
             if desc_ready = '1' then
               state_q <= s_idle;
             end if;
-
           when s_error =>
+
             -- One-cycle pulse (see the concurrent 'error'/'error_code'
             -- assignments above); unconditionally back to idle.
             state_q <= s_idle;
-
         end case;
+
       end if;
     end if;
   end process;

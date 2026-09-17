@@ -1,32 +1,32 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library vunit_lib;
 context vunit_lib.vunit_context;
 context vunit_lib.com_context;
-use vunit_lib.memory_pkg.all;
-use vunit_lib.axi_slave_pkg.all;
+  use vunit_lib.memory_pkg.all;
+  use vunit_lib.axi_slave_pkg.all;
 context vunit_lib.python_context;
-use vunit_lib.integer_array_pkg.all;
+  use vunit_lib.integer_array_pkg.all;
 
 library axi;
-use axi.axi_pkg.all;
+  use axi.axi_pkg.all;
 
 library axi_lite;
-use axi_lite.axi_lite_pkg.all;
+  use axi_lite.axi_lite_pkg.all;
 
 library register_file;
-use register_file.register_file_pkg.register_t;
+  use register_file.register_file_pkg.register_t;
 
 library bfm;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_regs_pkg.all;
-use cnn_accel.cnn_accel_register_record_pkg.all;
-use cnn_accel.cnn_accel_register_read_write_pkg.all;
-use cnn_accel.cnn_accel_python_ffi_pkg.all;
-use cnn_accel.cnn_accel_tb_util_pkg.all;
+  use cnn_accel.cnn_accel_regs_pkg.all;
+  use cnn_accel.cnn_accel_register_record_pkg.all;
+  use cnn_accel.cnn_accel_register_read_write_pkg.all;
+  use cnn_accel.cnn_accel_python_ffi_pkg.all;
+  use cnn_accel.cnn_accel_tb_util_pkg.all;
 
 -- VUnit-5 testbench for cnn_accel_top -- the project's ONE AND ONLY
 -- top-level testbench, specified by
@@ -82,22 +82,22 @@ entity tb_cnn_accel_top is
     -- Size of the modelled DDR, bytes. One flat read_and_write allocation
     -- starting at address 0, so DUT addresses map 1:1 onto memory
     -- addresses. Matches the DUT's 'g_ddr_limit' by default.
-    g_ddr_bytes : positive := 16#0020_0000#;
+    g_ddr_bytes               : positive := 16#0020_0000#;
     -- Testbench-level liveness bound: cycles waited after START before
     -- the TB itself fails the test. Independent of the DUT's own
     -- watchdog ('g_watchdog_cycles'). The DUT is contractually required
     -- never to hang (arch doc section 9), so hitting this is a real DUT
     -- bug, not a test-tuning knob.
-    g_timeout_cycles : positive := 2_000_000;
+    g_timeout_cycles          : positive := 2_000_000;
     -- DUT geometry, forwarded straight to the DUT generics of the same
     -- name. Every other DUT generic is left at its default: they are tied
     -- to the generated constants and to each other by assertions inside
     -- the DUT.
-    g_num_banks : positive := 2;
-    g_bank_words : positive := 1024;
-    g_pe_rows : positive := 8;
-    g_ddr_limit : positive := 16#0020_0000#;
-    g_watchdog_cycles : positive := 1_000_000;
+    g_num_banks               : positive := 2;
+    g_bank_words              : positive := 1024;
+    g_pe_rows                 : positive := 8;
+    g_ddr_limit               : positive := 16#0020_0000#;
+    g_watchdog_cycles         : positive := 1_000_000;
     -- AXI slave BFM randomized stalling, percent. 0 = no stalling.
     stall_probability_percent : natural := 0;
     -- Which pre-built 'TbCase' this run checks against -- passed to
@@ -111,9 +111,8 @@ entity tb_cnn_accel_top is
     -- there is no reason for 'module_cnn_accel.py' to also copy it into
     -- a generic (see 'get_program_start_address'/'get_output_region'/
     -- 'get_input_region'/'get_expect_error' in top_level_bridge.py).
-    g_case_name : string;
-    runner_cfg : string
-  );
+    g_case_name               : string;
+    runner_cfg                : string);
 end entity tb_cnn_accel_top;
 
 architecture tb of tb_cnn_accel_top is
@@ -170,24 +169,23 @@ architecture tb of tb_cnn_accel_top is
 
   -- See cnn_accel_tb_util_pkg.axi_response_latency: a response latency
   -- only makes sense together with stalling.
-  constant c_max_response_latency : time :=
-    axi_response_latency(stall_probability_percent, c_clk_period);
+  constant c_max_response_latency : time := axi_response_latency(stall_probability_percent, c_clk_period);
 
   constant c_axi_read_slave : axi_slave_t := new_axi_slave(
-    memory => memory,
-    address_fifo_depth => 4,
+    memory                    => memory,
+    address_fifo_depth        => 4,
     address_stall_probability => c_stall_probability,
-    data_stall_probability => c_stall_probability,
-    min_response_latency => 0 ns,
-    max_response_latency => c_max_response_latency
+    data_stall_probability    => c_stall_probability,
+    min_response_latency      => 0 ns,
+    max_response_latency      => c_max_response_latency
   );
 
   constant c_axi_write_slave : axi_slave_t := new_axi_slave(
-    memory => memory,
-    address_fifo_depth => 4,
+    memory                    => memory,
+    address_fifo_depth        => 4,
     write_response_fifo_depth => 4,
     address_stall_probability => c_stall_probability,
-    data_stall_probability => c_stall_probability
+    data_stall_probability    => c_stall_probability
   );
 
   ------------------------------------------------------------------------
@@ -210,6 +208,7 @@ begin
   -- per-test-case logic here.
   ------------------------------------------------------------------------
   main : process
+
     variable ddr : buffer_t;
     -- The exported region, read one byte per 'read_word' call and
     -- handed to Python directly (see 'ffi_export_bytes').
@@ -259,6 +258,7 @@ begin
     variable elapsed_cycles : natural := 0;
 
   begin
+
     test_runner_setup(runner, runner_cfg);
 
     exec_file(tb_path(runner_cfg) & "python_bridge/top_level_bridge.py");
@@ -278,12 +278,7 @@ begin
     -- at address 0, which is what makes DUT addresses and memory
     -- addresses the same number everywhere in this file and in Python.
     ----------------------------------------------------------------------
-    ddr := allocate(
-      memory,
-      num_bytes => g_ddr_bytes,
-      name => "ddr",
-      permissions => read_and_write
-    );
+    ddr := allocate(memory, num_bytes => g_ddr_bytes, name => "ddr", permissions => read_and_write);
     check_equal(
       base_address(ddr),
       0,
@@ -301,13 +296,11 @@ begin
     check_equal(
       export_bytes mod c_bytes_per_beat,
       0,
-      "the case's export_bytes must be a whole number of " & to_string(c_bytes_per_beat)
-      & "-byte words"
+      "the case's export_bytes must be a whole number of " & to_string(c_bytes_per_beat) & "-byte words"
     );
     check(
       export_base + export_bytes <= g_ddr_bytes,
-      "the export region must lie inside the modelled DDR (g_ddr_bytes = "
-      & to_string(g_ddr_bytes) & ")"
+      "the export region must lie inside the modelled DDR (g_ddr_bytes = " & to_string(g_ddr_bytes) & ")"
     );
 
     -- The compiler's own output: one 'ffi_write_indexed_bytes' call per
@@ -320,39 +313,43 @@ begin
     compiled_bounds := call("get_program_regions");
     num_compiled_regions := length(compiled_bounds) / 2;
     for r in 0 to num_compiled_regions - 1 loop
+
       ffi_write_indexed_bytes(
-        memory, "get_program_data", r,
+        memory,
+        "get_program_data",
+        r,
         base_addr => get(compiled_bounds, 2 * r),
         num_bytes => get(compiled_bounds, 2 * r + 1)
       );
     end loop;
+
     info(
-      "tb_cnn_accel_top: wrote " & to_string(num_compiled_regions)
+      "tb_cnn_accel_top: wrote "
+      & to_string(num_compiled_regions)
       & " compiled region(s) via call(""get_program_data"")"
     );
 
     -- The graph's own input tensors: a separate region, written the same
     -- way (see 'get_input_data' in top_level_bridge.py).
     ffi_write_bytes(memory, "get_input_data", inputs_base, inputs_bytes);
-    info(
-      "tb_cnn_accel_top: wrote " & to_string(inputs_bytes)
-      & " input bytes via call(""get_input_data"")"
-    );
+    info("tb_cnn_accel_top: wrote " & to_string(inputs_bytes) & " input bytes via call(""get_input_data"")");
 
     ----------------------------------------------------------------------
     -- Release reset and let the DUT settle before the first CSR access.
     ----------------------------------------------------------------------
     reset <= '1';
     for i in 1 to 8 loop
+
       wait until rising_edge(clk);
     end loop;
+
     reset <= '0';
     for i in 1 to 8 loop
+
       wait until rising_edge(clk);
     end loop;
 
     if run("test_run_program") then
-
       --------------------------------------------------------------------
       -- The entire host-side program-launch sequence: a base address and
       -- a start bit. Everything else the DUT discovers from memory
@@ -370,6 +367,7 @@ begin
       --------------------------------------------------------------------
       start_time := now;
       loop
+
         read_cnn_accel_status(net, status_slv);
         status := to_cnn_accel_status(status_slv);
         exit when status.done = '1' or status.error = '1';
@@ -378,7 +376,9 @@ begin
         if elapsed_cycles > g_timeout_cycles then
           check_failed(
             "tb_cnn_accel_top: neither DONE nor ERROR arrived within g_timeout_cycles = "
-            & to_string(g_timeout_cycles) & " cycles after CTRL.START. Last " & describe_status(status_slv, status)
+            & to_string(g_timeout_cycles)
+            & " cycles after CTRL.START. Last "
+            & describe_status(status_slv, status)
             & ". The DUT is contractually required never to hang (arch doc section 9), so this"
             & " is a DUT bug rather than a test-tuning problem."
           );
@@ -386,8 +386,10 @@ begin
         end if;
 
         for i in 1 to c_poll_interval_cycles loop
+
           wait until rising_edge(clk);
         end loop;
+
       end loop;
 
       --------------------------------------------------------------------
@@ -422,32 +424,33 @@ begin
       call(
         "check_result",
         arg(export_data),
-        kwarg("export_base", export_base) &
-        kwarg_unsigned("status", u_unsigned(status_slv)) &
-        kwarg("busy", status.busy) &
-        kwarg("done", status.done) &
-        kwarg("error", status.error) &
+        kwarg("export_base", export_base)
+        & kwarg_unsigned("status", u_unsigned(status_slv))
+        & kwarg("busy", status.busy)
+        & kwarg("done", status.done)
+        & kwarg("error", status.error)
+        &
         -- Passed at their native (4-bit/16-bit) field widths, with no
         -- resize: 'kwarg_unsigned' renders an 'unsigned' of any width as
         -- an exact Python integer.
-        kwarg_unsigned("err_code", status.err_code) &
-        kwarg_unsigned("err_pc_low", status.err_pc_low) &
-        kwarg_unsigned("hw_info", u_unsigned(hw_info_slv)) &
-        kwarg_unsigned("hw_info2", u_unsigned(hw_info2_slv)) &
-        kwarg_unsigned("hw_info3", u_unsigned(hw_info3_slv)) &
-        kwarg_unsigned("cmd_count", u_unsigned(cmd_count_slv)) &
-        kwarg_unsigned("cycle_count", u_unsigned(cycle_count_slv)) &
-        kwarg_unsigned("compute_cycles", u_unsigned(compute_cycles_slv)) &
-        kwarg_unsigned("stall_cycles", u_unsigned(stall_cycles_slv)) &
-        kwarg_unsigned("ddr_rd_bytes", u_unsigned(ddr_rd_bytes_slv)) &
-        kwarg_unsigned("ddr_wr_bytes", u_unsigned(ddr_wr_bytes_slv)) &
-        kwarg_unsigned("tensor_load_count", u_unsigned(tensor_load_count_slv)) &
-        kwarg_unsigned("tensor_store_count", u_unsigned(tensor_store_count_slv)) &
-        kwarg_unsigned("weight_load_bytes", u_unsigned(weight_load_bytes_slv)) &
-        kwarg_unsigned("local_bytes", u_unsigned(local_bytes_slv)) &
-        kwarg("axi_aw_count", axi_aw_count) &
-        kwarg_unsigned("axi_wr_lo_addr", axi_wr_lo_addr) &
-        kwarg_unsigned("axi_wr_hi_addr", axi_wr_hi_addr)
+        kwarg_unsigned("err_code", status.err_code)
+        & kwarg_unsigned("err_pc_low", status.err_pc_low)
+        & kwarg_unsigned("hw_info", u_unsigned(hw_info_slv))
+        & kwarg_unsigned("hw_info2", u_unsigned(hw_info2_slv))
+        & kwarg_unsigned("hw_info3", u_unsigned(hw_info3_slv))
+        & kwarg_unsigned("cmd_count", u_unsigned(cmd_count_slv))
+        & kwarg_unsigned("cycle_count", u_unsigned(cycle_count_slv))
+        & kwarg_unsigned("compute_cycles", u_unsigned(compute_cycles_slv))
+        & kwarg_unsigned("stall_cycles", u_unsigned(stall_cycles_slv))
+        & kwarg_unsigned("ddr_rd_bytes", u_unsigned(ddr_rd_bytes_slv))
+        & kwarg_unsigned("ddr_wr_bytes", u_unsigned(ddr_wr_bytes_slv))
+        & kwarg_unsigned("tensor_load_count", u_unsigned(tensor_load_count_slv))
+        & kwarg_unsigned("tensor_store_count", u_unsigned(tensor_store_count_slv))
+        & kwarg_unsigned("weight_load_bytes", u_unsigned(weight_load_bytes_slv))
+        & kwarg_unsigned("local_bytes", u_unsigned(local_bytes_slv))
+        & kwarg("axi_aw_count", axi_aw_count)
+        & kwarg_unsigned("axi_wr_lo_addr", axi_wr_lo_addr)
+        & kwarg_unsigned("axi_wr_hi_addr", axi_wr_hi_addr)
       );
 
       --------------------------------------------------------------------
@@ -469,7 +472,6 @@ begin
           "the program must not end with STATUS.ERROR set. " & describe_status(status_slv, status)
         );
       end if;
-
     end if;
 
     test_runner_cleanup(runner);
@@ -493,23 +495,23 @@ begin
   ------------------------------------------------------------------------
   dut : entity cnn_accel.cnn_accel_top
     generic map (
-      g_pe_rows => g_pe_rows,
-      g_num_banks => g_num_banks,
-      g_bank_words => g_bank_words,
-      g_ddr_limit => g_ddr_limit,
+      g_pe_rows         => g_pe_rows,
+      g_num_banks       => g_num_banks,
+      g_bank_words      => g_bank_words,
+      g_ddr_limit       => g_ddr_limit,
       g_watchdog_cycles => g_watchdog_cycles
     )
     port map (
-      clk => clk,
-      reset => reset,
+      clk            => clk,
+      reset          => reset,
       --
       s_axi_lite_m2s => s_axi_lite_m2s,
       s_axi_lite_s2m => s_axi_lite_s2m,
       --
-      m_axi_m2s => m_axi_m2s,
-      m_axi_s2m => m_axi_s2m,
+      m_axi_m2s      => m_axi_m2s,
+      m_axi_s2m      => m_axi_s2m,
       --
-      irq => irq
+      irq            => irq
     );
 
   ------------------------------------------------------------------------
@@ -520,7 +522,7 @@ begin
   ------------------------------------------------------------------------
   axi_lite_master_inst : entity bfm.axi_lite_master
     port map (
-      clk => clk,
+      clk          => clk,
       --
       axi_lite_m2s => s_axi_lite_m2s,
       axi_lite_s2m => s_axi_lite_s2m
@@ -533,16 +535,16 @@ begin
   ------------------------------------------------------------------------
   axi_slave_inst : entity bfm.axi_slave
     generic map (
-      axi_read_slave => c_axi_read_slave,
+      axi_read_slave  => c_axi_read_slave,
       axi_write_slave => c_axi_write_slave,
-      data_width => c_axi_data_width,
-      id_width => c_axi_id_width
+      data_width      => c_axi_data_width,
+      id_width        => c_axi_id_width
     )
     port map (
-      clk => clk,
+      clk           => clk,
       --
-      axi_read_m2s => m_axi_m2s.read,
-      axi_read_s2m => m_axi_s2m.read,
+      axi_read_m2s  => m_axi_m2s.read,
+      axi_read_s2m  => m_axi_s2m.read,
       --
       axi_write_m2s => m_axi_m2s.write,
       axi_write_s2m => m_axi_s2m.write
@@ -557,11 +559,14 @@ begin
   -- address range they landed in.
   ------------------------------------------------------------------------
   axi_monitor : process
+
     variable aw_count : natural := 0;
     variable lo_addr : u_unsigned(31 downto 0) := (others => '0');
     variable hi_addr : u_unsigned(31 downto 0) := (others => '0');
     variable aw_addr : u_unsigned(31 downto 0);
+
   begin
+
     wait until rising_edge(clk);
 
     if m_axi_m2s.write.aw.valid = '1' and m_axi_s2m.write.aw.ready = '1' then

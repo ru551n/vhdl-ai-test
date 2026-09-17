@@ -1,6 +1,6 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 -- Generated: opcodes (OPCODE_*), flag bit indices (FLAG_*), and the
 -- instruction word's byte-offset constants (c_instr_word_bytes, c_off_*).
@@ -13,11 +13,11 @@ use ieee.numeric_std.all;
 -- build_fpga.py invocation, which regenerates automatically) after
 -- editing cnn_accel_constants.py.
 library cnn_accel;
-use cnn_accel.cnn_accel_isa_pkg.all;
--- Generated hdl-registers constants (cnn_accel_constant_*); referenced by
--- selected name below. The use clause makes the compile-order dependency
--- visible to VUnit's dependency scanner.
-use cnn_accel.cnn_accel_regs_pkg;
+  use cnn_accel.cnn_accel_isa_pkg.all;
+  -- Generated hdl-registers constants (cnn_accel_constant_*); referenced by
+  -- selected name below. The use clause makes the compile-order dependency
+  -- visible to VUnit's dependency scanner.
+  use cnn_accel.cnn_accel_regs_pkg;
 
 -- Shared record types for modules/cnn_accel/ that hdl-registers cannot
 -- generate (mixed unsigned/signed record fields, handshake wrapper
@@ -142,13 +142,14 @@ package cnn_accel_pkg is
   -- 8 (the accelerator's activation type, D-arithmetic contract), so this
   -- array needs only its index range constrained at the declaration site.
   subtype tap_t is std_ulogic_vector(7 downto 0);
+
   type tap_array_t is array (natural range <>) of tap_t;
 
   type window_m2s_t is record
     valid      : std_ulogic;
-    last       : std_ulogic;  -- last output pixel of the feature map
-    first_tile : std_ulogic;  -- first input-channel tile of this output pixel
-    last_tile  : std_ulogic;  -- last input-channel tile of this output pixel
+    last       : std_ulogic; -- last output pixel of the feature map
+    first_tile : std_ulogic; -- first input-channel tile of this output pixel
+    last_tile  : std_ulogic; -- last input-channel tile of this output pixel
     data       : tap_array_t;
   end record;
 
@@ -175,7 +176,7 @@ package cnn_accel_pkg is
   type accum_m2s_t is record
     valid : std_ulogic;
     last  : std_ulogic;
-    data  : accum_array_t;  -- one partial sum per PE row
+    data  : accum_array_t; -- one partial sum per PE row
   end record;
 
   type accum_s2m_t is record
@@ -186,15 +187,15 @@ package cnn_accel_pkg is
   -- size (K_h = K_w = kernel_size) and tile_channels, per the element
   -- layout documented above. Constrain the record as
   -- 'window_m2s_t(data(0 to window_data_length(...) - 1))'.
-  function window_data_length(kernel_size : positive; tile_channels : positive) return positive;
+  function window_data_length (kernel_size : positive; tile_channels : positive) return positive;
 
   -- Flat-bit views of a tap array, for the boundaries that still need
   -- packed bits (AXI payloads, VUnit queue push/pop). Element 'i' of the
   -- array occupies bits '8*i + 7 downto 8*i' of the vector, so this is
   -- exactly the pre-D15 packing. Do not use these to work around indexing
   -- inside RTL -- that is what the array is for.
-  function to_slv(data : tap_array_t) return std_ulogic_vector;
-  function to_tap_array(data : std_ulogic_vector) return tap_array_t;
+  function to_slv (data : tap_array_t) return std_ulogic_vector;
+  function to_tap_array (data : std_ulogic_vector) return tap_array_t;
 
   ------------------------------------------------------------------------
   -- ISA v1.2 (H2) per-channel requant table entry, as kept on chip in
@@ -212,36 +213,44 @@ package cnn_accel_pkg is
 
   constant c_scale_entry_mult_width : positive := 32;
   constant c_scale_entry_shift_width : positive := 8;
-  constant c_scale_entry_width : positive :=
-    cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_scale_buffer_entry_bits;
+  constant c_scale_entry_width : positive := cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_scale_buffer_entry_bits;
 
 end package cnn_accel_pkg;
 
 package body cnn_accel_pkg is
 
-  function window_data_length(kernel_size : positive; tile_channels : positive) return positive is
+  function window_data_length (kernel_size : positive; tile_channels : positive) return positive is
   begin
+
     return kernel_size * kernel_size * tile_channels;
   end function;
 
-  function to_slv(data : tap_array_t) return std_ulogic_vector is
+  function to_slv (data : tap_array_t) return std_ulogic_vector is
+
     variable result : std_ulogic_vector(8 * data'length - 1 downto 0);
     variable idx : natural := 0;
   begin
+
     for i in data'range loop
+
       result(8 * (idx + 1) - 1 downto 8 * idx) := data(i);
       idx := idx + 1;
     end loop;
+
     return result;
   end function;
 
-  function to_tap_array(data : std_ulogic_vector) return tap_array_t is
+  function to_tap_array (data : std_ulogic_vector) return tap_array_t is
+
     variable normalized : std_ulogic_vector(data'length - 1 downto 0) := data;
     variable result : tap_array_t(0 to data'length / 8 - 1);
   begin
+
     for i in result'range loop
+
       result(i) := normalized(8 * (i + 1) - 1 downto 8 * i);
     end loop;
+
     return result;
   end function;
 

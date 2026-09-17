@@ -1,31 +1,31 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library vunit_lib;
 context vunit_lib.vunit_context;
 context vunit_lib.com_context;
-use vunit_lib.memory_pkg.all;
-use vunit_lib.axi_slave_pkg.all;
+  use vunit_lib.memory_pkg.all;
+  use vunit_lib.axi_slave_pkg.all;
 context vunit_lib.python_context;
-use vunit_lib.integer_array_pkg.all;
+  use vunit_lib.integer_array_pkg.all;
 
 library axi;
-use axi.axi_pkg.all;
+  use axi.axi_pkg.all;
 
 library axi_lite;
-use axi_lite.axi_lite_pkg.all;
+  use axi_lite.axi_lite_pkg.all;
 
 library register_file;
-use register_file.register_file_pkg.register_t;
+  use register_file.register_file_pkg.register_t;
 
 library bfm;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_regs_pkg.all;
-use cnn_accel.cnn_accel_register_record_pkg.all;
-use cnn_accel.cnn_accel_register_read_write_pkg.all;
-use cnn_accel.cnn_accel_python_ffi_pkg.all;
+  use cnn_accel.cnn_accel_regs_pkg.all;
+  use cnn_accel.cnn_accel_register_record_pkg.all;
+  use cnn_accel.cnn_accel_register_read_write_pkg.all;
+  use cnn_accel.cnn_accel_python_ffi_pkg.all;
 
 -- Feature test for the ISA v2.3 streaming-inference interface (spec
 -- section 6a, docs/superpowers/specs/2026-09-12-input-output-
@@ -55,8 +55,7 @@ use cnn_accel.cnn_accel_python_ffi_pkg.all;
 -- both completely unaffected.
 entity tb_cnn_accel_streaming is
   generic (
-    runner_cfg : string
-  );
+    runner_cfg : string);
 end entity tb_cnn_accel_streaming;
 
 architecture tb of tb_cnn_accel_streaming is
@@ -88,17 +87,14 @@ architecture tb of tb_cnn_accel_streaming is
   constant memory : memory_t := new_memory;
 
   constant c_axi_read_slave : axi_slave_t := new_axi_slave(
-    memory => memory,
-    address_fifo_depth => 4,
+    memory               => memory,
+    address_fifo_depth   => 4,
     min_response_latency => 0 ns,
     max_response_latency => 0 ns
   );
 
-  constant c_axi_write_slave : axi_slave_t := new_axi_slave(
-    memory => memory,
-    address_fifo_depth => 4,
-    write_response_fifo_depth => 4
-  );
+  constant c_axi_write_slave : axi_slave_t :=
+    new_axi_slave(memory => memory, address_fifo_depth => 4, write_response_fifo_depth => 4);
 
 begin
 
@@ -109,6 +105,7 @@ begin
   -- functions unchanged -- this file adds no new Python.
   ------------------------------------------------------------------------
   main : process
+
     variable ddr : buffer_t;
     variable region : integer_array_t;
     variable program_addr : natural;
@@ -141,20 +138,30 @@ begin
 
     impure function describe_status return string is
     begin
-      return "STATUS=" & to_string(unsigned(status_slv))
-        & " (busy=" & to_string(status.busy)
-        & ", done=" & to_string(status.done)
-        & ", error=" & to_string(status.error)
-        & ", queued=" & to_string(status.queued)
-        & ", err_code=" & to_string(to_integer(status.err_code)) & ")";
+
+      return "STATUS="
+             & to_string(unsigned(status_slv))
+             & " (busy="
+             & to_string(status.busy)
+             & ", done="
+             & to_string(status.done)
+             & ", error="
+             & to_string(status.error)
+             & ", queued="
+             & to_string(status.queued)
+             & ", err_code="
+             & to_string(to_integer(status.err_code))
+             & ")";
     end function;
 
     -- Poll STATUS until 'done' or 'error' (whichever comes first) since
     -- 'start_time', per 'tb_cnn_accel_top's own watchdog pattern.
     procedure wait_for_done_or_error is
     begin
+
       start_time := now;
       loop
+
         read_cnn_accel_status(net, status_slv);
         status := to_cnn_accel_status(status_slv);
         exit when status.done = '1' or status.error = '1';
@@ -163,24 +170,29 @@ begin
         if elapsed_cycles > c_timeout_cycles then
           check_failed(
             "tb_cnn_accel_streaming: neither DONE nor ERROR arrived within "
-            & to_string(c_timeout_cycles) & " cycles. Last " & describe_status
+            & to_string(c_timeout_cycles)
+            & " cycles. Last "
+            & describe_status
           );
           exit;
         end if;
 
         for i in 1 to c_poll_interval_cycles loop
+
           wait until rising_edge(clk);
         end loop;
+
       end loop;
+
     end procedure;
 
     -- Read every counter register and hand them, plus 'export_bytes'
     -- bytes read back from 'base', to 'check_result' -- identical to
     -- 'tb_cnn_accel_top's own final step, just callable per completion
     -- since this testbench observes more than one.
-    procedure check_completed_job(
-      base : natural;
-      bytes : natural;
+    procedure check_completed_job (
+      base            : natural;
+      bytes           : natural;
       -- True for job A's own check in a queued pair: its auto-dispatched
       -- successor starts in the SAME cycle its DONE asserts (spec
       -- section 6a -- no idle gap between frames is the entire point),
@@ -189,6 +201,7 @@ begin
       busy_after_done : boolean := false
     ) is
     begin
+
       read_cnn_accel_hw_info(net, hw_info_slv);
       read_cnn_accel_hw_info2(net, hw_info2_slv);
       read_cnn_accel_hw_info3(net, hw_info3_slv);
@@ -208,39 +221,41 @@ begin
       call(
         "check_result",
         arg(export_data),
-        kwarg("export_base", base) &
-        kwarg_unsigned("status", u_unsigned(status_slv)) &
-        kwarg("busy", status.busy) &
-        kwarg("done", status.done) &
-        kwarg("error", status.error) &
-        kwarg_unsigned("err_code", status.err_code) &
-        kwarg_unsigned("err_pc_low", status.err_pc_low) &
-        kwarg_unsigned("hw_info", u_unsigned(hw_info_slv)) &
-        kwarg_unsigned("hw_info2", u_unsigned(hw_info2_slv)) &
-        kwarg_unsigned("hw_info3", u_unsigned(hw_info3_slv)) &
-        kwarg_unsigned("cmd_count", u_unsigned(cmd_count_slv)) &
-        kwarg_unsigned("cycle_count", u_unsigned(cycle_count_slv)) &
-        kwarg_unsigned("compute_cycles", u_unsigned(compute_cycles_slv)) &
-        kwarg_unsigned("stall_cycles", u_unsigned(stall_cycles_slv)) &
-        kwarg_unsigned("ddr_rd_bytes", u_unsigned(ddr_rd_bytes_slv)) &
-        kwarg_unsigned("ddr_wr_bytes", u_unsigned(ddr_wr_bytes_slv)) &
-        kwarg_unsigned("tensor_load_count", u_unsigned(tensor_load_count_slv)) &
-        kwarg_unsigned("tensor_store_count", u_unsigned(tensor_store_count_slv)) &
-        kwarg_unsigned("weight_load_bytes", u_unsigned(weight_load_bytes_slv)) &
-        kwarg_unsigned("local_bytes", u_unsigned(local_bytes_slv)) &
+        kwarg("export_base", base)
+        & kwarg_unsigned("status", u_unsigned(status_slv))
+        & kwarg("busy", status.busy)
+        & kwarg("done", status.done)
+        & kwarg("error", status.error)
+        & kwarg_unsigned("err_code", status.err_code)
+        & kwarg_unsigned("err_pc_low", status.err_pc_low)
+        & kwarg_unsigned("hw_info", u_unsigned(hw_info_slv))
+        & kwarg_unsigned("hw_info2", u_unsigned(hw_info2_slv))
+        & kwarg_unsigned("hw_info3", u_unsigned(hw_info3_slv))
+        & kwarg_unsigned("cmd_count", u_unsigned(cmd_count_slv))
+        & kwarg_unsigned("cycle_count", u_unsigned(cycle_count_slv))
+        & kwarg_unsigned("compute_cycles", u_unsigned(compute_cycles_slv))
+        & kwarg_unsigned("stall_cycles", u_unsigned(stall_cycles_slv))
+        & kwarg_unsigned("ddr_rd_bytes", u_unsigned(ddr_rd_bytes_slv))
+        & kwarg_unsigned("ddr_wr_bytes", u_unsigned(ddr_wr_bytes_slv))
+        & kwarg_unsigned("tensor_load_count", u_unsigned(tensor_load_count_slv))
+        & kwarg_unsigned("tensor_store_count", u_unsigned(tensor_store_count_slv))
+        & kwarg_unsigned("weight_load_bytes", u_unsigned(weight_load_bytes_slv))
+        & kwarg_unsigned("local_bytes", u_unsigned(local_bytes_slv))
+        &
         -- No passive AXI monitor in this testbench (see the entity
         -- header: this file only exercises the queue/relocation
         -- protocol, not the residency invariants 'tb_cnn_accel_top'
         -- already covers) -- 0 disables the write-range check
         -- ('TbCase.check_live' only runs it when 'axi_aw_count' > 0).
-        kwarg("axi_aw_count", 0) &
-        kwarg_unsigned("axi_wr_lo_addr", u_unsigned'(x"00000000")) &
-        kwarg_unsigned("axi_wr_hi_addr", u_unsigned'(x"00000000")) &
-        kwarg("busy_after_done", busy_after_done)
+        kwarg("axi_aw_count", 0)
+        & kwarg_unsigned("axi_wr_lo_addr", u_unsigned'(x"00000000"))
+        & kwarg_unsigned("axi_wr_hi_addr", u_unsigned'(x"00000000"))
+        & kwarg("busy_after_done", busy_after_done)
       );
     end procedure;
 
   begin
+
     test_runner_setup(runner, runner_cfg);
 
     exec_file(tb_path(runner_cfg) & "python_bridge/top_level_bridge.py");
@@ -265,8 +280,11 @@ begin
     compiled_bounds := call("get_program_regions");
     num_compiled_regions := length(compiled_bounds) / 2;
     for r in 0 to num_compiled_regions - 1 loop
+
       ffi_write_indexed_bytes(
-        memory, "get_program_data", r,
+        memory,
+        "get_program_data",
+        r,
         base_addr => get(compiled_bounds, 2 * r),
         num_bytes => get(compiled_bounds, 2 * r + 1)
       );
@@ -280,17 +298,19 @@ begin
 
     reset <= '1';
     for i in 1 to 8 loop
+
       wait until rising_edge(clk);
     end loop;
+
     reset <= '0';
     for i in 1 to 8 loop
+
       wait until rising_edge(clk);
     end loop;
 
     write_cnn_accel_program_base_addr_addr(net, to_unsigned(program_addr, 32));
 
     if run("relocated_and_queued_pair") then
-
       --------------------------------------------------------------------
       -- Job A: compiled addresses, unrelocated (INPUT_ADDR/OUTPUT_ADDR
       -- are still 0, their reset value -- exactly the case every
@@ -334,7 +354,6 @@ begin
       check_completed_job(export_base + c_reloc_delta, export_bytes);
 
     elsif run("queue_full_rejected") then
-
       write_cnn_accel_ctrl_start(net, '1');
 
       write_cnn_accel_input_addr_addr(net, to_unsigned(c_reloc_delta, 32));
@@ -356,15 +375,12 @@ begin
       read_cnn_accel_status(net, status_slv);
       status := to_cnn_accel_status(status_slv);
       check_equal(
-        status.error, '1',
-        "a third START with the queue already full must raise ERR_QUEUE_FULL. "
-        & describe_status
+        status.error,
+        '1',
+        "a third START with the queue already full must raise ERR_QUEUE_FULL. " & describe_status
       );
       check_equal(to_integer(status.err_code), 16#A#, "expected ERR_QUEUE_FULL (0xA)");
-      check_equal(
-        status.queued, '1',
-        "the rejected third START must not disturb the already-queued job B"
-      );
+      check_equal(status.queued, '1', "the rejected third START must not disturb the already-queued job B");
 
       -- Clear the rejection's ERROR (write-1-to-clear) so it cannot be
       -- mistaken for a real fault below, then let job A and the queued
@@ -381,7 +397,6 @@ begin
       wait_for_done_or_error;
       check_equal(status.error, '0', "job B must not error. " & describe_status);
       check_completed_job(export_base + c_reloc_delta, export_bytes);
-
     end if;
 
     test_runner_cleanup(runner);
@@ -392,33 +407,33 @@ begin
 
   dut : entity cnn_accel.cnn_accel_top
     port map (
-      clk => clk,
-      reset => reset,
+      clk            => clk,
+      reset          => reset,
       s_axi_lite_m2s => s_axi_lite_m2s,
       s_axi_lite_s2m => s_axi_lite_s2m,
-      m_axi_m2s => m_axi_m2s,
-      m_axi_s2m => m_axi_s2m,
-      irq => irq
+      m_axi_m2s      => m_axi_m2s,
+      m_axi_s2m      => m_axi_s2m,
+      irq            => irq
     );
 
   axi_lite_master_inst : entity bfm.axi_lite_master
     port map (
-      clk => clk,
+      clk          => clk,
       axi_lite_m2s => s_axi_lite_m2s,
       axi_lite_s2m => s_axi_lite_s2m
     );
 
   axi_slave_inst : entity bfm.axi_slave
     generic map (
-      axi_read_slave => c_axi_read_slave,
+      axi_read_slave  => c_axi_read_slave,
       axi_write_slave => c_axi_write_slave,
-      data_width => c_axi_data_width,
-      id_width => c_axi_id_width
+      data_width      => c_axi_data_width,
+      id_width        => c_axi_id_width
     )
     port map (
-      clk => clk,
-      axi_read_m2s => m_axi_m2s.read,
-      axi_read_s2m => m_axi_s2m.read,
+      clk           => clk,
+      axi_read_m2s  => m_axi_m2s.read,
+      axi_read_s2m  => m_axi_s2m.read,
       axi_write_m2s => m_axi_m2s.write,
       axi_write_s2m => m_axi_s2m.write
     );

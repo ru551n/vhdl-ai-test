@@ -1,15 +1,15 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library vunit_lib;
 context vunit_lib.vunit_context;
 
 library axi_stream;
-use axi_stream.axi_stream_pkg.all;
+  use axi_stream.axi_stream_pkg.all;
 
 library math;
-use math.math_pkg.all;
+  use math.math_pkg.all;
 
 library cnn_accel;
 
@@ -18,7 +18,8 @@ library cnn_accel;
 -- modules/cnn_accel/doc/cnn_accel_weight_buffer_proposal.md section 10
 -- for the verification plan.
 entity tb_cnn_accel_weight_buffer is
-  generic (runner_cfg : string);
+  generic (
+    runner_cfg : string);
 end entity tb_cnn_accel_weight_buffer;
 
 architecture tb of tb_cnn_accel_weight_buffer is
@@ -66,23 +67,31 @@ architecture tb of tb_cnn_accel_weight_buffer is
   -- with the 'push_weight_row'/'push_bias_row' procedures below.
   ------------------------------------------------------------------------
 
-  function weight_row_expected(row : natural; salt : natural) return std_ulogic_vector is
+  function weight_row_expected (row : natural; salt : natural) return std_ulogic_vector is
+
     variable result : std_ulogic_vector(8 * c_weight_lanes - 1 downto 0);
   begin
+
     for lane in 0 to c_weight_lanes - 1 loop
-      result(8 * (lane + 1) - 1 downto 8 * lane) :=
-        std_ulogic_vector(to_unsigned((salt + row * 16 + lane) mod 256, 8));
+
+      result(8 * (lane + 1) - 1 downto 8 * lane) := std_ulogic_vector(to_unsigned((salt + row * 16 + lane) mod 256, 8));
     end loop;
+
     return result;
   end function;
 
-  function bias_row_expected(row : natural; salt : natural) return std_ulogic_vector is
+  function bias_row_expected (row : natural; salt : natural) return std_ulogic_vector is
+
     variable result : std_ulogic_vector(c_accum_width * c_bias_lanes - 1 downto 0);
   begin
+
     for lane in 0 to c_bias_lanes - 1 loop
-      result(c_accum_width * (lane + 1) - 1 downto c_accum_width * lane) :=
-        std_ulogic_vector(to_unsigned((salt + row * 1000 + lane * 7) mod (2 ** c_accum_width), c_accum_width));
+
+      result(c_accum_width * (lane + 1) - 1 downto c_accum_width * lane) := std_ulogic_vector(
+        to_unsigned((salt + row * 1000 + lane * 7) mod (2 ** c_accum_width), c_accum_width)
+      );
     end loop;
+
     return result;
   end function;
 
@@ -92,13 +101,14 @@ architecture tb of tb_cnn_accel_weight_buffer is
   -- section 10.
   ------------------------------------------------------------------------
 
-  procedure push_fill_beat(
-    signal clk_i : in std_ulogic;
-    signal m2s : out axi_stream_m2s_t;
-    signal s2m : in axi_stream_s2m_t;
-    data_value : in std_ulogic_vector
+  procedure push_fill_beat (
+    signal clk_i : in  std_ulogic;
+    signal m2s   : out axi_stream_m2s_t;
+    signal s2m   : in  axi_stream_s2m_t;
+    data_value   : in  std_ulogic_vector
   ) is
   begin
+
     m2s.data <= (others => '0');
     m2s.data(data_value'length - 1 downto 0) <= data_value;
     m2s.valid <= '1';
@@ -106,44 +116,50 @@ architecture tb of tb_cnn_accel_weight_buffer is
     m2s.valid <= '0';
   end procedure;
 
-  procedure push_weight_row(
-    signal clk_i : in std_ulogic;
-    signal m2s : out axi_stream_m2s_t;
-    signal s2m : in axi_stream_s2m_t;
-    row : in natural;
-    salt : in natural
+  procedure push_weight_row (
+    signal clk_i : in  std_ulogic;
+    signal m2s   : out axi_stream_m2s_t;
+    signal s2m   : in  axi_stream_s2m_t;
+    row          : in  natural;
+    salt         : in  natural
   ) is
   begin
+
     for lane in 0 to c_weight_lanes - 1 loop
-      push_fill_beat(
-        clk_i, m2s, s2m,
-        std_ulogic_vector(to_unsigned((salt + row * 16 + lane) mod 256, 8))
-      );
+
+      push_fill_beat(clk_i, m2s, s2m, std_ulogic_vector(to_unsigned((salt + row * 16 + lane) mod 256, 8)));
     end loop;
+
   end procedure;
 
-  procedure push_bias_row(
-    signal clk_i : in std_ulogic;
-    signal m2s : out axi_stream_m2s_t;
-    signal s2m : in axi_stream_s2m_t;
-    row : in natural;
-    salt : in natural
+  procedure push_bias_row (
+    signal clk_i : in  std_ulogic;
+    signal m2s   : out axi_stream_m2s_t;
+    signal s2m   : in  axi_stream_s2m_t;
+    row          : in  natural;
+    salt         : in  natural
   ) is
   begin
+
     for lane in 0 to c_bias_lanes - 1 loop
+
       push_fill_beat(
-        clk_i, m2s, s2m,
+        clk_i,
+        m2s,
+        s2m,
         std_ulogic_vector(to_unsigned((salt + row * 1000 + lane * 7) mod (2 ** c_accum_width), c_accum_width))
       );
     end loop;
+
   end procedure;
 
   -- Pulse 'fill_start' for exactly one cycle: begins a new fill session
   -- (both regions' write pointers/lane indices/row-assembly registers
   -- reset to 0 together). One settle delay before returning keeps the
   -- pulse unambiguous with respect to whatever the caller drives next.
-  procedure pulse_fill_start(signal clk_i : in std_ulogic; signal fs : out std_ulogic) is
+  procedure pulse_fill_start (signal clk_i : in std_ulogic; signal fs : out std_ulogic) is
   begin
+
     fs <= '1';
     wait until rising_edge(clk_i);
     wait for c_settle;
@@ -157,31 +173,33 @@ begin
   dut : entity cnn_accel.cnn_accel_weight_buffer
     generic map (
       g_weight_buffer_depth => c_depth,
-      g_bias_buffer_depth => c_bias_depth,
-      g_pe_rows => c_pe_rows,
-      g_pe_cols => c_pe_cols,
-      g_accum_width => c_accum_width,
-      g_fill_fifo_depth => 0
+      g_bias_buffer_depth   => c_bias_depth,
+      g_pe_rows             => c_pe_rows,
+      g_pe_cols             => c_pe_cols,
+      g_accum_width         => c_accum_width,
+      g_fill_fifo_depth     => 0
     )
     port map (
-      clk => clk,
-      reset => reset,
-      s_stream_m2s => s_stream_m2s,
-      s_stream_s2m => s_stream_s2m,
-      fill_start => fill_start,
-      fill_is_bias => fill_is_bias,
+      clk            => clk,
+      reset          => reset,
+      s_stream_m2s   => s_stream_m2s,
+      s_stream_s2m   => s_stream_s2m,
+      fill_start     => fill_start,
+      fill_is_bias   => fill_is_bias,
       weight_rd_addr => weight_rd_addr,
       weight_rd_data => weight_rd_data,
-      bias_rd_addr => bias_rd_addr,
-      bias_rd_data => bias_rd_data
+      bias_rd_addr   => bias_rd_addr,
+      bias_rd_data   => bias_rd_data
     );
 
   ------------------------------------------------------------------------
   main : process
+
     variable row : natural;
 
     procedure do_reset is
     begin
+
       reset <= '1';
       wait until rising_edge(clk);
       wait for c_settle;
@@ -191,24 +209,30 @@ begin
     -- Fill the whole weight set (weight region then bias region) with a
     -- 'salt'-tagged pattern. Pulses 'fill_start' itself, so the caller
     -- just supplies the pattern.
-    procedure fill_whole_buffer(salt : natural) is
+    procedure fill_whole_buffer (salt : natural) is
     begin
+
       pulse_fill_start(clk, fill_start);
       fill_is_bias <= '0';
       for r in 0 to c_depth - 1 loop
+
         push_weight_row(clk, s_stream_m2s, s_stream_s2m, r, salt);
       end loop;
+
       fill_is_bias <= '1';
       for r in 0 to c_bias_depth - 1 loop
+
         push_bias_row(clk, s_stream_m2s, s_stream_s2m, r, salt);
       end loop;
+
     end procedure;
 
     -- The weight region reads through the block RAM's output register, so
     -- data is valid TWO cycles after the address (see the DUT's read
     -- process). The bias/scale regions are still one.
-    procedure check_weight_row(row : natural; expected : std_ulogic_vector; msg : string) is
+    procedure check_weight_row (row : natural; expected : std_ulogic_vector; msg : string) is
     begin
+
       weight_rd_addr <= std_ulogic_vector(to_unsigned(row, c_addr_width));
       wait until rising_edge(clk);
       wait until rising_edge(clk);
@@ -216,8 +240,9 @@ begin
       check_equal(weight_rd_data, expected, msg);
     end procedure;
 
-    procedure check_bias_row(row : natural; expected : std_ulogic_vector; msg : string) is
+    procedure check_bias_row (row : natural; expected : std_ulogic_vector; msg : string) is
     begin
+
       bias_rd_addr <= std_ulogic_vector(to_unsigned(row, c_bias_addr_width));
       wait until rising_edge(clk);
       wait for c_settle;
@@ -225,6 +250,7 @@ begin
     end procedure;
 
   begin
+
     test_runner_setup(runner, runner_cfg);
 
     do_reset;
@@ -235,9 +261,12 @@ begin
       fill_whole_buffer(5);
 
       for r in 0 to c_depth - 1 loop
+
         check_weight_row(r, weight_row_expected(r, 5), "weight row after fill");
       end loop;
+
       for r in 0 to c_bias_depth - 1 loop
+
         check_bias_row(r, bias_row_expected(r, 5), "bias row after fill");
       end loop;
 
@@ -273,7 +302,8 @@ begin
       fill_is_bias <= '0';
       push_weight_row(clk, s_stream_m2s, s_stream_s2m, 0, 42);
       check_weight_row(
-        0, weight_row_expected(0, 42),
+        0,
+        weight_row_expected(0, 42),
         "same-cycle-as-fill_start beat dropped: row 0 holds only the real post-pulse fill"
       );
 
@@ -307,16 +337,10 @@ begin
       wait for c_settle;
       -- One cycle after presenting the address: row 2 has only reached
       -- the RAM's DO stage, so the output register still presents row 0.
-      check_equal(
-        weight_rd_data, weight_row_expected(0, 3),
-        "weight read data is NOT valid 1 cycle after the address"
-      );
+      check_equal(weight_rd_data, weight_row_expected(0, 3), "weight read data is NOT valid 1 cycle after the address");
       wait until rising_edge(clk);
       wait for c_settle;
-      check_equal(
-        weight_rd_data, weight_row_expected(2, 3),
-        "weight read data valid exactly 2 cycles after address"
-      );
+      check_equal(weight_rd_data, weight_row_expected(2, 3), "weight read data valid exactly 2 cycles after address");
 
       -- Change the address; on this same next cycle (before the next
       -- edge sees it), the *previous* row's data must still be held.
@@ -327,16 +351,14 @@ begin
       wait until rising_edge(clk);
       wait until rising_edge(clk);
       wait for c_settle;
-      check_equal(
-        weight_rd_data, weight_row_expected(1, 3),
-        "weight read data updates 2 cycles after the new address"
-      );
+      check_equal(weight_rd_data, weight_row_expected(1, 3), "weight read data updates 2 cycles after the new address");
 
       bias_rd_addr <= std_ulogic_vector(to_unsigned(c_bias_depth - 1, c_bias_addr_width));
       wait until rising_edge(clk);
       wait for c_settle;
       check_equal(
-        bias_rd_data, bias_row_expected(c_bias_depth - 1, 3),
+        bias_rd_data,
+        bias_row_expected(c_bias_depth - 1, 3),
         "bias read data valid exactly 1 cycle after address"
       );
 
@@ -349,6 +371,7 @@ begin
       pulse_fill_start(clk, fill_start);
       fill_is_bias <= '0';
       for r in 0 to c_depth - 1 loop
+
         check_true(s_stream_s2m.ready = '1', "ready before weight region is full");
         push_weight_row(clk, s_stream_m2s, s_stream_s2m, r, 0);
       end loop;
@@ -380,6 +403,7 @@ begin
       pulse_fill_start(clk, fill_start);
       fill_is_bias <= '1';
       for r in 0 to c_bias_depth - 1 loop
+
         check_true(s_stream_s2m.ready = '1', "ready before bias region is full");
         push_bias_row(clk, s_stream_m2s, s_stream_s2m, r, 0);
       end loop;
@@ -406,12 +430,15 @@ begin
       pulse_fill_start(clk, fill_start);
       fill_is_bias <= '0';
       for r in 0 to c_depth - 1 loop
+
         push_weight_row(clk, s_stream_m2s, s_stream_s2m, r, 2);
       end loop;
 
       for r in 0 to c_depth - 1 loop
+
         check_weight_row(
-          r, weight_row_expected(r, 2),
+          r,
+          weight_row_expected(r, 2),
           "post-abort fill fully overwrites the weight region, no leftover partial-fill row"
         );
       end loop;
@@ -432,22 +459,29 @@ begin
       check_weight_row(0, weight_row_expected(0, 300), "row 0 committed before the concurrent-read check");
 
       for r in 1 to c_depth - 1 loop
+
         for lane in 0 to c_weight_lanes - 1 loop
+
           weight_rd_addr <= std_ulogic_vector(to_unsigned(0, c_addr_width));
           push_fill_beat(
-            clk, s_stream_m2s, s_stream_s2m,
+            clk,
+            s_stream_m2s,
+            s_stream_s2m,
             std_ulogic_vector(to_unsigned((300 + r * 16 + lane) mod 256, 8))
           );
           wait for c_settle;
           check_equal(
-            weight_rd_data, weight_row_expected(0, 300),
+            weight_rd_data,
+            weight_row_expected(0, 300),
             "row 0 stays readable while a later row is still mid-assembly"
           );
         end loop;
+
       end loop;
 
       check_weight_row(
-        c_depth - 1, weight_row_expected(c_depth - 1, 300),
+        c_depth - 1,
+        weight_row_expected(c_depth - 1, 300),
         "last row fully committed after the concurrent fill/read pass"
       );
     end if;

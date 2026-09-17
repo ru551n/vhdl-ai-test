@@ -1,19 +1,19 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library vunit_lib;
 context vunit_lib.vunit_context;
-use vunit_lib.queue_pkg.all;
+  use vunit_lib.queue_pkg.all;
 
 library osvvm;
-use osvvm.RandomPkg.all;
+  use osvvm.randompkg.all;
 
 library axi_stream;
-use axi_stream.axi_stream_pkg.all;
+  use axi_stream.axi_stream_pkg.all;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_pkg.all;
 
 -- VUnit-5 testbench for cnn_accel_bias_requant. See
 -- modules/cnn_accel/doc/cnn_accel_bias_requant_req.md and
@@ -42,7 +42,7 @@ entity tb_cnn_accel_bias_requant is
     -- full-throughput test, nonzero otherwise): one input, one output
     -- here, so a simple in/out pair rather than tb_cnn_accel_pool.vhd's
     -- three-link split.
-    stall_probability_percent_in : natural := 20;
+    stall_probability_percent_in  : natural := 20;
     stall_probability_percent_out : natural := 20;
     -- Output-channel parallelism (lane count). Swept per test in
     -- module_cnn_accel.py's setup_vunit method -- default is a directed
@@ -53,9 +53,8 @@ entity tb_cnn_accel_bias_requant is
     -- g_accum_width*g_pe_rows<=128 ceiling, so full_throughput/
     -- backpressure are additionally run at g_pe_rows=8 -- the width the
     -- rest of the design actually uses.
-    g_pe_rows : positive := 4;
-    runner_cfg : string
-  );
+    g_pe_rows                     : positive := 4;
+    runner_cfg                    : string);
 end entity tb_cnn_accel_bias_requant;
 
 architecture tb of tb_cnn_accel_bias_requant is
@@ -110,15 +109,19 @@ architecture tb of tb_cnn_accel_bias_requant is
   -- pair; monitor_out pops and checks on every accepted output beat.
   constant expected_q : queue_t := new_queue;
 
-  type accum_arr_t is array (0 to c_pe_rows - 1) of
-    integer range -(2 ** (c_accum_width - 1)) to (2 ** (c_accum_width - 1) - 1);
+  type accum_arr_t is array (0 to c_pe_rows - 1)
+    of integer range - (2 ** (c_accum_width - 1)) to (2 ** (c_accum_width - 1) - 1);
+
   type result_arr_t is array (0 to c_pe_rows - 1) of signed(7 downto 0);
+
   -- Per-lane (multiplier, shift) for the ISA v1.2 per-channel table row.
   type scale_arr_t is array (0 to c_pe_rows - 1) of signed(31 downto 0);
+
   type shift_arr_t is array (0 to c_pe_rows - 1) of natural range 0 to 255;
 
-  function to_sl(cond : boolean) return std_ulogic is
+  function to_sl (cond : boolean) return std_ulogic is
   begin
+
     if cond then
       return '1';
     end if;
@@ -151,7 +154,8 @@ architecture tb of tb_cnn_accel_bias_requant is
   -- cnn_accel_model.py's round_shift_right_signed agree.
   ------------------------------------------------------------------------
 
-  function ref_round_shift_right(value : signed; shift : natural) return signed is
+  function ref_round_shift_right (value : signed; shift : natural) return signed is
+
     constant ext_width : positive := value'length + 1;
     variable value_ext : signed(ext_width - 1 downto 0);
     variable divisor : signed(ext_width - 1 downto 0);
@@ -161,6 +165,7 @@ architecture tb of tb_cnn_accel_bias_requant is
     variable twice_remainder : signed(ext_width downto 0);
     variable divisor_wide : signed(ext_width downto 0);
   begin
+
     assert shift >= 1
       report "ref_round_shift_right: this module's combined shift is always >= 15, shift<=0 is not exercised"
       severity failure;
@@ -189,11 +194,13 @@ architecture tb of tb_cnn_accel_bias_requant is
     end if;
   end function;
 
-  function ref_saturate_signed(value : signed; result_width : positive) return signed is
-    variable min_value_ext : signed(value'range) := to_signed(-(2 ** (result_width - 1)), value'length);
+  function ref_saturate_signed (value : signed; result_width : positive) return signed is
+
+    variable min_value_ext : signed(value'range) := to_signed(- (2 ** (result_width - 1)), value'length);
     variable max_value_ext : signed(value'range) := to_signed(2 ** (result_width - 1) - 1, value'length);
     variable clamped : signed(value'range);
   begin
+
     if value < min_value_ext then
       clamped := min_value_ext;
     elsif value > max_value_ext then
@@ -209,11 +216,13 @@ architecture tb of tb_cnn_accel_bias_requant is
   -- as two chained comparisons on the full-width value (not via an int8
   -- saturate first) so that it is independent of the RTL's
   -- saturate-then-clamp implementation.
-  function ref_clamp(value : signed; lo : integer; hi : integer) return signed is
+  function ref_clamp (value : signed; lo : integer; hi : integer) return signed is
+
     -- 'value' may be wider than integer: compare at its own width, never
     -- convert it.
     variable v : signed(value'length - 1 downto 0) := value;
   begin
+
     if v < to_signed(lo, v'length) then
       v := to_signed(lo, v'length);
     end if;
@@ -234,19 +243,20 @@ architecture tb of tb_cnn_accel_bias_requant is
   -- overflow semantic as the requant_en='1' path -- architectural decision
   -- D2, single overflow semantic across both paths, matching the golden
   -- model's fix #1). ISA v1.1 (H1) fields default to the v1.0 behaviour.
-  function ref_bias_requantize_relu(
-    accum : signed;
-    bias : signed;
-    bias_en : std_ulogic;
-    requant_en : std_ulogic;
-    relu_en : std_ulogic;
+  function ref_bias_requantize_relu (
+    accum         : signed;
+    bias          : signed;
+    bias_en       : std_ulogic;
+    requant_en    : std_ulogic;
+    relu_en       : std_ulogic;
     requant_scale : signed(31 downto 0);
     requant_shift : natural;
     output_offset : integer := 0;
-    clamp_en : std_ulogic := '0';
-    clamp_min : integer := -128;
-    clamp_max : integer := 127
+    clamp_en      : std_ulogic := '0';
+    clamp_min     : integer := -128;
+    clamp_max     : integer := 127
   ) return signed is
+
     constant sum_width : positive := accum'length + 1;
     constant product_width : positive := sum_width + requant_scale'length;
     -- One extra bit on both paths so the offset add cannot overflow.
@@ -256,6 +266,7 @@ architecture tb of tb_cnn_accel_bias_requant is
     variable bypass_total : signed(sum_width downto 0);
     variable lo, hi : integer;
   begin
+
     if clamp_en = '1' then
       lo := clamp_min;
       hi := clamp_max;
@@ -296,25 +307,34 @@ architecture tb of tb_cnn_accel_bias_requant is
   -- zero-padded above the active lanes.
   ------------------------------------------------------------------------
 
-  function to_accum_array(values : accum_arr_t) return accum_array_t is
+  function to_accum_array (values : accum_arr_t) return accum_array_t is
+
     variable result : accum_array_t(0 to c_pe_rows - 1)(c_accum_width - 1 downto 0);
   begin
+
     for i in 0 to c_pe_rows - 1 loop
+
       result(i) := to_signed(values(i), c_accum_width);
     end loop;
+
     return result;
   end function;
 
   -- Sized exactly to 'bias_rd_data's actual port width
   -- (g_accum_width*g_pe_rows, no axi_stream_data_sz padding -- that port
   -- is not an AXI4-Stream 'data' field).
-  function pack_lanes_bias(values : accum_arr_t) return std_ulogic_vector is
+  function pack_lanes_bias (values : accum_arr_t) return std_ulogic_vector is
+
     variable result : std_ulogic_vector(c_accum_width * c_pe_rows - 1 downto 0);
   begin
+
     for i in 0 to c_pe_rows - 1 loop
-      result(c_accum_width * (i + 1) - 1 downto c_accum_width * i) :=
-        std_ulogic_vector(to_signed(values(i), c_accum_width));
+
+      result(c_accum_width * (i + 1) - 1 downto c_accum_width * i) := std_ulogic_vector(
+        to_signed(values(i), c_accum_width)
+      );
     end loop;
+
     return result;
   end function;
 
@@ -322,24 +342,32 @@ architecture tb of tb_cnn_accel_bias_requant is
   -- comment: multiplier in the low 32 bits of each 40-bit lane, the raw
   -- 8-bit shift above it -- i.e. bytes 0..4 of the 8-byte DDR table entry
   -- (cnn_accel_model.pack_scale_table_for_hw).
-  function pack_lanes_scale(scales : scale_arr_t; shifts : shift_arr_t) return std_ulogic_vector is
+  function pack_lanes_scale (scales : scale_arr_t; shifts : shift_arr_t) return std_ulogic_vector is
+
     variable result : std_ulogic_vector(c_scale_entry_width * c_pe_rows - 1 downto 0);
     variable lo : natural;
   begin
+
     for i in 0 to c_pe_rows - 1 loop
+
       lo := c_scale_entry_width * i;
       result(lo + 31 downto lo) := std_ulogic_vector(scales(i));
       result(lo + 39 downto lo + 32) := std_ulogic_vector(to_unsigned(shifts(i), 8));
     end loop;
+
     return result;
   end function;
 
-  function pack_lanes_result(values : result_arr_t) return std_ulogic_vector is
+  function pack_lanes_result (values : result_arr_t) return std_ulogic_vector is
+
     variable result : std_ulogic_vector(axi_stream_data_sz - 1 downto 0) := (others => '0');
   begin
+
     for i in 0 to c_pe_rows - 1 loop
+
       result(8 * (i + 1) - 1 downto 8 * i) := std_ulogic_vector(values(i));
     end loop;
+
     return result;
   end function;
 
@@ -354,11 +382,13 @@ begin
   -- redundant with (not a substitute for) the functional scoreboard.
   ------------------------------------------------------------------------
 
-  bias_rd_addr_check : process(clk)
+  bias_rd_addr_check : process (clk)
   begin
+
     if rising_edge(clk) and reset = '0' then
       check_equal(
-        bias_rd_addr, std_ulogic_vector'(bias_rd_addr'range => '0'),
+        bias_rd_addr,
+        std_ulogic_vector'(bias_rd_addr'range => '0'),
         "bias_rd_addr must stay constant all-zeros (v1 single-bias-row design)"
       );
     end if;
@@ -367,35 +397,35 @@ begin
   ------------------------------------------------------------------------
   dut : entity cnn_accel.cnn_accel_bias_requant
     generic map (
-      g_accum_width => c_accum_width,
-      g_pe_rows => c_pe_rows,
-      g_bias_addr_width => c_bias_addr_width,
+      g_accum_width       => c_accum_width,
+      g_pe_rows           => c_pe_rows,
+      g_bias_addr_width   => c_bias_addr_width,
       g_max_requant_shift => c_max_requant_shift
     )
     port map (
-      clk => clk,
-      reset => reset,
+      clk                => clk,
+      reset              => reset,
 
-      cfg_bias_en => cfg_bias_en,
-      cfg_requant_en => cfg_requant_en,
-      cfg_relu_en => cfg_relu_en,
-      cfg_requant_scale => cfg_requant_scale,
-      cfg_requant_shift => cfg_requant_shift,
-      cfg_output_offset => cfg_output_offset,
-      cfg_clamp_en => cfg_clamp_en,
-      cfg_clamp_min => cfg_clamp_min,
-      cfg_clamp_max => cfg_clamp_max,
+      cfg_bias_en        => cfg_bias_en,
+      cfg_requant_en     => cfg_requant_en,
+      cfg_relu_en        => cfg_relu_en,
+      cfg_requant_scale  => cfg_requant_scale,
+      cfg_requant_shift  => cfg_requant_shift,
+      cfg_output_offset  => cfg_output_offset,
+      cfg_clamp_en       => cfg_clamp_en,
+      cfg_clamp_min      => cfg_clamp_min,
+      cfg_clamp_max      => cfg_clamp_max,
       cfg_per_channel_en => cfg_per_channel_en,
 
-      bias_rd_addr => bias_rd_addr,
-      bias_rd_data => bias_rd_data,
-      scale_rd_data => scale_rd_data,
+      bias_rd_addr       => bias_rd_addr,
+      bias_rd_data       => bias_rd_data,
+      scale_rd_data      => scale_rd_data,
 
-      s_accum_m2s => s_accum_m2s,
-      s_accum_s2m => s_accum_s2m,
+      s_accum_m2s        => s_accum_m2s,
+      s_accum_s2m        => s_accum_s2m,
 
-      m_out_m2s => m_out_m2s,
-      m_out_s2m => m_out_s2m
+      m_out_m2s          => m_out_m2s,
+      m_out_s2m          => m_out_s2m
     );
 
   ------------------------------------------------------------------------
@@ -404,20 +434,26 @@ begin
   ------------------------------------------------------------------------
 
   monitor_out : process
-    variable rnd : RandomPType;
+
+    variable rnd : randomptype;
     variable expected_data : std_ulogic_vector(axi_stream_data_sz - 1 downto 0);
     variable expected_last : std_ulogic;
+
   begin
+
     rnd.InitSeed(get_string_seed(runner_cfg) & "_monitor");
     m_out_s2m.ready <= '0';
     wait until reset = '0' and rising_edge(clk);
 
     loop
+
       if rnd.RandInt(0, 99) < stall_pct_out then
         m_out_s2m.ready <= '0';
         for i in 1 to rnd.RandInt(1, 4) loop
+
           wait until rising_edge(clk);
         end loop;
+
       end if;
 
       m_out_s2m.ready <= '1';
@@ -430,11 +466,13 @@ begin
         check_equal(m_out_m2s.last, expected_last, "m_out last mismatch");
       end if;
     end loop;
+
   end process;
 
   ------------------------------------------------------------------------
   main : process
-    variable rnd : RandomPType;
+
+    variable rnd : randomptype;
 
     -- ISA v1.1 (H1) epilogue fields for the next beats. Process-level
     -- state rather than extra 'send_beat' arguments so the v1.0 tests
@@ -455,34 +493,40 @@ begin
 
     procedure do_reset is
     begin
+
       reset <= '1';
       wait until rising_edge(clk);
       reset <= '0';
     end procedure;
 
-    procedure random_accum_arr(p_arr : out accum_arr_t) is
+    procedure random_accum_arr (p_arr : out accum_arr_t) is
     begin
+
       for i in 0 to c_pe_rows - 1 loop
-        p_arr(i) := rnd.RandInt(-(2 ** (c_accum_width - 1)), 2 ** (c_accum_width - 1) - 1);
+
+        p_arr(i) := rnd.RandInt(- (2 ** (c_accum_width - 1)), 2 ** (c_accum_width - 1) - 1);
       end loop;
+
     end procedure;
 
     -- Pushes one 's_accum' beat (with randomized input-side stall,
     -- driven by 'stall_pct_in') and enqueues its expected per-lane result
     -- (computed by ref_bias_requantize_relu, not the RTL) onto the
     -- scoreboard queue.
-    procedure send_beat(
+    procedure send_beat (
       accum_vals : accum_arr_t;
-      bias_vals : accum_arr_t;
-      bias_en : std_ulogic;
+      bias_vals  : accum_arr_t;
+      bias_en    : std_ulogic;
       requant_en : std_ulogic;
-      relu_en : std_ulogic;
-      scale : signed(31 downto 0);
-      shift : natural;
-      beat_last : std_ulogic
+      relu_en    : std_ulogic;
+      scale      : signed(31 downto 0);
+      shift      : natural;
+      beat_last  : std_ulogic
     ) is
+
       variable results : result_arr_t;
     begin
+
       cfg_bias_en <= bias_en;
       cfg_requant_en <= requant_en;
       cfg_relu_en <= relu_en;
@@ -502,8 +546,10 @@ begin
       if rnd.RandInt(0, 99) < stall_pct_in then
         s_accum_m2s.valid <= '0';
         for i in 1 to rnd.RandInt(1, 4) loop
+
           wait until rising_edge(clk);
         end loop;
+
       end if;
 
       s_accum_m2s.valid <= '1';
@@ -511,23 +557,36 @@ begin
       s_accum_m2s.valid <= '0';
 
       for i in 0 to c_pe_rows - 1 loop
+
         if h2_per_channel_en = '1' then
           -- Lane i requantised with ITS OWN table entry (the model's
           -- lane_requant_params); the scalar scale/shift are ignored.
           results(i) := ref_bias_requantize_relu(
             to_signed(accum_vals(i), c_accum_width),
             to_signed(bias_vals(i), c_accum_width),
-            bias_en, requant_en, relu_en,
-            h2_lane_scale(i), h2_lane_shift(i),
-            h1_offset, h1_clamp_en, h1_clamp_min, h1_clamp_max
+            bias_en,
+            requant_en,
+            relu_en,
+            h2_lane_scale(i),
+            h2_lane_shift(i),
+            h1_offset,
+            h1_clamp_en,
+            h1_clamp_min,
+            h1_clamp_max
           );
         else
           results(i) := ref_bias_requantize_relu(
             to_signed(accum_vals(i), c_accum_width),
             to_signed(bias_vals(i), c_accum_width),
-            bias_en, requant_en, relu_en,
-            scale, shift,
-            h1_offset, h1_clamp_en, h1_clamp_min, h1_clamp_max
+            bias_en,
+            requant_en,
+            relu_en,
+            scale,
+            shift,
+            h1_offset,
+            h1_clamp_en,
+            h1_clamp_min,
+            h1_clamp_max
           );
         end if;
       end loop;
@@ -538,34 +597,42 @@ begin
 
     -- Convenience: same directed value on every lane (mirrors
     -- tb_cnn_accel_pool.vhd's run_directed_extremes idiom).
-    procedure send_directed(
-      accum_val : integer;
-      bias_val : integer;
-      bias_en : std_ulogic;
+    procedure send_directed (
+      accum_val  : integer;
+      bias_val   : integer;
+      bias_en    : std_ulogic;
       requant_en : std_ulogic;
-      relu_en : std_ulogic;
-      scale : signed(31 downto 0);
-      shift : natural
+      relu_en    : std_ulogic;
+      scale      : signed(31 downto 0);
+      shift      : natural
     ) is
+
       variable accum_vals, bias_vals : accum_arr_t;
     begin
+
       for i in 0 to c_pe_rows - 1 loop
+
         accum_vals(i) := accum_val;
         bias_vals(i) := bias_val;
       end loop;
+
       send_beat(accum_vals, bias_vals, bias_en, requant_en, relu_en, scale, shift, '0');
     end procedure;
 
     -- Waits (bounded) until the scoreboard queue has drained, then
     -- confirms it is truly empty (every expected output actually
     -- arrived) rather than just timing out.
-    procedure drain_and_check(max_wait_cycles : positive) is
+    procedure drain_and_check (max_wait_cycles : positive) is
+
       variable cycles : natural := 0;
     begin
+
       while not is_empty(expected_q) and cycles < max_wait_cycles loop
+
         wait until rising_edge(clk);
         cycles := cycles + 1;
       end loop;
+
       check_true(is_empty(expected_q), "m_out scoreboard queue did not drain in time");
     end procedure;
 
@@ -578,6 +645,7 @@ begin
     variable start_time : time;
 
   begin
+
     test_runner_setup(runner, runner_cfg);
     rnd.InitSeed(get_string_seed(runner_cfg));
 
@@ -614,12 +682,16 @@ begin
       -- deliberately huge scale (2**20), shift=0, so almost every beat
       -- lands well outside the int8 range in one direction or the other.
       for beat in 0 to 39 loop
+
         random_accum_arr(accum_vals);
         for i in 0 to c_pe_rows - 1 loop
+
           bias_vals(i) := 0;
         end loop;
+
         send_beat(accum_vals, bias_vals, '0', '1', '0', to_signed(2 ** 20, 32), 0, '0');
       end loop;
+
       drain_and_check(200);
 
     elsif run("test_relu_before_saturate") then
@@ -644,20 +716,27 @@ begin
       -- All 8 combinations of cfg_bias_en/cfg_requant_en/cfg_relu_en,
       -- randomized accum/bias/scale/shift per beat within each combo.
       for combo in 0 to 7 loop
+
         for beat in 0 to 14 loop
+
           random_accum_arr(accum_vals);
           random_accum_arr(bias_vals);
           scale := rnd.RandSigned(32);
           shift := rnd.RandInt(0, c_max_requant_shift);
           send_beat(
-            accum_vals, bias_vals,
+            accum_vals,
+            bias_vals,
             to_sl((combo mod 2) = 1),
             to_sl(((combo / 2) mod 2) = 1),
             to_sl(((combo / 4) mod 2) = 1),
-            scale, shift, '0'
+            scale,
+            shift,
+            '0'
           );
         end loop;
+
       end loop;
+
       drain_and_check(500);
 
     elsif run("test_bypass_saturates") then
@@ -678,14 +757,21 @@ begin
 
       -- Randomized batch, bias/ReLU toggling, requant_en fixed at '0'.
       for beat in 0 to 39 loop
+
         random_accum_arr(accum_vals);
         random_accum_arr(bias_vals);
         send_beat(
-          accum_vals, bias_vals,
-          to_sl(rnd.RandInt(0, 1) = 1), '0', to_sl(rnd.RandInt(0, 1) = 1),
-          c_scale_one, 0, '0'
+          accum_vals,
+          bias_vals,
+          to_sl(rnd.RandInt(0, 1) = 1),
+          '0',
+          to_sl(rnd.RandInt(0, 1) = 1),
+          c_scale_one,
+          0,
+          '0'
         );
       end loop;
+
       drain_and_check(200);
 
     elsif run("test_bypass_relu_before_saturate") then
@@ -750,20 +836,27 @@ begin
       h1_offset := -32768;
       send_directed(2 ** 19 - 1, 0, '0', '0', '0', c_scale_one, 0);
       h1_offset := 32767;
-      send_directed(-(2 ** 19), 0, '0', '0', '0', c_scale_one, 0);
+      send_directed(- (2 ** 19), 0, '0', '0', '0', c_scale_one, 0);
       -- Randomized offsets across the full int16 range, both paths.
       for beat in 0 to 59 loop
+
         random_accum_arr(accum_vals);
         random_accum_arr(bias_vals);
         scale := rnd.RandSigned(32);
         shift := rnd.RandInt(0, c_max_requant_shift);
         h1_offset := rnd.RandInt(-32768, 32767);
         send_beat(
-          accum_vals, bias_vals,
-          to_sl(rnd.RandInt(0, 1) = 1), to_sl(rnd.RandInt(0, 1) = 1), to_sl(rnd.RandInt(0, 1) = 1),
-          scale, shift, '0'
+          accum_vals,
+          bias_vals,
+          to_sl(rnd.RandInt(0, 1) = 1),
+          to_sl(rnd.RandInt(0, 1) = 1),
+          to_sl(rnd.RandInt(0, 1) = 1),
+          scale,
+          shift,
+          '0'
         );
       end loop;
+
       h1_offset := 0;
       drain_and_check(400);
 
@@ -774,16 +867,16 @@ begin
       h1_clamp_en := '1';
       h1_clamp_min := -20;
       h1_clamp_max := 100;
-      send_directed(-50, 0, '0', '1', '0', c_scale_one, 0);   -- -> -20
-      send_directed(-20, 0, '0', '1', '0', c_scale_one, 0);   -- -> -20 (exact bound)
-      send_directed(0, 0, '0', '1', '0', c_scale_one, 0);     -- -> 0
-      send_directed(100, 0, '0', '1', '0', c_scale_one, 0);   -- -> 100 (exact bound)
-      send_directed(101, 0, '0', '1', '0', c_scale_one, 0);   -- -> 100
-      send_directed(1000, 0, '0', '1', '0', c_scale_one, 0);  -- -> 100
+      send_directed(-50, 0, '0', '1', '0', c_scale_one, 0); -- -> -20
+      send_directed(-20, 0, '0', '1', '0', c_scale_one, 0); -- -> -20 (exact bound)
+      send_directed(0, 0, '0', '1', '0', c_scale_one, 0); -- -> 0
+      send_directed(100, 0, '0', '1', '0', c_scale_one, 0); -- -> 100 (exact bound)
+      send_directed(101, 0, '0', '1', '0', c_scale_one, 0); -- -> 100
+      send_directed(1000, 0, '0', '1', '0', c_scale_one, 0); -- -> 100
       send_directed(-1000, 0, '0', '1', '0', c_scale_one, 0); -- -> -20
       -- With CLAMP_EN the ReLU flag is irrelevant: relu_en='1' must NOT
       -- raise the lower bound above clamp_min.
-      send_directed(-50, 0, '0', '1', '1', c_scale_one, 0);   -- -> -20, not 0
+      send_directed(-50, 0, '0', '1', '1', c_scale_one, 0); -- -> -20, not 0
       -- Offset and clamp together: (-50) + 40 = -10 -> in range -> -10;
       -- (-50) + 200 = 150 -> clamp_max 100.
       h1_offset := 40;
@@ -794,22 +887,23 @@ begin
       -- The full int8 range as clamp bounds must equal plain saturation.
       h1_clamp_min := -128;
       h1_clamp_max := 127;
-      send_directed(1000, 0, '0', '1', '0', c_scale_one, 0);  -- -> 127
+      send_directed(1000, 0, '0', '1', '0', c_scale_one, 0); -- -> 127
       send_directed(-1000, 0, '0', '1', '0', c_scale_one, 0); -- -> -128
       -- Degenerate clamp_min = clamp_max pins every value.
       h1_clamp_min := 7;
       h1_clamp_max := 7;
       send_directed(-1000, 0, '0', '1', '0', c_scale_one, 0); -- -> 7
-      send_directed(1000, 0, '0', '1', '0', c_scale_one, 0);  -- -> 7
+      send_directed(1000, 0, '0', '1', '0', c_scale_one, 0); -- -> 7
       -- Bypass path honours the same clamp.
       h1_clamp_min := -3;
       h1_clamp_max := 3;
-      send_directed(50, 0, '0', '0', '0', c_scale_one, 0);    -- -> 3
-      send_directed(-50, 0, '0', '0', '0', c_scale_one, 0);   -- -> -3
-      send_directed(1, 0, '0', '0', '0', c_scale_one, 0);     -- -> 1
+      send_directed(50, 0, '0', '0', '0', c_scale_one, 0); -- -> 3
+      send_directed(-50, 0, '0', '0', '0', c_scale_one, 0); -- -> -3
+      send_directed(1, 0, '0', '0', '0', c_scale_one, 0); -- -> 1
       -- Randomized: random (min <= max) bounds, random offset, both
       -- paths, all legacy flags.
       for beat in 0 to 79 loop
+
         random_accum_arr(accum_vals);
         random_accum_arr(bias_vals);
         scale := rnd.RandSigned(32);
@@ -818,19 +912,25 @@ begin
         h1_clamp_max := rnd.RandInt(h1_clamp_min, 127);
         h1_offset := rnd.RandInt(-32768, 32767);
         send_beat(
-          accum_vals, bias_vals,
-          to_sl(rnd.RandInt(0, 1) = 1), to_sl(rnd.RandInt(0, 1) = 1), to_sl(rnd.RandInt(0, 1) = 1),
-          scale, shift, '0'
+          accum_vals,
+          bias_vals,
+          to_sl(rnd.RandInt(0, 1) = 1),
+          to_sl(rnd.RandInt(0, 1) = 1),
+          to_sl(rnd.RandInt(0, 1) = 1),
+          scale,
+          shift,
+          '0'
         );
       end loop;
+
       -- Encoder-rejected clamp_min > clamp_max: RTL and golden model both
       -- return min(max(x, lo), hi) = hi. Pinned so they cannot drift apart.
       h1_offset := 0;
       h1_clamp_min := 50;
       h1_clamp_max := -50;
-      send_directed(0, 0, '0', '1', '0', c_scale_one, 0);     -- -> -50
-      send_directed(100, 0, '0', '1', '0', c_scale_one, 0);   -- -> -50
-      send_directed(-100, 0, '0', '1', '0', c_scale_one, 0);  -- -> -50
+      send_directed(0, 0, '0', '1', '0', c_scale_one, 0); -- -> -50
+      send_directed(100, 0, '0', '1', '0', c_scale_one, 0); -- -> -50
+      send_directed(-100, 0, '0', '1', '0', c_scale_one, 0); -- -> -50
       h1_clamp_en := '0';
       h1_clamp_min := -128;
       h1_clamp_max := 127;
@@ -843,7 +943,9 @@ begin
       -- Garbage in clamp_min/clamp_max (including min > max) must have
       -- no effect.
       for combo in 0 to 7 loop
+
         for beat in 0 to 14 loop
+
           random_accum_arr(accum_vals);
           random_accum_arr(bias_vals);
           scale := rnd.RandSigned(32);
@@ -851,20 +953,25 @@ begin
           h1_clamp_min := rnd.RandInt(-128, 127);
           h1_clamp_max := rnd.RandInt(-128, 127);
           send_beat(
-            accum_vals, bias_vals,
+            accum_vals,
+            bias_vals,
             to_sl((combo mod 2) = 1),
             to_sl(((combo / 2) mod 2) = 1),
             to_sl(((combo / 4) mod 2) = 1),
-            scale, shift, '0'
+            scale,
+            shift,
+            '0'
           );
         end loop;
+
       end loop;
+
       -- Directed v1.0 boundary cases with non-default clamp bounds
       -- present but disabled.
       h1_clamp_min := 10;
       h1_clamp_max := 20;
       send_directed(-1000, 0, '0', '1', '1', c_scale_one, 0); -- ReLU -> 0, not 10
-      send_directed(1000, 0, '0', '1', '0', c_scale_one, 0);  -- saturate -> 127, not 20
+      send_directed(1000, 0, '0', '1', '0', c_scale_one, 0); -- saturate -> 127, not 20
       send_directed(-1000, 0, '0', '1', '0', c_scale_one, 0); -- saturate -> -128
       send_directed(-1000, 0, '0', '0', '1', c_scale_one, 0); -- bypass ReLU -> 0
       h1_clamp_min := -128;
@@ -880,13 +987,28 @@ begin
       -- broadcast of the scalar cfg would be visible immediately).
       h2_per_channel_en := '1';
       for i in 0 to c_pe_rows - 1 loop
+
         case i mod 4 is
-          when 0 => h2_lane_scale(i) := c_scale_one;  h2_lane_shift(i) := 0;
-          when 1 => h2_lane_scale(i) := c_scale_half; h2_lane_shift(i) := 0;
-          when 2 => h2_lane_scale(i) := c_scale_one;  h2_lane_shift(i) := 1;
-          when others => h2_lane_scale(i) := -c_scale_one; h2_lane_shift(i) := 0;
+          when 0 =>
+
+            h2_lane_scale(i) := c_scale_one;
+            h2_lane_shift(i) := 0;
+          when 1 =>
+
+            h2_lane_scale(i) := c_scale_half;
+            h2_lane_shift(i) := 0;
+          when 2 =>
+
+            h2_lane_scale(i) := c_scale_one;
+            h2_lane_shift(i) := 1;
+          when others =>
+
+            h2_lane_scale(i) := -c_scale_one;
+            h2_lane_shift(i) := 0;
         end case;
+
       end loop;
+
       -- Scalar cfg deliberately garbage (must be ignored).
       send_directed(100, 0, '0', '1', '0', to_signed(12345, 32), 7);
       send_directed(-50, 0, '0', '1', '0', to_signed(-7, 32), 31);
@@ -894,26 +1016,35 @@ begin
       -- Randomised per-lane tables, all flag combinations, H1 fields
       -- mixed in: requant_en='0' must still bypass regardless of the table.
       for combo in 0 to 7 loop
+
         for beat in 0 to 19 loop
+
           random_accum_arr(accum_vals);
           random_accum_arr(bias_vals);
           for i in 0 to c_pe_rows - 1 loop
+
             h2_lane_scale(i) := rnd.RandSigned(32);
             h2_lane_shift(i) := rnd.RandInt(0, c_max_requant_shift);
           end loop;
+
           h1_offset := rnd.RandInt(-300, 300);
           h1_clamp_en := to_sl(rnd.RandInt(0, 1) = 1);
           h1_clamp_min := rnd.RandInt(-128, 0);
           h1_clamp_max := rnd.RandInt(0, 127);
           send_beat(
-            accum_vals, bias_vals,
+            accum_vals,
+            bias_vals,
             to_sl((combo mod 2) = 1),
             to_sl(((combo / 2) mod 2) = 1),
             to_sl(((combo / 4) mod 2) = 1),
-            rnd.RandSigned(32), rnd.RandInt(0, 255), to_sl(beat = 19)
+            rnd.RandSigned(32),
+            rnd.RandInt(0, 255),
+            to_sl(beat = 19)
           );
         end loop;
+
       end loop;
+
       h1_offset := 0;
       h1_clamp_en := '0';
       h1_clamp_min := -128;
@@ -928,30 +1059,41 @@ begin
       -- exactly the pre-H2 datapath, for every flag combination.
       h2_per_channel_en := '0';
       for combo in 0 to 7 loop
+
         for beat in 0 to 14 loop
+
           random_accum_arr(accum_vals);
           random_accum_arr(bias_vals);
           for i in 0 to c_pe_rows - 1 loop
+
             h2_lane_scale(i) := rnd.RandSigned(32);
             h2_lane_shift(i) := rnd.RandInt(0, 255);
           end loop;
+
           scale := rnd.RandSigned(32);
           shift := rnd.RandInt(0, c_max_requant_shift);
           send_beat(
-            accum_vals, bias_vals,
+            accum_vals,
+            bias_vals,
             to_sl((combo mod 2) = 1),
             to_sl(((combo / 2) mod 2) = 1),
             to_sl(((combo / 4) mod 2) = 1),
-            scale, shift, '0'
+            scale,
+            shift,
+            '0'
           );
         end loop;
+
       end loop;
+
       -- Directed: table says -1.0 / shift 5 on every lane, scalar says
       -- 1.0 / 0 -> result must be +100, not -3.
       for i in 0 to c_pe_rows - 1 loop
+
         h2_lane_scale(i) := -c_scale_one;
         h2_lane_shift(i) := 5;
       end loop;
+
       send_directed(100, 0, '0', '1', '0', c_scale_one, 0);
       h2_lane_scale := (others => (others => '0'));
       h2_lane_shift := (others => 0);
@@ -963,16 +1105,23 @@ begin
       -- output beat per accepted input beat.
       start_time := now;
       for beat in 0 to 299 loop
+
         random_accum_arr(accum_vals);
         random_accum_arr(bias_vals);
         scale := rnd.RandSigned(32);
         shift := rnd.RandInt(0, c_max_requant_shift);
         send_beat(
-          accum_vals, bias_vals,
-          to_sl(rnd.RandInt(0, 1) = 1), to_sl(rnd.RandInt(0, 1) = 1), to_sl(rnd.RandInt(0, 1) = 1),
-          scale, shift, to_sl(beat = 299)
+          accum_vals,
+          bias_vals,
+          to_sl(rnd.RandInt(0, 1) = 1),
+          to_sl(rnd.RandInt(0, 1) = 1),
+          to_sl(rnd.RandInt(0, 1) = 1),
+          scale,
+          shift,
+          to_sl(beat = 299)
         );
       end loop;
+
       drain_and_check(350);
 
       check_relation(
@@ -991,21 +1140,27 @@ begin
       wait until rising_edge(clk);
 
       for beat in 0 to 149 loop
+
         random_accum_arr(accum_vals);
         random_accum_arr(bias_vals);
         scale := rnd.RandSigned(32);
         shift := rnd.RandInt(0, c_max_requant_shift);
         send_beat(
-          accum_vals, bias_vals,
-          to_sl(rnd.RandInt(0, 1) = 1), to_sl(rnd.RandInt(0, 1) = 1), to_sl(rnd.RandInt(0, 1) = 1),
-          scale, shift, to_sl(beat = 149)
+          accum_vals,
+          bias_vals,
+          to_sl(rnd.RandInt(0, 1) = 1),
+          to_sl(rnd.RandInt(0, 1) = 1),
+          to_sl(rnd.RandInt(0, 1) = 1),
+          scale,
+          shift,
+          to_sl(beat = 149)
         );
       end loop;
+
       drain_and_check(2000);
 
       stall_pct_in <= stall_probability_percent_in;
       stall_pct_out <= stall_probability_percent_out;
-
     end if;
 
     test_runner_cleanup(runner);

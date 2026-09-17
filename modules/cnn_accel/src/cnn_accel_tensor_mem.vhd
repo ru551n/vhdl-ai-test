@@ -1,16 +1,16 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_pkg.all;
 
 library axi_stream;
-use axi_stream.axi_stream_pkg.all;
+  use axi_stream.axi_stream_pkg.all;
 
 library math;
-use math.math_pkg.ceil_log2;
-use math.math_pkg.is_power_of_two;
+  use math.math_pkg.ceil_log2;
+  use math.math_pkg.is_power_of_two;
 
 -- Local tensor scratchpad (doc/cnn_accel_top_v2_arch.md section 4):
 -- 'g_num_banks' independent banks of 'g_bank_words' x 'g_data_width'-bit
@@ -93,9 +93,9 @@ use math.math_pkg.is_power_of_two;
 -- contending with the other channel for the same bank.
 entity cnn_accel_tensor_mem is
   generic (
-    g_num_banks : positive := 2;
-    g_bank_words : positive := 1024;
-    g_data_width : positive := 64;
+    g_num_banks                : positive := 2;
+    g_bank_words               : positive := 1024;
+    g_data_width               : positive := 64;
     -- Simulation-only severity for the two "this request is impossible"
     -- caller-bug assertions: a bank-crossing request and an
     -- out-of-range bank index (see the header comment). 'failure' in
@@ -109,43 +109,42 @@ entity cnn_accel_tensor_mem is
     -- that the transfer really is clamped to the addressed bank, and
     -- that the neighbouring bank's contents are untouched. Nothing else
     -- may lower it.
-    g_illegal_request_severity : severity_level := failure
-  );
+    g_illegal_request_severity : severity_level := failure);
   port (
-    clk : in std_ulogic;
-    reset : in std_ulogic := '0';
+    clk        : in  std_ulogic;
+    reset      : in  std_ulogic := '0';
 
     --# {{}}
     -- Write channel 0.
-    w0_req_m2s : in dma_req_m2s_t;
+    w0_req_m2s : in  dma_req_m2s_t;
     w0_req_s2m : out dma_req_s2m_t;
-    s_w0_m2s : in axi_stream_m2s_t;
-    s_w0_s2m : out axi_stream_s2m_t;
-    w0_done : out std_ulogic := '0';
+    s_w0_m2s   : in  axi_stream_m2s_t;
+    s_w0_s2m   : out axi_stream_s2m_t;
+    w0_done    : out std_ulogic := '0';
 
     --# {{}}
     -- Write channel 1.
-    w1_req_m2s : in dma_req_m2s_t;
+    w1_req_m2s : in  dma_req_m2s_t;
     w1_req_s2m : out dma_req_s2m_t;
-    s_w1_m2s : in axi_stream_m2s_t;
-    s_w1_s2m : out axi_stream_s2m_t;
-    w1_done : out std_ulogic := '0';
+    s_w1_m2s   : in  axi_stream_m2s_t;
+    s_w1_s2m   : out axi_stream_s2m_t;
+    w1_done    : out std_ulogic := '0';
 
     --# {{}}
     -- Read channel 0.
-    r0_req_m2s : in dma_req_m2s_t;
+    r0_req_m2s : in  dma_req_m2s_t;
     r0_req_s2m : out dma_req_s2m_t;
-    m_r0_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_r0_s2m : in axi_stream_s2m_t;
-    r0_done : out std_ulogic := '0';
+    m_r0_m2s   : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_r0_s2m   : in  axi_stream_s2m_t;
+    r0_done    : out std_ulogic := '0';
 
     --# {{}}
     -- Read channel 1.
-    r1_req_m2s : in dma_req_m2s_t;
+    r1_req_m2s : in  dma_req_m2s_t;
     r1_req_s2m : out dma_req_s2m_t;
-    m_r1_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_r1_s2m : in axi_stream_s2m_t;
-    r1_done : out std_ulogic := '0'
+    m_r1_m2s   : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_r1_s2m   : in  axi_stream_s2m_t;
+    r1_done    : out std_ulogic := '0'
   );
 end entity cnn_accel_tensor_mem;
 
@@ -154,9 +153,13 @@ architecture a of cnn_accel_tensor_mem is
   constant c_bytes_per_word : positive := g_data_width / 8;
 
   subtype bank_idx_t is natural range 0 to g_num_banks - 1;
+
   subtype word_off_t is natural range 0 to g_bank_words - 1;
+
   subtype beat_cnt_t is natural range 0 to g_bank_words;
+
   subtype data_word_t is std_ulogic_vector(g_data_width - 1 downto 0);
+
   subtype owner_t is natural range 0 to 1;
 
   type addr_decode_t is record
@@ -170,8 +173,9 @@ architecture a of cnn_accel_tensor_mem is
   -- readability. Out-of-range bank indices (caller bug) are reported and
   -- wrapped, never corrupting an unintended bank via an out-of-bounds
   -- array access.
-  function to_sl(value : boolean) return std_ulogic is
+  function to_sl (value : boolean) return std_ulogic is
   begin
+
     if value then
       return '1';
     else
@@ -179,18 +183,22 @@ architecture a of cnn_accel_tensor_mem is
     end if;
   end function;
 
-  function decode_addr(addr : unsigned(31 downto 0)) return addr_decode_t is
+  function decode_addr (addr : unsigned(31 downto 0)) return addr_decode_t is
+
     variable word_addr : natural;
     variable bank_raw : natural;
     variable result : addr_decode_t;
   begin
+
     word_addr := to_integer(addr) / c_bytes_per_word;
     bank_raw := word_addr / g_bank_words;
 
     assert bank_raw < g_num_banks
-      report "cnn_accel_tensor_mem: address decodes to bank " & natural'image(bank_raw) &
-        ", outside g_num_banks=" & natural'image(g_num_banks) &
-        " (validation should have rejected this address before dispatch)"
+      report "cnn_accel_tensor_mem: address decodes to bank "
+             & natural'image(bank_raw)
+             & ", outside g_num_banks="
+             & natural'image(g_num_banks)
+             & " (validation should have rejected this address before dispatch)"
       severity g_illegal_request_severity;
 
     result.bank := bank_raw mod g_num_banks;
@@ -208,6 +216,7 @@ architecture a of cnn_accel_tensor_mem is
   -- alternates to the other one.
   signal w_last_granted : owner_t := 0;
   type owner_arr_t is array (natural range <>) of owner_t;
+
   signal w_last_granted_bank : owner_arr_t(0 to g_num_banks - 1) := (others => 0);
   signal r_last_granted_bank : owner_arr_t(0 to g_num_banks - 1) := (others => 0);
 
@@ -216,6 +225,7 @@ architecture a of cnn_accel_tensor_mem is
   -- channel (and only that channel) can capture it into its own private
   -- output register on the following cycle.
   type data_word_arr_t is array (natural range <>) of data_word_t;
+
   signal bank_rd_data_q : data_word_arr_t(0 to g_num_banks - 1) := (others => (others => '0'));
   signal bank_rd_valid_q : std_ulogic_vector(0 to g_num_banks - 1) := (others => '0');
   signal bank_rd_last_q : std_ulogic_vector(0 to g_num_banks - 1) := (others => '0');
@@ -264,8 +274,7 @@ begin
   ------------------------------------------------------------------------
 
   assert is_power_of_two(g_bank_words)
-    report "cnn_accel_tensor_mem: g_bank_words must be a power of two, got " &
-      positive'image(g_bank_words)
+    report "cnn_accel_tensor_mem: g_bank_words must be a power of two, got " & positive'image(g_bank_words)
     severity failure;
 
   ------------------------------------------------------------------------
@@ -286,8 +295,9 @@ begin
   w0_wants <= w0_busy and s_w0_m2s.valid;
   w1_wants <= w1_busy and s_w1_m2s.valid;
 
-  write_arbitrate : process(all)
+  write_arbitrate : process (all)
   begin
+
     if w0_wants = '1' and w1_wants = '1' and w0_bank = w1_bank then
       -- Contention on the same bank: give it to whichever channel did not
       -- win last time on that bank.
@@ -313,10 +323,13 @@ begin
   -- the last word is written.
   ------------------------------------------------------------------------
 
-  write_fsm_0 : process(clk)
+  write_fsm_0 : process (clk)
+
     variable decode : addr_decode_t;
     variable raw_beats, beats : natural;
+
   begin
+
     if rising_edge(clk) then
       w0_done_q <= '0';
 
@@ -333,9 +346,9 @@ begin
           end if;
         end if;
       elsif w0_req_m2s.valid = '1' then
-        assert w0_req_m2s.req.addr(2 downto 0) = "000" and
-          w0_req_m2s.req.length(2 downto 0) = "000"
-          report "cnn_accel_tensor_mem: w0 request not 8-byte aligned" severity failure;
+        assert w0_req_m2s.req.addr(2 downto 0) = "000" and w0_req_m2s.req.length(2 downto 0) = "000"
+          report "cnn_accel_tensor_mem: w0 request not 8-byte aligned"
+          severity failure;
 
         decode := decode_addr(w0_req_m2s.req.addr);
         raw_beats := to_integer(w0_req_m2s.req.length) / c_bytes_per_word;
@@ -346,15 +359,14 @@ begin
         -- request (severity 'error', run continues) rather than let it
         -- vanish into the 'raw_beats = 0' no-op path below.
         assert raw_beats /= 0
-          report "cnn_accel_tensor_mem: w0 request has zero length; a zero-length " &
-            "request is a caller bug"
+          report "cnn_accel_tensor_mem: w0 request has zero length; a zero-length " & "request is a caller bug"
           severity error;
 
         if decode.offset + raw_beats > g_bank_words then
           assert false
-            report "cnn_accel_tensor_mem: w0 request crosses a bank boundary " &
-              "(a bank-aware caller cannot produce this); the transfer is clamped " &
-              "to the addressed bank, silently truncating it"
+            report "cnn_accel_tensor_mem: w0 request crosses a bank boundary "
+                   & "(a bank-aware caller cannot produce this); the transfer is clamped "
+                   & "to the addressed bank, silently truncating it"
             severity g_illegal_request_severity;
           beats := g_bank_words - decode.offset;
         else
@@ -403,10 +415,13 @@ begin
     end if;
   end process;
 
-  write_fsm_1 : process(clk)
+  write_fsm_1 : process (clk)
+
     variable decode : addr_decode_t;
     variable raw_beats, beats : natural;
+
   begin
+
     if rising_edge(clk) then
       w1_done_q <= '0';
 
@@ -423,9 +438,9 @@ begin
           end if;
         end if;
       elsif w1_req_m2s.valid = '1' then
-        assert w1_req_m2s.req.addr(2 downto 0) = "000" and
-          w1_req_m2s.req.length(2 downto 0) = "000"
-          report "cnn_accel_tensor_mem: w1 request not 8-byte aligned" severity failure;
+        assert w1_req_m2s.req.addr(2 downto 0) = "000" and w1_req_m2s.req.length(2 downto 0) = "000"
+          report "cnn_accel_tensor_mem: w1 request not 8-byte aligned"
+          severity failure;
 
         decode := decode_addr(w1_req_m2s.req.addr);
         raw_beats := to_integer(w1_req_m2s.req.length) / c_bytes_per_word;
@@ -433,15 +448,14 @@ begin
         -- See 'write_fsm_0' for why this is asserted rather than just
         -- silently falling into the 'raw_beats = 0' no-op path below.
         assert raw_beats /= 0
-          report "cnn_accel_tensor_mem: w1 request has zero length; a zero-length " &
-            "request is a caller bug"
+          report "cnn_accel_tensor_mem: w1 request has zero length; a zero-length " & "request is a caller bug"
           severity error;
 
         if decode.offset + raw_beats > g_bank_words then
           assert false
-            report "cnn_accel_tensor_mem: w1 request crosses a bank boundary " &
-              "(a bank-aware caller cannot produce this); the transfer is clamped " &
-              "to the addressed bank, silently truncating it"
+            report "cnn_accel_tensor_mem: w1 request crosses a bank boundary "
+                   & "(a bank-aware caller cannot produce this); the transfer is clamped "
+                   & "to the addressed bank, silently truncating it"
             severity g_illegal_request_severity;
           beats := g_bank_words - decode.offset;
         else
@@ -527,13 +541,16 @@ begin
   -- purely a throughput/prefetch term: it lets the channel keep a read in
   -- flight while the output register is occupied and stalled, so the
   -- pipeline does not drain and refill on every consumer stall.
-  r0_can_issue <= r0_busy and to_sl(r0_beats_to_issue > 0) and
-    (not r0_out_valid or m_r0_s2m.ready or (not r0_skid_valid and not r0_capture));
-  r1_can_issue <= r1_busy and to_sl(r1_beats_to_issue > 0) and
-    (not r1_out_valid or m_r1_s2m.ready or (not r1_skid_valid and not r1_capture));
+  r0_can_issue <= r0_busy
+                  and to_sl(r0_beats_to_issue > 0)
+                  and (not r0_out_valid or m_r0_s2m.ready or (not r0_skid_valid and not r0_capture));
+  r1_can_issue <= r1_busy
+                  and to_sl(r1_beats_to_issue > 0)
+                  and (not r1_out_valid or m_r1_s2m.ready or (not r1_skid_valid and not r1_capture));
 
-  read_arbitrate : process(all)
+  read_arbitrate : process (all)
   begin
+
     if r0_can_issue = '1' and r1_can_issue = '1' and r0_bank = r1_bank then
       if r_last_granted_bank(r0_bank) = 0 then
         r0_grant <= '0';
@@ -594,11 +611,14 @@ begin
     -- entity, with two write and two read channels genuinely contending
     -- per bank, is the first place that gap between the two backends'
     -- inference heuristics actually mattered enough to fix.
-    bank_write : process(clk)
+    bank_write : process (clk)
+
       variable wr_addr : word_off_t;
       variable wr_data : data_word_t;
       variable wr_en : boolean;
+
     begin
+
       if rising_edge(clk) then
         wr_en := false;
         if w0_grant = '1' and w0_bank = b then
@@ -618,10 +638,13 @@ begin
       end if;
     end process;
 
-    bank_read : process(clk)
+    bank_read : process (clk)
+
       variable rd_addr : word_off_t;
       variable rd_en : boolean;
+
     begin
+
       if rising_edge(clk) then
         rd_en := false;
         -- 'bank_rd_valid_q' is the one bit in this process that must be
@@ -677,7 +700,7 @@ begin
       end if;
     end process;
 
-  end generate;
+  end generate bank_gen;
 
   r0_capture <= bank_rd_valid_q(r0_bank) and to_sl(bank_rd_owner_q(r0_bank) = 0);
   r1_capture <= bank_rd_valid_q(r1_bank) and to_sl(bank_rd_owner_q(r1_bank) = 1);
@@ -686,10 +709,13 @@ begin
   -- Read channel 0/1 FSMs.
   ------------------------------------------------------------------------
 
-  read_fsm_0 : process(clk)
+  read_fsm_0 : process (clk)
+
     variable decode : addr_decode_t;
     variable raw_beats, beats : natural;
+
   begin
+
     if rising_edge(clk) then
       if reset = '1' then
         r0_busy <= '0';
@@ -702,8 +728,8 @@ begin
         -- landing register" are mutually exclusive and no reordering is
         -- possible.
         assert not (r0_capture = '1' and r0_skid_valid = '1')
-          report "cnn_accel_tensor_mem: r0 beat landed with the landing register " &
-            "occupied -- read issue gating is broken"
+          report "cnn_accel_tensor_mem: r0 beat landed with the landing register "
+                 & "occupied -- read issue gating is broken"
           severity failure;
 
         if r0_capture = '1' then
@@ -747,9 +773,9 @@ begin
         end if;
 
         if r0_busy = '0' and r0_req_m2s.valid = '1' then
-          assert r0_req_m2s.req.addr(2 downto 0) = "000" and
-            r0_req_m2s.req.length(2 downto 0) = "000"
-            report "cnn_accel_tensor_mem: r0 request not 8-byte aligned" severity failure;
+          assert r0_req_m2s.req.addr(2 downto 0) = "000" and r0_req_m2s.req.length(2 downto 0) = "000"
+            report "cnn_accel_tensor_mem: r0 request not 8-byte aligned"
+            severity failure;
 
           decode := decode_addr(r0_req_m2s.req.addr);
           raw_beats := to_integer(r0_req_m2s.req.length) / c_bytes_per_word;
@@ -762,15 +788,14 @@ begin
           -- so the caller bug is visible without turning a bad program
           -- into a stopped simulation.
           assert raw_beats /= 0
-            report "cnn_accel_tensor_mem: r0 request has zero length; a zero-length " &
-              "request is a caller bug"
+            report "cnn_accel_tensor_mem: r0 request has zero length; a zero-length " & "request is a caller bug"
             severity error;
 
           if decode.offset + raw_beats > g_bank_words then
             assert false
-              report "cnn_accel_tensor_mem: r0 request crosses a bank boundary " &
-                "(a bank-aware caller cannot produce this); the transfer is clamped " &
-                "to the addressed bank, silently truncating it"
+              report "cnn_accel_tensor_mem: r0 request crosses a bank boundary "
+                     & "(a bank-aware caller cannot produce this); the transfer is clamped "
+                     & "to the addressed bank, silently truncating it"
               severity g_illegal_request_severity;
             beats := g_bank_words - decode.offset;
           else
@@ -790,10 +815,13 @@ begin
     end if;
   end process;
 
-  read_fsm_1 : process(clk)
+  read_fsm_1 : process (clk)
+
     variable decode : addr_decode_t;
     variable raw_beats, beats : natural;
+
   begin
+
     if rising_edge(clk) then
       if reset = '1' then
         r1_busy <= '0';
@@ -802,8 +830,8 @@ begin
       else
         -- Two-deep output buffer; see 'read_fsm_0' for the reasoning.
         assert not (r1_capture = '1' and r1_skid_valid = '1')
-          report "cnn_accel_tensor_mem: r1 beat landed with the landing register " &
-            "occupied -- read issue gating is broken"
+          report "cnn_accel_tensor_mem: r1 beat landed with the landing register "
+                 & "occupied -- read issue gating is broken"
           severity failure;
 
         if r1_capture = '1' then
@@ -841,9 +869,9 @@ begin
         end if;
 
         if r1_busy = '0' and r1_req_m2s.valid = '1' then
-          assert r1_req_m2s.req.addr(2 downto 0) = "000" and
-            r1_req_m2s.req.length(2 downto 0) = "000"
-            report "cnn_accel_tensor_mem: r1 request not 8-byte aligned" severity failure;
+          assert r1_req_m2s.req.addr(2 downto 0) = "000" and r1_req_m2s.req.length(2 downto 0) = "000"
+            report "cnn_accel_tensor_mem: r1 request not 8-byte aligned"
+            severity failure;
 
           decode := decode_addr(r1_req_m2s.req.addr);
           raw_beats := to_integer(r1_req_m2s.req.length) / c_bytes_per_word;
@@ -851,15 +879,14 @@ begin
           -- See 'read_fsm_0' for why this is asserted -- a zero-length
           -- read never pulses 'done' and would hang a waiting requester.
           assert raw_beats /= 0
-            report "cnn_accel_tensor_mem: r1 request has zero length; a zero-length " &
-              "request is a caller bug"
+            report "cnn_accel_tensor_mem: r1 request has zero length; a zero-length " & "request is a caller bug"
             severity error;
 
           if decode.offset + raw_beats > g_bank_words then
             assert false
-              report "cnn_accel_tensor_mem: r1 request crosses a bank boundary " &
-                "(a bank-aware caller cannot produce this); the transfer is clamped " &
-                "to the addressed bank, silently truncating it"
+              report "cnn_accel_tensor_mem: r1 request crosses a bank boundary "
+                     & "(a bank-aware caller cannot produce this); the transfer is clamped "
+                     & "to the addressed bank, silently truncating it"
               severity g_illegal_request_severity;
             beats := g_bank_words - decode.offset;
           else

@@ -1,21 +1,21 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library vunit_lib;
 context vunit_lib.vunit_context;
 context vunit_lib.com_context;
-use vunit_lib.memory_pkg.all;
-use vunit_lib.axi_slave_pkg.all;
+  use vunit_lib.memory_pkg.all;
+  use vunit_lib.axi_slave_pkg.all;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_pkg.all;
 
 library axi;
-use axi.axi_pkg.all;
+  use axi.axi_pkg.all;
 
 library axi_stream;
-use axi_stream.axi_stream_pkg.all;
+  use axi_stream.axi_stream_pkg.all;
 
 library bfm;
 
@@ -41,7 +41,8 @@ library bfm;
 -- 'ready' backpressure, since several tests interleave cycle-exact checks
 -- between individual beats.
 entity tb_cnn_accel_ofmap_dma is
-  generic (runner_cfg : string);
+  generic (
+    runner_cfg : string);
 end entity tb_cnn_accel_ofmap_dma;
 
 architecture tb of tb_cnn_accel_ofmap_dma is
@@ -89,11 +90,8 @@ architecture tb of tb_cnn_accel_ofmap_dma is
   -- Backpressure is switched on per test via the set_*_stall_probability
   -- procedures. Response FIFO depth > 1 lets more than one AW/W beat be
   -- accepted while their BRESPs are deliberately held back.
-  constant axi_slave : axi_slave_t := new_axi_slave(
-    memory => memory,
-    address_fifo_depth => 4,
-    write_response_fifo_depth => 4
-  );
+  constant axi_slave : axi_slave_t :=
+    new_axi_slave(memory => memory, address_fifo_depth => 4, write_response_fifo_depth => 4);
 
   -- Test-controlled: forces the resp value of the Nth B beat (0-indexed,
   -- counted over the whole test) to 'axi_resp_slverr' instead of
@@ -107,13 +105,14 @@ architecture tb of tb_cnn_accel_ofmap_dma is
   -- Stream-side helper: push one beat onto 's_stream', honoring 'ready'.
   ------------------------------------------------------------------------
 
-  procedure push_stream_beat(
-    signal clk_i : in std_ulogic;
-    signal m2s : out axi_stream_m2s_t;
-    signal s2m : in axi_stream_s2m_t;
-    data_value : in unsigned
+  procedure push_stream_beat (
+    signal clk_i : in  std_ulogic;
+    signal m2s   : out axi_stream_m2s_t;
+    signal s2m   : in  axi_stream_s2m_t;
+    data_value   : in  unsigned
   ) is
   begin
+
     m2s.data <= (others => '0');
     m2s.data(data_value'length - 1 downto 0) <= std_ulogic_vector(data_value);
     m2s.valid <= '1';
@@ -131,23 +130,23 @@ begin
       g_axi_data_width => c_axi_data_width
     )
     port map (
-      clk => clk,
-      reset => reset,
+      clk          => clk,
+      reset        => reset,
       --
-      req_m2s => req_m2s,
-      req_s2m => req_s2m,
-      dma_done => dma_done,
-      resp_error => resp_error,
+      req_m2s      => req_m2s,
+      req_s2m      => req_s2m,
+      dma_done     => dma_done,
+      resp_error   => resp_error,
       --
       s_stream_m2s => s_stream_m2s,
       s_stream_s2m => s_stream_s2m,
       --
       m_axi_aw_m2s => m_axi_aw_m2s,
       m_axi_aw_s2m => m_axi_aw_s2m,
-      m_axi_w_m2s => m_axi_w_m2s,
-      m_axi_w_s2m => m_axi_w_s2m,
-      m_axi_b_m2s => m_axi_b_m2s,
-      m_axi_b_s2m => m_axi_b_s2m
+      m_axi_w_m2s  => m_axi_w_m2s,
+      m_axi_w_s2m  => m_axi_w_s2m,
+      m_axi_b_m2s  => m_axi_b_m2s,
+      m_axi_b_s2m  => m_axi_b_s2m
     );
 
   ------------------------------------------------------------------------
@@ -159,13 +158,13 @@ begin
 
   axi_write_slave_inst : entity bfm.axi_write_slave
     generic map (
-      axi_slave => axi_slave,
-      data_width => c_axi_data_width,
-      id_width => 0,
+      axi_slave     => axi_slave,
+      data_width    => c_axi_data_width,
+      id_width      => 0,
       address_width => c_axi_addr_width
     )
     port map (
-      clk => clk,
+      clk           => clk,
       --
       axi_write_m2s => axi_write_m2s,
       axi_write_s2m => axi_write_s2m_bfm
@@ -178,8 +177,9 @@ begin
   -- completed handshake, so the presented resp is stable while valid is
   -- high and not yet accepted.
   ------------------------------------------------------------------------
-  bresp_override : process(all)
+  bresp_override : process (all)
   begin
+
     m_axi_b_s2m <= axi_write_s2m_bfm.b;
     if num_b_beats_served = inject_error_on_b_beat then
       m_axi_b_s2m.resp <= axi_resp_slverr;
@@ -188,6 +188,7 @@ begin
 
   bus_monitor : process
   begin
+
     wait until rising_edge(clk);
     if m_axi_aw_m2s.valid = '1' and m_axi_aw_s2m.ready = '1' then
       num_aw_beats_accepted <= num_aw_beats_accepted + 1;
@@ -199,18 +200,21 @@ begin
 
   ------------------------------------------------------------------------
   main : process
+
     variable buf : buffer_t;
 
     procedure do_reset is
     begin
+
       reset <= '1';
       wait until rising_edge(clk);
       wait for c_settle;
       reset <= '0';
     end procedure;
 
-    procedure issue_request(addr_val : natural; length_val : natural) is
+    procedure issue_request (addr_val : natural; length_val : natural) is
     begin
+
       req_m2s.req.addr <= to_unsigned(addr_val, 32);
       req_m2s.req.length <= to_unsigned(length_val, 32);
       req_m2s.valid <= '1';
@@ -224,56 +228,64 @@ begin
     -- pattern starting at 'salt' (the same pattern 'push_beats' produces).
     -- Any write with a different value or to an undeclared address fails
     -- at write time; a missing write fails at 'check_expected_was_written'.
-    procedure expect_beats(base_addr : natural; num_beats : natural; salt : natural) is
+    procedure expect_beats (base_addr : natural; num_beats : natural; salt : natural) is
     begin
+
       for i in 0 to num_beats - 1 loop
+
         set_expected_word(
-          memory => memory,
-          address => base_addr + i * c_bytes_per_beat,
+          memory   => memory,
+          address  => base_addr + i * c_bytes_per_beat,
           expected => std_ulogic_vector(to_unsigned(salt + i, c_axi_data_width))
         );
       end loop;
+
     end procedure;
 
     -- Pushes 'num_beats' stream beats with a simple counter pattern,
     -- starting at 'salt'.
-    procedure push_beats(num_beats : natural; salt : natural) is
+    procedure push_beats (num_beats : natural; salt : natural) is
     begin
+
       for i in 0 to num_beats - 1 loop
-        push_stream_beat(
-          clk, s_stream_m2s, s_stream_s2m,
-          to_unsigned(salt + i, c_axi_data_width)
-        );
+
+        push_stream_beat(clk, s_stream_m2s, s_stream_s2m, to_unsigned(salt + i, c_axi_data_width));
       end loop;
+
     end procedure;
 
     procedure wait_for_dma_done is
     begin
+
       wait until rising_edge(clk) and dma_done = '1';
     end procedure;
 
     -- Hold the slave's AW and W channels (stall probability 1.0 = never
     -- ready) or release them (0.0 = always ready).
-    function stall_probability(stalled : boolean) return real is
+    function stall_probability (stalled : boolean) return real is
     begin
+
       if stalled then
         return 1.0;
       end if;
       return 0.0;
     end function;
 
-    procedure set_aw_w_stalled(stalled : boolean) is
+    procedure set_aw_w_stalled (stalled : boolean) is
     begin
+
       set_address_stall_probability(net, axi_slave, stall_probability(stalled));
       set_data_stall_probability(net, axi_slave, stall_probability(stalled));
     end procedure;
 
-    procedure set_b_stalled(stalled : boolean) is
+    procedure set_b_stalled (stalled : boolean) is
     begin
+
       set_write_response_stall_probability(net, axi_slave, stall_probability(stalled));
     end procedure;
 
   begin
+
     test_runner_setup(runner, runner_cfg);
 
     buf := allocate(memory, num_bytes => c_memory_bytes, name => "ofmap_sink");
@@ -302,6 +314,7 @@ begin
       expect_beats(32, 4, 200);
 
       for i in 0 to 2 loop
+
         push_beats(1, 200 + i);
         check_equal(dma_done, '0', "dma_done must not pulse before the last beat's BRESP");
       end loop;
@@ -354,12 +367,16 @@ begin
 
       push_beats(1, 400);
       for i in 0 to 4 loop
+
         wait until rising_edge(clk);
       end loop;
+
       push_beats(1, 401);
       for i in 0 to 4 loop
+
         wait until rising_edge(clk);
       end loop;
+
       push_beats(1, 402);
 
       wait_for_dma_done;
@@ -377,16 +394,17 @@ begin
       -- blocks until 's_stream_s2m.ready' -- exactly what must *not*
       -- happen yet here) and hold it at the AXI boundary.
       s_stream_m2s.data <= (others => '0');
-      s_stream_m2s.data(c_axi_data_width - 1 downto 0) <=
-        std_ulogic_vector(to_unsigned(500, c_axi_data_width));
+      s_stream_m2s.data(c_axi_data_width - 1 downto 0) <= std_ulogic_vector(to_unsigned(500, c_axi_data_width));
       s_stream_m2s.valid <= '1';
       -- Beat is presented on 's_stream' and held at the AXI boundary;
       -- AWVALID must stay asserted (checked below) while not accepted.
       for i in 0 to 3 loop
+
         wait until rising_edge(clk);
         wait for c_settle;
         check_equal(m_axi_aw_m2s.valid, '1', "AWVALID must stay high while not accepted");
       end loop;
+
       check_equal(num_aw_beats_accepted, 0, "no AW beat may be accepted while the slave is stalled");
       set_aw_w_stalled(false);
 
@@ -429,6 +447,7 @@ begin
 
       -- Ready must stay low until the pending BRESPs actually drain.
       for i in 0 to 3 loop
+
         wait until rising_edge(clk);
         wait for c_settle;
         check_equal(req_s2m.ready, '0', "ready must not return before pending BRESPs are observed");

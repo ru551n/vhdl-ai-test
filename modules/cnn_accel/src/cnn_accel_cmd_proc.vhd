@@ -1,17 +1,17 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
-use cnn_accel.cnn_accel_v2_pkg.all;
-use cnn_accel.cnn_accel_isa_pkg.c_instr_word_bytes;
-use cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_activation_plane_channels;
-use cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_scale_table_entry_bytes;
-use cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_accum_width;
+  use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_v2_pkg.all;
+  use cnn_accel.cnn_accel_isa_pkg.c_instr_word_bytes;
+  use cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_activation_plane_channels;
+  use cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_scale_table_entry_bytes;
+  use cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_accum_width;
 
 library axi_stream;
-use axi_stream.axi_stream_pkg.all;
+  use axi_stream.axi_stream_pkg.all;
 
 -- ISA v2.0 command processor (doc/cnn_accel_top_v2_arch.md section 2:
 -- "decode / validate / dispatch / OT loop / retire"). Replaces rev 1's
@@ -87,156 +87,155 @@ use axi_stream.axi_stream_pkg.all;
 entity cnn_accel_cmd_proc is
   generic (
     -- Output-channel parallelism; the OT loop's tile size (section 5.4).
-    g_pe_rows : positive;
+    g_pe_rows              : positive;
     -- Input-channel/MAC parallelism; weight-image lane count per row.
-    g_pe_cols : positive;
+    g_pe_cols              : positive;
     -- Input channels per window_gen beat ("Ct").
-    g_tile_channels : positive;
+    g_tile_channels        : positive;
     -- Upper bound on kernel_h/kernel_w, for 'c_err_bad_geometry'.
-    g_max_kernel_size : positive;
+    g_max_kernel_size      : positive;
     -- Upper bound on pool_kernel_h/pool_kernel_w, for
     -- 'c_err_bad_geometry'. Separate from (and larger than)
     -- 'g_max_kernel_size' -- see cnn_accel_top's own generic comment.
     g_max_pool_kernel_size : positive;
     -- Upper bound on 'in_width * ceil(in_channels/g_tile_channels)', for
     -- 'c_err_bad_geometry' and for sizing the transpose buffer above.
-    g_max_row_tile_words : positive;
+    g_max_row_tile_words   : positive;
     -- Size of 'cnn_accel_tensor_mem', bytes; bound for 'c_err_local_range'.
-    g_tensor_bytes : positive;
+    g_tensor_bytes         : positive;
     -- Exclusive upper bound on any DDR byte address ('g_ddr_limit',
     -- section 6); bound for 'c_err_ddr_range'.
-    g_ddr_limit : positive := 16#0020_0000#;
+    g_ddr_limit            : positive := 16#0020_0000#;
     -- Cycles any single wait may take before 'c_err_timeout' (section 9).
-    g_watchdog_cycles : positive := 1_000_000
-  );
+    g_watchdog_cycles      : positive := 1_000_000);
   port (
-    clk : in std_ulogic;
+    clk                     : in  std_ulogic;
     -- Synchronous active-high reset ('reset_internal' at the IP top level).
-    reset : in std_ulogic := '0';
+    reset                   : in  std_ulogic := '0';
 
     --# {{}}
     -- Run control from 'cnn_accel_csr'.
-    start : in std_ulogic;
-    program_base_addr : in std_ulogic_vector(31 downto 0);
+    start                   : in  std_ulogic;
+    program_base_addr       : in  std_ulogic_vector(31 downto 0);
     -- ISA v2.3 streaming-inference relocation (spec section 6a): added to
     -- a descriptor's 'in_addr'/'out_addr' when it sets 'reloc_input'/
     -- 'reloc_output' (see 'effective_in_addr'/'effective_out_addr'
     -- below). 'cnn_accel_csr' latches these once at dispatch, exactly
     -- like 'program_base_addr' -- a mid-run bus write to either register
     -- never affects the command already in flight.
-    input_addr : in std_ulogic_vector(31 downto 0) := (others => '0');
-    output_addr : in std_ulogic_vector(31 downto 0) := (others => '0');
-    soft_reset_pulse : in std_ulogic;
-    seq_done : out std_ulogic := '0';
-    seq_error : out std_ulogic := '0';
-    err_code : out std_ulogic_vector(3 downto 0) := (others => '0');
-    err_pc : out std_ulogic_vector(31 downto 0) := (others => '0');
-    counters : out csr_counters_t := csr_counters_init;
+    input_addr              : in  std_ulogic_vector(31 downto 0) := (others => '0');
+    output_addr             : in  std_ulogic_vector(31 downto 0) := (others => '0');
+    soft_reset_pulse        : in  std_ulogic;
+    seq_done                : out std_ulogic := '0';
+    seq_error               : out std_ulogic := '0';
+    err_code                : out std_ulogic_vector(3 downto 0) := (others => '0');
+    err_pc                  : out std_ulogic_vector(31 downto 0) := (others => '0');
+    counters                : out csr_counters_t := csr_counters_init;
 
     --# {{}}
     -- Per-cycle external-traffic increments from 'cnn_accel_axi_mux'.
-    axi_rd_bytes : in unsigned(7 downto 0);
-    axi_wr_bytes : in unsigned(7 downto 0);
+    axi_rd_bytes            : in  unsigned(7 downto 0);
+    axi_wr_bytes            : in  unsigned(7 downto 0);
 
     --# {{}}
     -- 'cnn_accel_cmd_fetch'.
-    fetch_start : out std_ulogic := '0';
-    fetch_addr : out unsigned(31 downto 0) := (others => '0');
-    fetch_desc : in desc_v2_t;
-    fetch_pc : in unsigned(31 downto 0);
-    fetch_desc_valid : in std_ulogic;
-    fetch_desc_ready : out std_ulogic := '0';
-    fetch_error : in std_ulogic;
-    fetch_error_code : in err_code_t;
+    fetch_start             : out std_ulogic := '0';
+    fetch_addr              : out unsigned(31 downto 0) := (others => '0');
+    fetch_desc              : in  desc_v2_t;
+    fetch_pc                : in  unsigned(31 downto 0);
+    fetch_desc_valid        : in  std_ulogic;
+    fetch_desc_ready        : out std_ulogic := '0';
+    fetch_error             : in  std_ulogic;
+    fetch_error_code        : in  err_code_t;
 
     --# {{}}
     -- 'load' DDR read DMA: activations and 'LOAD'.
-    load_req_m2s : out dma_req_m2s_t;
-    load_req_s2m : in dma_req_s2m_t;
-    load_dma_done : in std_ulogic;
-    load_resp_error : in std_ulogic;
-    s_load_stream_m2s : in axi_stream_m2s_t;
-    s_load_stream_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
+    load_req_m2s            : out dma_req_m2s_t;
+    load_req_s2m            : in  dma_req_s2m_t;
+    load_dma_done           : in  std_ulogic;
+    load_resp_error         : in  std_ulogic;
+    s_load_stream_m2s       : in  axi_stream_m2s_t;
+    s_load_stream_s2m       : out axi_stream_s2m_t := axi_stream_s2m_init;
 
     --# {{}}
     -- 'wgt' DDR read DMA: weight/bias/scale images, ACT LUT, ADD src1.
-    wgt_req_m2s : out dma_req_m2s_t;
-    wgt_req_s2m : in dma_req_s2m_t;
-    wgt_dma_done : in std_ulogic;
-    wgt_resp_error : in std_ulogic;
-    s_wgt_stream_m2s : in axi_stream_m2s_t;
-    s_wgt_stream_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
+    wgt_req_m2s             : out dma_req_m2s_t;
+    wgt_req_s2m             : in  dma_req_s2m_t;
+    wgt_dma_done            : in  std_ulogic;
+    wgt_resp_error          : in  std_ulogic;
+    s_wgt_stream_m2s        : in  axi_stream_m2s_t;
+    s_wgt_stream_s2m        : out axi_stream_s2m_t := axi_stream_s2m_init;
 
     --# {{}}
     -- 'cnn_accel_ofmap_dma': every DDR write the IP ever performs.
-    store_req_m2s : out dma_req_m2s_t;
-    store_req_s2m : in dma_req_s2m_t;
-    store_dma_done : in std_ulogic;
-    store_resp_error : in std_ulogic;
-    m_store_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_store_stream_s2m : in axi_stream_s2m_t;
+    store_req_m2s           : out dma_req_m2s_t;
+    store_req_s2m           : in  dma_req_s2m_t;
+    store_dma_done          : in  std_ulogic;
+    store_resp_error        : in  std_ulogic;
+    m_store_stream_m2s      : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_store_stream_s2m      : in  axi_stream_s2m_t;
 
     --# {{}}
     -- 'cnn_accel_tensor_mem' write channel 0 (DDR -> LOCAL landing).
-    tm_w0_req_m2s : out dma_req_m2s_t;
-    tm_w0_req_s2m : in dma_req_s2m_t;
-    m_tm_w0_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_tm_w0_s2m : in axi_stream_s2m_t;
-    tm_w0_done : in std_ulogic;
+    tm_w0_req_m2s           : out dma_req_m2s_t;
+    tm_w0_req_s2m           : in  dma_req_s2m_t;
+    m_tm_w0_m2s             : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_tm_w0_s2m             : in  axi_stream_s2m_t;
+    tm_w0_done              : in  std_ulogic;
 
     --# {{}}
     -- 'cnn_accel_tensor_mem' write channel 1 (engine output).
-    tm_w1_req_m2s : out dma_req_m2s_t;
-    tm_w1_req_s2m : in dma_req_s2m_t;
-    m_tm_w1_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_tm_w1_s2m : in axi_stream_s2m_t;
-    tm_w1_done : in std_ulogic;
+    tm_w1_req_m2s           : out dma_req_m2s_t;
+    tm_w1_req_s2m           : in  dma_req_s2m_t;
+    m_tm_w1_m2s             : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_tm_w1_s2m             : in  axi_stream_s2m_t;
+    tm_w1_done              : in  std_ulogic;
 
     --# {{}}
     -- 'cnn_accel_tensor_mem' read channel 0 (engine input A / store source).
-    tm_r0_req_m2s : out dma_req_m2s_t;
-    tm_r0_req_s2m : in dma_req_s2m_t;
-    s_tm_r0_m2s : in axi_stream_m2s_t;
-    s_tm_r0_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
-    tm_r0_done : in std_ulogic;
+    tm_r0_req_m2s           : out dma_req_m2s_t;
+    tm_r0_req_s2m           : in  dma_req_s2m_t;
+    s_tm_r0_m2s             : in  axi_stream_m2s_t;
+    s_tm_r0_s2m             : out axi_stream_s2m_t := axi_stream_s2m_init;
+    tm_r0_done              : in  std_ulogic;
 
     --# {{}}
     -- 'cnn_accel_tensor_mem' read channel 1 (engine input B / weights / LUT).
-    tm_r1_req_m2s : out dma_req_m2s_t;
-    tm_r1_req_s2m : in dma_req_s2m_t;
-    s_tm_r1_m2s : in axi_stream_m2s_t;
-    s_tm_r1_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
-    tm_r1_done : in std_ulogic;
+    tm_r1_req_m2s           : out dma_req_m2s_t;
+    tm_r1_req_s2m           : in  dma_req_s2m_t;
+    s_tm_r1_m2s             : in  axi_stream_m2s_t;
+    s_tm_r1_s2m             : out axi_stream_s2m_t := axi_stream_s2m_init;
+    tm_r1_done              : in  std_ulogic;
 
     --# {{}}
     -- 'cnn_accel_conv_core' configuration and control.
-    conv_cfg_kernel_h : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_kernel_w : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_stride_h : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_stride_w : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_pad_top : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_pad_bottom : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_pad_left : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_pad_right : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_kernel_h       : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_kernel_w       : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_stride_h       : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_stride_w       : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_pad_top        : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_pad_bottom     : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_pad_left       : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_pad_right      : out std_ulogic_vector(7 downto 0) := (others => '0');
     -- ISA v2.1 'pad_value' for convolution: the int8 value a padded tap
     -- takes -- the input tensor's quantization zero-point, not 0. Driven
     -- straight from the descriptor and NOT gated on FLAG_PAD_EN, exactly
     -- like 'pool_cfg_pad_value' below: with the flag clear the four pad
     -- counts above are already zero, so no tap is ever padded and the
     -- fill value cannot be observed.
-    conv_cfg_pad_value : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_in_width : out std_ulogic_vector(15 downto 0) := (others => '0');
-    conv_cfg_in_height : out std_ulogic_vector(15 downto 0) := (others => '0');
-    conv_cfg_in_channels : out std_ulogic_vector(15 downto 0) := (others => '0');
-    conv_cfg_bias_en : out std_ulogic := '0';
-    conv_cfg_requant_en : out std_ulogic := '0';
-    conv_cfg_relu_en : out std_ulogic := '0';
-    conv_cfg_requant_scale : out std_ulogic_vector(31 downto 0) := (others => '0');
-    conv_cfg_requant_shift : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_output_offset : out std_ulogic_vector(15 downto 0) := (others => '0');
-    conv_cfg_clamp_en : out std_ulogic := '0';
-    conv_cfg_clamp_min : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_clamp_max : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_pad_value      : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_in_width       : out std_ulogic_vector(15 downto 0) := (others => '0');
+    conv_cfg_in_height      : out std_ulogic_vector(15 downto 0) := (others => '0');
+    conv_cfg_in_channels    : out std_ulogic_vector(15 downto 0) := (others => '0');
+    conv_cfg_bias_en        : out std_ulogic := '0';
+    conv_cfg_requant_en     : out std_ulogic := '0';
+    conv_cfg_relu_en        : out std_ulogic := '0';
+    conv_cfg_requant_scale  : out std_ulogic_vector(31 downto 0) := (others => '0');
+    conv_cfg_requant_shift  : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_output_offset  : out std_ulogic_vector(15 downto 0) := (others => '0');
+    conv_cfg_clamp_en       : out std_ulogic := '0';
+    conv_cfg_clamp_min      : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_clamp_max      : out std_ulogic_vector(7 downto 0) := (others => '0');
     conv_cfg_per_channel_en : out std_ulogic := '0';
     -- Output frame dimensions for the command being started:
     -- '(in_dim + pad_lo + pad_hi - kernel) / stride + 1' per axis, from
@@ -249,92 +248,92 @@ entity cnn_accel_cmd_proc is
     -- engine is ever started for a given descriptor, and the divider is
     -- fed from the conv or the pool kernel/stride fields according to
     -- that same class decision.
-    geom_out_width : out std_ulogic_vector(15 downto 0) := (others => '0');
-    geom_out_height : out std_ulogic_vector(15 downto 0) := (others => '0');
-    conv_start : out std_ulogic := '0';
-    conv_done : in std_ulogic;
-    m_conv_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_conv_stream_s2m : in axi_stream_s2m_t;
-    conv_fill_start : out std_ulogic := '0';
-    conv_fill_is_bias : out std_ulogic := '0';
-    conv_fill_is_scale : out std_ulogic := '0';
-    m_conv_weight_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_conv_weight_s2m : in axi_stream_s2m_t;
-    s_conv_out_m2s : in axi_stream_m2s_t;
-    s_conv_out_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
+    geom_out_width          : out std_ulogic_vector(15 downto 0) := (others => '0');
+    geom_out_height         : out std_ulogic_vector(15 downto 0) := (others => '0');
+    conv_start              : out std_ulogic := '0';
+    conv_done               : in  std_ulogic;
+    m_conv_stream_m2s       : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_conv_stream_s2m       : in  axi_stream_s2m_t;
+    conv_fill_start         : out std_ulogic := '0';
+    conv_fill_is_bias       : out std_ulogic := '0';
+    conv_fill_is_scale      : out std_ulogic := '0';
+    m_conv_weight_m2s       : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_conv_weight_s2m       : in  axi_stream_s2m_t;
+    s_conv_out_m2s          : in  axi_stream_m2s_t;
+    s_conv_out_s2m          : out axi_stream_s2m_t := axi_stream_s2m_init;
 
     --# {{}}
     -- Pooling path: the top level's dedicated 'cnn_accel_window_gen'
     -- instance plus its lane-parallel 'cnn_accel_pool' bank (see
     -- 'cnn_accel_top'). One activation plane is processed per pass, so
     -- the window generator always runs with 'T = 1'.
-    pool_cfg_kernel_h : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_kernel_w : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_stride_h : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_stride_w : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_kernel_h       : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_kernel_w       : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_stride_h       : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_stride_w       : out std_ulogic_vector(7 downto 0) := (others => '0');
     -- ISA v2.1 pooling padding. The four counts are already gated on
     -- FLAG_PAD_EN here (zero when the flag is clear), exactly as the
     -- conv path's are, so the window generator never has to know about
     -- the flag. 'pool_cfg_pad_value' is the int8 value a padded tap
     -- takes -- the tensor's zero-point, not 0.
-    pool_cfg_pad_top : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_pad_bottom : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_pad_left : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_pad_right : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_pad_value : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_in_width : out std_ulogic_vector(15 downto 0) := (others => '0');
-    pool_cfg_in_height : out std_ulogic_vector(15 downto 0) := (others => '0');
-    pool_cfg_opcode : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_requant_scale : out std_ulogic_vector(31 downto 0) := (others => '0');
-    pool_cfg_requant_shift : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_start : out std_ulogic := '0';
-    pool_done : in std_ulogic;
-    m_pool_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_pool_stream_s2m : in axi_stream_s2m_t;
-    s_pool_out_m2s : in axi_stream_m2s_t;
-    s_pool_out_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
+    pool_cfg_pad_top        : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_pad_bottom     : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_pad_left       : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_pad_right      : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_pad_value      : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_in_width       : out std_ulogic_vector(15 downto 0) := (others => '0');
+    pool_cfg_in_height      : out std_ulogic_vector(15 downto 0) := (others => '0');
+    pool_cfg_opcode         : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_requant_scale  : out std_ulogic_vector(31 downto 0) := (others => '0');
+    pool_cfg_requant_shift  : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_start              : out std_ulogic := '0';
+    pool_done               : in  std_ulogic;
+    m_pool_stream_m2s       : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_pool_stream_s2m       : in  axi_stream_s2m_t;
+    s_pool_out_m2s          : in  axi_stream_m2s_t;
+    s_pool_out_s2m          : out axi_stream_s2m_t := axi_stream_s2m_init;
 
     --# {{}}
     -- 'cnn_accel_elementwise' (ADD / UPSAMPLE / COPY / ACT /
     -- DEPTH_TO_SPACE).
-    ew_start : out std_ulogic := '0';
-    ew_opcode : out std_ulogic_vector(7 downto 0) := (others => '0');
-    ew_src0_addr : out unsigned(31 downto 0) := (others => '0');
-    ew_src1_addr : out unsigned(31 downto 0) := (others => '0');
-    ew_dst_addr : out unsigned(31 downto 0) := (others => '0');
-    ew_lut_addr : out unsigned(31 downto 0) := (others => '0');
-    ew_xfer_bytes : out unsigned(31 downto 0) := (others => '0');
-    ew_in_width : out unsigned(15 downto 0) := (others => '0');
-    ew_in_height : out unsigned(15 downto 0) := (others => '0');
-    ew_in_channels : out unsigned(15 downto 0) := (others => '0');
+    ew_start                : out std_ulogic := '0';
+    ew_opcode               : out std_ulogic_vector(7 downto 0) := (others => '0');
+    ew_src0_addr            : out unsigned(31 downto 0) := (others => '0');
+    ew_src1_addr            : out unsigned(31 downto 0) := (others => '0');
+    ew_dst_addr             : out unsigned(31 downto 0) := (others => '0');
+    ew_lut_addr             : out unsigned(31 downto 0) := (others => '0');
+    ew_xfer_bytes           : out unsigned(31 downto 0) := (others => '0');
+    ew_in_width             : out unsigned(15 downto 0) := (others => '0');
+    ew_in_height            : out unsigned(15 downto 0) := (others => '0');
+    ew_in_channels          : out unsigned(15 downto 0) := (others => '0');
     -- DEPTH_TO_SPACE only: the OUTPUT channel count and the upscale
     -- factor. Every other elementwise opcode is channel-preserving and
     -- has no use for either.
-    ew_out_channels : out unsigned(15 downto 0) := (others => '0');
-    ew_dts_factor : out unsigned(7 downto 0) := (others => '0');
-    ew_requant_scale : out signed(31 downto 0) := (others => '0');
-    ew_requant_shift : out unsigned(7 downto 0) := (others => '0');
-    ew_done : in std_ulogic;
-    ew_error : in std_ulogic;
-    ew_error_code : in err_code_t;
+    ew_out_channels         : out unsigned(15 downto 0) := (others => '0');
+    ew_dts_factor           : out unsigned(7 downto 0) := (others => '0');
+    ew_requant_scale        : out signed(31 downto 0) := (others => '0');
+    ew_requant_shift        : out unsigned(7 downto 0) := (others => '0');
+    ew_done                 : in  std_ulogic;
+    ew_error                : in  std_ulogic;
+    ew_error_code           : in  err_code_t;
     -- The engine's own four request/stream ports, muxed onto the physical
     -- ports above according to the command's space tags.
-    ew_src0_req_m2s : in dma_req_m2s_t;
-    ew_src0_req_s2m : out dma_req_s2m_t;
-    m_ew_src0_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_ew_src0_stream_s2m : in axi_stream_s2m_t;
-    ew_src1_req_m2s : in dma_req_m2s_t;
-    ew_src1_req_s2m : out dma_req_s2m_t;
-    m_ew_src1_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_ew_src1_stream_s2m : in axi_stream_s2m_t;
-    ew_dst_req_m2s : in dma_req_m2s_t;
-    ew_dst_req_s2m : out dma_req_s2m_t;
-    s_ew_dst_stream_m2s : in axi_stream_m2s_t;
-    s_ew_dst_stream_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
-    ew_lut_req_m2s : in dma_req_m2s_t;
-    ew_lut_req_s2m : out dma_req_s2m_t;
-    m_ew_lut_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_ew_lut_stream_s2m : in axi_stream_s2m_t
+    ew_src0_req_m2s         : in  dma_req_m2s_t;
+    ew_src0_req_s2m         : out dma_req_s2m_t;
+    m_ew_src0_stream_m2s    : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_ew_src0_stream_s2m    : in  axi_stream_s2m_t;
+    ew_src1_req_m2s         : in  dma_req_m2s_t;
+    ew_src1_req_s2m         : out dma_req_s2m_t;
+    m_ew_src1_stream_m2s    : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_ew_src1_stream_s2m    : in  axi_stream_s2m_t;
+    ew_dst_req_m2s          : in  dma_req_m2s_t;
+    ew_dst_req_s2m          : out dma_req_s2m_t;
+    s_ew_dst_stream_m2s     : in  axi_stream_m2s_t;
+    s_ew_dst_stream_s2m     : out axi_stream_s2m_t := axi_stream_s2m_init;
+    ew_lut_req_m2s          : in  dma_req_m2s_t;
+    ew_lut_req_s2m          : out dma_req_s2m_t;
+    m_ew_lut_stream_m2s     : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_ew_lut_stream_s2m     : in  axi_stream_s2m_t
   );
 end entity cnn_accel_cmd_proc;
 
@@ -369,26 +368,44 @@ architecture a of cnn_accel_cmd_proc is
   ------------------------------------------------------------------------
 
   type cmd_class_t is (
-    cls_halt,      -- terminate the program
-    cls_conv,      -- CONV2D / FC: conv_core, OT loop
-    cls_pool,      -- POOL_MAX / POOL_AVG: window_gen + pool bank
-    cls_xfer,      -- LOAD / STORE / LOADW: pure move, no engine
-    cls_elem,      -- ADD / UPSAMPLE / COPY / ACT / DEPTH_TO_SPACE:
-                   -- elementwise
-    cls_bad        -- anything else, including DWCONV2D
+    cls_halt, -- terminate the program
+    cls_conv, -- CONV2D / FC: conv_core, OT loop
+    cls_pool, -- POOL_MAX / POOL_AVG: window_gen + pool bank
+    cls_xfer, -- LOAD / STORE / LOADW: pure move, no engine
+    cls_elem, -- ADD / UPSAMPLE / COPY / ACT / DEPTH_TO_SPACE:
+    -- elementwise
+    cls_bad -- anything else, including DWCONV2D
   );
 
   type state_t is (
     st_idle,
-    st_fetch, st_fetch_wait,
-    st_precheck, st_validate, st_validate2,
-    st_geom_mul, st_div_w, st_div_h, st_geom_out, st_geom_out2,
-    st_range_sum, st_range, st_range_dst,
-    st_wgt_setup, st_wgt_req, st_wgt_run,
-    st_pass_setup, st_pass_req_dst, st_pass_run, st_pass_drain,
-    st_xfer_req_src, st_xfer_req_dst, st_xfer_run,
+    st_fetch,
+    st_fetch_wait,
+    st_precheck,
+    st_validate,
+    st_validate2,
+    st_geom_mul,
+    st_div_w,
+    st_div_h,
+    st_geom_out,
+    st_geom_out2,
+    st_range_sum,
+    st_range,
+    st_range_dst,
+    st_wgt_setup,
+    st_wgt_req,
+    st_wgt_run,
+    st_pass_setup,
+    st_pass_req_dst,
+    st_pass_run,
+    st_pass_drain,
+    st_xfer_req_src,
+    st_xfer_req_dst,
+    st_xfer_run,
     st_elem_run,
-    st_retire, st_error, st_done
+    st_retire,
+    st_error,
+    st_done
   );
 
   signal state : state_t := st_idle;
@@ -514,9 +531,9 @@ architecture a of cnn_accel_cmd_proc is
   -- operand widths and silently truncating that is the classic bug here.
   ------------------------------------------------------------------------
 
-  signal n_tiles_q : unsigned(15 downto 0) := (others => '0');   -- T = ceil(Cin/8)
+  signal n_tiles_q : unsigned(15 downto 0) := (others => '0'); -- T = ceil(Cin/8)
   signal n_planes_out_q : unsigned(15 downto 0) := (others => '0');
-  signal n_ot_q : unsigned(15 downto 0) := (others => '0');      -- ceil(Cout/pe_rows)
+  signal n_ot_q : unsigned(15 downto 0) := (others => '0'); -- ceil(Cout/pe_rows)
   signal in_plane_bytes_q : unsigned(31 downto 0) := (others => '0');
   signal in_row_bytes_q : unsigned(31 downto 0) := (others => '0');
   signal in_total_bytes_q : unsigned(31 downto 0) := (others => '0');
@@ -540,7 +557,7 @@ architecture a of cnn_accel_cmd_proc is
 
   signal out_w_q : unsigned(15 downto 0) := (others => '0');
   signal out_h_q : unsigned(15 downto 0) := (others => '0');
-  signal row_words_q : unsigned(15 downto 0) := (others => '0');  -- in_width * T
+  signal row_words_q : unsigned(15 downto 0) := (others => '0'); -- in_width * T
 
   -- 'n_tiles_q' and 'row_words_q' less one, registered in the same cycle
   -- as the values themselves.
@@ -673,7 +690,7 @@ architecture a of cnn_accel_cmd_proc is
   signal src0_is_ddr_q : std_ulogic := '0';
   signal dst_is_ddr_q : std_ulogic := '0';
   signal dst_is_weight_q : std_ulogic := '0';
-  signal side_is_ddr_q : std_ulogic := '0';   -- src1 / weights / LUT
+  signal side_is_ddr_q : std_ulogic := '0'; -- src1 / weights / LUT
   signal side_is_local_q : std_ulogic := '0'; -- ... in LOCAL_TENSOR
 
   -- ISA v2.3 streaming-inference relocation (spec section 6a):
@@ -741,6 +758,7 @@ architecture a of cnn_accel_cmd_proc is
   ------------------------------------------------------------------------
 
   type feed_state_t is (fd_idle, fd_issue, fd_wait, fd_done);
+
   signal feed_state : feed_state_t := fd_idle;
   signal feed_kick : std_ulogic := '0';
   signal feed_row_q : unsigned(15 downto 0) := (others => '0');
@@ -779,7 +797,9 @@ architecture a of cnn_accel_cmd_proc is
   ------------------------------------------------------------------------
 
   subtype word_t is std_ulogic_vector(8 * c_word_bytes - 1 downto 0);
+
   type rowbuf_t is array (0 to g_max_row_tile_words - 1) of word_t;
+
   signal rowbuf : rowbuf_t;
 
   signal tb_fill_q : std_ulogic := '0';
@@ -802,6 +822,7 @@ architecture a of cnn_accel_cmd_proc is
   ------------------------------------------------------------------------
 
   type wgt_region_t is (rg_weight, rg_bias, rg_scale);
+
   signal wgt_region_q : wgt_region_t := rg_weight;
   -- The region tag that belongs to the word currently in 'wgt_hold_q'.
   -- 'wgt_region_q' is the region being *requested*, and it is advanced as
@@ -901,8 +922,9 @@ architecture a of cnn_accel_cmd_proc is
 
   -- 'boolean' -> 'std_ulogic', so a predicate can be reduced to one
   -- registered bit in 'st_precheck'.
-  function to_sl(value : boolean) return std_ulogic is
+  function to_sl (value : boolean) return std_ulogic is
   begin
+
     if value then
       return '1';
     else
@@ -910,20 +932,22 @@ architecture a of cnn_accel_cmd_proc is
     end if;
   end function;
 
-  function classify(opcode : std_ulogic_vector(7 downto 0)) return cmd_class_t is
+  function classify (opcode : std_ulogic_vector(7 downto 0)) return cmd_class_t is
   begin
+
     if opcode = c_opcode_halt then
       return cls_halt;
     elsif opcode = c_opcode_conv2d or opcode = c_opcode_fc then
       return cls_conv;
     elsif opcode = c_opcode_pool_max or opcode = c_opcode_pool_avg then
       return cls_pool;
-    elsif opcode = c_opcode_load or opcode = c_opcode_store
-      or opcode = c_opcode_loadw then
+    elsif opcode = c_opcode_load or opcode = c_opcode_store or opcode = c_opcode_loadw then
       return cls_xfer;
-    elsif opcode = c_opcode_add or opcode = c_opcode_upsample
-      or opcode = c_opcode_copy or opcode = c_opcode_act
-      or opcode = c_opcode_depth_to_space then
+    elsif opcode = c_opcode_add
+          or opcode = c_opcode_upsample
+          or opcode = c_opcode_copy
+          or opcode = c_opcode_act
+          or opcode = c_opcode_depth_to_space then
       return cls_elem;
     else
       -- Includes DWCONV2D, which is allocated but rejected (section 5.2).
@@ -933,22 +957,29 @@ architecture a of cnn_accel_cmd_proc is
 
   -- True for the v1.2 opcodes, whose 'xfer_bytes' (W15) must be zero
   -- because in v1.2 that word was "reserved, must be 0" (section 5.1).
-  function is_v12_opcode(opcode : std_ulogic_vector(7 downto 0)) return boolean is
+  function is_v12_opcode (opcode : std_ulogic_vector(7 downto 0)) return boolean is
   begin
-    return opcode = c_opcode_halt or opcode = c_opcode_conv2d
-      or opcode = c_opcode_dwconv2d or opcode = c_opcode_pool_max
-      or opcode = c_opcode_pool_avg or opcode = c_opcode_fc;
+
+    return opcode = c_opcode_halt
+           or opcode = c_opcode_conv2d
+           or opcode = c_opcode_dwconv2d
+           or opcode = c_opcode_pool_max
+           or opcode = c_opcode_pool_avg
+           or opcode = c_opcode_fc;
   end function;
 
-  function is_aligned(addr : unsigned) return boolean is
+  function is_aligned (addr : unsigned) return boolean is
   begin
+
     return addr(c_word_shift - 1 downto 0) = 0;
   end function;
 
   -- ceil(value / 2**shift) for a power-of-two divisor.
-  function ceil_shift(value : unsigned; shift : natural) return unsigned is
+  function ceil_shift (value : unsigned; shift : natural) return unsigned is
+
     constant c_round : unsigned(value'range) := to_unsigned(2 ** shift - 1, value'length);
   begin
+
     return shift_right(value + c_round, shift);
   end function;
 
@@ -964,14 +995,16 @@ begin
   -- an OT pass must be exactly one output plane. Lifting this needs a
   -- width conversion on the ofmap path, not a change here.
   assert g_pe_rows = c_plane_channels
-    report "cnn_accel_cmd_proc: g_pe_rows must equal the activation plane " &
-      "channel count (" & integer'image(c_plane_channels) & ") -- one OT pass " &
-      "is one output plane"
+    report "cnn_accel_cmd_proc: g_pe_rows must equal the activation plane "
+           & "channel count ("
+           & integer'image(c_plane_channels)
+           & ") -- one OT pass "
+           & "is one output plane"
     severity failure;
 
   assert g_tile_channels = c_plane_channels
-    report "cnn_accel_cmd_proc: g_tile_channels must equal the activation " &
-      "plane channel count -- one scratchpad/DDR word is one input-channel tile"
+    report "cnn_accel_cmd_proc: g_tile_channels must equal the activation "
+           & "plane channel count -- one scratchpad/DDR word is one input-channel tile"
     severity failure;
 
   ------------------------------------------------------------------------
@@ -981,10 +1014,15 @@ begin
   ------------------------------------------------------------------------
 
   progress <= (src_m2s.valid and src_ready)
-    or (dst_m2s.valid and dst_ready)
-    or (side_m2s.valid and side_ready)
-    or src_done or dst_done or side_done
-    or conv_done or pool_done or ew_done or fetch_desc_valid;
+              or (dst_m2s.valid and dst_ready)
+              or (side_m2s.valid and side_ready)
+              or src_done
+              or dst_done
+              or side_done
+              or conv_done
+              or pool_done
+              or ew_done
+              or fetch_desc_valid;
 
   ------------------------------------------------------------------------
   -- Main command FSM, with the sequential divider inlined at the top of it.
@@ -1005,14 +1043,17 @@ begin
   -- would never be broken.
   ------------------------------------------------------------------------
 
-  main : process(clk)
+  main : process (clk)
+
     variable v_err : err_code_t;
     variable v_cls : cmd_class_t;
     variable v_len : unsigned(31 downto 0);
     variable v_prod : unsigned(31 downto 0);
     variable v_ok : boolean;
     variable v_rem : unsigned(31 downto 0);
+
   begin
+
     if rising_edge(clk) then
       ------------------------------------------------------------------
       -- One restoring-division step.
@@ -1057,9 +1098,9 @@ begin
       end if;
 
       case state is
-
         --------------------------------------------------------------
         when st_idle =>
+
           busy_q <= '0';
           if start = '1' then
             pc_q <= unsigned(program_base_addr);
@@ -1067,17 +1108,17 @@ begin
             state <= st_fetch;
             watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
           end if;
-
         --------------------------------------------------------------
         -- Descriptor fetch. 'cnn_accel_cmd_fetch' owns the burst; this
         -- state only hands it a PC and waits for the decoded record.
         when st_fetch =>
+
           fetch_start <= '1';
           fetch_addr <= pc_q;
           state <= st_fetch_wait;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
-
         when st_fetch_wait =>
+
           if fetch_error = '1' then
             pending_err_q <= fetch_error_code;
             state <= st_error;
@@ -1089,13 +1130,13 @@ begin
             state <= st_precheck;
             watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
           end if;
-
         --------------------------------------------------------------
         -- Pre-decode. Every wide comparison 'st_validate' needs, reduced
         -- to one registered bit, and the opcode decoded to one-hot flags.
         -- Reads only 'desc_q' (registered last cycle) and writes only
         -- registers; no state transition logic depends on any of it.
         when st_precheck =>
+
           op_is_add_q <= to_sl(desc_q.opcode = c_opcode_add);
           op_is_act_q <= to_sl(desc_q.opcode = c_opcode_act);
           op_is_loadw_q <= to_sl(desc_q.opcode = c_opcode_loadw);
@@ -1107,17 +1148,14 @@ begin
           padded_w_q <= resize(desc_q.in_width, 18);
           padded_h_q <= resize(desc_q.in_height, 18);
           if desc_q.flags(c_flag_pad_en) = '1' then
-            padded_w_q <= resize(desc_q.in_width, 18)
-              + desc_q.pad_left + desc_q.pad_right;
-            padded_h_q <= resize(desc_q.in_height, 18)
-              + desc_q.pad_top + desc_q.pad_bottom;
+            padded_w_q <= resize(desc_q.in_width, 18) + desc_q.pad_left + desc_q.pad_right;
+            padded_h_q <= resize(desc_q.in_height, 18) + desc_q.pad_top + desc_q.pad_bottom;
           end if;
 
           -- ISA v2.3: bits [1:0] of 'reserved_w0' are 'reloc_input'/
           -- 'reloc_output' now, not reserved -- only bits [7:2] are
           -- still policed here.
-          chk_reserved_bad_q <=
-            to_sl(desc_q.reserved_w0(7 downto 2) /= "000000" or desc_q.reserved_w10 /= x"00");
+          chk_reserved_bad_q <= to_sl(desc_q.reserved_w0(7 downto 2) /= "000000" or desc_q.reserved_w10 /= x"00");
           chk_xfer_nz_q <= to_sl(desc_q.xfer_bytes /= 0);
 
           chk_al_in_q <= to_sl(is_aligned(effective_in_addr));
@@ -1127,20 +1165,21 @@ begin
           chk_al_scale_q <= to_sl(is_aligned(desc_q.scale_addr));
           chk_al_xfer_q <= to_sl(is_aligned(desc_q.xfer_bytes));
 
-          chk_dims_nz_q <= to_sl(
-            desc_q.in_width /= 0 and desc_q.in_height /= 0
-            and desc_q.in_channels /= 0
-          );
+          chk_dims_nz_q <= to_sl(desc_q.in_width /= 0 and desc_q.in_height /= 0 and desc_q.in_channels /= 0);
           chk_conv_geom_q <= to_sl(
             desc_q.out_channels /= 0
-            and desc_q.kernel_h /= 0 and desc_q.kernel_w /= 0
-            and desc_q.stride_h /= 0 and desc_q.stride_w /= 0
+            and desc_q.kernel_h /= 0
+            and desc_q.kernel_w /= 0
+            and desc_q.stride_h /= 0
+            and desc_q.stride_w /= 0
             and desc_q.kernel_h <= g_max_kernel_size
             and desc_q.kernel_w <= g_max_kernel_size
           );
           chk_pool_geom_q <= to_sl(
-            desc_q.pool_kernel_h /= 0 and desc_q.pool_kernel_w /= 0
-            and desc_q.pool_stride_h /= 0 and desc_q.pool_stride_w /= 0
+            desc_q.pool_kernel_h /= 0
+            and desc_q.pool_kernel_w /= 0
+            and desc_q.pool_stride_h /= 0
+            and desc_q.pool_stride_w /= 0
             and desc_q.pool_kernel_h <= g_max_pool_kernel_size
             and desc_q.pool_kernel_w <= g_max_pool_kernel_size
           );
@@ -1148,19 +1187,18 @@ begin
           chk_dts_geom_q <= to_sl(
             desc_q.dts_factor = 2
             and desc_q.out_channels /= 0
-            and resize(desc_q.in_channels, 18)
-                = shift_left(resize(desc_q.out_channels, 18), 2)
+            and resize(desc_q.in_channels, 18) = shift_left(resize(desc_q.out_channels, 18), 2)
             and desc_q.in_channels(c_word_shift + 1 downto 0) = 0
           );
 
           state <= st_validate;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
-
         --------------------------------------------------------------
         -- Validation, part 1: everything decidable from the descriptor
         -- alone (section 9). Part 2 (address ranges) needs the byte
         -- counts and runs in 'st_range'.
         when st_validate =>
+
           v_err := c_err_none;
           v_cls := cls_q;
 
@@ -1178,9 +1216,7 @@ begin
           -- being executed with those bits quietly ignored, which is what
           -- would turn a future ISA extension into a silent wrong answer
           -- on old hardware.
-          if v_err = c_err_none
-            and (chk_reserved_bad_q = '1'
-              or (op_is_v12_q = '1' and chk_xfer_nz_q = '1')) then
+          if v_err = c_err_none and (chk_reserved_bad_q = '1' or (op_is_v12_q = '1' and chk_xfer_nz_q = '1')) then
             v_err := c_err_bad_reserved;
           end if;
 
@@ -1190,18 +1226,15 @@ begin
           -- by definition a write into that group.
           if v_err = c_err_none then
             if desc_q.space_src0 = c_space_reserved
-              or desc_q.space_dst = c_space_reserved
-              or desc_q.space_wgt = c_space_reserved
-              or (v_cls = cls_elem and op_is_add_q = '1'
-                  and desc_q.space_src1 = c_space_reserved) then
+               or desc_q.space_dst = c_space_reserved
+               or desc_q.space_wgt = c_space_reserved
+               or (v_cls = cls_elem and op_is_add_q = '1' and desc_q.space_src1 = c_space_reserved) then
               v_err := c_err_bad_space;
             elsif desc_q.space_src0 = c_space_local_weight then
               v_err := c_err_bad_space;
-            elsif desc_q.space_dst = c_space_local_weight
-              and op_is_loadw_q = '0' then
+            elsif desc_q.space_dst = c_space_local_weight and op_is_loadw_q = '0' then
               v_err := c_err_bad_space;
-            elsif op_is_add_q = '1'
-              and desc_q.space_src1 = c_space_local_weight then
+            elsif op_is_add_q = '1' and desc_q.space_src1 = c_space_local_weight then
               v_err := c_err_bad_space;
             end if;
           end if;
@@ -1213,7 +1246,6 @@ begin
           validate_err_q <= v_err;
           state <= st_validate2;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
-
         --------------------------------------------------------------
         -- Validation, part 1b: alignment, geometry, operand-space
         -- resolution and the class dispatch -- split from 'st_validate'
@@ -1221,6 +1253,7 @@ begin
         -- deep chain of checks off 'cls_q' and 'desc_q', now two shallower
         -- ones. Per command, so the extra cycle is free.
         when st_validate2 =>
+
           v_err := validate_err_q;
           v_cls := cls_q;
 
@@ -1231,15 +1264,12 @@ begin
           if v_err = c_err_none and v_cls /= cls_halt then
             v_ok := chk_al_in_q = '1' and chk_al_out_q = '1';
             if v_cls = cls_conv then
-              v_ok := v_ok and chk_al_wgt_q = '1'
-                and chk_al_bias_q = '1'
-                and chk_al_scale_q = '1';
+              v_ok := v_ok and chk_al_wgt_q = '1' and chk_al_bias_q = '1' and chk_al_scale_q = '1';
             end if;
             if op_is_add_q = '1' then
               v_ok := v_ok and chk_al_xfer_q = '1';
             elsif op_is_act_q = '1' then
-              v_ok := v_ok and chk_al_wgt_q = '1'
-                and chk_al_xfer_q = '1';
+              v_ok := v_ok and chk_al_wgt_q = '1' and chk_al_xfer_q = '1';
             elsif op_is_v12_q = '0' then
               v_ok := v_ok and chk_al_xfer_q = '1';
             end if;
@@ -1263,8 +1293,7 @@ begin
             end if;
           end if;
 
-          if v_err = c_err_none and v_cls = cls_elem
-            and op_is_copy_q = '0' and op_is_act_q = '0' then
+          if v_err = c_err_none and v_cls = cls_elem and op_is_copy_q = '0' and op_is_act_q = '0' then
             if chk_dims_nz_q = '0' then
               v_err := c_err_bad_geometry;
             end if;
@@ -1273,8 +1302,7 @@ begin
           -- DEPTH_TO_SPACE's own contract, already reduced to one bit in
           -- 'st_precheck' -- so this adds a single 1-bit term to this
           -- state's chain, not a second geometry comparison network.
-          if v_err = c_err_none and op_is_dts_q = '1'
-            and chk_dts_geom_q = '0' then
+          if v_err = c_err_none and op_is_dts_q = '1' and chk_dts_geom_q = '0' then
             v_err := c_err_bad_geometry;
           end if;
 
@@ -1329,12 +1357,23 @@ begin
           if v_cls = cls_xfer and desc_q.space_dst = c_space_local_tensor then
             dst_use_w0_q <= '1';
           end if;
+
           case v_cls is
-            when cls_conv => engine_conv_q <= '1';
-            when cls_pool => engine_pool_q <= '1';
-            when cls_elem => engine_elem_q <= '1';
-            when cls_xfer => xfer_active_q <= '1';
-            when others => null;
+            when cls_conv =>
+
+              engine_conv_q <= '1';
+            when cls_pool =>
+
+              engine_pool_q <= '1';
+            when cls_elem =>
+
+              engine_elem_q <= '1';
+            when cls_xfer =>
+
+              xfer_active_q <= '1';
+            when others =>
+
+              null;
           end case;
 
           if v_err /= c_err_none then
@@ -1346,26 +1385,20 @@ begin
             state <= st_geom_mul;
           end if;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
-
         --------------------------------------------------------------
         -- Geometry, step 1: the products that do not need a divide.
         when st_geom_mul =>
-          n_tiles_q <= resize(
-            ceil_shift(desc_q.in_channels, c_word_shift), n_tiles_q'length
-          );
+
+          n_tiles_q <= resize(ceil_shift(desc_q.in_channels, c_word_shift), n_tiles_q'length);
           -- See the declaration: the tile-buffer's "last tile?" tests read
           -- this instead of rebuilding the subtract every beat.
-          n_tiles_m1_q <= resize(
-            ceil_shift(desc_q.in_channels, c_word_shift), n_tiles_q'length
-          ) - 1;
+          n_tiles_m1_q <= resize(ceil_shift(desc_q.in_channels, c_word_shift), n_tiles_q'length) - 1;
           -- See the declarations: the tile-buffer drain reads these
           -- instead of walking off 'desc_q' every beat.
           tb_in_width_q <= desc_q.in_width;
           tb_in_width_m1_q <= desc_q.in_width - 1;
           tb_in_height_m1_q <= desc_q.in_height - 1;
-          n_ot_q <= resize(
-            ceil_shift(desc_q.out_channels, c_word_shift), n_ot_q'length
-          );
+          n_ot_q <= resize(ceil_shift(desc_q.out_channels, c_word_shift), n_ot_q'length);
 
           -- in_plane_bytes = in_width * in_height * 8. The product is
           -- resized explicitly: 16x16 multiplication is 32 bits wide in
@@ -1373,14 +1406,9 @@ begin
           v_prod := resize(desc_q.in_width * desc_q.in_height, v_prod'length);
           in_plane_bytes_q <= shift_left(v_prod, c_word_shift);
           in_row_bytes_q <= shift_left(resize(desc_q.in_width, 32), c_word_shift);
-          row_words_q <= resize(
-            desc_q.in_width * ceil_shift(desc_q.in_channels, c_word_shift),
-            row_words_q'length
-          );
-          row_words_m1_q <= resize(
-            desc_q.in_width * ceil_shift(desc_q.in_channels, c_word_shift),
-            row_words_q'length
-          ) - 1;
+          row_words_q <= resize(desc_q.in_width * ceil_shift(desc_q.in_channels, c_word_shift), row_words_q'length);
+          row_words_m1_q <= resize(desc_q.in_width * ceil_shift(desc_q.in_channels, c_word_shift), row_words_q'length)
+                            - 1;
           -- First of the three 'wgt_tile_bytes' products.
           kernel_area_q <= resize(desc_q.kernel_h * desc_q.kernel_w, 16);
 
@@ -1444,9 +1472,9 @@ begin
             state <= st_geom_out;
           end if;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
-
         --------------------------------------------------------------
         when st_div_w =>
+
           if div_busy_q = '0' and div_valid_q = '0' then
             div_busy_q <= '1';
             div_step_q <= 0;
@@ -1478,9 +1506,9 @@ begin
             end if;
           end if;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
-
         --------------------------------------------------------------
         when st_div_h =>
+
           if div_busy_q = '0' and div_valid_q = '0' then
             div_busy_q <= '1';
             div_step_q <= 0;
@@ -1494,7 +1522,6 @@ begin
             state <= st_geom_out;
           end if;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
-
         --------------------------------------------------------------
         -- Geometry, step 2a: the output plane itself. Nothing that needs a
         -- SECOND multiply on top of this product happens here -- chaining
@@ -1504,6 +1531,7 @@ begin
         -- 'st_geom_out2', off the register written here. One more cycle
         -- per command.
         when st_geom_out =>
+
           v_prod := resize(out_w_q * out_h_q, v_prod'length);
           out_plane_words_q <= v_prod;
           out_plane_bytes_q <= shift_left(v_prod, c_word_shift);
@@ -1511,18 +1539,16 @@ begin
 
           state <= st_geom_out2;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
-
         --------------------------------------------------------------
         -- Geometry, step 2b: the totals, each one product off a register.
         when st_geom_out2 =>
+
           v_prod := out_plane_words_q;
 
           if cls_q = cls_conv then
             -- One OT pass writes exactly one output plane (asserted
             -- above), so the whole ofmap is 'n_ot' planes.
-            out_total_bytes_q <= shift_left(
-              resize(v_prod * n_ot_q, 32), c_word_shift
-            );
+            out_total_bytes_q <= shift_left(resize(v_prod * n_ot_q, 32), c_word_shift);
             n_planes_out_q <= n_ot_q;
             -- One weight tile is, per 'pack_weights_for_hw'
             -- (T x k_h x k_w x pe_rows x pe_cols int8), this many bytes.
@@ -1537,9 +1563,7 @@ begin
             out_pass_off_q <= (others => '0');
             in_pass_off_q <= (others => '0');
           else
-            out_total_bytes_q <= shift_left(
-              resize(v_prod * n_tiles_q, 32), c_word_shift
-            );
+            out_total_bytes_q <= shift_left(resize(v_prod * n_tiles_q, 32), c_word_shift);
             n_planes_out_q <= n_tiles_q;
             pass_q <= (others => '0');
             -- Pass-offset accumulators start with 'pass_q' -- see their
@@ -1551,26 +1575,21 @@ begin
             in_pass_off_q <= (others => '0');
           end if;
 
-          in_total_bytes_q <= shift_left(
-            resize(in_plane_words_q * n_tiles_q, 32),
-            c_word_shift
-          );
+          in_total_bytes_q <= shift_left(resize(in_plane_words_q * n_tiles_q, 32), c_word_shift);
 
           state <= st_range_sum;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
-
         --------------------------------------------------------------
         -- Range check, step 0: the two extents. Nothing but the operand
         -- length select and one 33-bit add each; the comparisons and the
         -- error-priority chain that consume them are in the two states
         -- below. All of it is per-command.
         when st_range_sum =>
+
           -- Source extent.
           if cls_q = cls_xfer or cls_q = cls_elem then
             v_len := desc_q.xfer_bytes;
-            if cls_q = cls_elem
-              and (op_is_add_q = '1' or op_is_upsample_q = '1'
-                   or op_is_dts_q = '1') then
+            if cls_q = cls_elem and (op_is_add_q = '1' or op_is_upsample_q = '1' or op_is_dts_q = '1') then
               v_len := in_total_bytes_q;
             end if;
           else
@@ -1601,19 +1620,16 @@ begin
 
           -- Third and last 'wgt_tile_bytes' product. Landing it here is
           -- still three states ahead of 'st_wgt_setup', the first reader.
-          wgt_tile_bytes_q <= resize(
-            wgt_tile_taps_q * to_unsigned(g_pe_rows * g_pe_cols, 16),
-            wgt_tile_bytes_q'length
-          );
+          wgt_tile_bytes_q <= resize(wgt_tile_taps_q * to_unsigned(g_pe_rows * g_pe_cols, 16), wgt_tile_bytes_q'length);
 
           state <= st_range;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
-
         --------------------------------------------------------------
         -- Validation, part 2: address ranges, now that the byte counts
         -- exist. 'LOCAL_TENSOR' is bounded by 'g_tensor_bytes', 'DDR' by
         -- 'g_ddr_limit' (sections 3 and 6).
         when st_range =>
+
           -- Source extent only. The destination extent, the geometry
           -- bounds and the class dispatch move to 'st_range_dst': doing
           -- all of them in one cycle was a 19-level chain of 33-bit adds
@@ -1635,11 +1651,11 @@ begin
           range_err_q <= v_err;
           state <= st_range_dst;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
-
         --------------------------------------------------------------
         -- Validation, part 2b: destination extent, the row-bank and
         -- output-dimension bounds, and the dispatch.
         when st_range_dst =>
+
           v_err := range_err_q;
 
           if v_err = c_err_none then
@@ -1656,12 +1672,10 @@ begin
 
           -- 'cnn_accel_window_gen's own row-bank bound, and the transpose
           -- buffer's, are the same number (section 4 / entity comment).
-          if v_err = c_err_none and cls_q = cls_conv
-            and row_words_q > g_max_row_tile_words then
+          if v_err = c_err_none and cls_q = cls_conv and row_words_q > g_max_row_tile_words then
             v_err := c_err_bad_geometry;
           end if;
-          if v_err = c_err_none and (cls_q = cls_conv or cls_q = cls_pool)
-            and (out_w_q = 0 or out_h_q = 0) then
+          if v_err = c_err_none and (cls_q = cls_conv or cls_q = cls_pool) and (out_w_q = 0 or out_h_q = 0) then
             v_err := c_err_bad_geometry;
           end if;
 
@@ -1669,29 +1683,39 @@ begin
             pending_err_q <= v_err;
             state <= st_error;
           else
+
             case cls_q is
-              when cls_conv => state <= st_wgt_setup;
-              when cls_pool => state <= st_pass_setup;
-              when cls_xfer => state <= st_xfer_req_src;
+              when cls_conv =>
+
+                state <= st_wgt_setup;
+              when cls_pool =>
+
+                state <= st_pass_setup;
+              when cls_xfer =>
+
+                state <= st_xfer_req_src;
               when cls_elem =>
+
                 -- One-cycle dispatch pulse, landing on the first cycle of
                 -- 'st_elem_run'; the scalar command fields are already
                 -- stable (they are a pure function of 'desc_q').
                 ew_start <= '1';
                 state <= st_elem_run;
-              when others => state <= st_retire;
+              when others =>
+
+                state <= st_retire;
             end case;
+
           end if;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
-
         --------------------------------------------------------------
         -- CONV2D/FC weight refill for output-channel tile 'pass_q'
         -- (section 5.4). Skipped entirely when 'FLAG_WEIGHT_REUSE' is set
         -- (invariant R6: zero added to 'WEIGHT_LOAD_BYTES') or when the
         -- weights already live in 'LOCAL_WEIGHT'.
         when st_wgt_setup =>
-          if desc_q.flags(c_flag_weight_reuse) = '1'
-            or desc_q.space_wgt = c_space_local_weight then
+
+          if desc_q.flags(c_flag_weight_reuse) = '1' or desc_q.space_wgt = c_space_local_weight then
             state <= st_pass_setup;
           else
             wgt_stage_q <= 0;
@@ -1700,15 +1724,17 @@ begin
             state <= st_wgt_req;
           end if;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
-
         when st_wgt_req =>
+
           conv_fill_start <= '0';
           -- One request per sub-region, in the order the weight buffer
           -- expects (weights, then bias, then scale): each region's
           -- pointer is independent, so an empty region is simply skipped.
           if side_req_q.valid = '0' then
+
             case wgt_stage_q is
               when 0 =>
+
                 wgt_region_q <= rg_weight;
                 side_req_q.req.addr <= desc_q.weight_addr + wgt_pass_off_q;
                 side_req_q.req.length <= wgt_tile_bytes_q;
@@ -1716,38 +1742,37 @@ begin
                 wgt_fill_active_q <= '1';
                 cnt_wgt_bytes_q <= cnt_wgt_bytes_q + wgt_tile_bytes_q;
               when 1 =>
+
                 if desc_q.flags(c_flag_bias_en) = '1' then
                   wgt_region_q <= rg_bias;
                   side_req_q.req.addr <= desc_q.bias_addr + bias_pass_off_q;
-                  side_req_q.req.length <=
-                    to_unsigned(g_pe_rows * c_bias_entry_bytes, 32);
+                  side_req_q.req.length <= to_unsigned(g_pe_rows * c_bias_entry_bytes, 32);
                   side_req_q.valid <= '1';
                   wgt_fill_active_q <= '1';
-                  cnt_wgt_bytes_q <= cnt_wgt_bytes_q
-                    + to_unsigned(g_pe_rows * c_bias_entry_bytes, 32);
+                  cnt_wgt_bytes_q <= cnt_wgt_bytes_q + to_unsigned(g_pe_rows * c_bias_entry_bytes, 32);
                 else
                   wgt_stage_q <= 2;
                 end if;
               when others =>
+
                 if desc_q.flags(c_flag_per_channel_en) = '1' then
                   wgt_region_q <= rg_scale;
                   side_req_q.req.addr <= desc_q.scale_addr + scale_pass_off_q;
-                  side_req_q.req.length <=
-                    to_unsigned(g_pe_rows * c_scale_entry_bytes, 32);
+                  side_req_q.req.length <= to_unsigned(g_pe_rows * c_scale_entry_bytes, 32);
                   side_req_q.valid <= '1';
                   wgt_fill_active_q <= '1';
-                  cnt_wgt_bytes_q <= cnt_wgt_bytes_q
-                    + to_unsigned(g_pe_rows * c_scale_entry_bytes, 32);
+                  cnt_wgt_bytes_q <= cnt_wgt_bytes_q + to_unsigned(g_pe_rows * c_scale_entry_bytes, 32);
                 else
                   state <= st_pass_setup;
                 end if;
             end case;
+
           elsif side_req_ready = '1' then
             side_req_q.valid <= '0';
             state <= st_wgt_run;
           end if;
-
         when st_wgt_run =>
+
           if side_error = '1' then
             pending_err_q <= c_err_axi;
             state <= st_error;
@@ -1760,13 +1785,13 @@ begin
               state <= st_wgt_req;
             end if;
           end if;
-
         --------------------------------------------------------------
         -- One pass over the ifmap: an OT tile for conv, one activation
         -- plane for pooling. The destination write job is issued first so
         -- that no engine output beat can ever arrive before its sink is
         -- armed, then the engine is started and the feeder kicked.
         when st_pass_setup =>
+
           if pass_q = n_planes_out_q - 1 then
             pass_last_q <= '1';
           else
@@ -1778,8 +1803,8 @@ begin
           dst_req_q.valid <= '1';
           state <= st_pass_req_dst;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
-
         when st_pass_req_dst =>
+
           if dst_req_ready = '1' then
             dst_req_q.valid <= '0';
             if engine_conv_q = '1' then
@@ -1790,17 +1815,16 @@ begin
             feed_kick <= '1';
             state <= st_pass_run;
           end if;
-
         when st_pass_run =>
+
           if src_error = '1' or dst_error = '1' then
             pending_err_q <= c_err_axi;
             state <= st_error;
-          elsif (engine_conv_q = '1' and conv_done = '1')
-            or (engine_pool_q = '1' and pool_done = '1') then
+          elsif (engine_conv_q = '1' and conv_done = '1') or (engine_pool_q = '1' and pool_done = '1') then
             state <= st_pass_drain;
           end if;
-
         when st_pass_drain =>
+
           -- The engine has emitted its last beat; the sink still has to
           -- retire it. Waiting for 'dst_done' rather than the engine's
           -- own 'done' is what makes 'DDR_WR_BYTES' exact.
@@ -1815,16 +1839,11 @@ begin
               -- ... and advance with it, by one stride each. See their
               -- declaration for why this is exactly the product it
               -- replaces.
-              wgt_pass_off_q <= wgt_pass_off_q
-                + resize(wgt_tile_bytes_q(15 downto 0), 32);
-              bias_pass_off_q <= bias_pass_off_q
-                + to_unsigned(g_pe_rows * c_bias_entry_bytes, 32);
-              scale_pass_off_q <= scale_pass_off_q
-                + to_unsigned(g_pe_rows * c_scale_entry_bytes, 32);
-              out_pass_off_q <= out_pass_off_q
-                + resize(out_plane_bytes_q(15 downto 0), 32);
-              in_pass_off_q <= in_pass_off_q
-                + resize(in_plane_bytes_q(15 downto 0), 32);
+              wgt_pass_off_q <= wgt_pass_off_q + resize(wgt_tile_bytes_q(15 downto 0), 32);
+              bias_pass_off_q <= bias_pass_off_q + to_unsigned(g_pe_rows * c_bias_entry_bytes, 32);
+              scale_pass_off_q <= scale_pass_off_q + to_unsigned(g_pe_rows * c_scale_entry_bytes, 32);
+              out_pass_off_q <= out_pass_off_q + resize(out_plane_bytes_q(15 downto 0), 32);
+              in_pass_off_q <= in_pass_off_q + resize(in_plane_bytes_q(15 downto 0), 32);
               if engine_conv_q = '1' then
                 state <= st_wgt_setup;
               else
@@ -1832,7 +1851,6 @@ begin
               end if;
             end if;
           end if;
-
         --------------------------------------------------------------
         -- LOAD / STORE / LOADW: a single linear move of 'xfer_bytes'
         -- from the source space to the destination space. The two request
@@ -1840,6 +1858,7 @@ begin
         -- pass-through, so the direction is genuinely just the pair of
         -- space tags (section 5.2).
         when st_xfer_req_src =>
+
           if src_req_q.valid = '0' then
             src_req_q.req.addr <= effective_in_addr;
             src_req_q.req.length <= desc_q.xfer_bytes;
@@ -1848,8 +1867,8 @@ begin
             src_req_q.valid <= '0';
             state <= st_xfer_req_dst;
           end if;
-
         when st_xfer_req_dst =>
+
           if dst_is_weight_q = '1' then
             -- LOADW: the sink is the weight buffer's fill port, which has
             -- no request handshake -- only a fill-session pulse, and only
@@ -1875,8 +1894,8 @@ begin
             dst_req_q.valid <= '0';
             state <= st_xfer_run;
           end if;
-
         when st_xfer_run =>
+
           conv_fill_start <= '0';
           if src_error = '1' or dst_error = '1' then
             pending_err_q <= c_err_axi;
@@ -1889,22 +1908,22 @@ begin
           elsif dst_done = '1' then
             state <= st_retire;
           end if;
-
         --------------------------------------------------------------
         -- ADD / UPSAMPLE / COPY / ACT. 'cnn_accel_elementwise' owns its
         -- own request/stream sequencing; this module only supplies the
         -- scalar command fields and binds its four ports to the physical
         -- ones the space tags select.
         when st_elem_run =>
+
           if ew_error = '1' then
             pending_err_q <= ew_error_code;
             state <= st_error;
           elsif ew_done = '1' then
             state <= st_retire;
           end if;
-
         --------------------------------------------------------------
         when st_retire =>
+
           cnt_cmd_q <= cnt_cmd_q + 1;
           if desc_q.opcode = c_opcode_load then
             cnt_load_q <= cnt_load_q + 1;
@@ -1922,8 +1941,7 @@ begin
             if not is_aligned(desc_q.next_instr_addr) then
               pending_err_q <= c_err_misaligned;
               state <= st_error;
-            elsif resize(desc_q.next_instr_addr, 33) + c_instr_word_bytes
-              > g_ddr_limit then
+            elsif resize(desc_q.next_instr_addr, 33) + c_instr_word_bytes > g_ddr_limit then
               pending_err_q <= c_err_ddr_range;
               state <= st_error;
             else
@@ -1931,15 +1949,15 @@ begin
             end if;
           end if;
           watchdog_q <= to_unsigned(g_watchdog_cycles, watchdog_q'length);
-
         --------------------------------------------------------------
         when st_done =>
+
           seq_done <= '1';
           busy_q <= '0';
           state <= st_idle;
-
         --------------------------------------------------------------
         when st_error =>
+
           seq_error <= '1';
           err_code_q <= pending_err_q;
           err_pc_q <= pc_q;
@@ -1951,15 +1969,13 @@ begin
           side_req_q.valid <= '0';
           wgt_fill_active_q <= '0';
           state <= st_idle;
-
       end case;
 
       --------------------------------------------------------------
       -- The watchdog is the single termination guarantee for every wait
       -- above (section 9). 'st_idle'/'st_done'/'st_error' are excluded
       -- because they do not wait on anything.
-      if watchdog_q = 0 and busy_q = '1'
-        and state /= st_idle and state /= st_done and state /= st_error then
+      if watchdog_q = 0 and busy_q = '1' and state /= st_idle and state /= st_done and state /= st_error then
         pending_err_q <= c_err_timeout;
         state <= st_error;
       end if;
@@ -2005,11 +2021,14 @@ begin
   feed_tile_step_i <= resize(in_plane_bytes_q(15 downto 0), 32);
   feed_row_step_i <= resize(in_row_bytes_q(15 downto 0), 32);
 
-  feeder : process(clk)
+  feeder : process (clk)
   begin
+
     if rising_edge(clk) then
+
       case feed_state is
         when fd_idle =>
+
           if feed_kick = '1' then
             feed_row_q <= (others => '0');
             feed_tile_q <= (others => '0');
@@ -2022,8 +2041,8 @@ begin
             end if;
             feed_state <= fd_issue;
           end if;
-
         when fd_issue =>
+
           if feed_req_q.valid = '0' then
             if feed_split_q = '1' then
               -- One '(row, tile)' strip: plane 'tile' is
@@ -2042,8 +2061,8 @@ begin
             feed_req_q.valid <= '0';
             feed_state <= fd_wait;
           end if;
-
         when fd_wait =>
+
           if src_done = '1' then
             if feed_split_q = '0' then
               feed_state <= fd_done;
@@ -2065,8 +2084,8 @@ begin
               feed_state <= fd_issue;
             end if;
           end if;
-
         when fd_done =>
+
           feed_state <= fd_idle;
       end case;
 
@@ -2083,10 +2102,12 @@ begin
   -- bypass, which is a plain wire.
   ------------------------------------------------------------------------
 
-  tb_bypass <= '1' when engine_conv_q = '0' or n_tiles_q <= 1 else '0';
+  tb_bypass <= '1' when engine_conv_q = '0' or n_tiles_q <= 1 else
+               '0';
 
-  transpose : process(clk)
+  transpose : process (clk)
   begin
+
     if rising_edge(clk) then
       if tb_bypass = '0' then
         -- Fill: the feeder delivers one '(row, tile)' strip at a time, so
@@ -2156,17 +2177,21 @@ begin
   end process;
 
   -- Final beat of the frame: last tile of the last column of the last row.
-  tb_last_q <= '1' when tb_drain_q = '1' and tb_tile_q = n_tiles_m1_q
-    and tb_col_q = tb_in_width_m1_q and tb_row_q = tb_in_height_m1_q
-    else '0';
+  tb_last_q <= '1'
+                 when tb_drain_q = '1'
+                      and tb_tile_q = n_tiles_m1_q
+                      and tb_col_q = tb_in_width_m1_q
+                      and tb_row_q = tb_in_height_m1_q else
+               '0';
 
   ------------------------------------------------------------------------
   -- Engine input stream: the transpose buffer's drain side for a tiled
   -- convolution, the raw source stream otherwise.
   ------------------------------------------------------------------------
 
-  eng_in_mux : process(all)
+  eng_in_mux : process (all)
   begin
+
     if tb_bypass = '1' then
       eng_in_m2s <= src_m2s;
     else
@@ -2185,30 +2210,43 @@ begin
   -- beat out, from one 8-byte word in.
   ------------------------------------------------------------------------
 
-  weight_serializer : process(clk)
+  weight_serializer : process (clk)
   begin
+
     if rising_edge(clk) then
       if wgt_lanes_left_q = 0 then
         if wgt_fill_active_q = '1' and side_m2s.valid = '1' then
           wgt_hold_q <= side_m2s.data(word_t'range);
           wgt_hold_region_q <= wgt_region_q;
+
           case wgt_region_q is
-            when rg_weight => wgt_lanes_left_q <= c_word_bytes;
-            when rg_bias => wgt_lanes_left_q <= c_word_bytes / c_bias_entry_bytes;
-            when rg_scale => wgt_lanes_left_q <= c_word_bytes / c_scale_entry_bytes;
+            when rg_weight =>
+
+              wgt_lanes_left_q <= c_word_bytes;
+            when rg_bias =>
+
+              wgt_lanes_left_q <= c_word_bytes / c_bias_entry_bytes;
+            when rg_scale =>
+
+              wgt_lanes_left_q <= c_word_bytes / c_scale_entry_bytes;
           end case;
+
         end if;
       elsif m_conv_weight_s2m.ready = '1' then
         wgt_lanes_left_q <= wgt_lanes_left_q - 1;
+
         case wgt_hold_region_q is
           when rg_weight =>
+
             wgt_hold_q <= std_ulogic_vector(shift_right(unsigned(wgt_hold_q), 8));
           when rg_bias =>
-            wgt_hold_q <= std_ulogic_vector(
-              shift_right(unsigned(wgt_hold_q), 8 * c_bias_entry_bytes)
-            );
-          when rg_scale => wgt_hold_q <= (others => '0');
+
+            wgt_hold_q <= std_ulogic_vector(shift_right(unsigned(wgt_hold_q), 8 * c_bias_entry_bytes));
+          when rg_scale =>
+
+            wgt_hold_q <= (others => '0');
         end case;
+
       end if;
 
       if reset = '1' or soft_reset_pulse = '1' or state = st_error then
@@ -2217,7 +2255,8 @@ begin
     end if;
   end process;
 
-  wgt_lane_m2s.valid <= '1' when wgt_lanes_left_q /= 0 else '0';
+  wgt_lane_m2s.valid <= '1' when wgt_lanes_left_q /= 0 else
+                        '0';
   wgt_lane_m2s.last <= '0';
   wgt_lane_m2s.user <= (others => '0');
 
@@ -2225,14 +2264,17 @@ begin
   -- beat: it samples these in the same cycle as the beat (see that entity's
   -- 'fill_is_bias'/'fill_is_scale' contract), so they are decoded from the
   -- tag that travels with the held word, not from the request-side region.
-  conv_fill_is_bias <= '1' when wgt_hold_region_q = rg_bias else '0';
-  conv_fill_is_scale <= '1' when wgt_hold_region_q = rg_scale else '0';
+  conv_fill_is_bias <= '1' when wgt_hold_region_q = rg_bias else
+                       '0';
+  conv_fill_is_scale <= '1' when wgt_hold_region_q = rg_scale else
+                        '0';
   -- The lane always sits in the low bits of the holding register, so the
   -- region only decides how far the register is shifted after a beat, not
   -- where the beat is read from -- 'cnn_accel_weight_buffer' itself picks
   -- the width it cares about out of 'data'.
-  wgt_lane_data : process(all)
+  wgt_lane_data : process (all)
   begin
+
     wgt_lane_m2s.data <= (others => '0');
     wgt_lane_m2s.data(word_t'range) <= wgt_hold_q;
   end process;
@@ -2253,21 +2295,20 @@ begin
   -- above. A descriptor that never sets 'reloc_input'/'reloc_output'
   -- (every pre-v2.3 program) adds zero, reproducing its compiled address
   -- exactly.
-  effective_in_addr <=
-    desc_q.in_addr + unsigned(input_addr) when desc_q.reloc_input = '1'
-    else desc_q.in_addr;
-  effective_out_addr <=
-    desc_q.out_addr + unsigned(output_addr) when desc_q.reloc_output = '1'
-    else desc_q.out_addr;
+  effective_in_addr <= desc_q.in_addr + unsigned(input_addr) when desc_q.reloc_input = '1' else
+                       desc_q.in_addr;
+  effective_out_addr <= desc_q.out_addr + unsigned(output_addr) when desc_q.reloc_output = '1' else
+                        desc_q.out_addr;
 
-  src_req_eff <=
-    ew_src0_req_m2s when engine_elem_q = '1'
-    else feed_req_q when (engine_conv_q or engine_pool_q) = '1'
-    else src_req_q;
-  dst_req_eff <= ew_dst_req_m2s when engine_elem_q = '1' else dst_req_q;
+  src_req_eff <= ew_src0_req_m2s when engine_elem_q = '1' else
+                 feed_req_q when (engine_conv_q or engine_pool_q) = '1' else
+                 src_req_q;
+  dst_req_eff <= ew_dst_req_m2s when engine_elem_q = '1' else
+                 dst_req_q;
 
-  side_req_sel : process(all)
+  side_req_sel : process (all)
   begin
+
     if engine_elem_q = '1' and side_is_src1_q = '1' then
       side_req_eff <= ew_src1_req_m2s;
     elsif engine_elem_q = '1' and side_is_lut_q = '1' then
@@ -2278,33 +2319,47 @@ begin
   end process;
 
   -- src0: DDR -> 'load' read DMA, LOCAL_TENSOR -> scratchpad read 0.
-  load_req_m2s <= src_req_eff when src0_is_ddr_q = '1' else c_dma_req_init;
-  tm_r0_req_m2s <= src_req_eff when src0_is_ddr_q = '0' else c_dma_req_init;
-  src_req_ready <= load_req_s2m.ready when src0_is_ddr_q = '1' else tm_r0_req_s2m.ready;
-  src_done <= load_dma_done when src0_is_ddr_q = '1' else tm_r0_done;
-  src_error <= load_resp_error when src0_is_ddr_q = '1' else '0';
-  src_m2s <= s_load_stream_m2s when src0_is_ddr_q = '1' else s_tm_r0_m2s;
+  load_req_m2s <= src_req_eff when src0_is_ddr_q = '1' else
+                  c_dma_req_init;
+  tm_r0_req_m2s <= src_req_eff when src0_is_ddr_q = '0' else
+                   c_dma_req_init;
+  src_req_ready <= load_req_s2m.ready when src0_is_ddr_q = '1' else
+                   tm_r0_req_s2m.ready;
+  src_done <= load_dma_done when src0_is_ddr_q = '1' else
+              tm_r0_done;
+  src_error <= load_resp_error when src0_is_ddr_q = '1' else
+               '0';
+  src_m2s <= s_load_stream_m2s when src0_is_ddr_q = '1' else
+             s_tm_r0_m2s;
 
   -- side operand (src1 / weights / LUT): DDR -> 'wgt' read DMA,
   -- LOCAL_TENSOR -> scratchpad read 1, LOCAL_WEIGHT -> already resident.
-  wgt_req_m2s <= side_req_eff when side_is_ddr_q = '1' else c_dma_req_init;
-  tm_r1_req_m2s <= side_req_eff when side_is_local_q = '1' else c_dma_req_init;
-  side_req_ready <= wgt_req_s2m.ready when side_is_ddr_q = '1' else tm_r1_req_s2m.ready;
-  side_done <= wgt_dma_done when side_is_ddr_q = '1' else tm_r1_done;
-  side_error <= wgt_resp_error when side_is_ddr_q = '1' else '0';
-  side_m2s <= s_wgt_stream_m2s when side_is_ddr_q = '1' else s_tm_r1_m2s;
+  wgt_req_m2s <= side_req_eff when side_is_ddr_q = '1' else
+                 c_dma_req_init;
+  tm_r1_req_m2s <= side_req_eff when side_is_local_q = '1' else
+                   c_dma_req_init;
+  side_req_ready <= wgt_req_s2m.ready when side_is_ddr_q = '1' else
+                    tm_r1_req_s2m.ready;
+  side_done <= wgt_dma_done when side_is_ddr_q = '1' else
+               tm_r1_done;
+  side_error <= wgt_resp_error when side_is_ddr_q = '1' else
+                '0';
+  side_m2s <= s_wgt_stream_m2s when side_is_ddr_q = '1' else
+              s_tm_r1_m2s;
 
   -- dst: DDR -> ofmap DMA, LOCAL_TENSOR -> scratchpad write 0 (pure move)
   -- or write 1 (engine output), LOCAL_WEIGHT -> the weight buffer's fill
   -- port, which has no request handshake at all.
-  store_req_m2s <= dst_req_eff when dst_is_ddr_q = '1' else c_dma_req_init;
-  tm_w0_req_m2s <= dst_req_eff when dst_use_w0_q = '1' else c_dma_req_init;
-  tm_w1_req_m2s <= dst_req_eff
-    when dst_is_ddr_q = '0' and dst_is_weight_q = '0' and dst_use_w0_q = '0'
-    else c_dma_req_init;
+  store_req_m2s <= dst_req_eff when dst_is_ddr_q = '1' else
+                   c_dma_req_init;
+  tm_w0_req_m2s <= dst_req_eff when dst_use_w0_q = '1' else
+                   c_dma_req_init;
+  tm_w1_req_m2s <= dst_req_eff when dst_is_ddr_q = '0' and dst_is_weight_q = '0' and dst_use_w0_q = '0' else
+                   c_dma_req_init;
 
-  dst_port_sel : process(all)
+  dst_port_sel : process (all)
   begin
+
     if dst_is_ddr_q = '1' then
       dst_req_ready <= store_req_s2m.ready;
       dst_done <= store_dma_done;
@@ -2321,7 +2376,8 @@ begin
       dst_req_ready <= '1';
       dst_done <= '0';
       dst_error <= '0';
-      dst_ready <= '1' when wgt_lanes_left_q = 0 else '0';
+      dst_ready <= '1' when wgt_lanes_left_q = 0 else
+                   '0';
     else
       dst_req_ready <= tm_w1_req_s2m.ready;
       dst_done <= tm_w1_done;
@@ -2335,8 +2391,9 @@ begin
   -- producer is; 'src_ready'/'side_ready' are whatever its consumer is.
   ------------------------------------------------------------------------
 
-  producer_sel : process(all)
+  producer_sel : process (all)
   begin
+
     if engine_elem_q = '1' then
       dst_m2s <= s_ew_dst_stream_m2s;
     elsif engine_conv_q = '1' then
@@ -2349,8 +2406,9 @@ begin
     end if;
   end process;
 
-  consumer_sel : process(all)
+  consumer_sel : process (all)
   begin
+
     if engine_elem_q = '1' then
       src_ready <= m_ew_src0_stream_s2m.ready;
     elsif engine_conv_q = '1' then
@@ -2368,46 +2426,53 @@ begin
     end if;
   end process;
 
-  side_ready_sel : process(all)
+  side_ready_sel : process (all)
   begin
+
     if engine_elem_q = '1' and side_is_src1_q = '1' then
       side_ready <= m_ew_src1_stream_s2m.ready;
     elsif engine_elem_q = '1' and side_is_lut_q = '1' then
       side_ready <= m_ew_lut_stream_s2m.ready;
     elsif wgt_fill_active_q = '1' then
-      side_ready <= '1' when wgt_lanes_left_q = 0 else '0';
+      side_ready <= '1' when wgt_lanes_left_q = 0 else
+                    '0';
     else
       side_ready <= '0';
     end if;
   end process;
 
   -- Back-pressure towards the physical read ports.
-  s_load_stream_s2m.ready <= src_ready when src0_is_ddr_q = '1' else '0';
-  s_tm_r0_s2m.ready <= src_ready when src0_is_ddr_q = '0' else '0';
-  s_wgt_stream_s2m.ready <= side_ready when side_is_ddr_q = '1' else '0';
-  s_tm_r1_s2m.ready <= side_ready when side_is_local_q = '1' else '0';
+  s_load_stream_s2m.ready <= src_ready when src0_is_ddr_q = '1' else
+                             '0';
+  s_tm_r0_s2m.ready <= src_ready when src0_is_ddr_q = '0' else
+                       '0';
+  s_wgt_stream_s2m.ready <= side_ready when side_is_ddr_q = '1' else
+                            '0';
+  s_tm_r1_s2m.ready <= side_ready when side_is_local_q = '1' else
+                       '0';
 
   -- Forward towards the physical write ports. Only the selected sink ever
   -- sees 'valid', which is what makes invariant R1 structural: a command
   -- with a LOCAL destination cannot produce an AXI write beat.
-  store_fanout : process(all)
+  store_fanout : process (all)
   begin
+
     m_store_stream_m2s <= dst_m2s;
     m_tm_w0_m2s <= dst_m2s;
     m_tm_w1_m2s <= dst_m2s;
     m_store_stream_m2s.valid <= dst_m2s.valid and dst_is_ddr_q;
     m_tm_w0_m2s.valid <= dst_m2s.valid and dst_use_w0_q;
-    m_tm_w1_m2s.valid <= dst_m2s.valid and not (dst_is_ddr_q or dst_use_w0_q
-      or dst_is_weight_q);
+    m_tm_w1_m2s.valid <= dst_m2s.valid and not (dst_is_ddr_q or dst_use_w0_q or dst_is_weight_q);
   end process;
 
   -- Engine input fan-out. Same rule: only the engine that owns the
   -- command ever sees a valid beat.
-  eng_in_ready <= m_conv_stream_s2m.ready when engine_conv_q = '1'
-    else m_pool_stream_s2m.ready;
+  eng_in_ready <= m_conv_stream_s2m.ready when engine_conv_q = '1' else
+                  m_pool_stream_s2m.ready;
 
-  engine_fanout : process(all)
+  engine_fanout : process (all)
   begin
+
     m_conv_stream_m2s <= eng_in_m2s;
     m_pool_stream_m2s <= eng_in_m2s;
     m_ew_src0_stream_m2s <= src_m2s;
@@ -2416,8 +2481,9 @@ begin
     m_ew_src0_stream_m2s.valid <= src_m2s.valid and engine_elem_q;
   end process;
 
-  ew_side_fanout : process(all)
+  ew_side_fanout : process (all)
   begin
+
     m_ew_src1_stream_m2s <= side_m2s;
     m_ew_lut_stream_m2s <= side_m2s;
     m_ew_src1_stream_m2s.valid <= side_m2s.valid and engine_elem_q and side_is_src1_q;
@@ -2430,17 +2496,22 @@ begin
   wgt_lane_ready <= m_conv_weight_s2m.ready;
 
   -- Engine output back-pressure.
-  s_conv_out_s2m.ready <= dst_ready when engine_conv_q = '1' else '0';
-  s_pool_out_s2m.ready <= dst_ready when engine_pool_q = '1' else '0';
-  s_ew_dst_stream_s2m.ready <= dst_ready when engine_elem_q = '1' else '0';
+  s_conv_out_s2m.ready <= dst_ready when engine_conv_q = '1' else
+                          '0';
+  s_pool_out_s2m.ready <= dst_ready when engine_pool_q = '1' else
+                          '0';
+  s_ew_dst_stream_s2m.ready <= dst_ready when engine_elem_q = '1' else
+                               '0';
 
   -- Request-handshake acknowledgements back to 'cnn_accel_elementwise'.
-  ew_src0_req_s2m.ready <= src_req_ready when engine_elem_q = '1' else '0';
-  ew_dst_req_s2m.ready <= dst_req_ready when engine_elem_q = '1' else '0';
-  ew_src1_req_s2m.ready <= side_req_ready
-    when engine_elem_q = '1' and side_is_src1_q = '1' else '0';
-  ew_lut_req_s2m.ready <= side_req_ready
-    when engine_elem_q = '1' and side_is_lut_q = '1' else '0';
+  ew_src0_req_s2m.ready <= src_req_ready when engine_elem_q = '1' else
+                           '0';
+  ew_dst_req_s2m.ready <= dst_req_ready when engine_elem_q = '1' else
+                          '0';
+  ew_src1_req_s2m.ready <= side_req_ready when engine_elem_q = '1' and side_is_src1_q = '1' else
+                           '0';
+  ew_lut_req_s2m.ready <= side_req_ready when engine_elem_q = '1' and side_is_lut_q = '1' else
+                          '0';
 
   ------------------------------------------------------------------------
   -- Scalar command fields towards the engines. All pure functions of the
@@ -2468,8 +2539,9 @@ begin
   -- function of 'desc_q', latched in 'st_fetch_wait', while the earliest
   -- 'start' pulse any engine can see is issued in 'st_range_dst' -- seven
   -- states later. No engine can sample a stale value.
-  cfg_out : process(clk)
+  cfg_out : process (clk)
   begin
+
     if rising_edge(clk) then
       geom_out_width <= std_ulogic_vector(out_w_q);
       geom_out_height <= std_ulogic_vector(out_h_q);
@@ -2565,8 +2637,9 @@ begin
   -- beats, and the command counters from retirement.
   ------------------------------------------------------------------------
 
-  counting : process(clk)
+  counting : process (clk)
   begin
+
     if rising_edge(clk) then
       if busy_q = '1' then
         cnt_cycle_q <= cnt_cycle_q + 1;

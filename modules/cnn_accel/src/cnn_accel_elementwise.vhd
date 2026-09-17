@@ -1,16 +1,16 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library axi_stream;
-use axi_stream.axi_stream_pkg.all;
+  use axi_stream.axi_stream_pkg.all;
 
 library math;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
-use cnn_accel.cnn_accel_v2_pkg.all;
-use cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_activation_plane_channels;
+  use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_v2_pkg.all;
+  use cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_activation_plane_channels;
 
 -- ISA v2.0 "local-to-local" compute engine (doc/cnn_accel_top_v2_arch.md
 -- section 5.2, "cnn_accel_elementwise"): 'COPY', 'ACT', 'ADD' and
@@ -257,7 +257,7 @@ entity cnn_accel_elementwise is
     -- AXI4-Stream beat width for every channel this entity owns. Must
     -- equal '8 * cnn_accel_constant_activation_plane_channels' (asserted
     -- below) -- see the entity-level "Design simplification" comment.
-    g_axi_data_width : positive := 64;
+    g_axi_data_width    : positive := 64;
     -- Bound on ADD's per-operand rescale shift amount ('requant_shift'),
     -- the same role 'cnn_accel_bias_requant's own 'g_max_requant_shift'
     -- plays: values above this bound are silently clamped to it (not
@@ -269,89 +269,88 @@ entity cnn_accel_elementwise is
     -- will ever request (explicit 'xfer_bytes' for COPY/ACT, or the
     -- geometry-computed byte count for ADD/UPSAMPLE's input side).
     -- Exceeding it is reported as 'c_err_bad_geometry' ("oversized").
-    g_max_xfer_bytes : positive := 16 * 1024 * 1024
-  );
+    g_max_xfer_bytes    : positive := 16 * 1024 * 1024);
   port (
-    clk : in std_ulogic;
+    clk               : in  std_ulogic;
     -- Synchronous active-high reset ('reset_internal' at the IP top level).
-    reset : in std_ulogic := '0';
+    reset             : in  std_ulogic := '0';
 
     --# {{}}
     -- Command dispatch: scalar fields lifted from the decoded 'desc_v2_t'
     -- by 'cmd_proc' (mirrors 'cnn_accel_conv_core's 'cfg_*'-port
     -- convention rather than passing the whole record). Sampled only
     -- while idle, alongside 'start'.
-    start : in std_ulogic;
-    opcode : in std_ulogic_vector(7 downto 0);
+    start             : in  std_ulogic;
+    opcode            : in  std_ulogic_vector(7 downto 0);
     -- desc.in_addr (LOCAL_TENSOR; all four opcodes' first source).
-    src0_addr : in unsigned(31 downto 0);
+    src0_addr         : in  unsigned(31 downto 0);
     -- desc.xfer_bytes/src1_addr, ADD's second source address (W15 alias,
     -- see the entity-level comment); ignored by every other opcode.
-    src1_addr : in unsigned(31 downto 0);
+    src1_addr         : in  unsigned(31 downto 0);
     -- desc.out_addr (LOCAL_TENSOR; every opcode's destination).
-    dst_addr : in unsigned(31 downto 0);
+    dst_addr          : in  unsigned(31 downto 0);
     -- desc.weight_addr, reused as ACT's 256-entry LUT base address (see
     -- the entity-level resolved-ambiguity comment); ignored otherwise.
-    lut_addr : in unsigned(31 downto 0);
+    lut_addr          : in  unsigned(31 downto 0);
     -- desc.xfer_bytes, COPY/ACT's byte count; ignored by ADD/UPSAMPLE
     -- (see the entity-level resolved-ambiguity comment on ADD's size).
-    xfer_bytes : in unsigned(31 downto 0);
+    xfer_bytes        : in  unsigned(31 downto 0);
     -- desc.in_width/in_height/in_channels; ADD/UPSAMPLE geometry.
-    in_width : in unsigned(15 downto 0);
-    in_height : in unsigned(15 downto 0);
-    in_channels : in unsigned(15 downto 0);
+    in_width          : in  unsigned(15 downto 0);
+    in_height         : in  unsigned(15 downto 0);
+    in_channels       : in  unsigned(15 downto 0);
     -- desc.out_channels/desc.dts_factor: DEPTH_TO_SPACE only. It is the
     -- first opcode in this entity whose output channel count differs from
     -- its input's -- ADD/UPSAMPLE/COPY/ACT are all channel-preserving and
     -- leave both at their defaults. Only the defensive geometry re-check
     -- reads them; the address generator works entirely in tiles derived
     -- from 'in_channels'.
-    out_channels : in unsigned(15 downto 0) := (others => '0');
-    dts_factor : in unsigned(7 downto 0) := (others => '0');
+    out_channels      : in  unsigned(15 downto 0) := (others => '0');
+    dts_factor        : in  unsigned(7 downto 0) := (others => '0');
     -- desc.requant_scale/requant_shift; ADD's single shared (scale,
     -- shift) pair (see the entity-level shared-arithmetic comment).
-    requant_scale : in signed(31 downto 0);
-    requant_shift : in unsigned(7 downto 0);
+    requant_scale     : in  signed(31 downto 0);
+    requant_shift     : in  unsigned(7 downto 0);
 
     --# {{}}
     -- One-cycle pulse per command, success or failure (see entity-level
     -- comment); 'error'/'error_code' are only meaningful alongside it.
-    done : out std_ulogic := '0';
-    error : out std_ulogic := '0';
-    error_code : out err_code_t := c_err_none;
+    done              : out std_ulogic := '0';
+    error             : out std_ulogic := '0';
+    error_code        : out err_code_t := c_err_none;
 
     --# {{}}
     -- src0: tensor_mem 'r0'. This entity is the read side's consumer.
-    src0_req_m2s : out dma_req_m2s_t :=
+    src0_req_m2s      : out dma_req_m2s_t :=
       (valid => '0', req => (addr => (others => '0'), length => (others => '0')));
-    src0_req_s2m : in dma_req_s2m_t;
-    s_src0_stream_m2s : in axi_stream_m2s_t;
+    src0_req_s2m      : in  dma_req_s2m_t;
+    s_src0_stream_m2s : in  axi_stream_m2s_t;
     s_src0_stream_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
 
     --# {{}}
     -- src1: tensor_mem 'r1'. ADD's second source only.
-    src1_req_m2s : out dma_req_m2s_t :=
+    src1_req_m2s      : out dma_req_m2s_t :=
       (valid => '0', req => (addr => (others => '0'), length => (others => '0')));
-    src1_req_s2m : in dma_req_s2m_t;
-    s_src1_stream_m2s : in axi_stream_m2s_t;
+    src1_req_s2m      : in  dma_req_s2m_t;
+    s_src1_stream_m2s : in  axi_stream_m2s_t;
     s_src1_stream_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
 
     --# {{}}
     -- dst: tensor_mem 'w1'. This entity is the write side's producer.
-    dst_req_m2s : out dma_req_m2s_t :=
+    dst_req_m2s       : out dma_req_m2s_t :=
       (valid => '0', req => (addr => (others => '0'), length => (others => '0')));
-    dst_req_s2m : in dma_req_s2m_t;
-    m_dst_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_dst_stream_s2m : in axi_stream_s2m_t;
+    dst_req_s2m       : in  dma_req_s2m_t;
+    m_dst_stream_m2s  : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_dst_stream_s2m  : in  axi_stream_s2m_t;
 
     --# {{}}
     -- lut: this entity's own LOCAL_WEIGHT-backed 256-entry ACT table read
     -- (see the entity-level comment on why this is a dedicated port).
-    lut_req_m2s : out dma_req_m2s_t :=
+    lut_req_m2s       : out dma_req_m2s_t :=
       (valid => '0', req => (addr => (others => '0'), length => (others => '0')));
-    lut_req_s2m : in dma_req_s2m_t;
-    s_lut_stream_m2s : in axi_stream_m2s_t;
-    s_lut_stream_s2m : out axi_stream_s2m_t := axi_stream_s2m_init
+    lut_req_s2m       : in  dma_req_s2m_t;
+    s_lut_stream_m2s  : in  axi_stream_m2s_t;
+    s_lut_stream_s2m  : out axi_stream_s2m_t := axi_stream_s2m_init
   );
 end entity cnn_accel_elementwise;
 
@@ -404,18 +403,33 @@ architecture a of cnn_accel_elementwise is
   type state_t is (
     s_idle,
     s_bad,
-    s_lut_req, s_lut_run,
-    s_sd_req_src0, s_sd_req_dst, s_sd_run, s_sd_drain,
-    s_geom_rows, s_geom_total, s_geom_check,
-    s_add_req_src0, s_add_req_src1, s_add_req_dst, s_add_run, s_add_drain,
-    s_up_req_src0, s_up_run_src0,
-    s_up_req_dst, s_up_run_dst,
+    s_lut_req,
+    s_lut_run,
+    s_sd_req_src0,
+    s_sd_req_dst,
+    s_sd_run,
+    s_sd_drain,
+    s_geom_rows,
+    s_geom_total,
+    s_geom_check,
+    s_add_req_src0,
+    s_add_req_src1,
+    s_add_req_dst,
+    s_add_run,
+    s_add_drain,
+    s_up_req_src0,
+    s_up_run_src0,
+    s_up_req_dst,
+    s_up_run_dst,
     s_up_next,
-    s_dts_req_src0, s_dts_run_src0,
-    s_dts_req_dst, s_dts_run_dst,
+    s_dts_req_src0,
+    s_dts_run_src0,
+    s_dts_req_dst,
+    s_dts_run_dst,
     s_dts_next,
     s_finish
   );
+
   signal state_q : state_t := s_idle;
 
   signal error_code_q : err_code_t := c_err_none;
@@ -479,6 +493,7 @@ architecture a of cnn_accel_elementwise is
   -- levels, 12 of them CARRY4) purely because every compare and every
   -- increment in it was twice as wide as any value it would ever see.
   constant c_loop_width : positive := 16;
+
   subtype loop_count_t is unsigned(c_loop_width - 1 downto 0);
 
   signal n_tiles_m1_q : loop_count_t := (others => '0');
@@ -519,6 +534,7 @@ architecture a of cnn_accel_elementwise is
   -- (one per lane of a beat), which a flat register array gives for free
   -- as combinational muxes -- no read-port arbitration needed.
   type lut_mem_t is array (0 to c_lut_entries - 1) of std_ulogic_vector(7 downto 0);
+
   signal lut_mem_q : lut_mem_t := (others => (others => '0'));
   signal lut_beat_count_q : natural range 0 to c_lut_beats - 1 := 0;
 
@@ -652,6 +668,7 @@ architecture a of cnn_accel_elementwise is
   -- 'dy'/'dx' decode and its two conditional adds disappear from the
   -- per-iteration path entirely, becoming a 4:1 mux of registered values.
   type dts_plane_off_t is array (0 to c_dts_planes - 1) of unsigned(31 downto 0);
+
   signal dts_plane_off_q : dts_plane_off_t := (others => (others => '0'));
   -- The fully-formed destination byte address of the plane currently in
   -- flight, ready one whole state before 's_dts_req_dst' needs it.
@@ -758,10 +775,12 @@ architecture a of cnn_accel_elementwise is
   -- cnn_accel_bias_requant.vhd's stage-5 comment ('quot = shift_right(...)',
   -- 'round_up = product_u(shift_amt-1)'), reimplemented unpipelined here
   -- (see entity-level comment on why the whole entity cannot be reused).
-  function round_shift_right_signed(value : signed; shift_amt : natural) return signed is
+  function round_shift_right_signed (value : signed; shift_amt : natural) return signed is
+
     variable value_u : unsigned(value'range);
     variable quotient : signed(value'range);
   begin
+
     value_u := unsigned(value);
     quotient := shift_right(value, shift_amt);
     if value_u(shift_amt - 1) = '1' then
@@ -779,26 +798,26 @@ architecture a of cnn_accel_elementwise is
   -- (a no-op truncation for every value this entity ever computes) instead
   -- of letting intermediate widths balloon to 128/192/256 bits, which
   -- would fail to elaborate against the 64-bit accumulator variables below.
-  function mul64(l, r : unsigned) return unsigned is
+  function mul64 (l, r : unsigned) return unsigned is
   begin
+
     return resize(l * r, 64);
   end function;
 
 begin
 
   assert g_axi_data_width = 8 * cnn_accel_constant_activation_plane_channels
-    report "cnn_accel_elementwise: g_axi_data_width must equal 8*T " &
-           "(cnn_accel_constant_activation_plane_channels) -- see entity-level comment"
+    report "cnn_accel_elementwise: g_axi_data_width must equal 8*T "
+           & "(cnn_accel_constant_activation_plane_channels) -- see entity-level comment"
     severity failure;
 
   assert 2 ** c_dts_group_shift = c_dts_group_bytes
-    report "cnn_accel_elementwise: c_dts_group_shift must be log2 of " &
-           "c_dts_group_bytes (factor**2 * bytes-per-beat)"
+    report "cnn_accel_elementwise: c_dts_group_shift must be log2 of "
+           & "c_dts_group_bytes (factor**2 * bytes-per-beat)"
     severity failure;
 
   assert 2 ** c_beat_shift = c_bytes_per_beat
-    report "cnn_accel_elementwise: c_beat_shift must be log2 of " &
-           "c_bytes_per_beat"
+    report "cnn_accel_elementwise: c_beat_shift must be log2 of " & "c_bytes_per_beat"
     severity failure;
 
   assert c_lut_entries mod c_bytes_per_beat = 0
@@ -813,44 +832,54 @@ begin
   -- Combinational outputs.
   ------------------------------------------------------------------------
 
-  done <= '1' when state_q = s_finish or state_q = s_bad else '0';
-  error <= '1' when state_q = s_bad else '0';
-  error_code <= error_code_q when state_q = s_bad else c_err_none;
+  done <= '1' when state_q = s_finish or state_q = s_bad else
+          '0';
+  error <= '1' when state_q = s_bad else
+           '0';
+  error_code <= error_code_q when state_q = s_bad else
+                c_err_none;
 
-  src0_req_m2s.valid <= '1' when
-    state_q = s_sd_req_src0 or state_q = s_add_req_src0 or state_q = s_up_req_src0
-    or state_q = s_dts_req_src0
-    else '0';
+  src0_req_m2s.valid <= '1'
+                          when state_q = s_sd_req_src0
+                               or state_q = s_add_req_src0
+                               or state_q = s_up_req_src0
+                               or state_q = s_dts_req_src0 else
+                        '0';
   src0_req_m2s.req.addr <= cur_addr_q;
   src0_req_m2s.req.length <= cur_len_q;
 
-  src1_req_m2s.valid <= '1' when state_q = s_add_req_src1 else '0';
+  src1_req_m2s.valid <= '1' when state_q = s_add_req_src1 else
+                        '0';
   src1_req_m2s.req.addr <= cur_addr_q;
   src1_req_m2s.req.length <= cur_len_q;
 
-  dst_req_m2s.valid <= '1' when
-    state_q = s_sd_req_dst or state_q = s_add_req_dst or state_q = s_up_req_dst
-    or state_q = s_dts_req_dst
-    else '0';
+  dst_req_m2s.valid <= '1'
+                         when state_q = s_sd_req_dst
+                              or state_q = s_add_req_dst
+                              or state_q = s_up_req_dst
+                              or state_q = s_dts_req_dst else
+                       '0';
   dst_req_m2s.req.addr <= cur_addr_q;
   dst_req_m2s.req.length <= cur_len_q;
 
-  lut_req_m2s.valid <= '1' when state_q = s_lut_req else '0';
+  lut_req_m2s.valid <= '1' when state_q = s_lut_req else
+                       '0';
   lut_req_m2s.req.addr <= cur_addr_q;
   lut_req_m2s.req.length <= cur_len_q;
 
   -- Stream consumption: ready only in each channel's own run state.
-  s_src0_stream_s2m.ready <= '1' when
-    (state_q = s_sd_run and sd_pipe_en = '1') or
-    (state_q = s_add_run and s_src1_stream_m2s.valid = '1' and add_pipe_en = '1') or
-    state_q = s_up_run_src0 or state_q = s_dts_run_src0
-    else '0';
+  s_src0_stream_s2m.ready <= '1'
+                               when (state_q = s_sd_run and sd_pipe_en = '1')
+                                    or (state_q = s_add_run and s_src1_stream_m2s.valid = '1' and add_pipe_en = '1')
+                                    or state_q = s_up_run_src0
+                                    or state_q = s_dts_run_src0 else
+                             '0';
 
-  s_src1_stream_s2m.ready <= '1' when
-    state_q = s_add_run and s_src0_stream_m2s.valid = '1' and add_pipe_en = '1'
-    else '0';
+  s_src1_stream_s2m.ready <= '1' when state_q = s_add_run and s_src0_stream_m2s.valid = '1' and add_pipe_en = '1' else
+                             '0';
 
-  s_lut_stream_s2m.ready <= '1' when state_q = s_lut_run else '0';
+  s_lut_stream_s2m.ready <= '1' when state_q = s_lut_run else
+                            '0';
 
   ------------------------------------------------------------------------
   -- COPY/ACT per-lane mapping: passthrough, or through 'lut_mem_q' (ACT).
@@ -858,21 +887,22 @@ begin
 
   sd_pipe_en <= (not sd_valid_q(2)) or m_dst_stream_s2m.ready;
 
-  sd_accept <= '1' when state_q = s_sd_run
-    and s_src0_stream_m2s.valid = '1' and sd_pipe_en = '1' else '0';
+  sd_accept <= '1' when state_q = s_sd_run and s_src0_stream_m2s.valid = '1' and sd_pipe_en = '1' else
+               '0';
 
-  sd_active <= '1' when state_q = s_sd_run or state_q = s_sd_drain else '0';
+  sd_active <= '1' when state_q = s_sd_run or state_q = s_sd_drain else
+               '0';
 
   -- Stage 2's input: the table lookup, off stage 1's register.
   sd_lane_gen : for l in 0 to c_bytes_per_beat - 1 generate
-    sd_data_next(8 * l + 7 downto 8 * l) <=
-      lut_mem_q(to_integer(unsigned(sd_in_q(8 * l + 7 downto 8 * l))))
-        when opcode_q = c_opcode_act else
-      sd_in_q(8 * l + 7 downto 8 * l);
+    sd_data_next(8 * l + 7 downto 8 * l) <= lut_mem_q(to_integer(unsigned(sd_in_q(8 * l + 7 downto 8 * l))))
+                                              when opcode_q = c_opcode_act else
+                                            sd_in_q(8 * l + 7 downto 8 * l);
   end generate sd_lane_gen;
 
-  sd_control : process(clk)
+  sd_control : process (clk)
   begin
+
     if rising_edge(clk) then
       if reset = '1' then
         sd_valid_q <= (others => '0');
@@ -896,16 +926,21 @@ begin
   -- together whenever its output stage is full and the sink is not ready.
   add_pipe_en <= (not add_valid_q(5)) or m_dst_stream_s2m.ready;
 
-  add_accept <= '1' when state_q = s_add_run
-    and s_src0_stream_m2s.valid = '1' and s_src1_stream_m2s.valid = '1'
-    and add_pipe_en = '1' else '0';
+  add_accept <= '1'
+                  when state_q = s_add_run
+                       and s_src0_stream_m2s.valid = '1'
+                       and s_src1_stream_m2s.valid = '1'
+                       and add_pipe_en = '1' else
+                '0';
 
   -- The destination stream is driven from the ADD pipeline for as long as
   -- it holds beats, which outlasts 's_add_run' by up to four cycles.
-  add_active <= '1' when state_q = s_add_run or state_q = s_add_drain else '0';
+  add_active <= '1' when state_q = s_add_run or state_q = s_add_drain else
+                '0';
 
-  add_control : process(clk)
+  add_control : process (clk)
   begin
+
     if rising_edge(clk) then
       if reset = '1' then
         add_valid_q <= (others => '0');
@@ -936,21 +971,22 @@ begin
 
     saturate_inst : entity math.saturate_signed
       generic map (
-        input_width => c_sum_width,
-        result_width => 8,
+        input_width            => c_sum_width,
+        result_width           => 8,
         enable_output_register => false
       )
       port map (
-        clk => clk,
-        input_valid => '1',
-        input_value => sum_ext_4,
-        result_valid => open,
-        result_value => sat_byte_4,
+        clk                 => clk,
+        input_valid         => '1',
+        input_value         => sum_ext_4,
+        result_valid        => open,
+        result_value        => sat_byte_4,
         result_is_saturated => open
       );
 
-    lane_pipeline : process(clk)
+    lane_pipeline : process (clk)
     begin
+
       if rising_edge(clk) then
         if add_pipe_en = '1' then
           va_1 <= signed(s_src0_stream_m2s.data(8 * l + 7 downto 8 * l));
@@ -985,39 +1021,43 @@ begin
   -- only legal as a whole waveform/expression, not a sub-expression), so
   -- the payload mux is a separate signal, concatenated with zero-padding
   -- below rather than inline.
-  dst_data_muxed <=
-    sd_data_2 when sd_active = '1' else
-    add_data_5 when add_active = '1' else
-    pixel_buf_q when state_q = s_up_run_dst or state_q = s_dts_run_dst else
-    (g_axi_data_width - 1 downto 0 => '0');
+  dst_data_muxed <= sd_data_2 when sd_active = '1' else
+                    add_data_5 when add_active = '1' else
+                    pixel_buf_q when state_q = s_up_run_dst or state_q = s_dts_run_dst else
+                    (g_axi_data_width - 1 downto 0 => '0');
 
-  m_dst_stream_m2s.data <= (axi_stream_data_sz - 1 downto g_axi_data_width => '0') &
-    dst_data_muxed;
+  m_dst_stream_m2s.data <= (axi_stream_data_sz - 1 downto g_axi_data_width => '0') & dst_data_muxed;
 
-  m_dst_stream_m2s.valid <=
-    sd_valid_q(2) when sd_active = '1' else
-    add_valid_q(5) when add_active = '1' else
-    '1' when state_q = s_up_run_dst or state_q = s_dts_run_dst else
-    '0';
+  m_dst_stream_m2s.valid <= sd_valid_q(2) when sd_active = '1' else
+                            add_valid_q(5) when add_active = '1' else
+                            '1' when state_q = s_up_run_dst or state_q = s_dts_run_dst else
+                            '0';
 
-  m_dst_stream_m2s.last <=
-    sd_last_q(2) when sd_active = '1' else
-    -- src0/src1/dst were all requested with the same length ('xfer_len_q'),
-    -- so their 'last' beats coincide; see entity-level comment.
-    add_last_q(5) when add_active = '1' else
-    -- DEPTH_TO_SPACE's write bursts are ONE beat each (every '(dy, dx)'
-    -- lands at an unrelated destination tile), so its only beat is always
-    -- the last one.
-    '1' when (state_q = s_up_run_dst and beat_in_burst_q = 1)
-      or state_q = s_dts_run_dst else
-    '0';
+  m_dst_stream_m2s.last <= sd_last_q(2) when sd_active = '1' else
+                           -- src0/src1/dst were all requested with the same length ('xfer_len_q'),
+                           -- so their 'last' beats coincide; see entity-level comment.
+                           add_last_q(5)
+                             when add_active = '1' else
+                           -- DEPTH_TO_SPACE's write bursts are ONE beat each (every '(dy, dx)'
+                           -- lands at an unrelated destination tile), so its only beat is always
+                           -- the last one.
+                           '1'
+                             when (state_q = s_up_run_dst and beat_in_burst_q = 1) or state_q = s_dts_run_dst else
+                           '0';
 
   ------------------------------------------------------------------------
   -- FSM.
   ------------------------------------------------------------------------
 
-  fsm : process(clk)
-    variable in_w64, in_h64, in_c64, n_tiles64, total64, out_w64, out_h64 : unsigned(63 downto 0);
+  fsm : process (clk)
+
+    variable in_w64 : unsigned(63 downto 0);
+    variable in_h64 : unsigned(63 downto 0);
+    variable in_c64 : unsigned(63 downto 0);
+    variable n_tiles64 : unsigned(63 downto 0);
+    variable total64 : unsigned(63 downto 0);
+    variable out_w64 : unsigned(63 downto 0);
+    variable out_h64 : unsigned(63 downto 0);
     -- 'requant_shift' is 8 bits ('shared/ModernVHDL.md', "Always constrain
     -- the range"): unconstrained this was a 32-bit compare and add.
     variable shift_raw : natural range 0 to 2 ** 8 - 1;
@@ -1026,8 +1066,12 @@ begin
     -- state advances to (computed here so the following 's_up_req_src0'
     -- request's address can be latched in the same state, rather than
     -- split across a second process -- see entity-level comment history).
-    variable next_ix_v, next_iy_v, next_tile_v : loop_count_t;
+    variable next_ix_v : loop_count_t;
+    variable next_iy_v : loop_count_t;
+    variable next_tile_v : loop_count_t;
+
   begin
+
     if rising_edge(clk) then
       if reset = '1' then
         state_q <= s_idle;
@@ -1037,10 +1081,11 @@ begin
         dts_plane_q <= 0;
         error_code_q <= c_err_none;
       else
-        case state_q is
 
+        case state_q is
           ------------------------------------------------------------------
           when s_idle =>
+
             if start = '1' then
               opcode_q <= opcode;
               src0_addr_q <= src0_addr;
@@ -1057,9 +1102,9 @@ begin
               end if;
 
               if opcode = c_opcode_copy or opcode = c_opcode_act then
-                bad := xfer_bytes = 0 or
-                       (xfer_bytes mod to_unsigned(c_bytes_per_beat, 32)) /= 0 or
-                       xfer_bytes > to_unsigned(g_max_xfer_bytes, 32);
+                bad := xfer_bytes = 0
+                       or (xfer_bytes mod to_unsigned(c_bytes_per_beat, 32)) /= 0
+                       or xfer_bytes > to_unsigned(g_max_xfer_bytes, 32);
                 if bad then
                   error_code_q <= c_err_bad_geometry;
                   state_q <= s_bad;
@@ -1077,8 +1122,7 @@ begin
                   end if;
                 end if;
 
-              elsif opcode = c_opcode_add or opcode = c_opcode_upsample
-                or opcode = c_opcode_depth_to_space then
+              elsif opcode = c_opcode_add or opcode = c_opcode_upsample or opcode = c_opcode_depth_to_space then
                 -- Latch the raw geometry only; the products that turn it
                 -- into a byte count are evaluated over the next two
                 -- states. ADD's output frame is its input frame, so both
@@ -1095,8 +1139,7 @@ begin
                   -- whole beats at all, which 'dts_geom_bad_q' rejects.
                   n_tiles64 := in_c64 / to_unsigned(c_dts_group_bytes, 64);
                 else
-                  n_tiles64 := (in_c64 + to_unsigned(c_bytes_per_beat, 64) - 1) /
-                               to_unsigned(c_bytes_per_beat, 64);
+                  n_tiles64 := (in_c64 + to_unsigned(c_bytes_per_beat, 64) - 1) / to_unsigned(c_bytes_per_beat, 64);
                 end if;
 
                 -- 'unsigned "*" natural' (numeric_std A.17) converts the
@@ -1107,8 +1150,7 @@ begin
                 -- runtime (bound check failure), not at analysis time.
                 -- Route through 'mul64' like every other product in this
                 -- process, for the same reason its own comment gives.
-                if opcode = c_opcode_upsample
-                  or opcode = c_opcode_depth_to_space then
+                if opcode = c_opcode_upsample or opcode = c_opcode_depth_to_space then
                   -- Both scale the frame by 2 in each dimension; only what
                   -- happens to the CHANNELS differs, and that is already
                   -- folded into 'n_tiles64' above.
@@ -1145,34 +1187,36 @@ begin
                 dts_factor_q <= dts_factor;
 
                 state_q <= s_geom_rows;
-
               else
                 error_code_q <= c_err_unsupported_op;
                 state_q <= s_bad;
               end if;
             end if;
-
           ------------------------------------------------------------------
           when s_bad =>
-            state_q <= s_idle;
 
+            state_q <= s_idle;
           when s_finish =>
-            state_q <= s_idle;
 
+            state_q <= s_idle;
           ------------------------------------------------------------------
           -- ACT: preload the 256-entry LUT before streaming.
           ------------------------------------------------------------------
           when s_lut_req =>
+
             if lut_req_s2m.ready = '1' then
               state_q <= s_lut_run;
             end if;
-
           when s_lut_run =>
+
             if s_lut_stream_m2s.valid = '1' then
               for lane in 0 to c_bytes_per_beat - 1 loop
-                lut_mem_q(lut_beat_count_q * c_bytes_per_beat + lane) <=
-                  s_lut_stream_m2s.data(8 * lane + 7 downto 8 * lane);
+
+                lut_mem_q(lut_beat_count_q * c_bytes_per_beat + lane) <= s_lut_stream_m2s.data(
+                  8 * lane + 7 downto 8 * lane
+                );
               end loop;
+
               if s_lut_stream_m2s.last = '1' then
                 cur_addr_q <= src0_addr_q;
                 cur_len_q <= xfer_len_q;
@@ -1181,7 +1225,6 @@ begin
                 lut_beat_count_q <= lut_beat_count_q + 1;
               end if;
             end if;
-
           ------------------------------------------------------------------
           -- Geometry, step 1: rows = n_tiles * out_h.
           --
@@ -1192,9 +1235,8 @@ begin
           -- a 32x32 array.
           ------------------------------------------------------------------
           when s_geom_rows =>
-            geom_rows_q <= resize(
-              n_tiles_q(15 downto 0) * out_h_q(17 downto 0), 32
-            );
+
+            geom_rows_q <= resize(n_tiles_q(15 downto 0) * out_h_q(17 downto 0), 32);
 
             -- DEPTH_TO_SPACE's defensive geometry re-check (see
             -- 'dts_geom_bad_q'). Evaluated here rather than in 's_idle'
@@ -1212,28 +1254,23 @@ begin
             --    model's own precondition. Compared in 18 bits so a large
             --    'out_channels' is rejected rather than wrapped.
             if dts_factor_q /= c_dts_factor
-              or n_tiles_q = 0
-              or in_c_q(c_dts_group_shift - 1 downto 0) /= 0
-              or resize(in_c_q, 18) /= shift_left(resize(out_c_q, 18), 2)
-            then
+               or n_tiles_q = 0
+               or in_c_q(c_dts_group_shift - 1 downto 0) /= 0
+               or resize(in_c_q, 18) /= shift_left(resize(out_c_q, 18), 2) then
               dts_geom_bad_q <= '1';
             else
               dts_geom_bad_q <= '0';
             end if;
 
             state_q <= s_geom_total;
-
           ------------------------------------------------------------------
           -- Geometry, step 2: total bytes = rows * out_w * bytes_per_beat,
           -- validated, and then the opcode's own entry state.
           ------------------------------------------------------------------
           when s_geom_total =>
-            geom_total_q <= mul64(
-              resize(geom_rows_q * out_w_q(17 downto 0), 64),
-              to_unsigned(c_bytes_per_beat, 64)
-            );
-            state_q <= s_geom_check;
 
+            geom_total_q <= mul64(resize(geom_rows_q * out_w_q(17 downto 0), 64), to_unsigned(c_bytes_per_beat, 64));
+            state_q <= s_geom_check;
           ------------------------------------------------------------------
           -- Geometry, step 3: validate and dispatch. A separate state from
           -- the multiply above so that the range comparison and the whole
@@ -1242,10 +1279,12 @@ begin
           -- chain.
           ------------------------------------------------------------------
           when s_geom_check =>
+
             total64 := geom_total_q;
-            bad := geom_zero_q = '1' or
-                   total64 = 0 or total64 > to_unsigned(g_max_xfer_bytes, 64) or
-                   (opcode_q = c_opcode_depth_to_space and dts_geom_bad_q = '1');
+            bad := geom_zero_q = '1'
+                   or total64 = 0
+                   or total64 > to_unsigned(g_max_xfer_bytes, 64)
+                   or (opcode_q = c_opcode_depth_to_space and dts_geom_bad_q = '1');
             if bad then
               error_code_q <= c_err_bad_geometry;
               state_q <= s_bad;
@@ -1302,8 +1341,7 @@ begin
                 dts_plane_off_q(0) <= (others => '0');
                 dts_plane_off_q(1) <= to_unsigned(c_bytes_per_beat, 32);
                 dts_plane_off_q(2) <= shift_left(out_w_q, c_beat_shift);
-                dts_plane_off_q(3) <= shift_left(out_w_q, c_beat_shift) +
-                                      to_unsigned(c_bytes_per_beat, 32);
+                dts_plane_off_q(3) <= shift_left(out_w_q, c_beat_shift) + to_unsigned(c_bytes_per_beat, 32);
 
                 state_q <= s_dts_req_src0;
               else
@@ -1312,79 +1350,79 @@ begin
                 state_q <= s_up_req_src0;
               end if;
             end if;
-
           ------------------------------------------------------------------
           -- COPY / ACT: stream src0 -> (LUT or passthrough) -> dst.
           ------------------------------------------------------------------
           when s_sd_req_src0 =>
+
             if src0_req_s2m.ready = '1' then
               cur_addr_q <= dst_addr_q;
               cur_len_q <= xfer_len_q;
               state_q <= s_sd_req_dst;
             end if;
-
           when s_sd_req_dst =>
+
             if dst_req_s2m.ready = '1' then
               state_q <= s_sd_run;
             end if;
-
           when s_sd_run =>
+
             if sd_accept = '1' and s_src0_stream_m2s.last = '1' then
               state_q <= s_sd_drain;
             end if;
-
           -- The last input beat has entered the pipeline; 'sd_active'
           -- keeps driving the destination stream until it is empty.
           when s_sd_drain =>
+
             if sd_valid_q = (sd_valid_q'range => '0') then
               state_q <= s_finish;
             end if;
-
           ------------------------------------------------------------------
           -- ADD: stream src0 & src1 (joined) -> rescale/sum/saturate -> dst.
           ------------------------------------------------------------------
           when s_add_req_src0 =>
+
             if src0_req_s2m.ready = '1' then
               cur_addr_q <= src1_addr_q;
               cur_len_q <= xfer_len_q;
               state_q <= s_add_req_src1;
             end if;
-
           when s_add_req_src1 =>
+
             if src1_req_s2m.ready = '1' then
               cur_addr_q <= dst_addr_q;
               cur_len_q <= xfer_len_q;
               state_q <= s_add_req_dst;
             end if;
-
           when s_add_req_dst =>
+
             if dst_req_s2m.ready = '1' then
               state_q <= s_add_run;
             end if;
-
           when s_add_run =>
+
             if add_accept = '1' and s_src0_stream_m2s.last = '1' then
               state_q <= s_add_drain;
             end if;
-
           -- The last input beat has entered the pipeline; up to four beats
           -- are still in it. 'add_active' keeps driving the destination
           -- stream from here, and the command is only finished once every
           -- one of them has been accepted.
           when s_add_drain =>
+
             if add_valid_q = (add_valid_q'range => '0') then
               state_q <= s_finish;
             end if;
-
           ------------------------------------------------------------------
           -- UPSAMPLE: one T-byte pixel-plane per iteration.
           ------------------------------------------------------------------
           when s_up_req_src0 =>
+
             if src0_req_s2m.ready = '1' then
               state_q <= s_up_run_src0;
             end if;
-
           when s_up_run_src0 =>
+
             -- Exactly one beat was requested; the first (and only) valid
             -- beat is always the last.
             if s_src0_stream_m2s.valid = '1' then
@@ -1404,13 +1442,13 @@ begin
               beat_in_burst_q <= 0;
               state_q <= s_up_req_dst;
             end if;
-
           when s_up_req_dst =>
+
             if dst_req_s2m.ready = '1' then
               state_q <= s_up_run_dst;
             end if;
-
           when s_up_run_dst =>
+
             if m_dst_stream_s2m.ready = '1' then
               if beat_in_burst_q = 1 then
                 if row_phase_q = 0 then
@@ -1433,8 +1471,8 @@ begin
                 beat_in_burst_q <= 1;
               end if;
             end if;
-
           when s_up_next =>
+
             -- Compute the *next* pixel's loop counters here (rather than
             -- advancing them and re-deriving the address in a second,
             -- same-edge process): a second process triggered off the same
@@ -1468,9 +1506,7 @@ begin
               -- Re-evaluate the terminal-count flag from the counters
               -- being committed above, so the next visit to this state
               -- reads a register instead of a compare tree.
-              if next_ix_v >= in_w_m1_q and next_iy_v >= in_h_m1_q and
-                 next_tile_v >= n_tiles_m1_q
-              then
+              if next_ix_v >= in_w_m1_q and next_iy_v >= in_h_m1_q and next_tile_v >= n_tiles_m1_q then
                 last_pixel_q <= '1';
               else
                 last_pixel_q <= '0';
@@ -1496,15 +1532,12 @@ begin
                 ew_pix_bytes_q <= ew_row_base_bytes_q + ew_two_out_w_bytes_q;
                 ew_dst_q <= ew_row_base_bytes_q + ew_two_out_w_bytes_q;
               else
-                ew_pix_bytes_q <= ew_pix_bytes_q +
-                                  to_unsigned(2 * c_bytes_per_beat, 32);
-                ew_dst_q <= ew_pix_bytes_q +
-                            to_unsigned(2 * c_bytes_per_beat, 32);
+                ew_pix_bytes_q <= ew_pix_bytes_q + to_unsigned(2 * c_bytes_per_beat, 32);
+                ew_dst_q <= ew_pix_bytes_q + to_unsigned(2 * c_bytes_per_beat, 32);
               end if;
 
               state_q <= s_up_req_src0;
             end if;
-
           ------------------------------------------------------------------
           -- DEPTH_TO_SPACE: one T-byte channel tile per iteration, over
           -- the '(c_tile_out, y_in, x_in, dy, dx)' loop nest. Unlike
@@ -1513,11 +1546,12 @@ begin
           -- read/write pair per iteration. See the entity-level note.
           ------------------------------------------------------------------
           when s_dts_req_src0 =>
+
             if src0_req_s2m.ready = '1' then
               state_q <= s_dts_run_src0;
             end if;
-
           when s_dts_run_src0 =>
+
             -- Exactly one beat was requested, so the first valid beat is
             -- also the last.
             if s_src0_stream_m2s.valid = '1' then
@@ -1535,20 +1569,20 @@ begin
               cur_len_q <= to_unsigned(c_bytes_per_beat, 32);
               state_q <= s_dts_req_dst;
             end if;
-
           when s_dts_req_dst =>
+
             if dst_req_s2m.ready = '1' then
               state_q <= s_dts_run_dst;
             end if;
-
           when s_dts_run_dst =>
+
             -- A one-beat burst: 'last' is asserted combinationally for the
             -- whole of this state, so accepting the beat completes it.
             if m_dst_stream_s2m.ready = '1' then
               state_q <= s_dts_next;
             end if;
-
           when s_dts_next =>
+
             -- Same "advance and re-derive the address from the same local
             -- variables, in one state" discipline as 's_up_next' -- see
             -- its comment for why splitting them across processes is a
@@ -1594,9 +1628,7 @@ begin
 
                 -- Re-evaluate the terminal-count flag from the counters
                 -- being committed above (see its declaration).
-                if next_ix_v >= in_w_m1_q and next_iy_v >= in_h_m1_q and
-                   next_tile_v >= n_tiles_m1_q
-                then
+                if next_ix_v >= in_w_m1_q and next_iy_v >= in_h_m1_q and next_tile_v >= n_tiles_m1_q then
                   last_pixel_q <= '1';
                 else
                   last_pixel_q <= '0';
@@ -1626,17 +1658,15 @@ begin
                   ew_pix_bytes_q <= ew_row_base_bytes_q + ew_two_out_w_bytes_q;
                   ew_dst_q <= ew_row_base_bytes_q + ew_two_out_w_bytes_q;
                 else
-                  ew_pix_bytes_q <= ew_pix_bytes_q +
-                                     to_unsigned(2 * c_bytes_per_beat, 32);
-                  ew_dst_q <= ew_pix_bytes_q +
-                               to_unsigned(2 * c_bytes_per_beat, 32);
+                  ew_pix_bytes_q <= ew_pix_bytes_q + to_unsigned(2 * c_bytes_per_beat, 32);
+                  ew_dst_q <= ew_pix_bytes_q + to_unsigned(2 * c_bytes_per_beat, 32);
                 end if;
 
                 state_q <= s_dts_req_src0;
               end if;
             end if;
-
         end case;
+
       end if;
     end if;
   end process;

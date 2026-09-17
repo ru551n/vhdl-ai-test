@@ -1,25 +1,25 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library vunit_lib;
 context vunit_lib.vunit_context;
-use vunit_lib.queue_pkg.all;
-use vunit_lib.integer_array_pkg.all;
-use vunit_lib.memory_pkg.all;
-use vunit_lib.axi_slave_pkg.all;
+  use vunit_lib.queue_pkg.all;
+  use vunit_lib.integer_array_pkg.all;
+  use vunit_lib.memory_pkg.all;
+  use vunit_lib.axi_slave_pkg.all;
 
 library axi;
-use axi.axi_pkg.all;
+  use axi.axi_pkg.all;
 
 library axi_stream;
-use axi_stream.axi_stream_pkg.all;
+  use axi_stream.axi_stream_pkg.all;
 
 library bfm;
-use bfm.stall_bfm_pkg.all;
+  use bfm.stall_bfm_pkg.all;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_pkg.all;
 
 -- VUnit-5 testbench for cnn_accel_axi_read_dma. See
 -- modules/cnn_accel/doc/cnn_accel_axi_read_dma_req.md and
@@ -37,7 +37,8 @@ use cnn_accel.cnn_accel_pkg.all;
 -- data/last checking plus randomized backpressure), since one whole DMA
 -- request maps to exactly one AXI4-Stream packet.
 entity tb_cnn_accel_axi_read_dma is
-  generic (runner_cfg : string);
+  generic (
+    runner_cfg : string);
 end entity tb_cnn_accel_axi_read_dma;
 
 architecture tb of tb_cnn_accel_axi_read_dma is
@@ -74,12 +75,12 @@ architecture tb of tb_cnn_accel_axi_read_dma is
   constant c_memory_bytes : positive := 32 * 1024;
   constant memory : memory_t := new_memory;
   constant axi_slave : axi_slave_t := new_axi_slave(
-    memory => memory,
-    address_fifo_depth => 4,
+    memory                    => memory,
+    address_fifo_depth        => 4,
     address_stall_probability => 0.3,
-    data_stall_probability => 0.3,
-    min_response_latency => 0 ns,
-    max_response_latency => 3 * c_clk_period
+    data_stall_probability    => 0.3,
+    min_response_latency      => 0 ns,
+    max_response_latency      => 3 * c_clk_period
   );
 
   signal m_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
@@ -105,7 +106,8 @@ architecture tb of tb_cnn_accel_axi_read_dma is
   -- request's stream content is fully predictable regardless of how it got
   -- split into bursts.
   ------------------------------------------------------------------------------
-  function word_pattern(byte_addr : natural) return unsigned is
+  function word_pattern (byte_addr : natural) return unsigned is
+
     -- Knuth multiplicative hash constant (0x9E3779B1 = 2654435761). Computed
     -- with explicit unsigned arithmetic and a truncating 32-bit resize
     -- (intentional modulo-2**32 wraparound) rather than 'natural'/'integer'
@@ -115,42 +117,52 @@ architecture tb of tb_cnn_accel_axi_read_dma is
     constant multiplier : unsigned(31 downto 0) := x"9e3779b1";
     variable product : unsigned(63 downto 0);
   begin
+
     product := word_idx * multiplier;
     return product(31 downto 0) + to_unsigned(12345, 32);
   end function;
 
-  procedure push_reference_bytes(base_addr : natural; length_bytes : natural) is
+  procedure push_reference_bytes (base_addr : natural; length_bytes : natural) is
+
     variable ref : integer_array_t;
     variable word_value : unsigned(31 downto 0);
     variable byte_idx : natural := 0;
   begin
+
     if length_bytes = 0 then
       return;
     end if;
     ref := new_1d(length => length_bytes, bit_width => 8, is_signed => false);
     for word_offset in 0 to length_bytes / c_bytes_per_beat - 1 loop
+
       word_value := word_pattern(base_addr + word_offset * c_bytes_per_beat);
       for byte_in_word in 0 to c_bytes_per_beat - 1 loop
+
         set(
-          arr => ref,
-          idx => byte_idx,
+          arr   => ref,
+          idx   => byte_idx,
           value => to_integer(word_value(8 * (byte_in_word + 1) - 1 downto 8 * byte_in_word))
         );
         byte_idx := byte_idx + 1;
       end loop;
+
     end loop;
+
     push_ref(reference_data_queue, ref);
   end procedure;
 
-  procedure fill_memory_pattern(base_addr : natural; length_bytes : natural) is
+  procedure fill_memory_pattern (base_addr : natural; length_bytes : natural) is
   begin
+
     for word_offset in 0 to length_bytes / c_bytes_per_beat - 1 loop
+
       write_word(
-        memory => memory,
+        memory  => memory,
         address => base_addr + word_offset * c_bytes_per_beat,
-        word => std_ulogic_vector(word_pattern(base_addr + word_offset * c_bytes_per_beat))
+        word    => std_ulogic_vector(word_pattern(base_addr + word_offset * c_bytes_per_beat))
       );
     end loop;
+
   end procedure;
 
 begin
@@ -158,9 +170,9 @@ begin
   clk <= not clk after c_clk_period / 2;
   test_runner_watchdog(runner, 1 ms);
 
-
   ------------------------------------------------------------------------------
   main : process
+
     variable buf : buffer_t;
     variable num_requests_expected : natural := 0;
     -- A 'length_bytes = 0' request produces no AXI4-Stream packet at all (no
@@ -169,13 +181,14 @@ begin
     -- exit condition below; tracked separately from 'num_requests_expected'.
     variable num_packets_expected : natural := 0;
 
-    procedure do_request(
-      addr : natural;
-      length_bytes : natural;
-      push_reference : boolean := true;
+    procedure do_request (
+      addr              : natural;
+      length_bytes      : natural;
+      push_reference    : boolean := true;
       expect_resp_error : boolean := false
     ) is
     begin
+
       fill_memory_pattern(base_addr => addr, length_bytes => length_bytes);
       if push_reference then
         push_reference_bytes(base_addr => addr, length_bytes => length_bytes);
@@ -199,6 +212,7 @@ begin
     end procedure;
 
   begin
+
     test_runner_setup(runner, runner_cfg);
 
     buf := allocate(memory, num_bytes => c_memory_bytes, name => "dma_source");
@@ -255,25 +269,25 @@ begin
 
     elsif run("test_zero_length") then
       do_request(addr => 16#5000#, length_bytes => 0, push_reference => false);
-
     end if;
 
-    wait until
-      num_requests_completed = num_requests_expected and
-      num_packets_checked = num_packets_expected and
-      rising_edge(clk);
+    wait until num_requests_completed = num_requests_expected
+               and num_packets_checked = num_packets_expected
+               and rising_edge(clk);
 
     test_runner_cleanup(runner);
   end process;
-
 
   ------------------------------------------------------------------------------
   -- dma_done must fire exactly once per accepted request: count pulses
   -- between successive 'req_m2s.valid and req_s2m.ready' accept events.
   ------------------------------------------------------------------------------
   done_once_check : process
+
     variable dma_done_pulses_this_request : natural := 0;
+
   begin
+
     wait until rising_edge(clk);
 
     if reset = '1' then
@@ -281,7 +295,8 @@ begin
     else
       if req_m2s.valid = '1' and req_s2m.ready = '1' then
         check_equal(
-          dma_done_pulses_this_request, 0,
+          dma_done_pulses_this_request,
+          0,
           "dma_done must not still be pending from a previous request when a new one is accepted"
         );
       end if;
@@ -298,7 +313,6 @@ begin
     end if;
   end process;
 
-
   ------------------------------------------------------------------------------
   -- AXI4 read slave BFM, backed by the VUnit memory model pre-filled with
   -- 'word_pattern' by each request.
@@ -308,18 +322,17 @@ begin
 
   axi_read_slave_inst : entity bfm.axi_read_slave
     generic map (
-      axi_slave => axi_slave,
-      data_width => c_axi_data_width,
-      id_width => c_axi_id_width,
+      axi_slave     => axi_slave,
+      data_width    => c_axi_data_width,
+      id_width      => c_axi_id_width,
       address_width => c_axi_addr_width
     )
     port map (
-      clk => clk,
+      clk          => clk,
       --
       axi_read_m2s => axi_read_m2s,
       axi_read_s2m => axi_read_s2m_bfm
     );
-
 
   ------------------------------------------------------------------------------
   -- Passive RRESP override: forwards the BFM's R channel untouched except
@@ -328,8 +341,9 @@ begin
   -- completed handshake, so the presented resp is stable while valid is
   -- high and not yet accepted.
   ------------------------------------------------------------------------------
-  rresp_override : process(all)
+  rresp_override : process (all)
   begin
+
     m_axi_r_s2m <= axi_read_s2m_bfm.r;
     if total_r_beats_served = inject_error_at_beat then
       m_axi_r_s2m.resp <= axi_resp_slverr;
@@ -338,54 +352,53 @@ begin
 
   r_beat_counter : process
   begin
+
     wait until rising_edge(clk);
     if m_axi_r_s2m.valid = '1' and m_axi_r_m2s.ready = '1' then
       total_r_beats_served <= total_r_beats_served + 1;
     end if;
   end process;
 
-
   ------------------------------------------------------------------------------
   axi_stream_slave_inst : entity bfm.axi_stream_slave
     generic map (
-      data_width => c_axi_data_width,
+      data_width           => c_axi_data_width,
       reference_data_queue => reference_data_queue,
-      stall_config => (stall_probability => 0.5, min_stall_cycles => 1, max_stall_cycles => 8)
+      stall_config         => (stall_probability => 0.5, min_stall_cycles => 1, max_stall_cycles => 8)
     )
     port map (
-      clk => clk,
+      clk                 => clk,
       --
-      ready => m_stream_s2m.ready,
-      valid => m_stream_m2s.valid,
-      last => m_stream_m2s.last,
-      data => m_stream_m2s.data(c_axi_data_width - 1 downto 0),
+      ready               => m_stream_s2m.ready,
+      valid               => m_stream_m2s.valid,
+      last                => m_stream_m2s.last,
+      data                => m_stream_m2s.data(c_axi_data_width - 1 downto 0),
       --
-      enable => stream_checker_enable,
+      enable              => stream_checker_enable,
       num_packets_checked => num_packets_checked
     );
-
 
   ------------------------------------------------------------------------------
   dut : entity cnn_accel.cnn_accel_axi_read_dma
     generic map (
       g_axi_addr_width => c_axi_addr_width,
       g_axi_data_width => c_axi_data_width,
-      g_axi_id_width => c_axi_id_width
+      g_axi_id_width   => c_axi_id_width
     )
     port map (
-      clk => clk,
-      reset => reset,
+      clk          => clk,
+      reset        => reset,
       --
-      req_m2s => req_m2s,
-      req_s2m => req_s2m,
+      req_m2s      => req_m2s,
+      req_s2m      => req_s2m,
       --
-      dma_done => dma_done,
-      resp_error => resp_error,
+      dma_done     => dma_done,
+      resp_error   => resp_error,
       --
       m_axi_ar_m2s => m_axi_ar_m2s,
       m_axi_ar_s2m => m_axi_ar_s2m,
-      m_axi_r_m2s => m_axi_r_m2s,
-      m_axi_r_s2m => m_axi_r_s2m,
+      m_axi_r_m2s  => m_axi_r_m2s,
+      m_axi_r_s2m  => m_axi_r_s2m,
       --
       m_stream_m2s => m_stream_m2s,
       m_stream_s2m => m_stream_s2m
