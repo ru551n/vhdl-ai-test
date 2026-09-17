@@ -257,7 +257,7 @@ entity cnn_accel_elementwise is
     -- AXI4-Stream beat width for every channel this entity owns. Must
     -- equal '8 * cnn_accel_constant_activation_plane_channels' (asserted
     -- below) -- see the entity-level "Design simplification" comment.
-    g_axi_data_width    : positive := 64;
+    g_axi_data_width : positive := 64;
     -- Bound on ADD's per-operand rescale shift amount ('requant_shift'),
     -- the same role 'cnn_accel_bias_requant's own 'g_max_requant_shift'
     -- plays: values above this bound are silently clamped to it (not
@@ -269,88 +269,84 @@ entity cnn_accel_elementwise is
     -- will ever request (explicit 'xfer_bytes' for COPY/ACT, or the
     -- geometry-computed byte count for ADD/UPSAMPLE's input side).
     -- Exceeding it is reported as 'c_err_bad_geometry' ("oversized").
-    g_max_xfer_bytes    : positive := 16 * 1024 * 1024);
+    g_max_xfer_bytes : positive := 16 * 1024 * 1024);
   port (
-    clk               : in  std_ulogic;
+    clk : in std_ulogic;
     -- Synchronous active-high reset ('reset_internal' at the IP top level).
-    reset             : in  std_ulogic := '0';
+    reset : in std_ulogic := '0';
 
     --# {{}}
     -- Command dispatch: scalar fields lifted from the decoded 'desc_v2_t'
     -- by 'cmd_proc' (mirrors 'cnn_accel_conv_core's 'cfg_*'-port
     -- convention rather than passing the whole record). Sampled only
     -- while idle, alongside 'start'.
-    start             : in  std_ulogic;
-    opcode            : in  std_ulogic_vector(7 downto 0);
+    start : in std_ulogic;
+    opcode : in std_ulogic_vector(7 downto 0);
     -- desc.in_addr (LOCAL_TENSOR; all four opcodes' first source).
-    src0_addr         : in  unsigned(31 downto 0);
+    src0_addr : in unsigned(31 downto 0);
     -- desc.xfer_bytes/src1_addr, ADD's second source address (W15 alias,
     -- see the entity-level comment); ignored by every other opcode.
-    src1_addr         : in  unsigned(31 downto 0);
+    src1_addr : in unsigned(31 downto 0);
     -- desc.out_addr (LOCAL_TENSOR; every opcode's destination).
-    dst_addr          : in  unsigned(31 downto 0);
+    dst_addr : in unsigned(31 downto 0);
     -- desc.weight_addr, reused as ACT's 256-entry LUT base address (see
     -- the entity-level resolved-ambiguity comment); ignored otherwise.
-    lut_addr          : in  unsigned(31 downto 0);
+    lut_addr : in unsigned(31 downto 0);
     -- desc.xfer_bytes, COPY/ACT's byte count; ignored by ADD/UPSAMPLE
     -- (see the entity-level resolved-ambiguity comment on ADD's size).
-    xfer_bytes        : in  unsigned(31 downto 0);
+    xfer_bytes : in unsigned(31 downto 0);
     -- desc.in_width/in_height/in_channels; ADD/UPSAMPLE geometry.
-    in_width          : in  unsigned(15 downto 0);
-    in_height         : in  unsigned(15 downto 0);
-    in_channels       : in  unsigned(15 downto 0);
+    in_width : in unsigned(15 downto 0);
+    in_height : in unsigned(15 downto 0);
+    in_channels : in unsigned(15 downto 0);
     -- desc.out_channels/desc.dts_factor: DEPTH_TO_SPACE only. It is the
     -- first opcode in this entity whose output channel count differs from
     -- its input's -- ADD/UPSAMPLE/COPY/ACT are all channel-preserving and
     -- leave both at their defaults. Only the defensive geometry re-check
     -- reads them; the address generator works entirely in tiles derived
     -- from 'in_channels'.
-    out_channels      : in  unsigned(15 downto 0) := (others => '0');
-    dts_factor        : in  unsigned(7 downto 0) := (others => '0');
+    out_channels : in unsigned(15 downto 0) := (others => '0');
+    dts_factor : in unsigned(7 downto 0) := (others => '0');
     -- desc.requant_scale/requant_shift; ADD's single shared (scale,
     -- shift) pair (see the entity-level shared-arithmetic comment).
-    requant_scale     : in  signed(31 downto 0);
-    requant_shift     : in  unsigned(7 downto 0);
+    requant_scale : in signed(31 downto 0);
+    requant_shift : in unsigned(7 downto 0);
 
     --# {{}}
     -- One-cycle pulse per command, success or failure (see entity-level
     -- comment); 'error'/'error_code' are only meaningful alongside it.
-    done              : out std_ulogic := '0';
-    error             : out std_ulogic := '0';
-    error_code        : out err_code_t := c_err_none;
+    done : out std_ulogic := '0';
+    error : out std_ulogic := '0';
+    error_code : out err_code_t := c_err_none;
 
     --# {{}}
     -- src0: tensor_mem 'r0'. This entity is the read side's consumer.
-    src0_req_m2s      : out dma_req_m2s_t :=
-      (valid => '0', req => (addr => (others => '0'), length => (others => '0')));
-    src0_req_s2m      : in  dma_req_s2m_t;
-    s_src0_stream_m2s : in  axi_stream_m2s_t;
+    src0_req_m2s : out dma_req_m2s_t := (valid => '0', req => (addr => (others => '0'), length => (others => '0')));
+    src0_req_s2m : in dma_req_s2m_t;
+    s_src0_stream_m2s : in axi_stream_m2s_t;
     s_src0_stream_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
 
     --# {{}}
     -- src1: tensor_mem 'r1'. ADD's second source only.
-    src1_req_m2s      : out dma_req_m2s_t :=
-      (valid => '0', req => (addr => (others => '0'), length => (others => '0')));
-    src1_req_s2m      : in  dma_req_s2m_t;
-    s_src1_stream_m2s : in  axi_stream_m2s_t;
+    src1_req_m2s : out dma_req_m2s_t := (valid => '0', req => (addr => (others => '0'), length => (others => '0')));
+    src1_req_s2m : in dma_req_s2m_t;
+    s_src1_stream_m2s : in axi_stream_m2s_t;
     s_src1_stream_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
 
     --# {{}}
     -- dst: tensor_mem 'w1'. This entity is the write side's producer.
-    dst_req_m2s       : out dma_req_m2s_t :=
-      (valid => '0', req => (addr => (others => '0'), length => (others => '0')));
-    dst_req_s2m       : in  dma_req_s2m_t;
-    m_dst_stream_m2s  : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_dst_stream_s2m  : in  axi_stream_s2m_t;
+    dst_req_m2s : out dma_req_m2s_t := (valid => '0', req => (addr => (others => '0'), length => (others => '0')));
+    dst_req_s2m : in dma_req_s2m_t;
+    m_dst_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_dst_stream_s2m : in axi_stream_s2m_t;
 
     --# {{}}
     -- lut: this entity's own LOCAL_WEIGHT-backed 256-entry ACT table read
     -- (see the entity-level comment on why this is a dedicated port).
-    lut_req_m2s       : out dma_req_m2s_t :=
-      (valid => '0', req => (addr => (others => '0'), length => (others => '0')));
-    lut_req_s2m       : in  dma_req_s2m_t;
-    s_lut_stream_m2s  : in  axi_stream_m2s_t;
-    s_lut_stream_s2m  : out axi_stream_s2m_t := axi_stream_s2m_init
+    lut_req_m2s : out dma_req_m2s_t := (valid => '0', req => (addr => (others => '0'), length => (others => '0')));
+    lut_req_s2m : in dma_req_s2m_t;
+    s_lut_stream_m2s : in axi_stream_m2s_t;
+    s_lut_stream_s2m : out axi_stream_s2m_t := axi_stream_s2m_init
   );
 end entity cnn_accel_elementwise;
 
@@ -971,16 +967,16 @@ begin
 
     saturate_inst : entity math.saturate_signed
       generic map (
-        input_width            => c_sum_width,
-        result_width           => 8,
+        input_width => c_sum_width,
+        result_width => 8,
         enable_output_register => false
       )
       port map (
-        clk                 => clk,
-        input_valid         => '1',
-        input_value         => sum_ext_4,
-        result_valid        => open,
-        result_value        => sat_byte_4,
+        clk => clk,
+        input_valid => '1',
+        input_value => sum_ext_4,
+        result_valid => open,
+        result_value => sat_byte_4,
         result_is_saturated => open
       );
 

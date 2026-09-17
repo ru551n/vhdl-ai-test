@@ -44,25 +44,25 @@ entity cnn_accel_pool is
     -- 'g_max_kernel_size**2 * 127' (the maximum possible window sum)
     -- without overflow -- no saturation/rounding is applied in this
     -- module, per doc/cnn_accel_pool_req.md.
-    g_accum_width     : positive);
+    g_accum_width : positive);
   port (
-    clk               : in  std_ulogic;
+    clk : in std_ulogic;
     -- Synchronous active-high reset ('reset_internal' at the IP top level).
-    reset             : in  std_ulogic := '0';
+    reset : in std_ulogic := '0';
     --# {{}}
     -- 'OPCODE_POOL_MAX' vs 'OPCODE_POOL_AVG' (cnn_accel_pkg), sampled at
     -- 's_window' accept time -- selects whether that window's result is
     -- routed to 'm_max' or 'm_avgsum'. Any other value is treated as the
     -- 'OPCODE_POOL_MAX' path (upstream routing guarantees this module only
     -- ever receives pooling opcodes).
-    cfg_opcode        : in  std_ulogic_vector(7 downto 0);
+    cfg_opcode : in std_ulogic_vector(7 downto 0);
     -- Pool kernel height/width for the in-flight instruction. Contract:
     -- '1 <= cfg_pool_kernel_h, cfg_pool_kernel_w <= g_max_kernel_size'.
     -- 'cfg_pool_kernel_h * cfg_pool_kernel_w' taps (the lowest-indexed
     -- elements of 's_window_m2s.data') are active; the rest of the window
     -- beat is ignored.
-    cfg_pool_kernel_h : in  std_ulogic_vector(7 downto 0);
-    cfg_pool_kernel_w : in  std_ulogic_vector(7 downto 0);
+    cfg_pool_kernel_h : in std_ulogic_vector(7 downto 0);
+    cfg_pool_kernel_w : in std_ulogic_vector(7 downto 0);
     --# {{}}
     -- One pooling window per beat, from 'cnn_accel_window_gen' (already
     -- opcode-selected upstream). Element 'i' of 'data' is tap 'i'
@@ -74,21 +74,21 @@ entity cnn_accel_pool is
     -- 'first_tile'/'last_tile' are unused here: pooling is
     -- channel-parallel across lanes, never channel-tiled, so a pooling
     -- window is always exactly one tile.
-    s_window_m2s      : in  window_m2s_t(data(0 to g_max_kernel_size * g_max_kernel_size - 1));
-    s_window_s2m      : out window_s2m_t;
+    s_window_m2s : in window_m2s_t(data(0 to g_max_kernel_size * g_max_kernel_size - 1));
+    s_window_s2m : out window_s2m_t;
     --# {{}}
     -- 'OPCODE_POOL_MAX' result: int8 max over the window's active taps, on
     -- 'data(7 downto 0)' ('data' high bits are 0). To the final output
     -- 'handshake_mux' (bypasses 'cnn_accel_bias_requant').
-    m_max_m2s         : out axi_stream_m2s_t;
-    m_max_s2m         : in  axi_stream_s2m_t;
+    m_max_m2s : out axi_stream_m2s_t;
+    m_max_s2m : in axi_stream_s2m_t;
     --# {{}}
     -- 'OPCODE_POOL_AVG' result: int32 (g_accum_width-bit) sum over the
     -- window's active taps, on 'data(g_accum_width - 1 downto 0)' ('data'
     -- high bits are 0). To 'cnn_accel_bias_requant' for the pool-area
     -- divide.
-    m_avgsum_m2s      : out axi_stream_m2s_t;
-    m_avgsum_s2m      : in  axi_stream_s2m_t
+    m_avgsum_m2s : out axi_stream_m2s_t;
+    m_avgsum_s2m : in axi_stream_s2m_t
   );
 end entity cnn_accel_pool;
 

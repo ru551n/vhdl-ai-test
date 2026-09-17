@@ -100,7 +100,7 @@ entity tb_cnn_accel_conv_core is
     -- full-throughput test, nonzero otherwise) -- mirrors every other
     -- cnn_accel testbench's identical in/out generic pair. 's_stream' is
     -- the one input link stalled; 'm_out' the one output link.
-    stall_probability_percent_in  : natural := 20;
+    stall_probability_percent_in : natural := 20;
     stall_probability_percent_out : natural := 20;
     -- VUnit's own per-test-config output directory, filled in by VUnit
     -- itself. Only 'test_bitexact_compiler_cases' still uses it: module_
@@ -112,15 +112,15 @@ entity tb_cnn_accel_conv_core is
     -- into its own private scratch directory, at THIS config's
     -- 'g_pe_rows' (run_selected_case checks every selected case's
     -- 'pe_rows' field against it either way).
-    output_path                   : string;
+    output_path : string;
     -- THE single scaling knob (flow_status.md S1-S7). Default is the
     -- shipped 8; module_cnn_accel.py adds a second config at the
     -- CI-proven 16 (cnn_accel_constants.PE_ROWS_SCALED) with a matching
     -- 'vectors_root'. Not read from the generated cnn_accel_regs_pkg here
     -- on purpose -- this testbench must be able to run at the non-default
     -- legal value, which is exactly what the generated constant is not.
-    g_pe_rows                     : positive := 8;
-    runner_cfg                    : string);
+    g_pe_rows : positive := 8;
+    runner_cfg : string);
 end entity tb_cnn_accel_conv_core;
 
 architecture tb of tb_cnn_accel_conv_core is
@@ -266,59 +266,59 @@ begin
   ------------------------------------------------------------------------
   dut : entity cnn_accel.cnn_accel_conv_core
     generic map (
-      g_pe_rows             => c_pe_rows,
-      g_pe_cols             => c_pe_cols,
-      g_accum_width         => c_accum_width,
-      g_max_kernel_size     => c_max_kernel_size,
-      g_tile_channels       => c_tile_channels,
-      g_max_row_tile_words  => c_max_row_tile_words,
+      g_pe_rows => c_pe_rows,
+      g_pe_cols => c_pe_cols,
+      g_accum_width => c_accum_width,
+      g_max_kernel_size => c_max_kernel_size,
+      g_tile_channels => c_tile_channels,
+      g_max_row_tile_words => c_max_row_tile_words,
       g_weight_buffer_depth => c_weight_buffer_depth,
-      g_bias_buffer_depth   => c_bias_buffer_depth
+      g_bias_buffer_depth => c_bias_buffer_depth
     )
     port map (
-      clk                => clk,
-      reset              => reset,
+      clk => clk,
+      reset => reset,
 
-      cfg_kernel_h       => cfg_kernel_h,
-      cfg_kernel_w       => cfg_kernel_w,
-      cfg_stride_h       => cfg_stride_h,
-      cfg_stride_w       => cfg_stride_w,
-      cfg_pad_top        => cfg_pad_top,
-      cfg_pad_bottom     => cfg_pad_bottom,
-      cfg_pad_left       => cfg_pad_left,
-      cfg_pad_right      => cfg_pad_right,
-      cfg_pad_value      => cfg_pad_value,
-      cfg_in_width       => cfg_in_width,
-      cfg_in_height      => cfg_in_height,
-      cfg_out_width      => cfg_out_width,
-      cfg_out_height     => cfg_out_height,
-      cfg_in_channels    => cfg_in_channels,
+      cfg_kernel_h => cfg_kernel_h,
+      cfg_kernel_w => cfg_kernel_w,
+      cfg_stride_h => cfg_stride_h,
+      cfg_stride_w => cfg_stride_w,
+      cfg_pad_top => cfg_pad_top,
+      cfg_pad_bottom => cfg_pad_bottom,
+      cfg_pad_left => cfg_pad_left,
+      cfg_pad_right => cfg_pad_right,
+      cfg_pad_value => cfg_pad_value,
+      cfg_in_width => cfg_in_width,
+      cfg_in_height => cfg_in_height,
+      cfg_out_width => cfg_out_width,
+      cfg_out_height => cfg_out_height,
+      cfg_in_channels => cfg_in_channels,
 
-      cfg_bias_en        => cfg_bias_en,
-      cfg_requant_en     => cfg_requant_en,
-      cfg_relu_en        => cfg_relu_en,
-      cfg_requant_scale  => cfg_requant_scale,
-      cfg_requant_shift  => cfg_requant_shift,
-      cfg_output_offset  => cfg_output_offset,
-      cfg_clamp_en       => cfg_clamp_en,
-      cfg_clamp_min      => cfg_clamp_min,
-      cfg_clamp_max      => cfg_clamp_max,
+      cfg_bias_en => cfg_bias_en,
+      cfg_requant_en => cfg_requant_en,
+      cfg_relu_en => cfg_relu_en,
+      cfg_requant_scale => cfg_requant_scale,
+      cfg_requant_shift => cfg_requant_shift,
+      cfg_output_offset => cfg_output_offset,
+      cfg_clamp_en => cfg_clamp_en,
+      cfg_clamp_min => cfg_clamp_min,
+      cfg_clamp_max => cfg_clamp_max,
       cfg_per_channel_en => cfg_per_channel_en,
 
-      start              => start,
-      done               => done,
+      start => start,
+      done => done,
 
-      s_stream_m2s       => s_stream_m2s,
-      s_stream_s2m       => s_stream_s2m,
+      s_stream_m2s => s_stream_m2s,
+      s_stream_s2m => s_stream_s2m,
 
-      fill_start         => fill_start,
-      fill_is_bias       => fill_is_bias,
-      fill_is_scale      => fill_is_scale,
-      s_weight_m2s       => s_weight_m2s,
-      s_weight_s2m       => s_weight_s2m,
+      fill_start => fill_start,
+      fill_is_bias => fill_is_bias,
+      fill_is_scale => fill_is_scale,
+      s_weight_m2s => s_weight_m2s,
+      s_weight_s2m => s_weight_s2m,
 
-      m_out_m2s          => m_out_m2s,
-      m_out_s2m          => m_out_s2m
+      m_out_m2s => m_out_m2s,
+      m_out_s2m => m_out_s2m
     );
 
   ------------------------------------------------------------------------

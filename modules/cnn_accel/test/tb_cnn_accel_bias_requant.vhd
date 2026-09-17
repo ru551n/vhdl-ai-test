@@ -42,7 +42,7 @@ entity tb_cnn_accel_bias_requant is
     -- full-throughput test, nonzero otherwise): one input, one output
     -- here, so a simple in/out pair rather than tb_cnn_accel_pool.vhd's
     -- three-link split.
-    stall_probability_percent_in  : natural := 20;
+    stall_probability_percent_in : natural := 20;
     stall_probability_percent_out : natural := 20;
     -- Output-channel parallelism (lane count). Swept per test in
     -- module_cnn_accel.py's setup_vunit method -- default is a directed
@@ -53,8 +53,8 @@ entity tb_cnn_accel_bias_requant is
     -- g_accum_width*g_pe_rows<=128 ceiling, so full_throughput/
     -- backpressure are additionally run at g_pe_rows=8 -- the width the
     -- rest of the design actually uses.
-    g_pe_rows                     : positive := 4;
-    runner_cfg                    : string);
+    g_pe_rows : positive := 4;
+    runner_cfg : string);
 end entity tb_cnn_accel_bias_requant;
 
 architecture tb of tb_cnn_accel_bias_requant is
@@ -244,17 +244,17 @@ architecture tb of tb_cnn_accel_bias_requant is
   -- D2, single overflow semantic across both paths, matching the golden
   -- model's fix #1). ISA v1.1 (H1) fields default to the v1.0 behaviour.
   function ref_bias_requantize_relu (
-    accum         : signed;
-    bias          : signed;
-    bias_en       : std_ulogic;
-    requant_en    : std_ulogic;
-    relu_en       : std_ulogic;
+    accum : signed;
+    bias : signed;
+    bias_en : std_ulogic;
+    requant_en : std_ulogic;
+    relu_en : std_ulogic;
     requant_scale : signed(31 downto 0);
     requant_shift : natural;
     output_offset : integer := 0;
-    clamp_en      : std_ulogic := '0';
-    clamp_min     : integer := -128;
-    clamp_max     : integer := 127
+    clamp_en : std_ulogic := '0';
+    clamp_min : integer := -128;
+    clamp_max : integer := 127
   ) return signed is
 
     constant sum_width : positive := accum'length + 1;
@@ -397,35 +397,35 @@ begin
   ------------------------------------------------------------------------
   dut : entity cnn_accel.cnn_accel_bias_requant
     generic map (
-      g_accum_width       => c_accum_width,
-      g_pe_rows           => c_pe_rows,
-      g_bias_addr_width   => c_bias_addr_width,
+      g_accum_width => c_accum_width,
+      g_pe_rows => c_pe_rows,
+      g_bias_addr_width => c_bias_addr_width,
       g_max_requant_shift => c_max_requant_shift
     )
     port map (
-      clk                => clk,
-      reset              => reset,
+      clk => clk,
+      reset => reset,
 
-      cfg_bias_en        => cfg_bias_en,
-      cfg_requant_en     => cfg_requant_en,
-      cfg_relu_en        => cfg_relu_en,
-      cfg_requant_scale  => cfg_requant_scale,
-      cfg_requant_shift  => cfg_requant_shift,
-      cfg_output_offset  => cfg_output_offset,
-      cfg_clamp_en       => cfg_clamp_en,
-      cfg_clamp_min      => cfg_clamp_min,
-      cfg_clamp_max      => cfg_clamp_max,
+      cfg_bias_en => cfg_bias_en,
+      cfg_requant_en => cfg_requant_en,
+      cfg_relu_en => cfg_relu_en,
+      cfg_requant_scale => cfg_requant_scale,
+      cfg_requant_shift => cfg_requant_shift,
+      cfg_output_offset => cfg_output_offset,
+      cfg_clamp_en => cfg_clamp_en,
+      cfg_clamp_min => cfg_clamp_min,
+      cfg_clamp_max => cfg_clamp_max,
       cfg_per_channel_en => cfg_per_channel_en,
 
-      bias_rd_addr       => bias_rd_addr,
-      bias_rd_data       => bias_rd_data,
-      scale_rd_data      => scale_rd_data,
+      bias_rd_addr => bias_rd_addr,
+      bias_rd_data => bias_rd_data,
+      scale_rd_data => scale_rd_data,
 
-      s_accum_m2s        => s_accum_m2s,
-      s_accum_s2m        => s_accum_s2m,
+      s_accum_m2s => s_accum_m2s,
+      s_accum_s2m => s_accum_s2m,
 
-      m_out_m2s          => m_out_m2s,
-      m_out_s2m          => m_out_s2m
+      m_out_m2s => m_out_m2s,
+      m_out_s2m => m_out_s2m
     );
 
   ------------------------------------------------------------------------
@@ -515,13 +515,13 @@ begin
     -- scoreboard queue.
     procedure send_beat (
       accum_vals : accum_arr_t;
-      bias_vals  : accum_arr_t;
-      bias_en    : std_ulogic;
+      bias_vals : accum_arr_t;
+      bias_en : std_ulogic;
       requant_en : std_ulogic;
-      relu_en    : std_ulogic;
-      scale      : signed(31 downto 0);
-      shift      : natural;
-      beat_last  : std_ulogic
+      relu_en : std_ulogic;
+      scale : signed(31 downto 0);
+      shift : natural;
+      beat_last : std_ulogic
     ) is
 
       variable results : result_arr_t;
@@ -598,13 +598,13 @@ begin
     -- Convenience: same directed value on every lane (mirrors
     -- tb_cnn_accel_pool.vhd's run_directed_extremes idiom).
     procedure send_directed (
-      accum_val  : integer;
-      bias_val   : integer;
-      bias_en    : std_ulogic;
+      accum_val : integer;
+      bias_val : integer;
+      bias_en : std_ulogic;
       requant_en : std_ulogic;
-      relu_en    : std_ulogic;
-      scale      : signed(31 downto 0);
-      shift      : natural
+      relu_en : std_ulogic;
+      scale : signed(31 downto 0);
+      shift : natural
     ) is
 
       variable accum_vals, bias_vals : accum_arr_t;

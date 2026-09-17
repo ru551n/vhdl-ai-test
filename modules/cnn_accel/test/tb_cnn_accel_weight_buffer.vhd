@@ -102,10 +102,10 @@ architecture tb of tb_cnn_accel_weight_buffer is
   ------------------------------------------------------------------------
 
   procedure push_fill_beat (
-    signal clk_i : in  std_ulogic;
-    signal m2s   : out axi_stream_m2s_t;
-    signal s2m   : in  axi_stream_s2m_t;
-    data_value   : in  std_ulogic_vector
+    signal clk_i : in std_ulogic;
+    signal m2s : out axi_stream_m2s_t;
+    signal s2m : in axi_stream_s2m_t;
+    data_value : in std_ulogic_vector
   ) is
   begin
 
@@ -117,11 +117,11 @@ architecture tb of tb_cnn_accel_weight_buffer is
   end procedure;
 
   procedure push_weight_row (
-    signal clk_i : in  std_ulogic;
-    signal m2s   : out axi_stream_m2s_t;
-    signal s2m   : in  axi_stream_s2m_t;
-    row          : in  natural;
-    salt         : in  natural
+    signal clk_i : in std_ulogic;
+    signal m2s : out axi_stream_m2s_t;
+    signal s2m : in axi_stream_s2m_t;
+    row : in natural;
+    salt : in natural
   ) is
   begin
 
@@ -133,11 +133,11 @@ architecture tb of tb_cnn_accel_weight_buffer is
   end procedure;
 
   procedure push_bias_row (
-    signal clk_i : in  std_ulogic;
-    signal m2s   : out axi_stream_m2s_t;
-    signal s2m   : in  axi_stream_s2m_t;
-    row          : in  natural;
-    salt         : in  natural
+    signal clk_i : in std_ulogic;
+    signal m2s : out axi_stream_m2s_t;
+    signal s2m : in axi_stream_s2m_t;
+    row : in natural;
+    salt : in natural
   ) is
   begin
 
@@ -173,23 +173,23 @@ begin
   dut : entity cnn_accel.cnn_accel_weight_buffer
     generic map (
       g_weight_buffer_depth => c_depth,
-      g_bias_buffer_depth   => c_bias_depth,
-      g_pe_rows             => c_pe_rows,
-      g_pe_cols             => c_pe_cols,
-      g_accum_width         => c_accum_width,
-      g_fill_fifo_depth     => 0
+      g_bias_buffer_depth => c_bias_depth,
+      g_pe_rows => c_pe_rows,
+      g_pe_cols => c_pe_cols,
+      g_accum_width => c_accum_width,
+      g_fill_fifo_depth => 0
     )
     port map (
-      clk            => clk,
-      reset          => reset,
-      s_stream_m2s   => s_stream_m2s,
-      s_stream_s2m   => s_stream_s2m,
-      fill_start     => fill_start,
-      fill_is_bias   => fill_is_bias,
+      clk => clk,
+      reset => reset,
+      s_stream_m2s => s_stream_m2s,
+      s_stream_s2m => s_stream_s2m,
+      fill_start => fill_start,
+      fill_is_bias => fill_is_bias,
       weight_rd_addr => weight_rd_addr,
       weight_rd_data => weight_rd_data,
-      bias_rd_addr   => bias_rd_addr,
-      bias_rd_data   => bias_rd_data
+      bias_rd_addr => bias_rd_addr,
+      bias_rd_data => bias_rd_data
     );
 
   ------------------------------------------------------------------------

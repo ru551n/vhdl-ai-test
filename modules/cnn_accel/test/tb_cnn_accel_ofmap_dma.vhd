@@ -106,10 +106,10 @@ architecture tb of tb_cnn_accel_ofmap_dma is
   ------------------------------------------------------------------------
 
   procedure push_stream_beat (
-    signal clk_i : in  std_ulogic;
-    signal m2s   : out axi_stream_m2s_t;
-    signal s2m   : in  axi_stream_s2m_t;
-    data_value   : in  unsigned
+    signal clk_i : in std_ulogic;
+    signal m2s : out axi_stream_m2s_t;
+    signal s2m : in axi_stream_s2m_t;
+    data_value : in unsigned
   ) is
   begin
 
@@ -130,23 +130,23 @@ begin
       g_axi_data_width => c_axi_data_width
     )
     port map (
-      clk          => clk,
-      reset        => reset,
+      clk => clk,
+      reset => reset,
       --
-      req_m2s      => req_m2s,
-      req_s2m      => req_s2m,
-      dma_done     => dma_done,
-      resp_error   => resp_error,
+      req_m2s => req_m2s,
+      req_s2m => req_s2m,
+      dma_done => dma_done,
+      resp_error => resp_error,
       --
       s_stream_m2s => s_stream_m2s,
       s_stream_s2m => s_stream_s2m,
       --
       m_axi_aw_m2s => m_axi_aw_m2s,
       m_axi_aw_s2m => m_axi_aw_s2m,
-      m_axi_w_m2s  => m_axi_w_m2s,
-      m_axi_w_s2m  => m_axi_w_s2m,
-      m_axi_b_m2s  => m_axi_b_m2s,
-      m_axi_b_s2m  => m_axi_b_s2m
+      m_axi_w_m2s => m_axi_w_m2s,
+      m_axi_w_s2m => m_axi_w_s2m,
+      m_axi_b_m2s => m_axi_b_m2s,
+      m_axi_b_s2m => m_axi_b_s2m
     );
 
   ------------------------------------------------------------------------
@@ -158,13 +158,13 @@ begin
 
   axi_write_slave_inst : entity bfm.axi_write_slave
     generic map (
-      axi_slave     => axi_slave,
-      data_width    => c_axi_data_width,
-      id_width      => 0,
+      axi_slave => axi_slave,
+      data_width => c_axi_data_width,
+      id_width => 0,
       address_width => c_axi_addr_width
     )
     port map (
-      clk           => clk,
+      clk => clk,
       --
       axi_write_m2s => axi_write_m2s,
       axi_write_s2m => axi_write_s2m_bfm
@@ -234,8 +234,8 @@ begin
       for i in 0 to num_beats - 1 loop
 
         set_expected_word(
-          memory   => memory,
-          address  => base_addr + i * c_bytes_per_beat,
+          memory => memory,
+          address => base_addr + i * c_bytes_per_beat,
           expected => std_ulogic_vector(to_unsigned(salt + i, c_axi_data_width))
         );
       end loop;

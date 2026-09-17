@@ -93,9 +93,9 @@ library math;
 -- contending with the other channel for the same bank.
 entity cnn_accel_tensor_mem is
   generic (
-    g_num_banks                : positive := 2;
-    g_bank_words               : positive := 1024;
-    g_data_width               : positive := 64;
+    g_num_banks : positive := 2;
+    g_bank_words : positive := 1024;
+    g_data_width : positive := 64;
     -- Simulation-only severity for the two "this request is impossible"
     -- caller-bug assertions: a bank-crossing request and an
     -- out-of-range bank index (see the header comment). 'failure' in
@@ -111,40 +111,40 @@ entity cnn_accel_tensor_mem is
     -- may lower it.
     g_illegal_request_severity : severity_level := failure);
   port (
-    clk        : in  std_ulogic;
-    reset      : in  std_ulogic := '0';
+    clk : in std_ulogic;
+    reset : in std_ulogic := '0';
 
     --# {{}}
     -- Write channel 0.
-    w0_req_m2s : in  dma_req_m2s_t;
+    w0_req_m2s : in dma_req_m2s_t;
     w0_req_s2m : out dma_req_s2m_t;
-    s_w0_m2s   : in  axi_stream_m2s_t;
-    s_w0_s2m   : out axi_stream_s2m_t;
-    w0_done    : out std_ulogic := '0';
+    s_w0_m2s : in axi_stream_m2s_t;
+    s_w0_s2m : out axi_stream_s2m_t;
+    w0_done : out std_ulogic := '0';
 
     --# {{}}
     -- Write channel 1.
-    w1_req_m2s : in  dma_req_m2s_t;
+    w1_req_m2s : in dma_req_m2s_t;
     w1_req_s2m : out dma_req_s2m_t;
-    s_w1_m2s   : in  axi_stream_m2s_t;
-    s_w1_s2m   : out axi_stream_s2m_t;
-    w1_done    : out std_ulogic := '0';
+    s_w1_m2s : in axi_stream_m2s_t;
+    s_w1_s2m : out axi_stream_s2m_t;
+    w1_done : out std_ulogic := '0';
 
     --# {{}}
     -- Read channel 0.
-    r0_req_m2s : in  dma_req_m2s_t;
+    r0_req_m2s : in dma_req_m2s_t;
     r0_req_s2m : out dma_req_s2m_t;
-    m_r0_m2s   : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_r0_s2m   : in  axi_stream_s2m_t;
-    r0_done    : out std_ulogic := '0';
+    m_r0_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_r0_s2m : in axi_stream_s2m_t;
+    r0_done : out std_ulogic := '0';
 
     --# {{}}
     -- Read channel 1.
-    r1_req_m2s : in  dma_req_m2s_t;
+    r1_req_m2s : in dma_req_m2s_t;
     r1_req_s2m : out dma_req_s2m_t;
-    m_r1_m2s   : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_r1_s2m   : in  axi_stream_s2m_t;
-    r1_done    : out std_ulogic := '0'
+    m_r1_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_r1_s2m : in axi_stream_s2m_t;
+    r1_done : out std_ulogic := '0'
   );
 end entity cnn_accel_tensor_mem;
 

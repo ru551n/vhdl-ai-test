@@ -9,22 +9,22 @@
 # Used by vsg-rs (and VSG):  vsg-rs -c vsg.yaml --recursive modules   (add --fix to format)
 rule:
   # ---------------------------------------------------------------------------------------------
-  # Alignment
+  # Alignment: none (this repository's choice; VUnit itself aligns only some lists)
   # ---------------------------------------------------------------------------------------------
   group:
-    # VUnit does not align the ":" and ":=" of consecutive declarations, the "<=" of
-    # consecutive assignments, or trailing comments in columns; alignment rules would reflow
-    # most declarative regions.
+    # Turns off every vertical alignment: `:` and `:=` of consecutive declarations, `<=` of
+    # consecutive assignments, trailing comments, `:` in generic, port and parameter lists
+    # (entity_017, component_017, procedure_410) and `=>` in maps (instantiation_010).
     alignment:
       disable: true
 
   # ---------------------------------------------------------------------------------------------
   # Options that differ from VSG's defaults
   # ---------------------------------------------------------------------------------------------
-  # Port modes are padded to the width of "out", not of "inout": `in  std_logic`,
-  # `out std_logic` (VSG pads to `in    `, `out   `).
+  # One space after port modes, so that the types do not form a column: `in std_logic`,
+  # `out std_logic` (VSG pads to `in    `, `out   `; VUnit pads to the width of `out`).
   port_007:
-    spaces_after: 2
+    spaces_after: 1
   port_008:
     spaces_after: 1
   port_009:

@@ -57,28 +57,28 @@ entity cnn_accel_weight_buffer is
     -- Rows in the (separate, much shallower) bias region -- independent of
     -- 'g_weight_buffer_depth' so it can fall out of block RAM into
     -- LUTRAM/registers (see proposal doc section 3.2).
-    g_bias_buffer_depth   : positive := 8;
+    g_bias_buffer_depth : positive := 8;
     -- Output-channel parallelism: rows per read tile, and bias lanes per
     -- read tile.
-    g_pe_rows             : positive;
+    g_pe_rows : positive;
     -- Input-channel/MAC parallelism: weight lanes per read tile, together
     -- with 'g_pe_rows'.
-    g_pe_cols             : positive;
+    g_pe_cols : positive;
     -- Bit width of one bias lane (int32 accumulator width elsewhere in
     -- this IP). Added by vhdesign to give 'bias_rd_data' a well-typed
     -- width -- see proposal doc section 3.1.
-    g_accum_width         : positive := 32;
+    g_accum_width : positive := 32;
     -- Depth of the shallow prefetch FIFO placed on the fill stream, ahead
     -- of the row-assembly/write logic, to absorb DDR4/DMA burst latency.
     -- '0' means no FIFO is instantiated at all (the fill stream connects
     -- straight through, exactly the old single-bank timing). Reuses
     -- hdl-modules' 'fifo.fifo' (shared/ReusableRTL.md) -- must be a power
     -- of two whenever nonzero (that entity's own constraint).
-    g_fill_fifo_depth     : natural := 32);
+    g_fill_fifo_depth : natural := 32);
   port (
-    clk            : in  std_ulogic;
+    clk : in std_ulogic;
     -- Synchronous active-high reset ('reset_internal' at the IP top level).
-    reset          : in  std_ulogic := '0';
+    reset : in std_ulogic := '0';
     --# {{}}
     -- AXI4-Stream fill port, from the weight/bias 'cnn_accel_axi_read_dma'
     -- instance (optionally through the internal prefetch FIFO). One
@@ -86,8 +86,8 @@ entity cnn_accel_weight_buffer is
     -- 'data(7 downto 0)', or one bias lane on
     -- 'data(g_accum_width - 1 downto 0)') into the region selected by
     -- 'fill_is_bias'. 'last'/'user' are not used.
-    s_stream_m2s   : in  axi_stream_m2s_t;
-    s_stream_s2m   : out axi_stream_s2m_t;
+    s_stream_m2s : in axi_stream_m2s_t;
+    s_stream_s2m : out axi_stream_s2m_t;
     --# {{}}
     -- Pulse: starts a new fill session -- resets the weight and bias
     -- write row pointers/lane indices/row-assembly registers to 0. Must be
@@ -95,23 +95,23 @@ entity cnn_accel_weight_buffer is
     -- set (replaces the old 'fill_bank_sel'-edge-triggered "new fill
     -- session" detector -- see proposal doc section 3.4). A beat presented
     -- on the same cycle as 'fill_start' is not accepted.
-    fill_start     : in  std_ulogic := '0';
+    fill_start : in std_ulogic := '0';
     -- '0' routes fill beats to the weight region, '1' to the bias region
     -- (unless 'fill_is_scale' is '1').
-    fill_is_bias   : in  std_ulogic;
+    fill_is_bias : in std_ulogic;
     -- '1' routes fill beats to the per-channel scale region (ISA v1.2),
     -- overriding 'fill_is_bias'. One 'c_scale_entry_width'-bit lane
     -- ('data(c_scale_entry_width - 1 downto 0)') per accepted beat.
-    fill_is_scale  : in  std_ulogic := '0';
+    fill_is_scale : in std_ulogic := '0';
     --# {{}}
     -- Row (tile) address into the weight region.
-    weight_rd_addr : in  std_ulogic_vector(num_bits_needed(g_weight_buffer_depth - 1) - 1 downto 0);
+    weight_rd_addr : in std_ulogic_vector(num_bits_needed(g_weight_buffer_depth - 1) - 1 downto 0);
     -- Clock enable for the WEIGHT region's two-stage read pipeline (and
     -- only that -- the bias/scale reads are unaffected). '0' freezes both
     -- stages, so 'weight_rd_data' is bit-identical on a frozen cycle and
     -- the reader's own frozen pipeline stays paired with it. Defaults to
     -- '1', i.e. the always-on read this port used to be.
-    weight_rd_en   : in  std_ulogic := '1';
+    weight_rd_en : in std_ulogic := '1';
     -- One int8 weight per active PE ('g_pe_rows*g_pe_cols' lanes),
     -- registered, **2 cycle** read latency (see the block-RAM output
     -- register note on the read process below), advanced only on cycles
@@ -120,15 +120,15 @@ entity cnn_accel_weight_buffer is
     weight_rd_data : out std_ulogic_vector(8 * g_pe_rows * g_pe_cols - 1 downto 0);
     --# {{}}
     -- Row (tile) address into the bias region.
-    bias_rd_addr   : in  std_ulogic_vector(num_bits_needed(g_bias_buffer_depth - 1) - 1 downto 0);
+    bias_rd_addr : in std_ulogic_vector(num_bits_needed(g_bias_buffer_depth - 1) - 1 downto 0);
     -- One int32 (g_accum_width-bit) bias per output channel lane
     -- ('g_pe_rows' lanes), registered, 1 cycle read latency.
-    bias_rd_data   : out std_ulogic_vector(g_accum_width * g_pe_rows - 1 downto 0);
+    bias_rd_data : out std_ulogic_vector(g_accum_width * g_pe_rows - 1 downto 0);
     -- One per-channel requant table entry (multiplier + shift, see
     -- cnn_accel_pkg's 'c_scale_entry_width' comment) per output channel
     -- lane of the row addressed by 'bias_rd_addr', registered, 1 cycle
     -- read latency -- same timing as 'bias_rd_data'.
-    scale_rd_data  : out std_ulogic_vector(c_scale_entry_width * g_pe_rows - 1 downto 0)
+    scale_rd_data : out std_ulogic_vector(c_scale_entry_width * g_pe_rows - 1 downto 0)
   );
 end entity cnn_accel_weight_buffer;
 
@@ -290,7 +290,7 @@ begin
 
     fill_fifo_inst : entity fifo.fifo
       generic map (
-        width                  => c_fifo_width,
+        width => c_fifo_width,
         -- '+ 1' because of 'enable_output_register' below: 'fifo.fifo'
         -- takes one word of 'depth' for the output register itself
         -- ('memory_depth := depth - 1') and then asserts that what is left
@@ -300,7 +300,7 @@ begin
         -- FIFO's usable capacity is one word MORE than before (the word
         -- sitting in the output register), never less -- so no fill
         -- sequence that fitted before can fail to fit now.
-        depth                  => g_fill_fifo_depth + 1,
+        depth => g_fill_fifo_depth + 1,
         -- Block-RAM OUTPUT REGISTER on the prefetch FIFO (shared/
         -- TimingAndResources.md, "Memories and lookup": use the block
         -- RAM's output register; never put logic between a RAM's data
@@ -327,13 +327,13 @@ begin
         enable_output_register => true
       )
       port map (
-        clk         => clk,
+        clk => clk,
         write_ready => fifo_write_ready,
         write_valid => fifo_write_valid,
-        write_data  => fifo_write_data,
-        read_ready  => fifo_read_ready,
-        read_valid  => fifo_read_valid,
-        read_data   => fifo_read_data
+        write_data => fifo_write_data,
+        read_ready => fifo_read_ready,
+        read_valid => fifo_read_valid,
+        read_data => fifo_read_data
       );
 
   end generate fill_fifo_gen;

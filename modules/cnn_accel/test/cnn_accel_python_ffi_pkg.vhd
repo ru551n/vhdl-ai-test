@@ -40,11 +40,11 @@ package cnn_accel_python_ffi_pkg is
   -- top_level_bridge.py), where one Python function alone cannot name
   -- which region's bytes to return.
   procedure ffi_write_indexed_bytes (
-    memory        : memory_t;
+    memory : memory_t;
     function_name : string;
-    index         : natural;
-    base_addr     : natural;
-    num_bytes     : natural
+    index : natural;
+    base_addr : natural;
+    num_bytes : natural
   );
 
 end package;
@@ -80,7 +80,7 @@ package body cnn_accel_python_ffi_pkg is
   end procedure;
 
   impure function ffi_export_bytes (
-    memory    : memory_t;
+    memory : memory_t;
     base_addr : natural;
     num_bytes : natural
   ) return integer_array_t is
@@ -98,11 +98,11 @@ package body cnn_accel_python_ffi_pkg is
   end function;
 
   procedure ffi_write_indexed_bytes (
-    memory        : memory_t;
+    memory : memory_t;
     function_name : string;
-    index         : natural;
-    base_addr     : natural;
-    num_bytes     : natural
+    index : natural;
+    base_addr : natural;
+    num_bytes : natural
   ) is
 
     variable data : integer_array_t;

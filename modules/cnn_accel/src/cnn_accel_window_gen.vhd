@@ -67,7 +67,7 @@ entity cnn_accel_window_gen is
     -- Upper bound on 'cfg_kernel_h'/'cfg_kernel_w'; sizes the row-bank
     -- count (below) and the window's tap grid. Contract:
     -- 'g_max_kernel_size >= 2' (asserted below).
-    g_max_kernel_size    : positive;
+    g_max_kernel_size : positive;
     -- Upper bound on 'cfg_in_width * ceil(cfg_in_channels / g_tile_channels)'
     -- ("row-tile-word count"); sizes each row bank's depth (BRAM-inference
     -- intent). Bounding the *product* (rather than sizing width and
@@ -81,7 +81,7 @@ entity cnn_accel_window_gen is
     -- one tile's channels must fit in 's_stream_m2s.data''s low bytes.
     -- 'cfg_in_channels' need not be a multiple of this -- see the
     -- entity-level comment on channel tiling / D11 zero-padding.
-    g_tile_channels      : positive;
+    g_tile_channels : positive;
     -- Number of tap-assembly buffers a window can be built into ("N"
     -- below). 1 is the historical single-buffered behaviour; >= 2 lets
     -- the next window's column walk overlap the current window's
@@ -97,21 +97,21 @@ entity cnn_accel_window_gen is
     -- width. That is why this is a generic and not a constant: the CONV
     -- instance is throughput-critical and pays it, the POOL instance
     -- (K = 5, so 200 bytes per buffer) is not and does not.
-    g_assembly_buffers   : positive := 1);
+    g_assembly_buffers : positive := 1);
   port (
-    clk             : in  std_ulogic;
+    clk : in std_ulogic;
     -- Synchronous active-high reset ('reset_internal' at the IP top level).
-    reset           : in  std_ulogic := '0';
+    reset : in std_ulogic := '0';
     --# {{}}
     -- Kernel/stride/padding/frame-size configuration, latched at 'start'.
-    cfg_kernel_h    : in  std_ulogic_vector(7 downto 0);
-    cfg_kernel_w    : in  std_ulogic_vector(7 downto 0);
-    cfg_stride_h    : in  std_ulogic_vector(7 downto 0);
-    cfg_stride_w    : in  std_ulogic_vector(7 downto 0);
-    cfg_pad_top     : in  std_ulogic_vector(7 downto 0);
-    cfg_pad_bottom  : in  std_ulogic_vector(7 downto 0);
-    cfg_pad_left    : in  std_ulogic_vector(7 downto 0);
-    cfg_pad_right   : in  std_ulogic_vector(7 downto 0);
+    cfg_kernel_h : in std_ulogic_vector(7 downto 0);
+    cfg_kernel_w : in std_ulogic_vector(7 downto 0);
+    cfg_stride_h : in std_ulogic_vector(7 downto 0);
+    cfg_stride_w : in std_ulogic_vector(7 downto 0);
+    cfg_pad_top : in std_ulogic_vector(7 downto 0);
+    cfg_pad_bottom : in std_ulogic_vector(7 downto 0);
+    cfg_pad_left : in std_ulogic_vector(7 downto 0);
+    cfg_pad_right : in std_ulogic_vector(7 downto 0);
     -- ISA v2.1: the signed int8 value every PADDED tap of the window
     -- takes -- the input tensor's quantization zero-point, not
     -- necessarily 0. Defaults to zero, which is the pre-v2.1
@@ -121,10 +121,10 @@ entity cnn_accel_window_gen is
     -- where it lands: an all-'pad value' clear at the start of every
     -- column walk, so a tap that is never written (out of frame, or
     -- beyond the runtime kernel size) reads back as padding.
-    cfg_pad_value   : in  std_ulogic_vector(7 downto 0) := (others => '0');
-    cfg_in_width    : in  std_ulogic_vector(15 downto 0);
-    cfg_in_height   : in  std_ulogic_vector(15 downto 0);
-    cfg_in_channels : in  std_ulogic_vector(15 downto 0);
+    cfg_pad_value : in std_ulogic_vector(7 downto 0) := (others => '0');
+    cfg_in_width : in std_ulogic_vector(15 downto 0);
+    cfg_in_height : in std_ulogic_vector(15 downto 0);
+    cfg_in_channels : in std_ulogic_vector(15 downto 0);
     -- Output frame dimensions for the command being started, i.e. exactly
     -- '(in_dim + pad_lo + pad_hi - kernel) / stride + 1' in each axis.
     --
@@ -142,23 +142,23 @@ entity cnn_accel_window_gen is
     -- Contract: stable and correct for the command's geometry whenever
     -- 'start' is asserted. Both are '>= 1' for any geometry
     -- 'cnn_accel_cmd_proc' does not reject.
-    cfg_out_width   : in  std_ulogic_vector(15 downto 0);
-    cfg_out_height  : in  std_ulogic_vector(15 downto 0);
+    cfg_out_width : in std_ulogic_vector(15 downto 0);
+    cfg_out_height : in std_ulogic_vector(15 downto 0);
     --# {{}}
     -- Pulse, from cnn_accel_layer_ctrl: latches the 'cfg_*' ports above and
     -- resets row/column counters and line-buffer pointers for a new frame.
-    start           : in  std_ulogic;
+    start : in std_ulogic;
     -- Pulse: the final tile beat of the final window of the frame has
     -- been accepted (m_window_s2m.ready = '1' the same cycle).
-    done            : out std_ulogic;
+    done : out std_ulogic;
     --# {{}}
     -- Raster-order int8 input pixels, from the ifmap
     -- cnn_accel_axi_read_dma. One accepted beat writes one channel-tile
     -- of one column; 'data' low '8 * g_tile_channels' bits hold that
     -- tile's channels (remaining high bits, if any, are ignored) -- see
     -- the entity-level comment on channel tiling.
-    s_stream_m2s    : in  axi_stream_m2s_t;
-    s_stream_s2m    : out axi_stream_s2m_t;
+    s_stream_m2s : in axi_stream_m2s_t;
+    s_stream_s2m : out axi_stream_s2m_t;
     --# {{}}
     -- One K_h x K_w x g_tile_channels window per beat, 'T' consecutive
     -- beats per output pixel (one per input-channel tile). 'data' low
@@ -170,8 +170,8 @@ entity cnn_accel_window_gen is
     -- (D11), not garbage. 'first_tile'/'last_tile' mark the first/last
     -- tile of the current output pixel (both '1' when 'T = 1'). 'last' is
     -- '1' only for the final tile beat of the final window of the frame.
-    m_window_m2s    : out window_m2s_t(data(0 to window_data_length(g_max_kernel_size, g_tile_channels) - 1));
-    m_window_s2m    : in  window_s2m_t
+    m_window_m2s : out window_m2s_t(data(0 to window_data_length(g_max_kernel_size, g_tile_channels) - 1));
+    m_window_s2m : in window_s2m_t
   );
 end entity cnn_accel_window_gen;
 

@@ -55,23 +55,23 @@ entity cnn_accel_ofmap_dma is
     g_axi_addr_width : positive;
     g_axi_data_width : positive);
   port (
-    clk          : in  std_ulogic;
-    reset        : in  std_ulogic := '0';
+    clk : in std_ulogic;
+    reset : in std_ulogic := '0';
     --# {{}}
-    req_m2s      : in  dma_req_m2s_t;
-    req_s2m      : out dma_req_s2m_t;
-    dma_done     : out std_ulogic := '0';
-    resp_error   : out std_ulogic := '0';
+    req_m2s : in dma_req_m2s_t;
+    req_s2m : out dma_req_s2m_t;
+    dma_done : out std_ulogic := '0';
+    resp_error : out std_ulogic := '0';
     --# {{}}
-    s_stream_m2s : in  axi_stream_m2s_t;
+    s_stream_m2s : in axi_stream_m2s_t;
     s_stream_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
     --# {{}}
     m_axi_aw_m2s : out axi_m2s_a_t := axi_m2s_a_init;
-    m_axi_aw_s2m : in  axi_s2m_a_t;
-    m_axi_w_m2s  : out axi_m2s_w_t := axi_m2s_w_init;
-    m_axi_w_s2m  : in  axi_s2m_w_t;
-    m_axi_b_m2s  : out axi_m2s_b_t := axi_m2s_b_init;
-    m_axi_b_s2m  : in  axi_s2m_b_t
+    m_axi_aw_s2m : in axi_s2m_a_t;
+    m_axi_w_m2s : out axi_m2s_w_t := axi_m2s_w_init;
+    m_axi_w_s2m : in axi_s2m_w_t;
+    m_axi_b_m2s : out axi_m2s_b_t := axi_m2s_b_init;
+    m_axi_b_s2m : in axi_s2m_b_t
   );
 end entity;
 
@@ -347,24 +347,24 @@ begin
   ------------------------------------------------------------------------------
   dma_axi_write_simple_inst : entity dma_axi_write_simple.dma_axi_write_simple
     generic map (
-      address_width              => g_axi_addr_width,
-      stream_data_width          => g_axi_data_width,
-      axi_data_width             => g_axi_data_width,
-      packet_length_beats        => 1,
-      enable_axi3                => false,
+      address_width => g_axi_addr_width,
+      stream_data_width => g_axi_data_width,
+      axi_data_width => g_axi_data_width,
+      packet_length_beats => 1,
+      enable_axi3 => false,
       write_done_aggregate_count => 1,
       write_done_aggregate_ticks => 1
     )
     port map (
-      clk           => clk,
+      clk => clk,
       --
-      stream_ready  => stream_ready_i,
-      stream_valid  => s_stream_m2s.valid,
-      stream_data   => stream_data_i,
+      stream_ready => stream_ready_i,
+      stream_valid => s_stream_m2s.valid,
+      stream_data => stream_data_i,
       --
-      regs_up       => regs_up,
-      regs_down     => regs_down,
-      interrupt     => interrupt,
+      regs_up => regs_up,
+      regs_down => regs_down,
+      interrupt => interrupt,
       --
       axi_write_m2s => axi_write_m2s,
       axi_write_s2m => axi_write_s2m

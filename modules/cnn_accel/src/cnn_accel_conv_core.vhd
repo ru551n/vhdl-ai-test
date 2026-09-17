@@ -105,23 +105,23 @@ entity cnn_accel_conv_core is
   generic (
     -- Output-channel parallelism (cnn_accel_pe_array/cnn_accel_
     -- weight_buffer/cnn_accel_bias_requant's own 'g_pe_rows').
-    g_pe_rows             : positive;
+    g_pe_rows : positive;
     -- Input-channel/MAC parallelism per cycle (cnn_accel_pe_array/
     -- cnn_accel_weight_buffer's own 'g_pe_cols').
-    g_pe_cols             : positive;
+    g_pe_cols : positive;
     -- Accumulator width (int32 default).
-    g_accum_width         : positive := 32;
+    g_accum_width : positive := 32;
     -- Upper bound on 'cfg_kernel_h'/'cfg_kernel_w' (cnn_accel_window_gen/
     -- cnn_accel_pe_array's own 'g_max_kernel_size').
-    g_max_kernel_size     : positive;
+    g_max_kernel_size : positive;
     -- Input channels processed in parallel per beat/tile ("Ct")
     -- (cnn_accel_window_gen/cnn_accel_pe_array's own 'g_tile_channels').
     -- Recommended equal to 'g_pe_cols' -- see the elaboration-time assert
     -- below.
-    g_tile_channels       : positive;
+    g_tile_channels : positive;
     -- Upper bound on 'cfg_in_width * ceil(cfg_in_channels/g_tile_channels)'
     -- (cnn_accel_window_gen's own 'g_max_row_tile_words').
-    g_max_row_tile_words  : positive;
+    g_max_row_tile_words : positive;
     -- Rows per cnn_accel_weight_buffer weight region (cnn_accel_weight_
     -- buffer/cnn_accel_pe_array's own 'g_weight_buffer_depth'). Must cover
     -- the whole layer's rows ('T * groups_per_tile'), per
@@ -132,28 +132,28 @@ entity cnn_accel_conv_core is
     -- region -- cnn_accel_weight_buffer's own 'g_bias_buffer_depth',
     -- forwarded unmodified so 'bias_rd_addr''s width here matches that
     -- entity's actual bias-region address width by construction.
-    g_bias_buffer_depth   : positive := 8;
+    g_bias_buffer_depth : positive := 8;
     -- Upper bound on the runtime-variable 'cfg_requant_shift'
     -- (cnn_accel_bias_requant's own 'g_max_requant_shift').
-    g_max_requant_shift   : natural := 31);
+    g_max_requant_shift : natural := 31);
   port (
-    clk                : in  std_ulogic;
+    clk : in std_ulogic;
     -- Synchronous active-high reset ('reset_internal' at the IP top level),
     -- fanned out unmodified to every submodule instance.
-    reset              : in  std_ulogic := '0';
+    reset : in std_ulogic := '0';
     --# {{}}
     -- Kernel/stride/padding/frame-size configuration, latched at 'start' by
     -- cnn_accel_window_gen; 'cfg_kernel_h'/'cfg_kernel_w' are also sampled
     -- directly (combinationally, at 's_window' accept time) by
     -- cnn_accel_pe_array -- see that entity's own port comment.
-    cfg_kernel_h       : in  std_ulogic_vector(7 downto 0);
-    cfg_kernel_w       : in  std_ulogic_vector(7 downto 0);
-    cfg_stride_h       : in  std_ulogic_vector(7 downto 0);
-    cfg_stride_w       : in  std_ulogic_vector(7 downto 0);
-    cfg_pad_top        : in  std_ulogic_vector(7 downto 0);
-    cfg_pad_bottom     : in  std_ulogic_vector(7 downto 0);
-    cfg_pad_left       : in  std_ulogic_vector(7 downto 0);
-    cfg_pad_right      : in  std_ulogic_vector(7 downto 0);
+    cfg_kernel_h : in std_ulogic_vector(7 downto 0);
+    cfg_kernel_w : in std_ulogic_vector(7 downto 0);
+    cfg_stride_h : in std_ulogic_vector(7 downto 0);
+    cfg_stride_w : in std_ulogic_vector(7 downto 0);
+    cfg_pad_top : in std_ulogic_vector(7 downto 0);
+    cfg_pad_bottom : in std_ulogic_vector(7 downto 0);
+    cfg_pad_left : in std_ulogic_vector(7 downto 0);
+    cfg_pad_right : in std_ulogic_vector(7 downto 0);
     -- ISA v2.1 'pad_value': the signed int8 value every PADDED tap of the
     -- window takes. For a quantized int8 tensor whose zero-point is not
     -- 0, that value is the ZERO-POINT and not 0 -- a padded tap of 0 is
@@ -163,40 +163,40 @@ entity cnn_accel_conv_core is
     -- so that error lands on every border output of every layer.
     -- Defaults to 0, which is the pre-v2.1 zero-padding exactly, so a
     -- descriptor that never sets the field is bit-identical to before.
-    cfg_pad_value      : in  std_ulogic_vector(7 downto 0) := (others => '0');
-    cfg_in_width       : in  std_ulogic_vector(15 downto 0);
-    cfg_in_height      : in  std_ulogic_vector(15 downto 0);
-    cfg_in_channels    : in  std_ulogic_vector(15 downto 0);
+    cfg_pad_value : in std_ulogic_vector(7 downto 0) := (others => '0');
+    cfg_in_width : in std_ulogic_vector(15 downto 0);
+    cfg_in_height : in std_ulogic_vector(15 downto 0);
+    cfg_in_channels : in std_ulogic_vector(15 downto 0);
     -- Pre-computed output frame dimensions, straight through to
     -- 'cnn_accel_window_gen' -- see that entity's port comment for why
     -- the division that produces them lives in 'cnn_accel_cmd_proc'.
-    cfg_out_width      : in  std_ulogic_vector(15 downto 0);
-    cfg_out_height     : in  std_ulogic_vector(15 downto 0);
+    cfg_out_width : in std_ulogic_vector(15 downto 0);
+    cfg_out_height : in std_ulogic_vector(15 downto 0);
     --# {{}}
     -- Output-quantization configuration for cnn_accel_bias_requant, sampled
     -- combinationally per accepted beat (not latched at 'start' -- see that
     -- entity's own header comment).
-    cfg_bias_en        : in  std_ulogic;
-    cfg_requant_en     : in  std_ulogic;
-    cfg_relu_en        : in  std_ulogic;
-    cfg_requant_scale  : in  std_ulogic_vector(31 downto 0);
-    cfg_requant_shift  : in  std_ulogic_vector(7 downto 0);
+    cfg_bias_en : in std_ulogic;
+    cfg_requant_en : in std_ulogic;
+    cfg_relu_en : in std_ulogic;
+    cfg_requant_scale : in std_ulogic_vector(31 downto 0);
+    cfg_requant_shift : in std_ulogic_vector(7 downto 0);
     -- ISA v1.1 (H1) epilogue fields (instruction word W13 + FLAG_CLAMP_EN);
     -- all-zero reproduces the v1.0 epilogue exactly.
-    cfg_output_offset  : in  std_ulogic_vector(15 downto 0) := (others => '0');
-    cfg_clamp_en       : in  std_ulogic := '0';
-    cfg_clamp_min      : in  std_ulogic_vector(7 downto 0) := (others => '0');
-    cfg_clamp_max      : in  std_ulogic_vector(7 downto 0) := (others => '0');
+    cfg_output_offset : in std_ulogic_vector(15 downto 0) := (others => '0');
+    cfg_clamp_en : in std_ulogic := '0';
+    cfg_clamp_min : in std_ulogic_vector(7 downto 0) := (others => '0');
+    cfg_clamp_max : in std_ulogic_vector(7 downto 0) := (others => '0');
     -- ISA v1.2 (H2) FLAG_PER_CHANNEL_EN: cnn_accel_bias_requant takes each
     -- lane's (multiplier, shift) from cnn_accel_weight_buffer's scale
     -- region (filled through 's_weight' with 'fill_is_scale') instead of
     -- 'cfg_requant_scale'/'cfg_requant_shift'. '0' is the pre-H2 datapath.
-    cfg_per_channel_en : in  std_ulogic := '0';
+    cfg_per_channel_en : in std_ulogic := '0';
     --# {{}}
     -- Pulse: latches the 'cfg_*' ports above and resets cnn_accel_
     -- window_gen's row/column counters and line-buffer pointers for a new
     -- frame (unmodified pass-through of that entity's own 'start' port).
-    start              : in  std_ulogic;
+    start : in std_ulogic;
     -- Pulse: the final requantized output beat of the frame ('m_out_m2s.
     -- last') has been accepted ('m_out_s2m.ready' the same cycle). NOT the
     -- same signal as cnn_accel_window_gen's own internal 'done' (which
@@ -206,13 +206,13 @@ entity cnn_accel_conv_core is
     -- in-flight well after that); window_gen's 'done' is not a port of
     -- this entity for exactly that reason -- it would be misleading at
     -- this boundary.
-    done               : out std_ulogic;
+    done : out std_ulogic;
     --# {{}}
     -- Raster-order int8 input activations, unmodified pass-through of
     -- cnn_accel_window_gen's own 's_stream' port -- see that entity's own
     -- port comment for the exact one-beat-per-'(col,tile)'-cell contract.
-    s_stream_m2s       : in  axi_stream_m2s_t;
-    s_stream_s2m       : out axi_stream_s2m_t;
+    s_stream_m2s : in axi_stream_m2s_t;
+    s_stream_s2m : out axi_stream_s2m_t;
     --# {{}}
     -- Weight/bias preload fill port, unmodified pass-through of
     -- cnn_accel_weight_buffer's own 's_stream'/'fill_start'/
@@ -220,19 +220,19 @@ entity cnn_accel_conv_core is
     -- Exposed so a testbench (this milestone) or a future
     -- cnn_accel_axi_read_dma instance (a later milestone) can preload
     -- weights/biases; no fill sequencer is built here.
-    fill_start         : in  std_ulogic := '0';
-    fill_is_bias       : in  std_ulogic;
+    fill_start : in std_ulogic := '0';
+    fill_is_bias : in std_ulogic;
     -- ISA v1.2 (H2): routes fill beats to the per-channel scale region
     -- (one 8-byte table entry, 'data(39 downto 0)', per beat) -- see
     -- cnn_accel_weight_buffer's own port comment.
-    fill_is_scale      : in  std_ulogic := '0';
-    s_weight_m2s       : in  axi_stream_m2s_t;
-    s_weight_s2m       : out axi_stream_s2m_t;
+    fill_is_scale : in std_ulogic := '0';
+    s_weight_m2s : in axi_stream_m2s_t;
+    s_weight_s2m : out axi_stream_s2m_t;
     --# {{}}
     -- Requantized int8 output activations, unmodified pass-through of
     -- cnn_accel_bias_requant's own 'm_out' port.
-    m_out_m2s          : out axi_stream_m2s_t;
-    m_out_s2m          : in  axi_stream_s2m_t
+    m_out_m2s : out axi_stream_m2s_t;
+    m_out_s2m : in axi_stream_s2m_t
   );
 end entity cnn_accel_conv_core;
 
@@ -322,23 +322,23 @@ begin
   ------------------------------------------------------------------------
   s_stream_pipeline_inst : entity common.handshake_pipeline
     generic map (
-      data_width               => axi_stream_data_sz,
-      full_throughput          => true,
+      data_width => axi_stream_data_sz,
+      full_throughput => true,
       pipeline_control_signals => true,
-      pipeline_data_signals    => true
+      pipeline_data_signals => true
     )
     port map (
-      clk          => clk,
+      clk => clk,
       --
-      input_ready  => s_stream_s2m.ready,
-      input_valid  => s_stream_m2s.valid,
-      input_last   => s_stream_m2s.last,
-      input_data   => s_stream_m2s.data,
+      input_ready => s_stream_s2m.ready,
+      input_valid => s_stream_m2s.valid,
+      input_last => s_stream_m2s.last,
+      input_data => s_stream_m2s.data,
       --
       output_ready => stream_s2m.ready,
       output_valid => stream_m2s.valid,
-      output_last  => stream_m2s.last,
-      output_data  => stream_m2s.data
+      output_last => stream_m2s.last,
+      output_data => stream_m2s.data
     );
 
   -- 'user' is unused on this link (bias_requant/cmd_proc/tensor_mem all
@@ -351,23 +351,23 @@ begin
   ------------------------------------------------------------------------
   m_out_pipeline_inst : entity common.handshake_pipeline
     generic map (
-      data_width               => axi_stream_data_sz,
-      full_throughput          => true,
+      data_width => axi_stream_data_sz,
+      full_throughput => true,
       pipeline_control_signals => true,
-      pipeline_data_signals    => true
+      pipeline_data_signals => true
     )
     port map (
-      clk          => clk,
+      clk => clk,
       --
-      input_ready  => out_s2m.ready,
-      input_valid  => out_m2s.valid,
-      input_last   => out_m2s.last,
-      input_data   => out_m2s.data,
+      input_ready => out_s2m.ready,
+      input_valid => out_m2s.valid,
+      input_last => out_m2s.last,
+      input_data => out_m2s.data,
       --
       output_ready => m_out_s2m.ready,
       output_valid => m_out_m2s_int.valid,
-      output_last  => m_out_m2s_int.last,
-      output_data  => m_out_m2s_int.data
+      output_last => m_out_m2s_int.last,
+      output_data => m_out_m2s_int.data
     );
 
   m_out_m2s_int.user <= (others => '0');
@@ -400,9 +400,9 @@ begin
 
   window_gen_inst : entity cnn_accel.cnn_accel_window_gen
     generic map (
-      g_max_kernel_size    => g_max_kernel_size,
+      g_max_kernel_size => g_max_kernel_size,
       g_max_row_tile_words => g_max_row_tile_words,
-      g_tile_channels      => g_tile_channels,
+      g_tile_channels => g_tile_channels,
       -- The conv path is the throughput-critical window_gen instance, so
       -- it is the one that pays for a pipelined tap assembly: with
       -- 'g_assembly_buffers' windows in flight the generator sustains one
@@ -415,44 +415,44 @@ begin
       -- the single source (same pattern as cnn_accel_v2_pkg's
       -- 'c_isa_version'). The POOL instance in cnn_accel_top deliberately
       -- keeps the entity default of 1 -- see that constant's own comment.
-      g_assembly_buffers   => cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_assembly_buffers
+      g_assembly_buffers => cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_assembly_buffers
     )
     port map (
-      clk             => clk,
-      reset           => reset,
+      clk => clk,
+      reset => reset,
 
-      cfg_kernel_h    => cfg_kernel_h,
-      cfg_kernel_w    => cfg_kernel_w,
-      cfg_stride_h    => cfg_stride_h,
-      cfg_stride_w    => cfg_stride_w,
-      cfg_pad_top     => cfg_pad_top,
-      cfg_pad_bottom  => cfg_pad_bottom,
-      cfg_pad_left    => cfg_pad_left,
-      cfg_pad_right   => cfg_pad_right,
+      cfg_kernel_h => cfg_kernel_h,
+      cfg_kernel_w => cfg_kernel_w,
+      cfg_stride_h => cfg_stride_h,
+      cfg_stride_w => cfg_stride_w,
+      cfg_pad_top => cfg_pad_top,
+      cfg_pad_bottom => cfg_pad_bottom,
+      cfg_pad_left => cfg_pad_left,
+      cfg_pad_right => cfg_pad_right,
       -- ISA v2.1 'pad_value', now honoured by CONV2D too (it reached the
       -- POOL path first, in 4915955, where a zero-filled tap wins every
       -- border max). It was tied to zero here on purpose while that
       -- change was in flight; it is the descriptor's field now, and a
       -- descriptor that leaves it at its 0 default still zero-pads
       -- exactly as before.
-      cfg_pad_value   => cfg_pad_value,
-      cfg_in_width    => cfg_in_width,
-      cfg_in_height   => cfg_in_height,
+      cfg_pad_value => cfg_pad_value,
+      cfg_in_width => cfg_in_width,
+      cfg_in_height => cfg_in_height,
       cfg_in_channels => cfg_in_channels,
-      cfg_out_width   => cfg_out_width,
-      cfg_out_height  => cfg_out_height,
+      cfg_out_width => cfg_out_width,
+      cfg_out_height => cfg_out_height,
 
-      start           => start,
+      start => start,
       -- Not this entity's 'done' -- see the port comment above.
-      done            => open,
+      done => open,
 
       -- Behind this entity's input skid buffer, not the port itself --
       -- see the 'stream_m2s' declaration comment.
-      s_stream_m2s    => stream_m2s,
-      s_stream_s2m    => stream_s2m,
+      s_stream_m2s => stream_m2s,
+      s_stream_s2m => stream_s2m,
 
-      m_window_m2s    => window_m2s,
-      m_window_s2m    => window_s2m
+      m_window_m2s => window_m2s,
+      m_window_s2m => window_s2m
     );
 
   ------------------------------------------------------------------------
@@ -462,29 +462,29 @@ begin
 
   pe_array_inst : entity cnn_accel.cnn_accel_pe_array
     generic map (
-      g_pe_rows             => g_pe_rows,
-      g_pe_cols             => g_pe_cols,
-      g_accum_width         => g_accum_width,
-      g_max_kernel_size     => g_max_kernel_size,
-      g_tile_channels       => g_tile_channels,
+      g_pe_rows => g_pe_rows,
+      g_pe_cols => g_pe_cols,
+      g_accum_width => g_accum_width,
+      g_max_kernel_size => g_max_kernel_size,
+      g_tile_channels => g_tile_channels,
       g_weight_buffer_depth => g_weight_buffer_depth
     )
     port map (
-      clk            => clk,
-      reset          => reset,
+      clk => clk,
+      reset => reset,
 
-      cfg_kernel_h   => cfg_kernel_h,
-      cfg_kernel_w   => cfg_kernel_w,
+      cfg_kernel_h => cfg_kernel_h,
+      cfg_kernel_w => cfg_kernel_w,
 
-      s_window_m2s   => window_m2s,
-      s_window_s2m   => window_s2m,
+      s_window_m2s => window_m2s,
+      s_window_s2m => window_s2m,
 
       weight_rd_addr => weight_rd_addr,
-      weight_rd_en   => weight_rd_en,
+      weight_rd_en => weight_rd_en,
       weight_rd_data => weight_rd_data,
 
-      m_accum_m2s    => accum_m2s,
-      m_accum_s2m    => accum_s2m
+      m_accum_m2s => accum_m2s,
+      m_accum_s2m => accum_s2m
     );
 
   ------------------------------------------------------------------------
@@ -497,29 +497,29 @@ begin
   weight_buffer_inst : entity cnn_accel.cnn_accel_weight_buffer
     generic map (
       g_weight_buffer_depth => g_weight_buffer_depth,
-      g_bias_buffer_depth   => g_bias_buffer_depth,
-      g_pe_rows             => g_pe_rows,
-      g_pe_cols             => g_pe_cols,
-      g_accum_width         => g_accum_width
+      g_bias_buffer_depth => g_bias_buffer_depth,
+      g_pe_rows => g_pe_rows,
+      g_pe_cols => g_pe_cols,
+      g_accum_width => g_accum_width
     )
     port map (
-      clk            => clk,
-      reset          => reset,
+      clk => clk,
+      reset => reset,
 
-      s_stream_m2s   => s_weight_m2s,
-      s_stream_s2m   => s_weight_s2m,
+      s_stream_m2s => s_weight_m2s,
+      s_stream_s2m => s_weight_s2m,
 
-      fill_start     => fill_start,
-      fill_is_bias   => fill_is_bias,
-      fill_is_scale  => fill_is_scale,
+      fill_start => fill_start,
+      fill_is_bias => fill_is_bias,
+      fill_is_scale => fill_is_scale,
 
       weight_rd_addr => weight_rd_addr,
-      weight_rd_en   => weight_rd_en,
+      weight_rd_en => weight_rd_en,
       weight_rd_data => weight_rd_data,
 
-      bias_rd_addr   => bias_rd_addr,
-      bias_rd_data   => bias_rd_data,
-      scale_rd_data  => scale_rd_data
+      bias_rd_addr => bias_rd_addr,
+      bias_rd_data => bias_rd_data,
+      scale_rd_data => scale_rd_data
     );
 
   ------------------------------------------------------------------------
@@ -530,37 +530,37 @@ begin
 
   bias_requant_inst : entity cnn_accel.cnn_accel_bias_requant
     generic map (
-      g_accum_width       => g_accum_width,
-      g_pe_rows           => g_pe_rows,
-      g_bias_addr_width   => c_bias_addr_width,
+      g_accum_width => g_accum_width,
+      g_pe_rows => g_pe_rows,
+      g_bias_addr_width => c_bias_addr_width,
       g_max_requant_shift => g_max_requant_shift
     )
     port map (
-      clk                => clk,
-      reset              => reset,
+      clk => clk,
+      reset => reset,
 
-      cfg_bias_en        => cfg_bias_en,
-      cfg_requant_en     => cfg_requant_en,
-      cfg_relu_en        => cfg_relu_en,
-      cfg_requant_scale  => cfg_requant_scale,
-      cfg_requant_shift  => cfg_requant_shift,
-      cfg_output_offset  => cfg_output_offset,
-      cfg_clamp_en       => cfg_clamp_en,
-      cfg_clamp_min      => cfg_clamp_min,
-      cfg_clamp_max      => cfg_clamp_max,
+      cfg_bias_en => cfg_bias_en,
+      cfg_requant_en => cfg_requant_en,
+      cfg_relu_en => cfg_relu_en,
+      cfg_requant_scale => cfg_requant_scale,
+      cfg_requant_shift => cfg_requant_shift,
+      cfg_output_offset => cfg_output_offset,
+      cfg_clamp_en => cfg_clamp_en,
+      cfg_clamp_min => cfg_clamp_min,
+      cfg_clamp_max => cfg_clamp_max,
       cfg_per_channel_en => cfg_per_channel_en,
 
-      bias_rd_addr       => bias_rd_addr,
-      bias_rd_data       => bias_rd_data,
-      scale_rd_data      => scale_rd_data,
+      bias_rd_addr => bias_rd_addr,
+      bias_rd_data => bias_rd_data,
+      scale_rd_data => scale_rd_data,
 
-      s_accum_m2s        => accum_m2s,
-      s_accum_s2m        => accum_s2m,
+      s_accum_m2s => accum_m2s,
+      s_accum_s2m => accum_s2m,
 
       -- Into this entity's output skid buffer, not straight to the port
       -- -- see the 'out_m2s' declaration comment.
-      m_out_m2s          => out_m2s,
-      m_out_s2m          => out_s2m
+      m_out_m2s => out_m2s,
+      m_out_s2m => out_s2m
     );
 
   ------------------------------------------------------------------------
