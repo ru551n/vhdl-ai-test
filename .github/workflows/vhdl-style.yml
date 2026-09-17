@@ -2,15 +2,15 @@ name: VHDL style
 
 # Checks the VHDL in modules/ against the VUnit-derived style in vsg.yaml with vsg-rs
 # (https://github.com/ru551n/vsg-rs). On pull requests, layout problems are posted as suggested
-# changes, rule violations as code scanning alerts (Security tab) and annotations, and one
-# comment summarizes everything. To fix them locally:
+# changes, rule violations as annotations, and one comment summarizes everything. To fix them
+# locally:
 #
 #   pip install vsg-rs
 #   vsg-rs -c vsg.yaml --recursive modules --fix
 
 on:
   push:
-    branches: [main, "style/**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -29,12 +29,9 @@ jobs:
       contents: read
       # Formatting suggestions and the summary comment on pull requests.
       pull-requests: write
-      # Code scanning upload.
-      security-events: write
     steps:
       - uses: actions/checkout@v5
 
       - uses: ru551n/vsg-rs@v0.9.4
         with:
           args: -c vsg.yaml --recursive modules
-          sarif-upload: true
