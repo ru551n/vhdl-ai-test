@@ -26,7 +26,9 @@ jobs:
     name: vsg-rs
     runs-on: ubuntu-24.04
     permissions:
-      contents: read
+      # Write only so that the action can resolve its earlier suggestions once they no longer
+      # apply (GitHub requires it for resolving review threads); the job never pushes.
+      contents: write
       # Formatting suggestions and the summary comment on pull requests.
       pull-requests: write
     steps:
