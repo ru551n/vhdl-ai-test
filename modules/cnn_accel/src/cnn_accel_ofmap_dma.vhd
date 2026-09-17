@@ -1,21 +1,21 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_pkg.all;
 
 library axi;
-use axi.axi_pkg.all;
+  use axi.axi_pkg.all;
 
 library axi_stream;
-use axi_stream.axi_stream_pkg.all;
+  use axi_stream.axi_stream_pkg.all;
 
 library math;
-use math.math_pkg.log2;
+  use math.math_pkg.log2;
 
 library dma_axi_write_simple;
-use dma_axi_write_simple.dma_axi_write_simple_register_record_pkg.all;
+  use dma_axi_write_simple.dma_axi_write_simple_register_record_pkg.all;
 
 -- Thin wrapper around hdl-modules 'dma_axi_write_simple.dma_axi_write_simple'
 -- (the plain, non-AXI-Lite entity, reused unmodified) that adapts its native
@@ -53,26 +53,25 @@ use dma_axi_write_simple.dma_axi_write_simple_register_record_pkg.all;
 entity cnn_accel_ofmap_dma is
   generic (
     g_axi_addr_width : positive;
-    g_axi_data_width : positive
-  );
+    g_axi_data_width : positive);
   port (
-    clk : in std_ulogic;
-    reset : in std_ulogic := '0';
+    clk          : in  std_ulogic;
+    reset        : in  std_ulogic := '0';
     --# {{}}
-    req_m2s : in dma_req_m2s_t;
-    req_s2m : out dma_req_s2m_t;
-    dma_done : out std_ulogic := '0';
-    resp_error : out std_ulogic := '0';
+    req_m2s      : in  dma_req_m2s_t;
+    req_s2m      : out dma_req_s2m_t;
+    dma_done     : out std_ulogic := '0';
+    resp_error   : out std_ulogic := '0';
     --# {{}}
-    s_stream_m2s : in axi_stream_m2s_t;
+    s_stream_m2s : in  axi_stream_m2s_t;
     s_stream_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
     --# {{}}
     m_axi_aw_m2s : out axi_m2s_a_t := axi_m2s_a_init;
-    m_axi_aw_s2m : in axi_s2m_a_t;
-    m_axi_w_m2s : out axi_m2s_w_t := axi_m2s_w_init;
-    m_axi_w_s2m : in axi_s2m_w_t;
-    m_axi_b_m2s : out axi_m2s_b_t := axi_m2s_b_init;
-    m_axi_b_s2m : in axi_s2m_b_t
+    m_axi_aw_s2m : in  axi_s2m_a_t;
+    m_axi_w_m2s  : out axi_m2s_w_t := axi_m2s_w_init;
+    m_axi_w_s2m  : in  axi_s2m_w_t;
+    m_axi_b_m2s  : out axi_m2s_b_t := axi_m2s_b_init;
+    m_axi_b_s2m  : in  axi_s2m_b_t
   );
 end entity;
 
@@ -86,6 +85,7 @@ architecture a of cnn_accel_ofmap_dma is
   constant c_bytes_to_beats_shift : natural := log2(c_axi_data_width_bytes);
 
   type state_t is (s_idle, s_zero_len, s_active, s_drain);
+
   signal state_q : state_t := s_idle;
 
   signal addr_q : unsigned(31 downto 0) := (others => '0');
@@ -160,15 +160,16 @@ begin
   ------------------------------------------------------------------------------
 
   assert g_axi_data_width <= cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_max_axi_data_width
-    report "cnn_accel_ofmap_dma: g_axi_data_width (" & positive'image(g_axi_data_width) &
-      ") exceeds the S6 activation-plane bound (" &
-      integer'image(cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_max_axi_data_width) &
-      " bits = " &
-      integer'image(cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_activation_plane_channels) &
-      " bytes/beat). Activation planes are T-byte granular, so a wider bus " &
-      "makes addr/length alignment depend on runtime layer geometry, and an " &
-      "unaligned request hangs (dma_done never fires) instead of erroring. " &
-      "See doc/cnn_accel_arch.md 'Off-chip activation layout (decision S6)'."
+    report "cnn_accel_ofmap_dma: g_axi_data_width ("
+           & positive'image(g_axi_data_width)
+           & ") exceeds the S6 activation-plane bound ("
+           & integer'image(cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_max_axi_data_width)
+           & " bits = "
+           & integer'image(cnn_accel.cnn_accel_regs_pkg.cnn_accel_constant_activation_plane_channels)
+           & " bytes/beat). Activation planes are T-byte granular, so a wider bus "
+           & "makes addr/length alignment depend on runtime layer geometry, and an "
+           & "unaligned request hangs (dma_done never fires) instead of erroring. "
+           & "See doc/cnn_accel_arch.md 'Off-chip activation layout (decision S6)'."
     severity failure;
 
   ------------------------------------------------------------------------------
@@ -189,18 +190,15 @@ begin
 
   aw_handshake_i <= axi_write_m2s.aw.valid and axi_write_s2m.aw.ready;
   b_handshake_i <= axi_write_m2s.b.ready and axi_write_s2m.b.valid;
-  b_completes_request_i <= b_handshake_i
-    when state_q = s_active and bresp_last_q = '1' else '0';
-
+  b_completes_request_i <= b_handshake_i when state_q = s_active and bresp_last_q = '1' else
+                           '0';
 
   ------------------------------------------------------------------------------
   -- Ring-buffer register-plane adaptation: degenerate single-shot buffer,
   -- one request at a time. See proposal doc section 3.2.
   ------------------------------------------------------------------------------
 
-  regs_down.buffer_start_address <= std_ulogic_vector(
-    resize(addr_q, regs_down.buffer_start_address'length)
-  );
+  regs_down.buffer_start_address <= std_ulogic_vector(resize(addr_q, regs_down.buffer_start_address'length));
   -- One extra segment (= one AXI beat, since 'packet_length_beats => 1'
   -- below, see section 3.3) of padding beyond 'addr + length': this makes
   -- 'buffer_read_address = buffer_start_address' (below) a *correct*
@@ -229,11 +227,13 @@ begin
   -- count, agreeing with the ring buffer's own now-correct self-block
   -- (above): stops issuing new 'AW's once this request's beats have all
   -- been issued, without waiting for the ring buffer's internal state.
-  enable_i <= '1' when state_q = s_active and aw_issued_q < expected_beats_q else '0';
+  enable_i <= '1' when state_q = s_active and aw_issued_q < expected_beats_q else
+              '0';
 
   -- Combinational: always in step with 'state_q', so a reset that lands
   -- back in 's_idle' makes 'req_s2m.ready' high again the very next cycle.
-  req_s2m_ready_i <= '1' when state_q = s_idle else '0';
+  req_s2m_ready_i <= '1' when state_q = s_idle else
+                     '0';
   req_s2m.ready <= req_s2m_ready_i;
 
   -- Pulses: derived combinationally from the current state and this
@@ -242,11 +242,10 @@ begin
   dma_done <= '1' when state_q = s_zero_len else
               '1' when b_completes_request_i = '1' else
               '0';
-  resp_error <= '1' when (
-    b_completes_request_i = '1'
-    and (error_latched_q = '1' or axi_write_s2m.b.resp /= axi_resp_okay)
-  ) else '0';
-
+  resp_error <= '1'
+                  when (b_completes_request_i = '1'
+                        and (error_latched_q = '1' or axi_write_s2m.b.resp /= axi_resp_okay)) else
+                '0';
 
   ------------------------------------------------------------------------------
   -- 'outstanding_q': physical AW-accepted-but-B-not-yet-seen transaction
@@ -259,10 +258,10 @@ begin
                         outstanding_q - 1 when aw_handshake_i = '0' and b_handshake_i = '1' else
                         outstanding_q;
 
-
   ------------------------------------------------------------------------------
-  main : process(clk) is
+  main : process (clk) is
   begin
+
     if rising_edge(clk) then
       outstanding_q <= outstanding_next_i;
 
@@ -284,8 +283,10 @@ begin
           state_q <= s_drain;
         end if;
       else
+
         case state_q is
           when s_idle =>
+
             if req_m2s.valid = '1' then
               addr_q <= req_m2s.req.addr;
               length_q <= req_m2s.req.length;
@@ -306,11 +307,11 @@ begin
                 state_q <= s_active;
               end if;
             end if;
-
           when s_zero_len =>
-            state_q <= s_idle;
 
+            state_q <= s_idle;
           when s_active =>
+
             if aw_handshake_i = '1' then
               aw_issued_q <= aw_issued_q + 1;
             end if;
@@ -332,38 +333,38 @@ begin
                 state_q <= s_idle;
               end if;
             end if;
-
           when s_drain =>
+
             if outstanding_next_i = 0 then
               state_q <= s_idle;
             end if;
         end case;
+
       end if;
     end if;
   end process;
 
-
   ------------------------------------------------------------------------------
   dma_axi_write_simple_inst : entity dma_axi_write_simple.dma_axi_write_simple
     generic map (
-      address_width => g_axi_addr_width,
-      stream_data_width => g_axi_data_width,
-      axi_data_width => g_axi_data_width,
-      packet_length_beats => 1,
-      enable_axi3 => false,
+      address_width              => g_axi_addr_width,
+      stream_data_width          => g_axi_data_width,
+      axi_data_width             => g_axi_data_width,
+      packet_length_beats        => 1,
+      enable_axi3                => false,
       write_done_aggregate_count => 1,
       write_done_aggregate_ticks => 1
     )
     port map (
-      clk => clk,
+      clk           => clk,
       --
-      stream_ready => stream_ready_i,
-      stream_valid => s_stream_m2s.valid,
-      stream_data => stream_data_i,
+      stream_ready  => stream_ready_i,
+      stream_valid  => s_stream_m2s.valid,
+      stream_data   => stream_data_i,
       --
-      regs_up => regs_up,
-      regs_down => regs_down,
-      interrupt => interrupt,
+      regs_up       => regs_up,
+      regs_down     => regs_down,
+      interrupt     => interrupt,
       --
       axi_write_m2s => axi_write_m2s,
       axi_write_s2m => axi_write_s2m

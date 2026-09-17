@@ -1,15 +1,15 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library axi_stream;
-use axi_stream.axi_stream_pkg.all;
+  use axi_stream.axi_stream_pkg.all;
 
 library math;
-use math.math_pkg.all;
+  use math.math_pkg.all;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_pkg.all;
 
 -- Configurable K_h x K_w / stride / padding (with a configurable pad
 -- value, ISA v2.1) / input-channel-tiled sliding-window generator. See modules/cnn_accel/doc/cnn_accel_window_gen_req.md,
@@ -67,7 +67,7 @@ entity cnn_accel_window_gen is
     -- Upper bound on 'cfg_kernel_h'/'cfg_kernel_w'; sizes the row-bank
     -- count (below) and the window's tap grid. Contract:
     -- 'g_max_kernel_size >= 2' (asserted below).
-    g_max_kernel_size : positive;
+    g_max_kernel_size    : positive;
     -- Upper bound on 'cfg_in_width * ceil(cfg_in_channels / g_tile_channels)'
     -- ("row-tile-word count"); sizes each row bank's depth (BRAM-inference
     -- intent). Bounding the *product* (rather than sizing width and
@@ -81,7 +81,7 @@ entity cnn_accel_window_gen is
     -- one tile's channels must fit in 's_stream_m2s.data''s low bytes.
     -- 'cfg_in_channels' need not be a multiple of this -- see the
     -- entity-level comment on channel tiling / D11 zero-padding.
-    g_tile_channels : positive;
+    g_tile_channels      : positive;
     -- Number of tap-assembly buffers a window can be built into ("N"
     -- below). 1 is the historical single-buffered behaviour; >= 2 lets
     -- the next window's column walk overlap the current window's
@@ -97,22 +97,21 @@ entity cnn_accel_window_gen is
     -- width. That is why this is a generic and not a constant: the CONV
     -- instance is throughput-critical and pays it, the POOL instance
     -- (K = 5, so 200 bytes per buffer) is not and does not.
-    g_assembly_buffers : positive := 1
-  );
+    g_assembly_buffers   : positive := 1);
   port (
-    clk : in std_ulogic;
+    clk             : in  std_ulogic;
     -- Synchronous active-high reset ('reset_internal' at the IP top level).
-    reset : in std_ulogic := '0';
+    reset           : in  std_ulogic := '0';
     --# {{}}
     -- Kernel/stride/padding/frame-size configuration, latched at 'start'.
-    cfg_kernel_h : in std_ulogic_vector(7 downto 0);
-    cfg_kernel_w : in std_ulogic_vector(7 downto 0);
-    cfg_stride_h : in std_ulogic_vector(7 downto 0);
-    cfg_stride_w : in std_ulogic_vector(7 downto 0);
-    cfg_pad_top : in std_ulogic_vector(7 downto 0);
-    cfg_pad_bottom : in std_ulogic_vector(7 downto 0);
-    cfg_pad_left : in std_ulogic_vector(7 downto 0);
-    cfg_pad_right : in std_ulogic_vector(7 downto 0);
+    cfg_kernel_h    : in  std_ulogic_vector(7 downto 0);
+    cfg_kernel_w    : in  std_ulogic_vector(7 downto 0);
+    cfg_stride_h    : in  std_ulogic_vector(7 downto 0);
+    cfg_stride_w    : in  std_ulogic_vector(7 downto 0);
+    cfg_pad_top     : in  std_ulogic_vector(7 downto 0);
+    cfg_pad_bottom  : in  std_ulogic_vector(7 downto 0);
+    cfg_pad_left    : in  std_ulogic_vector(7 downto 0);
+    cfg_pad_right   : in  std_ulogic_vector(7 downto 0);
     -- ISA v2.1: the signed int8 value every PADDED tap of the window
     -- takes -- the input tensor's quantization zero-point, not
     -- necessarily 0. Defaults to zero, which is the pre-v2.1
@@ -122,10 +121,10 @@ entity cnn_accel_window_gen is
     -- where it lands: an all-'pad value' clear at the start of every
     -- column walk, so a tap that is never written (out of frame, or
     -- beyond the runtime kernel size) reads back as padding.
-    cfg_pad_value : in std_ulogic_vector(7 downto 0) := (others => '0');
-    cfg_in_width : in std_ulogic_vector(15 downto 0);
-    cfg_in_height : in std_ulogic_vector(15 downto 0);
-    cfg_in_channels : in std_ulogic_vector(15 downto 0);
+    cfg_pad_value   : in  std_ulogic_vector(7 downto 0) := (others => '0');
+    cfg_in_width    : in  std_ulogic_vector(15 downto 0);
+    cfg_in_height   : in  std_ulogic_vector(15 downto 0);
+    cfg_in_channels : in  std_ulogic_vector(15 downto 0);
     -- Output frame dimensions for the command being started, i.e. exactly
     -- '(in_dim + pad_lo + pad_hi - kernel) / stride + 1' in each axis.
     --
@@ -143,23 +142,23 @@ entity cnn_accel_window_gen is
     -- Contract: stable and correct for the command's geometry whenever
     -- 'start' is asserted. Both are '>= 1' for any geometry
     -- 'cnn_accel_cmd_proc' does not reject.
-    cfg_out_width : in std_ulogic_vector(15 downto 0);
-    cfg_out_height : in std_ulogic_vector(15 downto 0);
+    cfg_out_width   : in  std_ulogic_vector(15 downto 0);
+    cfg_out_height  : in  std_ulogic_vector(15 downto 0);
     --# {{}}
     -- Pulse, from cnn_accel_layer_ctrl: latches the 'cfg_*' ports above and
     -- resets row/column counters and line-buffer pointers for a new frame.
-    start : in std_ulogic;
+    start           : in  std_ulogic;
     -- Pulse: the final tile beat of the final window of the frame has
     -- been accepted (m_window_s2m.ready = '1' the same cycle).
-    done : out std_ulogic;
+    done            : out std_ulogic;
     --# {{}}
     -- Raster-order int8 input pixels, from the ifmap
     -- cnn_accel_axi_read_dma. One accepted beat writes one channel-tile
     -- of one column; 'data' low '8 * g_tile_channels' bits hold that
     -- tile's channels (remaining high bits, if any, are ignored) -- see
     -- the entity-level comment on channel tiling.
-    s_stream_m2s : in axi_stream_m2s_t;
-    s_stream_s2m : out axi_stream_s2m_t;
+    s_stream_m2s    : in  axi_stream_m2s_t;
+    s_stream_s2m    : out axi_stream_s2m_t;
     --# {{}}
     -- One K_h x K_w x g_tile_channels window per beat, 'T' consecutive
     -- beats per output pixel (one per input-channel tile). 'data' low
@@ -171,8 +170,8 @@ entity cnn_accel_window_gen is
     -- (D11), not garbage. 'first_tile'/'last_tile' mark the first/last
     -- tile of the current output pixel (both '1' when 'T = 1'). 'last' is
     -- '1' only for the final tile beat of the final window of the frame.
-    m_window_m2s : out window_m2s_t(data(0 to window_data_length(g_max_kernel_size, g_tile_channels) - 1));
-    m_window_s2m : in window_s2m_t
+    m_window_m2s    : out window_m2s_t(data(0 to window_data_length(g_max_kernel_size, g_tile_channels) - 1));
+    m_window_s2m    : in  window_s2m_t
   );
 end entity cnn_accel_window_gen;
 
@@ -200,6 +199,7 @@ architecture a of cnn_accel_window_gen is
   -- discards them, exactly as the predecessor's 'rd_addr(b) <= 0' branch
   -- did.
   constant c_addr_width : positive := num_bits_needed(g_max_row_tile_words - 1);
+
   subtype word_t is unsigned(c_addr_width - 1 downto 0);
 
   -- Signed row/column coordinate. 'cfg_in_width'/'cfg_in_height' are
@@ -255,15 +255,14 @@ architecture a of cnn_accel_window_gen is
   -- below (see its comment for why that logic moved out of 'control').
   ------------------------------------------------------------------------
 
-  type row_bank_t is array (0 to g_max_row_tile_words - 1) of
-    std_ulogic_vector(c_lane_width - 1 downto 0);
+  type row_bank_t is array (0 to g_max_row_tile_words - 1) of std_ulogic_vector(c_lane_width - 1 downto 0);
 
   -- Registered read output, one word per bank, one cycle after 'rd_addr'
   -- is presented -- the BRAM-inference-critical registered read port
   -- (proposal doc section 2 rule 1). No reset: read-data content has no
   -- completeness contract of its own, same as cnn_accel_weight_buffer.vhd.
-  type bank_word_arr_t is array (0 to g_max_kernel_size - 1) of
-    std_ulogic_vector(c_lane_width - 1 downto 0);
+  type bank_word_arr_t is array (0 to g_max_kernel_size - 1) of std_ulogic_vector(c_lane_width - 1 downto 0);
+
   signal bank_rd_data : bank_word_arr_t;
 
   -- S7: ONE shared read address register, not one per bank, driving every
@@ -300,14 +299,15 @@ architecture a of cnn_accel_window_gen is
   signal wr_data_c : std_ulogic_vector(c_lane_width - 1 downto 0);
 
   type flag_arr_t is array (0 to g_max_kernel_size - 1) of std_ulogic;
+
   signal in_frame_now : flag_arr_t := (others => '0');
 
   -- Which kernel-row tap (if any) each bank currently represents, for the
   -- capture stage's tap-index decode. S7: registered (maintained by
   -- 'control' together with 'out_row_q', see the geometry block below)
   -- rather than recomputed combinationally from 'row_top' every cycle.
-  type kr_arr_t is array (0 to g_max_kernel_size - 1) of
-    integer range 0 to g_max_kernel_size - 1;
+  type kr_arr_t is array (0 to g_max_kernel_size - 1) of integer range 0 to g_max_kernel_size - 1;
+
   signal kr_of_q : kr_arr_t := (others => 0);
 
   -- 'kr_of_q(b) * kernel_w_q', i.e. the first tap index of the kernel row
@@ -331,8 +331,9 @@ architecture a of cnn_accel_window_gen is
   -- 'kr_kw_q' is the 'k * kernel_w' table this is selected from, computed
   -- once at 'start', so the per-output-row update is a mux over
   -- 'g_max_kernel_size' registers and not a second runtime multiply.
-  type kr_base_arr_t is array (0 to g_max_kernel_size - 1) of
-    integer range 0 to g_max_kernel_size * g_max_kernel_size - 1;
+  type kr_base_arr_t is array (0 to g_max_kernel_size - 1)
+    of integer range 0 to g_max_kernel_size * g_max_kernel_size - 1;
+
   signal kr_base_q : kr_base_arr_t := (others => 0);
   signal kr_kw_q : kr_base_arr_t := (others => 0);
 
@@ -361,8 +362,9 @@ architecture a of cnn_accel_window_gen is
   -- computed from exactly the same 'kr_base_walk_q'/'kc_q' pair, one cycle
   -- earlier and in the same register stage as 'kc_capture_q' itself, so
   -- the selected slot is bit-identical; only its arrival time moves.
-  type tap_sel_arr_t is array (0 to g_max_kernel_size - 1) of
-    std_ulogic_vector(0 to g_max_kernel_size * g_max_kernel_size - 1);
+  type tap_sel_arr_t is array (0 to g_max_kernel_size - 1)
+    of std_ulogic_vector(0 to g_max_kernel_size * g_max_kernel_size - 1);
+
   signal tap_sel_capture_q : tap_sel_arr_t := (others => (others => '0'));
   -- '1' the cycle after any cycle 'issue_q' was high -- i.e. this
   -- cycle's 'bank_rd_data' is meaningful and should be captured.
@@ -426,7 +428,9 @@ architecture a of cnn_accel_window_gen is
   -- re-arm cycle this rework also removes), 1.5 for N = 2 and 1 for
   -- N = 3.
   subtype window_taps_t is tap_array_t(0 to c_window_data_length - 1);
+
   type assembly_arr_t is array (0 to g_assembly_buffers - 1) of window_taps_t;
+
   signal assembly_q : assembly_arr_t := (others => (others => (others => '0')));
 
   -- Per-buffer "holds a complete, not-yet-accepted window" flag. Set by
@@ -438,12 +442,9 @@ architecture a of cnn_accel_window_gen is
   -- 'out_row_q'/'out_col_q'/'rd_tile_q' at presentation time -- those
   -- counters now belong to the walk being *launched*, which is up to
   -- 'g_assembly_buffers - 1' windows ahead of the one being presented.
-  signal meta_first_tile_q : std_ulogic_vector(0 to g_assembly_buffers - 1) :=
-    (others => '0');
-  signal meta_last_tile_q : std_ulogic_vector(0 to g_assembly_buffers - 1) :=
-    (others => '0');
-  signal meta_last_q : std_ulogic_vector(0 to g_assembly_buffers - 1) :=
-    (others => '0');
+  signal meta_first_tile_q : std_ulogic_vector(0 to g_assembly_buffers - 1) := (others => '0');
+  signal meta_last_tile_q : std_ulogic_vector(0 to g_assembly_buffers - 1) := (others => '0');
+  signal meta_last_q : std_ulogic_vector(0 to g_assembly_buffers - 1) := (others => '0');
 
   -- Per-walk snapshots of the two 'control'-maintained geometry values the
   -- column walk consumes *while it runs*. They used to be read live from
@@ -634,6 +635,7 @@ architecture a of cnn_accel_window_gen is
   -- 'anchor_limit', which makes the head of this queue the minimum and
   -- therefore the only entry 'write_freeze_i' has to compare against.
   type anchor_arr_t is array (0 to g_assembly_buffers - 1) of coord_t;
+
   signal anchor_res_q : anchor_arr_t := (others => g_max_kernel_size);
 
   -- 'row_top mod g_max_kernel_size', kept as a ring counter (step
@@ -655,7 +657,9 @@ architecture a of cnn_accel_window_gen is
   -- 154.23 MHz); splitting the adds out into these accumulators -- each
   -- of which is then its own single-chain register-to-register path --
   -- is what removes it.
-  signal row_top_next_q, row_bot_next_q, row_top_k_next_q : coord_t := 0;
+  signal row_top_next_q : coord_t := 0;
+  signal row_bot_next_q : coord_t := 0;
+  signal row_top_k_next_q : coord_t := 0;
   signal col_left_next_q, col_right_next_q : coord_t := 0;
 
   -- Frame constants, one-shot at 'start': the '-1'/'-2' forms of the
@@ -664,12 +668,15 @@ architecture a of cnn_accel_window_gen is
   -- column geometry at every output-row boundary, the per-kernel-row
   -- upper row bound 'in_height_q - 1 - kr' and the per-kernel-row
   -- 'kr < kernel_h_q' predicate.
-  signal in_height_m1_q, in_width_m1_q, in_width_m2_q : coord_t := 0;
+  signal in_height_m1_q : coord_t := 0;
+  signal in_width_m1_q : coord_t := 0;
+  signal in_width_m2_q : coord_t := 0;
   signal col_left_start_q, col_left_start_next_q : coord_t := 0;
   signal col_right_start_next_q : coord_t := 0;
   signal real_col_right_start_q : coord_t := 0;
   signal has_real_col_start_q : std_ulogic := '0';
   type coord_arr_t is array (0 to g_max_kernel_size - 1) of coord_t;
+
   signal row_hi_bound_q : coord_arr_t := (others => 0);
   signal kr_valid_q : flag_arr_t := (others => '0');
 
@@ -768,8 +775,9 @@ architecture a of cnn_accel_window_gen is
   signal clear_q : std_ulogic := '0';
   signal clear_buf_q : natural range 0 to g_assembly_buffers - 1 := 0;
 
-  function imin(a, b : integer) return integer is
+  function imin (a, b : integer) return integer is
   begin
+
     if a < b then
       return a;
     else
@@ -777,8 +785,9 @@ architecture a of cnn_accel_window_gen is
     end if;
   end function;
 
-  function imax(a, b : integer) return integer is
+  function imax (a, b : integer) return integer is
   begin
+
     if a > b then
       return a;
     else
@@ -786,8 +795,9 @@ architecture a of cnn_accel_window_gen is
     end if;
   end function;
 
-  function to_sl(cond : boolean) return std_ulogic is
+  function to_sl (cond : boolean) return std_ulogic is
   begin
+
     if cond then
       return '1';
     end if;
@@ -810,9 +820,11 @@ architecture a of cnn_accel_window_gen is
   -- in 'control's D11 comment, and the reason 'v' is bounded at
   -- '2 * g_assembly_buffers' is simply that it must hold the intermediate
   -- 'idx + 1' for every legal 'idx', N = 1 included.
-  function next_buf(idx : natural) return natural is
+  function next_buf (idx : natural) return natural is
+
     variable v : natural range 0 to 2 * g_assembly_buffers;
   begin
+
     v := idx + 1;
     if v >= g_assembly_buffers then
       return 0;
@@ -827,8 +839,8 @@ begin
     severity failure;
 
   assert g_tile_channels * 8 <= axi_stream_data_sz
-    report "cnn_accel_window_gen: g_tile_channels * 8 must be <= axi_stream_data_sz " &
-      "(128) -- one channel-tile must fit in one s_stream beat"
+    report "cnn_accel_window_gen: g_tile_channels * 8 must be <= axi_stream_data_sz "
+           & "(128) -- one channel-tile must fit in one s_stream beat"
     severity failure;
 
   ------------------------------------------------------------------------
@@ -860,18 +872,21 @@ begin
   -- 'all' inference does not reliably track signals read only through
   -- nested loops/array indexing.
   ------------------------------------------------------------------------
-  wr_decode : process(
-    wr_tile_q, n_tiles_q, last_tile_channels_q, s_stream_m2s.data
-  )
+  wr_decode : process (wr_tile_q, n_tiles_q, last_tile_channels_q, s_stream_m2s.data)
+
     variable v_write_data : std_ulogic_vector(c_lane_width - 1 downto 0);
+
   begin
+
     v_write_data := s_stream_m2s.data(c_lane_width - 1 downto 0);
     if wr_tile_q = n_tiles_q - 1 then
       for c in 0 to g_tile_channels - 1 loop
+
         if c >= last_tile_channels_q then
           v_write_data(8 * (c + 1) - 1 downto 8 * c) := (others => '0');
         end if;
       end loop;
+
     end if;
     wr_data_c <= v_write_data;
   end process;
@@ -892,8 +907,9 @@ begin
     signal bank_mem : row_bank_t;
   begin
 
-    write_port : process(clk)
+    write_port : process (clk)
     begin
+
       if rising_edge(clk) then
         if fire = '1' and wr_bank_q = b then
           bank_mem(wr_addr_q) <= wr_data_c;
@@ -901,14 +917,15 @@ begin
       end if;
     end process;
 
-    read_port : process(clk)
+    read_port : process (clk)
     begin
+
       if rising_edge(clk) then
         bank_rd_data(b) <= bank_mem(rd_addr_q);
       end if;
     end process;
 
-  end generate;
+  end generate gen_banks;
 
   ------------------------------------------------------------------------
   -- THE ROW-BANK INVARIANT.
@@ -1002,7 +1019,8 @@ begin
   -- which is what keeps them exactly coherent with those counters rather
   -- than a cycle behind them).
   ------------------------------------------------------------------------
-  control : process(clk)
+  control : process (clk)
+
     -- Ranged, not plain 'integer'. Every one of these is a copy of an
     -- 8- or 16-bit port or register, but as unconstrained integers they
     -- made every 'mod' and every product below 32 bits wide in the
@@ -1011,13 +1029,20 @@ begin
     -- in the design once the divisions were gone.
     variable v_in_channels : natural range 0 to 65535;
     variable v_n_tiles : natural range 0 to 65535;
-    variable v_kh, v_kw, v_sh, v_sw, v_pt, v_pl : natural range 0 to 255;
+    variable v_kh : natural range 0 to 255;
+    variable v_kw : natural range 0 to 255;
+    variable v_sh : natural range 0 to 255;
+    variable v_sw : natural range 0 to 255;
+    variable v_pt : natural range 0 to 255;
+    variable v_pl : natural range 0 to 255;
     variable v_inh, v_inw : natural range 0 to 65535;
     variable v_row_top, v_col_left : coord_t;
     variable v_pt_mod : natural range 0 to g_max_kernel_size - 1;
     variable v_mod : natural range 0 to 2 * g_max_kernel_size - 2;
     variable v_kr : natural range 0 to 2 * g_max_kernel_size - 1;
+
   begin
+
     if rising_edge(clk) then
       if reset = '1' then
         active_q <= '0';
@@ -1051,7 +1076,7 @@ begin
         -- backpressures the feeder for that cycle.
         -- ------------------------------------------------------------
         assert unsigned(cfg_kernel_h) <= to_unsigned(g_max_kernel_size, 8)
-          and unsigned(cfg_kernel_w) <= to_unsigned(g_max_kernel_size, 8)
+               and unsigned(cfg_kernel_w) <= to_unsigned(g_max_kernel_size, 8)
           report "cnn_accel_window_gen: cfg_kernel_h/w must be <= g_max_kernel_size"
           severity failure;
 
@@ -1078,8 +1103,8 @@ begin
         v_n_tiles := (v_in_channels + g_tile_channels - 1) / g_tile_channels;
 
         assert to_integer(unsigned(cfg_in_width)) * v_n_tiles <= g_max_row_tile_words
-          report "cnn_accel_window_gen: cfg_in_width * ceil(cfg_in_channels/g_tile_channels) " &
-            "must be <= g_max_row_tile_words"
+          report "cnn_accel_window_gen: cfg_in_width * ceil(cfg_in_channels/g_tile_channels) "
+                 & "must be <= g_max_row_tile_words"
           severity failure;
 
         n_tiles_q <= to_unsigned(v_n_tiles, 16);
@@ -1166,6 +1191,7 @@ begin
         -- per-output-row 'kr_base_q' update below is a mux, not a
         -- multiply.
         for k in 0 to g_max_kernel_size - 1 loop
+
           kr_kw_q(k) <= k * v_kw;
         end loop;
 
@@ -1175,6 +1201,7 @@ begin
         -- compares: 'row_top + kr <= in_height - 1' is exactly
         -- 'row_top <= row_hi_bound_q(kr)'.
         for k in 0 to g_max_kernel_size - 1 loop
+
           row_hi_bound_q(k) <= v_inh - 1 - k;
           kr_valid_q(k) <= to_sl(k < v_kh);
         end loop;
@@ -1192,9 +1219,7 @@ begin
         -- once here so that boundary is a set of plain register copies.
         col_left_start_q <= v_col_left;
         real_col_right_start_q <= imin(v_col_left + v_kw - 1, v_inw - 1);
-        has_real_col_start_q <= to_sl(
-          v_col_left <= v_inw - 1 and v_col_left + v_kw - 1 >= 0
-        );
+        has_real_col_start_q <= to_sl(v_col_left <= v_inw - 1 and v_col_left + v_kw - 1 >= 0);
         col_left_start_next_q <= v_col_left + v_sw;
         col_right_start_next_q <= v_col_left + v_sw + v_kw - 1;
 
@@ -1228,12 +1253,8 @@ begin
         -- stage 2. Written on the same edge that raises 'active_q'/
         -- 'launch_active_q', so they are valid from the first live cycle --
         -- nothing reads them during stage 3 itself.
-        col_step_words_q <= to_unsigned(
-          (sw_ntiles_q - to_integer(n_tiles_q) + 1) mod 2 ** c_addr_width, c_addr_width
-        );
-        row_start_words_q <= to_unsigned(
-          (-pl_ntiles_q) mod 2 ** c_addr_width, c_addr_width
-        );
+        col_step_words_q <= to_unsigned((sw_ntiles_q - to_integer(n_tiles_q) + 1) mod 2 ** c_addr_width, c_addr_width);
+        row_start_words_q <= to_unsigned((-pl_ntiles_q) mod 2 ** c_addr_width, c_addr_width);
         rd_base_q <= to_unsigned((-pl_ntiles_q) mod 2 ** c_addr_width, c_addr_width);
 
         v_kh := to_integer(kernel_h_q);
@@ -1243,6 +1264,7 @@ begin
         v_row_top := -v_pt;
 
         for b in 0 to g_max_kernel_size - 1 loop
+
           v_kr := b + g_max_kernel_size - row_top_mod_q;
           if v_kr >= g_max_kernel_size then
             v_kr := v_kr - g_max_kernel_size;
@@ -1251,9 +1273,7 @@ begin
           -- Start-time only: one narrow multiply per bank, off every
           -- cycle-by-cycle path (see 'kr_base_q's declaration).
           kr_base_q(b) <= v_kr * v_kw;
-          row_ok_q(b) <= to_sl(
-            v_kr < v_kh and v_row_top + v_kr >= 0 and v_row_top + v_kr <= v_inh - 1
-          );
+          row_ok_q(b) <= to_sl(v_kr < v_kh and v_row_top + v_kr >= 0 and v_row_top + v_kr <= v_inh - 1);
         end loop;
 
       else
@@ -1296,29 +1316,37 @@ begin
         if walk_start = '1' and consume = '1' then
           if n_res_q = g_assembly_buffers then
             for i in 0 to g_assembly_buffers - 2 loop
+
               anchor_res_q(i) <= anchor_res_q(i + 1);
             end loop;
+
             anchor_res_q(g_assembly_buffers - 1) <= anchor_limit_q;
           else
             for i in 0 to g_assembly_buffers - 1 loop
+
               if i = n_res_q - 1 then
                 anchor_res_q(i) <= anchor_limit_q;
               elsif i < g_assembly_buffers - 1 then
                 anchor_res_q(i) <= anchor_res_q(i + 1);
               end if;
             end loop;
+
           end if;
         elsif walk_start = '1' then
           for i in 0 to g_assembly_buffers - 1 loop
+
             if i = n_res_q then
               anchor_res_q(i) <= anchor_limit_q;
             end if;
           end loop;
+
           n_res_q <= n_res_q + 1;
         elsif consume = '1' then
           for i in 0 to g_assembly_buffers - 2 loop
+
             anchor_res_q(i) <= anchor_res_q(i + 1);
           end loop;
+
           n_res_q <= n_res_q - 1;
         end if;
 
@@ -1367,9 +1395,7 @@ begin
                 -- 'anchor_limit' clamps 'row_top' up to 0 (top padding
                 -- reserves no bank), which is a sign-bit select here.
                 real_row_bot_q <= imin(row_bot_next_q, in_height_m1_q);
-                has_real_row_q <= to_sl(
-                  row_top_next_q <= in_height_m1_q and row_bot_next_q >= 0
-                );
+                has_real_row_q <= to_sl(row_top_next_q <= in_height_m1_q and row_bot_next_q >= 0);
                 if row_top_next_q >= 0 then
                   anchor_limit_q <= row_top_k_next_q;
                 else
@@ -1390,17 +1416,17 @@ begin
                 row_top_mod_q <= v_mod;
 
                 for b in 0 to g_max_kernel_size - 1 loop
+
                   v_kr := b + g_max_kernel_size - v_mod;
                   if v_kr >= g_max_kernel_size then
                     v_kr := v_kr - g_max_kernel_size;
                   end if;
                   kr_of_q(b) <= v_kr;
                   kr_base_q(b) <= kr_kw_q(v_kr);
-                  row_ok_q(b) <= kr_valid_q(v_kr) and to_sl(
-                    row_top_next_q >= -v_kr
-                    and row_top_next_q <= row_hi_bound_q(v_kr)
-                  );
+                  row_ok_q(b) <= kr_valid_q(v_kr)
+                                 and to_sl(row_top_next_q >= -v_kr and row_top_next_q <= row_hi_bound_q(v_kr));
                 end loop;
+
               end if;
             else
               out_col_q <= out_col_q + 1;
@@ -1409,9 +1435,7 @@ begin
               -- look-ahead accumulators, then push those one stride on.
               col_left_q <= col_left_next_q;
               real_col_right_q <= imin(col_right_next_q, in_width_m1_q);
-              has_real_col_q <= to_sl(
-                col_left_next_q <= in_width_m1_q and col_right_next_q >= 0
-              );
+              has_real_col_q <= to_sl(col_left_next_q <= in_width_m1_q and col_right_next_q >= 0);
 
               col_left_next_q <= col_left_next_q + to_integer(stride_w_q);
               col_right_next_q <= col_right_next_q + to_integer(stride_w_q);
@@ -1436,11 +1460,14 @@ begin
   -- latches them into that window's buffer, and the presentation side
   -- below reads them back out of 'meta_*_q'.
   launch_last_pixel <= '1'
-    when (out_row_q = out_height_q - 1 and out_col_q = out_width_q - 1
-          and rd_tile_q = n_tiles_q - 1)
-    else '0';
-  launch_first_tile <= '1' when rd_tile_q = 0 else '0';
-  launch_last_tile <= '1' when rd_tile_q = n_tiles_q - 1 else '0';
+                         when (out_row_q = out_height_q - 1
+                               and out_col_q = out_width_q - 1
+                               and rd_tile_q = n_tiles_q - 1) else
+                       '0';
+  launch_first_tile <= '1' when rd_tile_q = 0 else
+                       '0';
+  launch_last_tile <= '1' when rd_tile_q = n_tiles_q - 1 else
+                      '0';
 
   ------------------------------------------------------------------------
   -- Presentation side: an N:1 mux of registers, selected by the
@@ -1454,14 +1481,16 @@ begin
   -- 7.0.0-dev's 'all' inference does not reliably track signals read only
   -- through nested loops/array indexing.
   ------------------------------------------------------------------------
-  present : process(buf_out_q, full_q, assembly_q, meta_first_tile_q, meta_last_tile_q, meta_last_q)
+  present : process (buf_out_q, full_q, assembly_q, meta_first_tile_q, meta_last_tile_q, meta_last_q)
   begin
+
     window_valid <= '0';
     m_window_m2s.data <= (others => (others => '0'));
     m_window_m2s.last <= '0';
     m_window_m2s.first_tile <= '0';
     m_window_m2s.last_tile <= '0';
     for buf in 0 to g_assembly_buffers - 1 loop
+
       if buf_out_q = buf then
         window_valid <= full_q(buf);
         m_window_m2s.data <= assembly_q(buf);
@@ -1470,6 +1499,7 @@ begin
         m_window_m2s.last_tile <= meta_last_tile_q(buf);
       end if;
     end loop;
+
   end process;
 
   m_window_m2s.valid <= window_valid;
@@ -1491,8 +1521,10 @@ begin
   -- consumer stops launches after at most 'g_assembly_buffers' windows
   -- and nothing in flight is ever overwritten or reordered.
   ------------------------------------------------------------------------
-  issue_free <= '1' when issue_q = '0' or kc_q = kernel_w_q - 1 else '0';
-  buffer_free <= '1' when n_res_q < g_assembly_buffers or consume = '1' else '0';
+  issue_free <= '1' when issue_q = '0' or kc_q = kernel_w_q - 1 else
+                '0';
+  buffer_free <= '1' when n_res_q < g_assembly_buffers or consume = '1' else
+                 '0';
   walk_start <= launch_active_q and row_ready_i and issue_free and buffer_free;
 
   buf_next_c <= next_buf(buf_issue_q);
@@ -1546,24 +1578,31 @@ begin
   -- 'all' inference does not reliably track signals read only through
   -- nested loops/array indexing.
   ------------------------------------------------------------------------
-  anchor_head_c <= anchor_limit_q when n_res_q = 0 else anchor_res_q(0);
+  anchor_head_c <= anchor_limit_q when n_res_q = 0 else
+                   anchor_res_q(0);
 
-  read_qualify : process(
-    cur_row_q, cur_col_q, issue_q, rd_col_ok_q,
-    has_real_row_q, real_row_bot_q, has_real_col_q, real_col_right_q,
-    anchor_head_c, row_ok_walk_q
+  read_qualify : process (
+    cur_row_q,
+    cur_col_q,
+    issue_q,
+    rd_col_ok_q,
+    has_real_row_q,
+    real_row_bot_q,
+    has_real_col_q,
+    real_col_right_q,
+    anchor_head_c,
+    row_ok_walk_q
   )
+
     variable v_cur_row : coord_t;
+
   begin
+
     v_cur_row := to_integer(cur_row_q);
 
     if has_real_row_q = '0'
-      or v_cur_row > real_row_bot_q
-      or (
-        v_cur_row = real_row_bot_q
-        and (has_real_col_q = '0' or to_integer(cur_col_q) > real_col_right_q)
-      )
-    then
+       or v_cur_row > real_row_bot_q
+       or (v_cur_row = real_row_bot_q and (has_real_col_q = '0' or to_integer(cur_col_q) > real_col_right_q)) then
       row_ready_i <= '1';
     else
       row_ready_i <= '0';
@@ -1576,8 +1615,10 @@ begin
     end if;
 
     for b in 0 to g_max_kernel_size - 1 loop
+
       in_frame_now(b) <= issue_q and row_ok_walk_q(b) and rd_col_ok_q;
     end loop;
+
   end process;
 
   ------------------------------------------------------------------------
@@ -1654,11 +1695,14 @@ begin
   -- 'in_frame_now', so an out-of-frame cycle reads cell 0 exactly as the
   -- predecessor's 'rd_addr(b) <= 0' branch did.
   ------------------------------------------------------------------------
-  walk_control : process(clk)
+  walk_control : process (clk)
+
     variable v_next_word : word_t;
     variable v_next_col : coord_t;
     variable v_next_ok : boolean;
+
   begin
+
     if rising_edge(clk) then
       if reset = '1' or start = '1' then
         issue_q <= '0';
@@ -1688,7 +1732,6 @@ begin
         rd_col_ok_q <= '0';
         clear_q <= '0';
         clear_buf_q <= 0;
-
       else
         --------------------------------------------------------------
         -- 1. Delay pipeline: always shifts by one cycle, so the capture
@@ -1709,10 +1752,12 @@ begin
         -- bounds are generics, so this is a fixed comparator array, not a
         -- variable-bound loop.
         for b in 0 to g_max_kernel_size - 1 loop
+
           for t in 0 to g_max_kernel_size * g_max_kernel_size - 1 loop
-            tap_sel_capture_q(b)(t) <=
-              to_sl(t = kr_base_walk_q(b) + to_integer(kc_q));
+
+            tap_sel_capture_q(b)(t) <= to_sl(t = kr_base_walk_q(b) + to_integer(kc_q));
           end loop;
+
         end loop;
 
         --------------------------------------------------------------
@@ -1723,10 +1768,12 @@ begin
         --------------------------------------------------------------
         if clear_q = '1' then
           for buf in 0 to g_assembly_buffers - 1 loop
+
             if clear_buf_q = buf then
               assembly_q(buf) <= (others => pad_value_q);
             end if;
           end loop;
+
         end if;
 
         --------------------------------------------------------------
@@ -1740,21 +1787,28 @@ begin
         --------------------------------------------------------------
         if capture_valid_q = '1' then
           for buf in 0 to g_assembly_buffers - 1 loop
+
             if buf_capture_q = buf then
               for b in 0 to g_max_kernel_size - 1 loop
+
                 if in_frame_capture_q(b) = '1' then
                   for t in 0 to g_max_kernel_size * g_max_kernel_size - 1 loop
+
                     if tap_sel_capture_q(b)(t) = '1' then
                       for c in 0 to g_tile_channels - 1 loop
-                        assembly_q(buf)(t * g_tile_channels + c) <=
-                          bank_rd_data(b)(8 * (c + 1) - 1 downto 8 * c);
+
+                        assembly_q(buf)(t * g_tile_channels + c) <= bank_rd_data(b)(8 * (c + 1) - 1 downto 8 * c);
                       end loop;
+
                     end if;
                   end loop;
+
                 end if;
               end loop;
+
             end if;
           end loop;
+
         end if;
 
         --------------------------------------------------------------
@@ -1769,19 +1823,23 @@ begin
         --------------------------------------------------------------
         if consume = '1' then
           for buf in 0 to g_assembly_buffers - 1 loop
+
             if buf_out_q = buf then
               full_q(buf) <= '0';
             end if;
           end loop;
+
           buf_out_q <= next_buf(buf_out_q);
         end if;
 
         if capture_last_q = '1' then
           for buf in 0 to g_assembly_buffers - 1 loop
+
             if buf_capture_q = buf then
               full_q(buf) <= '1';
             end if;
           end loop;
+
         end if;
 
         --------------------------------------------------------------
@@ -1811,6 +1869,7 @@ begin
           row_ok_walk_q <= row_ok_q;
 
           for buf in 0 to g_assembly_buffers - 1 loop
+
             if buf_next_c = buf then
               -- Only the (three-bit, low-fanout) per-window metadata is
               -- written here. The buffer's all-'cfg_pad_value' clear --

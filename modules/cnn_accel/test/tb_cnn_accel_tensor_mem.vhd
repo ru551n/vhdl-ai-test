@@ -1,19 +1,19 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library vunit_lib;
 context vunit_lib.vunit_context;
-use vunit_lib.queue_pkg.all;
+  use vunit_lib.queue_pkg.all;
 
 library osvvm;
-use osvvm.RandomPkg.all;
+  use osvvm.randompkg.all;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_pkg.all;
 
 library axi_stream;
-use axi_stream.axi_stream_pkg.all;
+  use axi_stream.axi_stream_pkg.all;
 
 -- VUnit-5 testbench for cnn_accel_tensor_mem.
 --
@@ -53,7 +53,7 @@ use axi_stream.axi_stream_pkg.all;
 -- those queues once 'rN_done' pulses.
 entity tb_cnn_accel_tensor_mem is
   generic (
-    runner_cfg : string;
+    runner_cfg                       : string;
     -- Lowers the DUT's 'g_illegal_request_severity' from its 'failure'
     -- default to 'error' -- set ONLY by
     -- 'test_bank_crossing_request_is_detected', which has to survive the
@@ -62,8 +62,7 @@ entity tb_cnn_accel_tensor_mem is
     -- the neighbouring bank is left untouched. A boolean rather than a
     -- 'severity_level' generic so VUnit only ever has to pass a value
     -- type it handles natively.
-    g_illegal_request_severity_error : boolean := false
-  );
+    g_illegal_request_severity_error : boolean := false);
 end entity tb_cnn_accel_tensor_mem;
 
 architecture tb of tb_cnn_accel_tensor_mem is
@@ -143,6 +142,7 @@ architecture tb of tb_cnn_accel_tensor_mem is
 
   function illegal_request_severity return severity_level is
   begin
+
     if g_illegal_request_severity_error then
       return error;
     end if;
@@ -203,13 +203,15 @@ architecture tb of tb_cnn_accel_tensor_mem is
   -- would need to compute it in, and every 'salt + i' this testbench ever
   -- forms is tiny (well under 2**c_data_width) anyway, so 'to_unsigned'
   -- alone is exact.
-  function word_value(salt : natural; i : natural) return std_ulogic_vector is
+  function word_value (salt : natural; i : natural) return std_ulogic_vector is
   begin
+
     return std_ulogic_vector(to_unsigned(salt + i, c_data_width));
   end function;
 
-  function word_addr_bytes(bank : natural; offset : natural) return natural is
+  function word_addr_bytes (bank : natural; offset : natural) return natural is
   begin
+
     return (bank * c_bank_words + offset) * c_bytes_per_word;
   end function;
 
@@ -217,13 +219,14 @@ architecture tb of tb_cnn_accel_tensor_mem is
   -- Write-side helper: push one beat onto 's_wN', honoring 'ready'.
   ------------------------------------------------------------------------
 
-  procedure push_write_beat(
-    signal clk_i : in std_ulogic;
-    signal m2s : out axi_stream_m2s_t;
-    signal s2m : in axi_stream_s2m_t;
-    data_value : in std_ulogic_vector
+  procedure push_write_beat (
+    signal clk_i : in  std_ulogic;
+    signal m2s   : out axi_stream_m2s_t;
+    signal s2m   : in  axi_stream_s2m_t;
+    data_value   : in  std_ulogic_vector
   ) is
   begin
+
     m2s.data <= (others => '0');
     m2s.data(data_value'length - 1 downto 0) <= data_value;
     m2s.valid <= '1';
@@ -237,38 +240,38 @@ begin
 
   dut : entity cnn_accel.cnn_accel_tensor_mem
     generic map (
-      g_num_banks => c_num_banks,
-      g_bank_words => c_bank_words,
-      g_data_width => c_data_width,
+      g_num_banks                => c_num_banks,
+      g_bank_words               => c_bank_words,
+      g_data_width               => c_data_width,
       g_illegal_request_severity => illegal_request_severity
     )
     port map (
-      clk => clk,
-      reset => reset,
+      clk        => clk,
+      reset      => reset,
       --
       w0_req_m2s => w0_req_m2s,
       w0_req_s2m => w0_req_s2m,
-      s_w0_m2s => s_w0_m2s,
-      s_w0_s2m => s_w0_s2m,
-      w0_done => w0_done,
+      s_w0_m2s   => s_w0_m2s,
+      s_w0_s2m   => s_w0_s2m,
+      w0_done    => w0_done,
       --
       w1_req_m2s => w1_req_m2s,
       w1_req_s2m => w1_req_s2m,
-      s_w1_m2s => s_w1_m2s,
-      s_w1_s2m => s_w1_s2m,
-      w1_done => w1_done,
+      s_w1_m2s   => s_w1_m2s,
+      s_w1_s2m   => s_w1_s2m,
+      w1_done    => w1_done,
       --
       r0_req_m2s => r0_req_m2s,
       r0_req_s2m => r0_req_s2m,
-      m_r0_m2s => m_r0_m2s,
-      m_r0_s2m => m_r0_s2m,
-      r0_done => r0_done,
+      m_r0_m2s   => m_r0_m2s,
+      m_r0_s2m   => m_r0_s2m,
+      r0_done    => r0_done,
       --
       r1_req_m2s => r1_req_m2s,
       r1_req_s2m => r1_req_s2m,
-      m_r1_m2s => m_r1_m2s,
-      m_r1_s2m => m_r1_s2m,
-      r1_done => r1_done
+      m_r1_m2s   => m_r1_m2s,
+      m_r1_s2m   => m_r1_s2m,
+      r1_done    => r1_done
     );
 
   ------------------------------------------------------------------------
@@ -287,15 +290,20 @@ begin
   ------------------------------------------------------------------------
 
   consume_r0 : process
-    variable rnd : RandomPType;
+
+    variable rnd : randomptype;
+
   begin
+
     rnd.InitSeed(get_string_seed(runner_cfg) & "_r0");
     m_r0_s2m.ready <= '0';
     wait until reset = '0' and rising_edge(clk);
 
     loop
+
       case r0_mode is
         when c_mode_toggle =>
+
           m_r0_s2m.ready <= '1';
           wait until rising_edge(clk);
           if m_r0_m2s.valid = '1' and m_r0_s2m.ready = '1' then
@@ -304,8 +312,8 @@ begin
           end if;
           m_r0_s2m.ready <= '0';
           wait until rising_edge(clk);
-
         when c_mode_full_speed =>
+
           -- 'r0_pause' lets a directed test hold this channel's 'ready' low
           -- for a controlled number of cycles mid-burst without switching
           -- away from full-speed mode; every accepted beat's time is also
@@ -321,11 +329,12 @@ begin
             push(r0_captured_q, m_r0_m2s.data(c_data_width - 1 downto 0));
             push(r0_captured_q, m_r0_m2s.last);
           end if;
-
         when others => -- c_mode_random
+
           if rnd.RandInt(0, 99) < r0_stall_pct then
             m_r0_s2m.ready <= '0';
             for i in 1 to rnd.RandInt(1, 8) loop
+
               -- Abandon a multi-cycle random stall as soon as the main
               -- process switches mode, so 'r0_mode' takes effect on the
               -- next edge rather than up to 8 cycles later. Without this,
@@ -335,6 +344,7 @@ begin
               exit when r0_mode /= c_mode_random;
               wait until rising_edge(clk);
             end loop;
+
           end if;
           m_r0_s2m.ready <= '1';
           wait until rising_edge(clk);
@@ -343,21 +353,28 @@ begin
             push(r0_captured_q, m_r0_m2s.last);
           end if;
       end case;
+
     end loop;
+
   end process;
 
   -- Read channel 1 consumer: identical structure to 'consume_r0', its own
   -- seed/mode/stall/queue.
   consume_r1 : process
-    variable rnd : RandomPType;
+
+    variable rnd : randomptype;
+
   begin
+
     rnd.InitSeed(get_string_seed(runner_cfg) & "_r1");
     m_r1_s2m.ready <= '0';
     wait until reset = '0' and rising_edge(clk);
 
     loop
+
       case r1_mode is
         when c_mode_toggle =>
+
           m_r1_s2m.ready <= '1';
           wait until rising_edge(clk);
           if m_r1_m2s.valid = '1' and m_r1_s2m.ready = '1' then
@@ -366,19 +383,20 @@ begin
           end if;
           m_r1_s2m.ready <= '0';
           wait until rising_edge(clk);
-
         when c_mode_full_speed =>
+
           m_r1_s2m.ready <= '1';
           wait until rising_edge(clk);
           if m_r1_m2s.valid = '1' and m_r1_s2m.ready = '1' then
             push(r1_captured_q, m_r1_m2s.data(c_data_width - 1 downto 0));
             push(r1_captured_q, m_r1_m2s.last);
           end if;
-
         when others => -- c_mode_random
+
           if rnd.RandInt(0, 99) < r1_stall_pct then
             m_r1_s2m.ready <= '0';
             for i in 1 to rnd.RandInt(1, 8) loop
+
               -- Abandon a multi-cycle random stall as soon as the main
               -- process switches mode, so 'r1_mode' takes effect on the
               -- next edge rather than up to 8 cycles later. Without this,
@@ -388,6 +406,7 @@ begin
               exit when r1_mode /= c_mode_random;
               wait until rising_edge(clk);
             end loop;
+
           end if;
           m_r1_s2m.ready <= '1';
           wait until rising_edge(clk);
@@ -396,11 +415,14 @@ begin
             push(r1_captured_q, m_r1_m2s.last);
           end if;
       end case;
+
     end loop;
+
   end process;
 
   ------------------------------------------------------------------------
   main : process
+
     variable t_start, t_end : time;
     variable t_start_r1, t_end_r1 : time;
     variable r0_seen, r1_seen : boolean;
@@ -416,6 +438,7 @@ begin
 
     procedure do_reset is
     begin
+
       reset <= '1';
       wait until rising_edge(clk);
       wait for c_settle;
@@ -428,17 +451,18 @@ begin
 
     -- Issues one write request on w0/w1 and streams 'num_words' beats
     -- starting at 'salt', blocking until the last beat is accepted.
-    procedure write_words(
+    procedure write_words (
       signal wr_req_m2s : out dma_req_m2s_t;
-      signal wr_req_s2m : in dma_req_s2m_t;
-      signal wr_m2s : out axi_stream_m2s_t;
-      signal wr_s2m : in axi_stream_s2m_t;
-      bank : natural;
-      offset : natural;
-      num_words : natural;
-      salt : natural
+      signal wr_req_s2m : in  dma_req_s2m_t;
+      signal wr_m2s     : out axi_stream_m2s_t;
+      signal wr_s2m     : in  axi_stream_s2m_t;
+      bank              : natural;
+      offset            : natural;
+      num_words         : natural;
+      salt              : natural
     ) is
     begin
+
       wr_req_m2s.req.addr <= to_unsigned(word_addr_bytes(bank, offset), 32);
       wr_req_m2s.req.length <= to_unsigned(num_words * c_bytes_per_word, 32);
       wr_req_m2s.valid <= '1';
@@ -447,22 +471,25 @@ begin
       wr_req_m2s.valid <= '0';
 
       for i in 0 to num_words - 1 loop
+
         push_write_beat(clk, wr_m2s, wr_s2m, word_value(salt, i));
       end loop;
+
     end procedure;
 
     -- Issues one write request on wr_req_*, non-blocking on request
     -- acceptance (mirrors 'issue_read' below) so the caller can drive both
     -- write channels' beats concurrently afterward instead of streaming one
     -- channel's whole transfer before starting the other.
-    procedure issue_write(
+    procedure issue_write (
       signal wr_req_m2s : out dma_req_m2s_t;
-      signal wr_req_s2m : in dma_req_s2m_t;
-      bank : natural;
-      offset : natural;
-      num_words : natural
+      signal wr_req_s2m : in  dma_req_s2m_t;
+      bank              : natural;
+      offset            : natural;
+      num_words         : natural
     ) is
     begin
+
       wr_req_m2s.req.addr <= to_unsigned(word_addr_bytes(bank, offset), 32);
       wr_req_m2s.req.length <= to_unsigned(num_words * c_bytes_per_word, 32);
       wr_req_m2s.valid <= '1';
@@ -474,14 +501,15 @@ begin
     -- Issues one read request on rN, non-blocking on request acceptance so
     -- the caller can issue r0 and r1 back-to-back without waiting a whole
     -- request out (used by the concurrency test).
-    procedure issue_read(
+    procedure issue_read (
       signal rd_req_m2s : out dma_req_m2s_t;
-      signal rd_req_s2m : in dma_req_s2m_t;
-      bank : natural;
-      offset : natural;
-      num_words : natural
+      signal rd_req_s2m : in  dma_req_s2m_t;
+      bank              : natural;
+      offset            : natural;
+      num_words         : natural
     ) is
     begin
+
       rd_req_m2s.req.addr <= to_unsigned(word_addr_bytes(bank, offset), 32);
       rd_req_m2s.req.length <= to_unsigned(num_words * c_bytes_per_word, 32);
       rd_req_m2s.valid <= '1';
@@ -497,11 +525,14 @@ begin
     -- original bug: a dropped beat shows up either as a straight data
     -- mismatch (a later word replacing an earlier one) or as the queue
     -- coming up short.
-    procedure check_captured(q : queue_t; num_words : natural; salt : natural; msg : string) is
+    procedure check_captured (q : queue_t; num_words : natural; salt : natural; msg : string) is
+
       variable data_v : std_ulogic_vector(c_data_width - 1 downto 0);
       variable last_v : std_ulogic;
     begin
+
       for i in 0 to num_words - 1 loop
+
         check_false(is_empty(q), msg & ": beat " & natural'image(i) & " missing (queue empty -- beat lost)");
         data_v := pop(q);
         last_v := pop(q);
@@ -512,6 +543,7 @@ begin
           check_equal(last_v, '0', msg & ": non-final beat must not carry 'last'");
         end if;
       end loop;
+
       check_true(is_empty(q), msg & ": no extra/duplicate beats delivered");
     end procedure;
 
@@ -530,25 +562,36 @@ begin
     -- immediately after its predecessor" -- zero bubbles, a sustained 1
     -- beat/cycle -- and, because the allowance is the exact fill latency
     -- rather than a slack margin, it also fails if that latency grows.
-    procedure check_full_rate(t_from : time; t_to : time; num_words : natural; msg : string) is
+    procedure check_full_rate (t_from : time; t_to : time; num_words : natural; msg : string) is
+
       variable span_cycles : natural;
       variable stream_cycles : natural;
     begin
+
       span_cycles := (t_to - t_from) / c_clk_period;
       stream_cycles := span_cycles - c_read_pipeline_cycles;
       info(
-        msg & ": " & natural'image(num_words) & " beats streamed in " &
-        natural'image(stream_cycles) & " cycles (" &
-        real'image(real(num_words) / real(stream_cycles)) &
-        " beats/cycle) after " & natural'image(c_read_pipeline_cycles) &
-        " cycles of pipeline fill; target is 1.0 beats/cycle"
+        msg
+        & ": "
+        & natural'image(num_words)
+        & " beats streamed in "
+        & natural'image(stream_cycles)
+        & " cycles ("
+        & real'image(real(num_words) / real(stream_cycles))
+        & " beats/cycle) after "
+        & natural'image(c_read_pipeline_cycles)
+        & " cycles of pipeline fill; target is 1.0 beats/cycle"
       );
       check_relation(
         span_cycles <= num_words + c_read_pipeline_cycles,
-        msg & ": does not sustain 1 beat/cycle (measured " &
-        natural'image(stream_cycles) & " cycles for " & natural'image(num_words) &
-        " beats, allowing " & natural'image(c_read_pipeline_cycles) &
-        " cycles of pipeline fill)"
+        msg
+        & ": does not sustain 1 beat/cycle (measured "
+        & natural'image(stream_cycles)
+        & " cycles for "
+        & natural'image(num_words)
+        & " beats, allowing "
+        & natural'image(c_read_pipeline_cycles)
+        & " cycles of pipeline fill)"
       );
     end procedure;
 
@@ -562,24 +605,41 @@ begin
     -- (no random-mode consumer on either channel) is fully deterministic,
     -- so that span is a single exact number under correct RTL, and a
     -- refill bubble after the stall can only inflate it.
-    procedure check_no_refill_bubble(t_from : time; t_to : time; num_words : natural; stall_len : natural; msg : string) is
+    procedure check_no_refill_bubble (
+      t_from    : time;
+      t_to      : time;
+      num_words : natural;
+      stall_len : natural;
+      msg       : string
+    ) is
+
       variable span_cycles : natural;
     begin
+
       span_cycles := (t_to - t_from) / c_clk_period;
       info(
-        msg & ": r0 span " & natural'image(span_cycles) & " cycles for " &
-        natural'image(num_words) & " beats with a " & natural'image(stall_len) &
-        "-cycle stall (bank 0 contended by r1 throughout)"
+        msg
+        & ": r0 span "
+        & natural'image(span_cycles)
+        & " cycles for "
+        & natural'image(num_words)
+        & " beats with a "
+        & natural'image(stall_len)
+        & "-cycle stall (bank 0 contended by r1 throughout)"
       );
       check_relation(
         span_cycles <= c_bubble_expected_span_cycles,
-        msg & ": r0's transfer span exceeds the exact deterministic bound (" &
-        natural'image(span_cycles) & " > " & natural'image(c_bubble_expected_span_cycles) &
-        ") -- refill bubble after the stall?"
+        msg
+        & ": r0's transfer span exceeds the exact deterministic bound ("
+        & natural'image(span_cycles)
+        & " > "
+        & natural'image(c_bubble_expected_span_cycles)
+        & ") -- refill bubble after the stall?"
       );
     end procedure;
 
   begin
+
     test_runner_setup(runner, runner_cfg);
 
     do_reset;
@@ -653,6 +713,7 @@ begin
       r0_seen := false;
       r1_seen := false;
       while not (r0_seen and r1_seen) loop
+
         wait until rising_edge(clk);
         if r0_done = '1' then
           r0_seen := true;
@@ -661,6 +722,7 @@ begin
           r1_seen := true;
         end if;
       end loop;
+
       wait for c_settle;
 
       check_captured(r0_captured_q, c_bank_words / 2, 100, "concurrent r0 (fast/toggle consumer)");
@@ -734,6 +796,7 @@ begin
       r0_seen := false;
       r1_seen := false;
       while not (r0_seen and r1_seen) loop
+
         wait until rising_edge(clk);
         if r0_done = '1' and not r0_seen then
           r0_seen := true;
@@ -744,6 +807,7 @@ begin
           t_end_r1 := now;
         end if;
       end loop;
+
       wait for c_settle;
 
       check_captured(r0_captured_q, c_bank_words, 400, "concurrent full-rate r0 data integrity");
@@ -805,12 +869,16 @@ begin
       -- steady state before pausing, and leave plenty of beats after the
       -- stall for the post-stall spacing to be checked.
       for i in 1 to c_stall_start_cycles loop
+
         wait until rising_edge(clk);
       end loop;
+
       r0_pause <= '1';
       for i in 1 to c_stall_len loop
+
         wait until rising_edge(clk);
       end loop;
+
       r0_pause <= '0';
 
       wait until rising_edge(clk) and r0_done = '1';
@@ -820,7 +888,9 @@ begin
 
       check_captured(r0_captured_q, c_bubble_r0_words, 600, "r0 no-refill-bubble-after-stall data integrity");
       check_captured(
-        r1_captured_q, c_bank_words - c_bubble_r0_words, 600 + c_bubble_r0_words,
+        r1_captured_q,
+        c_bank_words - c_bubble_r0_words,
+        600 + c_bubble_r0_words,
         "r0 no-refill-bubble-after-stall: r1 contention data integrity"
       );
       check_no_refill_bubble(t_start, t_end, c_bubble_r0_words, c_stall_len, "test_r0_no_refill_bubble_after_stall");
@@ -865,6 +935,7 @@ begin
       wr_w0_done_seen := false;
       wr_w1_done_seen := false;
       while not (wr_w0_done_seen and wr_w1_done_seen) loop
+
         wr_both_wanted := wr_w0_left > 0 and wr_w1_left > 0;
         wait until rising_edge(clk);
 
@@ -880,8 +951,8 @@ begin
           if wr_have_prev then
             check_true(
               (wr_w0_won and wr_prev_grant = 1) or (wr_w1_won and wr_prev_grant = 0),
-              "test_write_w0_w1_same_bank_round_robin: arbiter did not alternate on sustained same-bank contention " &
-              "(one channel granted twice in a row -- possible starvation)"
+              "test_write_w0_w1_same_bank_round_robin: arbiter did not alternate on sustained same-bank contention "
+              & "(one channel granted twice in a row -- possible starvation)"
             );
           end if;
           if wr_w0_won then
@@ -920,6 +991,7 @@ begin
           wr_w1_done_seen := true;
         end if;
       end loop;
+
       wait for c_settle;
 
       -- Read each channel's range back independently and check the data
@@ -973,8 +1045,10 @@ begin
       -- completion) -- wait a fixed margin instead of on 'done', then
       -- prove the DUT is still alive and correct with a real transfer.
       for i in 1 to 10 loop
+
         wait until rising_edge(clk);
       end loop;
+
       check_equal(r0_done, '0', "zero-length r0 request must never pulse done");
       check_equal(r1_done, '0', "zero-length r1 request must never pulse done");
 
@@ -1001,13 +1075,10 @@ begin
       -- flat range, so a large enough buffer straddled a bank boundary,
       -- every access to it was clamped, and the tail of the tensor was
       -- silently never moved.
-
       -- Seed bank 1 (the neighbour) with a distinctive pattern, and the
       -- crossing range of bank 0 with another.
       write_words(w1_req_m2s, w1_req_s2m, s_w1_m2s, s_w1_s2m, 1, 0, c_cross_words, 2000);
-      write_words(
-        w0_req_m2s, w0_req_s2m, s_w0_m2s, s_w0_s2m, 0, c_cross_offset, c_cross_fit_words, 1000
-      );
+      write_words(w0_req_m2s, w0_req_s2m, s_w0_m2s, s_w0_s2m, 0, c_cross_offset, c_cross_fit_words, 1000);
 
       -- (1) Crossing READ: ask for 'c_cross_words' words from
       -- 'c_cross_offset' in bank 0, of which only 'c_cross_fit_words'
@@ -1020,10 +1091,7 @@ begin
       issue_read(r0_req_m2s, r0_req_s2m, 0, c_cross_offset, c_cross_words);
       wait until rising_edge(clk) and r0_done = '1';
       wait for c_settle;
-      check_captured(
-        r0_captured_q, c_cross_fit_words, 1000,
-        "bank-crossing read is clamped to the addressed bank"
-      );
+      check_captured(r0_captured_q, c_cross_fit_words, 1000, "bank-crossing read is clamped to the addressed bank");
 
       -- (2) Crossing WRITE: same geometry. Only 'c_cross_fit_words'
       -- beats are ever accepted (streaming more would hang this process
@@ -1032,8 +1100,10 @@ begin
       -- clamp happened).
       issue_write(w0_req_m2s, w0_req_s2m, 0, c_cross_offset, c_cross_words);
       for i in 0 to c_cross_fit_words - 1 loop
+
         push_write_beat(clk, s_w0_m2s, s_w0_s2m, word_value(3000, i));
       end loop;
+
       wait until rising_edge(clk) and w0_done = '1';
       wait for c_settle;
 
@@ -1042,10 +1112,7 @@ begin
       issue_read(r0_req_m2s, r0_req_s2m, 0, c_cross_offset, c_cross_fit_words);
       wait until rising_edge(clk) and r0_done = '1';
       wait for c_settle;
-      check_captured(
-        r0_captured_q, c_cross_fit_words, 3000,
-        "bank-crossing write is clamped to the addressed bank"
-      );
+      check_captured(r0_captured_q, c_cross_fit_words, 3000, "bank-crossing write is clamped to the addressed bank");
 
       -- ...and the neighbouring bank still holds exactly what was
       -- written into it before: a clamped transfer must never wrap into,
@@ -1055,7 +1122,9 @@ begin
       wait until rising_edge(clk) and r0_done = '1';
       wait for c_settle;
       check_captured(
-        r0_captured_q, c_cross_words, 2000,
+        r0_captured_q,
+        c_cross_words,
+        2000,
         "bank-crossing transfers left the neighbouring bank untouched"
       );
 
@@ -1082,6 +1151,7 @@ begin
       issue_read(r0_req_m2s, r0_req_s2m, 0, 0, c_bank_words);
 
       for i in 1 to c_reset_at_cycle loop
+
         wait until rising_edge(clk);
       end loop;
 
@@ -1100,17 +1170,15 @@ begin
       flush(r0_captured_q);
 
       for i in 1 to c_post_reset_watch_cycles loop
+
         wait until rising_edge(clk);
-        check_equal(
-          r0_done, '0',
-          "reset mid-transfer: r0 pulsed 'done' after reset with no request outstanding"
-        );
+        check_equal(r0_done, '0', "reset mid-transfer: r0 pulsed 'done' after reset with no request outstanding");
       end loop;
+
       wait for c_settle;
       check_true(
         is_empty(r0_captured_q),
-        "reset mid-transfer: a stale beat was emitted after reset was released " &
-        "(bank_rd_valid_q not reset)"
+        "reset mid-transfer: a stale beat was emitted after reset was released " & "(bank_rd_valid_q not reset)"
       );
 
       -- The reset must abort the transfer, not merely pause it: the DUT
@@ -1119,7 +1187,9 @@ begin
       wait until rising_edge(clk) and r0_done = '1';
       wait for c_settle;
       check_captured(
-        r0_captured_q, c_bank_words / 2, 400,
+        r0_captured_q,
+        c_bank_words / 2,
+        400,
         "post-reset readback: the DUT recovers and serves a fresh request"
       );
     end if;

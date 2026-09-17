@@ -1,14 +1,14 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library axi_stream;
-use axi_stream.axi_stream_pkg.all;
+  use axi_stream.axi_stream_pkg.all;
 
 library math;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_pkg.all;
 
 -- Shared output-quantization stage. See
 -- modules/cnn_accel/doc/cnn_accel_bias_requant_req.md and
@@ -87,59 +87,58 @@ use cnn_accel.cnn_accel_pkg.all;
 entity cnn_accel_bias_requant is
   generic (
     -- Input accumulator width (int32 default).
-    g_accum_width : positive := 32;
+    g_accum_width       : positive := 32;
     -- Output-channel parallelism: number of independent lanes.
-    g_pe_rows : positive := 8;
+    g_pe_rows           : positive := 8;
     -- Width of 'bias_rd_addr'. Added by vhdesign (not in the requirement)
     -- so this module's read-address port can be sized to match
     -- cnn_accel_weight_buffer's actual 'bias_rd_addr' width
     -- (num_bits_needed(g_weight_buffer_depth - 1)) at cnn_accel_top
     -- integration time. The value driven is always all-zeros in v1 (see
     -- entity-level comment above) regardless of this generic's value.
-    g_bias_addr_width : positive := 1;
+    g_bias_addr_width   : positive := 1;
     -- Added by vhdesign: upper bound on the runtime-variable
     -- 'cfg_requant_shift' that this module supports at full precision.
     -- 'cfg_requant_shift' values above this bound are clamped to it (a
     -- defensive limit, not expected to be hit by compiled programs -- see
     -- proposal doc §4).
-    g_max_requant_shift : natural := 31
-  );
+    g_max_requant_shift : natural := 31);
   port (
-    clk : in std_ulogic;
-    reset : in std_ulogic;
+    clk                : in  std_ulogic;
+    reset              : in  std_ulogic;
 
-    cfg_bias_en : in std_ulogic;
-    cfg_requant_en : in std_ulogic;
-    cfg_relu_en : in std_ulogic;
-    cfg_requant_scale : in std_ulogic_vector(31 downto 0);
-    cfg_requant_shift : in std_ulogic_vector(7 downto 0);
+    cfg_bias_en        : in  std_ulogic;
+    cfg_requant_en     : in  std_ulogic;
+    cfg_relu_en        : in  std_ulogic;
+    cfg_requant_scale  : in  std_ulogic_vector(31 downto 0);
+    cfg_requant_shift  : in  std_ulogic_vector(7 downto 0);
     -- ISA v1.1 (H1) epilogue fields, instruction word W13. Signed int16 /
     -- int8 / int8; all-zero (and cfg_clamp_en='0') reproduces v1.0.
-    cfg_output_offset : in std_ulogic_vector(15 downto 0) := (others => '0');
-    cfg_clamp_en : in std_ulogic := '0';
-    cfg_clamp_min : in std_ulogic_vector(7 downto 0) := (others => '0');
-    cfg_clamp_max : in std_ulogic_vector(7 downto 0) := (others => '0');
+    cfg_output_offset  : in  std_ulogic_vector(15 downto 0) := (others => '0');
+    cfg_clamp_en       : in  std_ulogic := '0';
+    cfg_clamp_min      : in  std_ulogic_vector(7 downto 0) := (others => '0');
+    cfg_clamp_max      : in  std_ulogic_vector(7 downto 0) := (others => '0');
     -- ISA v1.2 (H2) FLAG_PER_CHANNEL_EN: '1' selects lane-wise
     -- (multiplier, shift) from 'scale_rd_data' instead of the two cfg_*
     -- ports above. Sampled per beat like every other cfg_* port.
-    cfg_per_channel_en : in std_ulogic := '0';
+    cfg_per_channel_en : in  std_ulogic := '0';
 
-    bias_rd_addr : out std_ulogic_vector(g_bias_addr_width - 1 downto 0);
-    bias_rd_data : in std_ulogic_vector(g_accum_width * g_pe_rows - 1 downto 0);
+    bias_rd_addr       : out std_ulogic_vector(g_bias_addr_width - 1 downto 0);
+    bias_rd_data       : in  std_ulogic_vector(g_accum_width * g_pe_rows - 1 downto 0);
     -- Per-channel requant table row for the same 'bias_rd_addr' (cnn_accel_
     -- weight_buffer's 'scale_rd_data'), 'c_scale_entry_width' bits per
     -- lane; only read while cfg_per_channel_en='1'.
-    scale_rd_data : in std_ulogic_vector(c_scale_entry_width * g_pe_rows - 1 downto 0) := (others => '0');
+    scale_rd_data      : in  std_ulogic_vector(c_scale_entry_width * g_pe_rows - 1 downto 0) := (others => '0');
 
     -- One int32-ish (g_accum_width-bit) partial sum per PE row, from
     -- cnn_accel_pe_array's 'm_accum_m2s'. An array of lanes (D15), not a
     -- packed AXI4-Stream payload, so lane 'l' is indexed directly --
     -- see cnn_accel_pkg.vhd's 'accum_m2s_t' doc comment.
-    s_accum_m2s : in accum_m2s_t(data(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0));
-    s_accum_s2m : out accum_s2m_t;
+    s_accum_m2s        : in  accum_m2s_t(data(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0));
+    s_accum_s2m        : out accum_s2m_t;
 
-    m_out_m2s : out axi_stream_m2s_t;
-    m_out_s2m : in axi_stream_s2m_t
+    m_out_m2s          : out axi_stream_m2s_t;
+    m_out_s2m          : in  axi_stream_s2m_t
   );
 end entity cnn_accel_bias_requant;
 
@@ -232,8 +231,11 @@ architecture a of cnn_accel_bias_requant is
   subtype shift_t is natural range 15 to 15 + g_max_requant_shift;
 
   type accum_lanes_t is array (0 to g_pe_rows - 1) of signed(g_accum_width - 1 downto 0);
+
   type sum_lanes_t is array (0 to g_pe_rows - 1) of signed(c_sum_width - 1 downto 0);
+
   type product_lanes_t is array (0 to g_pe_rows - 1) of signed(c_product_width - 1 downto 0);
+
   type byte_lanes_t is array (0 to g_pe_rows - 1) of signed(7 downto 0);
 
   -- Bypass path intermediate: 'total' saturated to 17 bits, then the
@@ -245,16 +247,23 @@ architecture a of cnn_accel_bias_requant is
   constant c_offs_round_width : positive := 17;
 
   type bypass_sat_lanes_t is array (0 to g_pe_rows - 1) of signed(c_bypass_sat_width - 1 downto 0);
+
   type bypass_sum_lanes_t is array (0 to g_pe_rows - 1) of signed(c_bypass_sum_width - 1 downto 0);
+
   type offs_round_lanes_t is array (0 to g_pe_rows - 1) of signed(c_offs_round_width - 1 downto 0);
 
   -- Scale and shift are per lane since ISA v1.2 (per-channel
   -- requantization); the remaining config is shared by all lanes.
   type shift_lanes_t is array (0 to g_pe_rows - 1) of shift_t;
+
   type scale_lanes_t is array (0 to g_pe_rows - 1) of signed(c_scale_entry_mult_width - 1 downto 0);
+
   type shift_pipe_t is array (1 to 4) of shift_lanes_t;
+
   type scale_pipe_t is array (1 to 2) of scale_lanes_t;
+
   type offset_pipe_t is array (1 to 4) of signed(15 downto 0);
+
   type bound_pipe_t is array (1 to 7) of signed(7 downto 0);
 
   ------------------------------------------------------------------------
@@ -381,15 +390,16 @@ begin
     signal shift_amt_raw_l : natural range 0 to 255;
     signal shift_amt_clamped_l : natural range 0 to g_max_requant_shift;
   begin
-    lane_scale(l) <=
-      signed(scale_rd_data(c_lane_lo + c_scale_entry_mult_width - 1 downto c_lane_lo))
-      when cfg_per_channel_en = '1' else signed(cfg_requant_scale);
-    shift_raw_l <=
-      scale_rd_data(c_lane_lo + c_scale_entry_width - 1 downto c_lane_lo + c_scale_entry_mult_width)
-      when cfg_per_channel_en = '1' else cfg_requant_shift;
+    lane_scale(l) <= signed(scale_rd_data(c_lane_lo + c_scale_entry_mult_width - 1 downto c_lane_lo))
+                       when cfg_per_channel_en = '1' else
+                     signed(cfg_requant_scale);
+    shift_raw_l <= scale_rd_data(c_lane_lo + c_scale_entry_width - 1 downto c_lane_lo + c_scale_entry_mult_width)
+                     when cfg_per_channel_en = '1' else
+                   cfg_requant_shift;
 
     shift_amt_raw_l <= to_integer(unsigned(shift_raw_l));
-    shift_amt_clamped_l <= shift_amt_raw_l when shift_amt_raw_l <= g_max_requant_shift else g_max_requant_shift;
+    shift_amt_clamped_l <= shift_amt_raw_l when shift_amt_raw_l <= g_max_requant_shift else
+                           g_max_requant_shift;
     combined_shift(l) <= 15 + shift_amt_clamped_l;
   end generate lane_cfg_gen;
 
@@ -398,7 +408,8 @@ begin
   clamp_lo <= signed(cfg_clamp_min) when cfg_clamp_en = '1' else
               to_signed(0, 8) when cfg_relu_en = '1' else
               to_signed(-128, 8);
-  clamp_hi <= signed(cfg_clamp_max) when cfg_clamp_en = '1' else to_signed(127, 8);
+  clamp_hi <= signed(cfg_clamp_max) when cfg_clamp_en = '1' else
+              to_signed(127, 8);
 
   ------------------------------------------------------------------------
   -- v1 bias addressing: single bias row (row 0) for the whole layer --
@@ -420,9 +431,8 @@ begin
   ------------------------------------------------------------------------
 
   lane_gen : for l in 0 to g_pe_rows - 1 generate
-
-    -- Stage 7: requant path saturated to int8, then the path mux and the
-    -- general clamp.
+  -- Stage 7: requant path saturated to int8, then the path mux and the
+  -- general clamp.
     signal sat_result_l : signed(7 downto 0);
     signal pre_clamp_l : signed(7 downto 0);
 
@@ -454,16 +464,16 @@ begin
 
     bypass_saturate_wide_inst : entity math.saturate_signed
       generic map (
-        input_width => c_sum_width,
-        result_width => c_bypass_sat_width,
+        input_width            => c_sum_width,
+        result_width           => c_bypass_sat_width,
         enable_output_register => false
       )
       port map (
-        clk => clk,
-        input_valid => '1',
-        input_value => total_2(l),
-        result_valid => open,
-        result_value => bypass_sat_next(l),
+        clk                 => clk,
+        input_valid         => '1',
+        input_value         => total_2(l),
+        result_valid        => open,
+        result_value        => bypass_sat_next(l),
         result_is_saturated => open
       );
 
@@ -471,16 +481,16 @@ begin
 
     bypass_saturate_signed_inst : entity math.saturate_signed
       generic map (
-        input_width => c_bypass_sum_width,
-        result_width => 8,
+        input_width            => c_bypass_sum_width,
+        result_width           => 8,
         enable_output_register => false
       )
       port map (
-        clk => clk,
-        input_valid => '1',
-        input_value => bypass_4(l),
-        result_valid => open,
-        result_value => bypass_sat8_next(l),
+        clk                 => clk,
+        input_valid         => '1',
+        input_value         => bypass_4(l),
+        result_valid        => open,
+        result_value        => bypass_sat8_next(l),
         result_is_saturated => open
       );
 
@@ -515,10 +525,13 @@ begin
     -- proposal doc section 4.
     --------------------------------------------------------------------
 
-    round_shift_proc : process(all)
+    round_shift_proc : process (all)
+
       variable product_u : unsigned(c_product_width - 1 downto 0);
       variable shift_amt : shift_t;
+
     begin
+
       shift_amt := shift_p(4)(l);
       product_u := unsigned(prod_4(l));
 
@@ -550,20 +563,21 @@ begin
 
     saturate_signed_inst : entity math.saturate_signed
       generic map (
-        input_width => c_product_width,
-        result_width => 8,
+        input_width            => c_product_width,
+        result_width           => 8,
         enable_output_register => false
       )
       port map (
-        clk => clk,
-        input_valid => '1',
-        input_value => scaled_6(l),
-        result_valid => open,
-        result_value => sat_result_l,
+        clk                 => clk,
+        input_valid         => '1',
+        input_value         => scaled_6(l),
+        result_valid        => open,
+        result_value        => sat_result_l,
         result_is_saturated => open
       );
 
-    pre_clamp_l <= sat_result_l when requant_en_p(6) = '1' else bypass_6(l);
+    pre_clamp_l <= sat_result_l when requant_en_p(6) = '1' else
+                   bypass_6(l);
     pre_clamp_next(l) <= pre_clamp_l;
 
     --------------------------------------------------------------------
@@ -584,7 +598,7 @@ begin
 
   data_padding_gen : if 8 * g_pe_rows < axi_stream_data_sz generate
     next_out_data_full(axi_stream_data_sz - 1 downto 8 * g_pe_rows) <= (others => '0');
-  end generate;
+  end generate data_padding_gen;
 
   ------------------------------------------------------------------------
   -- The pipeline registers themselves. Reset clears the valid chain only
@@ -592,8 +606,9 @@ begin
   -- single-stage version this replaces.
   ------------------------------------------------------------------------
 
-  pipeline : process(clk)
+  pipeline : process (clk)
   begin
+
     if rising_edge(clk) then
       if reset = '1' then
         valid_q <= (others => '0');
@@ -602,9 +617,11 @@ begin
         valid_q(1) <= s_accum_m2s.valid;
         last_q(1) <= s_accum_m2s.last;
         for l in 0 to g_pe_rows - 1 loop
+
           accum_1(l) <= s_accum_m2s.data(l);
           bias_1(l) <= signed(bias_rd_data(g_accum_width * (l + 1) - 1 downto g_accum_width * l));
         end loop;
+
         bias_en_1 <= cfg_bias_en;
         requant_en_p(1) <= cfg_requant_en;
         scale_p(1) <= lane_scale;
@@ -629,8 +646,10 @@ begin
         valid_q(3) <= valid_q(2);
         last_q(3) <= last_q(2);
         for l in 0 to g_pe_rows - 1 loop
+
           prod_3(l) <= total_2(l) * scale_p(2)(l);
         end loop;
+
         bypass_3 <= bypass_sat_next;
         requant_en_p(3) <= requant_en_p(2);
         shift_p(3) <= shift_p(2);

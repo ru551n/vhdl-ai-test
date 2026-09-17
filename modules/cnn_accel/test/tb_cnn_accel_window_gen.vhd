@@ -1,19 +1,19 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library vunit_lib;
 context vunit_lib.vunit_context;
-use vunit_lib.queue_pkg.all;
+  use vunit_lib.queue_pkg.all;
 
 library osvvm;
-use osvvm.RandomPkg.all;
+  use osvvm.randompkg.all;
 
 library axi_stream;
-use axi_stream.axi_stream_pkg.all;
+  use axi_stream.axi_stream_pkg.all;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_pkg.all;
 
 -- VUnit-5 testbench for cnn_accel_window_gen, covering both the
 -- pre-tiling spatial state machine (kernel/stride/padding/backpressure,
@@ -42,8 +42,7 @@ entity tb_cnn_accel_window_gen is
     -- scheduling property, not a numerical one -- which is exactly what
     -- makes running the whole suite twice the right check.
     g_assembly_buffers : positive := 1;
-    runner_cfg : string
-  );
+    runner_cfg         : string);
 end entity tb_cnn_accel_window_gen;
 
 architecture tb of tb_cnn_accel_window_gen is
@@ -145,36 +144,33 @@ architecture tb of tb_cnn_accel_window_gen is
     h : natural;
     w : natural;
   end record;
+
   type shape_arr_t is array (natural range <>) of shape_t;
 
   -- Kernel shapes swept by test_kernel_stride_shapes: 1x1 up to
   -- c_kernel_max x c_kernel_max, square and non-square (mirrors
   -- tb_cnn_accel_pool.vhd's identical 'c_shapes').
-  constant c_shapes : shape_arr_t(0 to 4) := (
-    (1, 1), (2, 2), (3, 3), (2, 3), (3, 2)
-  );
-  constant c_strides : shape_arr_t(0 to 1) := (
-    (1, 1), (2, 2)
-  );
+  constant c_shapes : shape_arr_t(0 to 4) := ((1, 1), (2, 2), (3, 3), (2, 3), (3, 2));
+  constant c_strides : shape_arr_t(0 to 1) := ((1, 1), (2, 2));
 
   type pad_t is record
-    top : natural;
+    top    : natural;
     bottom : natural;
-    left : natural;
-    right : natural;
+    left   : natural;
+    right  : natural;
   end record;
+
   type pad_arr_t is array (natural range <>) of pad_t;
 
   -- Padding combinations swept by test_padding_all_sides: none, symmetric,
   -- and two asymmetric combinations (pad_top /= pad_bottom, pad_left /=
   -- pad_right -- including one large enough, relative to the 3x3 kernel,
   -- to clip a window's real-row range down to a single row).
-  constant c_pads : pad_arr_t(0 to 3) := (
-    (0, 0, 0, 0), (1, 1, 1, 1), (2, 0, 0, 2), (1, 2, 2, 1)
-  );
+  constant c_pads : pad_arr_t(0 to 3) := ((0, 0, 0, 0), (1, 1, 1, 1), (2, 0, 0, 2), (1, 2, 2, 1));
 
-  function to_sl(cond : boolean) return std_ulogic is
+  function to_sl (cond : boolean) return std_ulogic is
   begin
+
     if cond then
       return '1';
     end if;
@@ -183,8 +179,9 @@ architecture tb of tb_cnn_accel_window_gen is
 
   -- T = ceil(in_channels / c_tile_channels), the number of input-channel
   -- tiles per output pixel -- mirrors the DUT's own 'n_tiles_q'.
-  function n_tiles(in_channels : natural) return natural is
+  function n_tiles (in_channels : natural) return natural is
   begin
+
     return (in_channels + c_tile_channels - 1) / c_tile_channels;
   end function;
 
@@ -198,11 +195,14 @@ architecture tb of tb_cnn_accel_window_gen is
   -- outside '[0, in_channels)' (D11's final-tile-lane zero-padding --
   -- deliberately still 0: that is a *channel* lane that does not exist,
   -- not a spatial position outside the frame), the real pixel otherwise.
-  function golden_tap(
-    frame : frame_t; in_h, in_w, in_channels : natural; row, col, channel : integer;
-    pad_value : integer
+  function golden_tap (
+    frame                   : frame_t;
+    in_h, in_w, in_channels : natural;
+    row, col, channel       : integer;
+    pad_value               : integer
   ) return integer is
   begin
+
     if row < 0 or col < 0 or row > in_h - 1 or col > in_w - 1 then
       return pad_value;
     end if;
@@ -217,38 +217,49 @@ architecture tb of tb_cnn_accel_window_gen is
   -- 'kh * kw * c_tile_channels * 8' bits of a fixed 'c_max_window_bits'-
   -- wide vector, per cnn_accel_pkg's documented 'window_m2s_t.data'
   -- layout; remaining high bits stay 0.
-  function golden_window(
-    frame : frame_t;
+  function golden_window (
+    frame                                                      : frame_t;
     in_h, in_w, in_channels, kh, kw, sh, sw, pad_top, pad_left : natural;
-    out_row, out_col, tile_idx : natural;
-    pad_value : integer
+    out_row, out_col, tile_idx                                 : natural;
+    pad_value                                                  : integer
   ) return std_ulogic_vector is
+
     -- Every element starts at the pad value, not 0: the DUT clears its
     -- whole tap-assembly register to 'cfg_pad_value' at the start of each
     -- window, so the taps beyond the runtime 'kh * kw' (which no consumer
     -- looks at) hold the pad value as well.
     variable result : std_ulogic_vector(c_max_window_bits - 1 downto 0) := (others => '0');
-    variable input_row, input_col, tap_idx, abs_channel : integer;
+    variable input_row : integer;
+    variable input_col : integer;
+    variable tap_idx : integer;
+    variable abs_channel : integer;
   begin
+
     for i in 0 to c_max_window_length - 1 loop
+
       result(8 * (i + 1) - 1 downto 8 * i) := std_ulogic_vector(to_signed(pad_value, 8));
     end loop;
+
     for kr in 0 to kh - 1 loop
+
       for kc in 0 to kw - 1 loop
+
         input_row := out_row * sh + kr - pad_top;
         input_col := out_col * sw + kc - pad_left;
         tap_idx := kr * kw + kc;
         for c in 0 to c_tile_channels - 1 loop
+
           abs_channel := tile_idx * c_tile_channels + c;
           result(8 * (tap_idx * c_tile_channels + c + 1) - 1 downto 8 * (tap_idx * c_tile_channels + c)) :=
-            std_ulogic_vector(to_signed(
-              golden_tap(
-                frame, in_h, in_w, in_channels, input_row, input_col, abs_channel, pad_value
-              ), 8
-            ));
+            std_ulogic_vector(
+              to_signed(golden_tap(frame, in_h, in_w, in_channels, input_row, input_col, abs_channel, pad_value), 8)
+            );
         end loop;
+
       end loop;
+
     end loop;
+
     return result;
   end function;
 
@@ -263,16 +274,19 @@ begin
   -- 'done <= consume and last_pixel and last_tile_flag'.
   ------------------------------------------------------------------------
 
-  done_relation_check : process(clk)
+  done_relation_check : process (clk)
   begin
+
     if rising_edge(clk) then
       if reset = '1' then
         done_pulse_count <= 0;
       else
         if done = '1' then
           check_true(
-            m_window_m2s.valid = '1' and m_window_s2m.ready = '1' and m_window_m2s.last = '1'
-              and m_window_m2s.last_tile = '1',
+            m_window_m2s.valid = '1'
+            and m_window_s2m.ready = '1'
+            and m_window_m2s.last = '1'
+            and m_window_m2s.last_tile = '1',
             "done must coincide with acceptance of the final ('last', 'last_tile') window beat"
           );
           done_pulse_count <= done_pulse_count + 1;
@@ -293,11 +307,16 @@ begin
   -- than as a scoreboard mismatch many beats later (or, worse, not at all
   -- when the mutation happens to reorder rather than corrupt).
   ------------------------------------------------------------------------
-  window_hold_check : process(clk)
+  window_hold_check : process (clk)
+
     variable v_held : std_ulogic := '0';
     variable v_data : std_ulogic_vector(c_max_window_bits - 1 downto 0) := (others => '0');
-    variable v_first_tile, v_last_tile, v_last : std_ulogic := '0';
+    variable v_first_tile : std_ulogic := '0';
+    variable v_last_tile : std_ulogic := '0';
+    variable v_last : std_ulogic := '0';
+
   begin
+
     if rising_edge(clk) then
       if reset = '1' or start = '1' then
         -- A reset or a new 'start' legitimately drops a held beat
@@ -323,34 +342,34 @@ begin
   ------------------------------------------------------------------------
   dut : entity cnn_accel.cnn_accel_window_gen
     generic map (
-      g_max_kernel_size => c_kernel_max,
+      g_max_kernel_size    => c_kernel_max,
       g_max_row_tile_words => c_row_tile_words_max,
-      g_tile_channels => c_tile_channels,
-      g_assembly_buffers => g_assembly_buffers
+      g_tile_channels      => c_tile_channels,
+      g_assembly_buffers   => g_assembly_buffers
     )
     port map (
-      clk => clk,
-      reset => reset,
-      cfg_kernel_h => cfg_kernel_h,
-      cfg_kernel_w => cfg_kernel_w,
-      cfg_stride_h => cfg_stride_h,
-      cfg_stride_w => cfg_stride_w,
-      cfg_pad_top => cfg_pad_top,
-      cfg_pad_bottom => cfg_pad_bottom,
-      cfg_pad_left => cfg_pad_left,
-      cfg_pad_right => cfg_pad_right,
-      cfg_pad_value => cfg_pad_value,
-      cfg_in_width => cfg_in_width,
-      cfg_in_height => cfg_in_height,
-      cfg_out_width => cfg_out_width,
-      cfg_out_height => cfg_out_height,
+      clk             => clk,
+      reset           => reset,
+      cfg_kernel_h    => cfg_kernel_h,
+      cfg_kernel_w    => cfg_kernel_w,
+      cfg_stride_h    => cfg_stride_h,
+      cfg_stride_w    => cfg_stride_w,
+      cfg_pad_top     => cfg_pad_top,
+      cfg_pad_bottom  => cfg_pad_bottom,
+      cfg_pad_left    => cfg_pad_left,
+      cfg_pad_right   => cfg_pad_right,
+      cfg_pad_value   => cfg_pad_value,
+      cfg_in_width    => cfg_in_width,
+      cfg_in_height   => cfg_in_height,
+      cfg_out_width   => cfg_out_width,
+      cfg_out_height  => cfg_out_height,
       cfg_in_channels => cfg_in_channels,
-      start => start,
-      done => done,
-      s_stream_m2s => s_stream_m2s,
-      s_stream_s2m => s_stream_s2m,
-      m_window_m2s => m_window_m2s,
-      m_window_s2m => m_window_s2m
+      start           => start,
+      done            => done,
+      s_stream_m2s    => s_stream_m2s,
+      s_stream_s2m    => s_stream_s2m,
+      m_window_m2s    => m_window_m2s,
+      m_window_s2m    => m_window_s2m
     );
 
   ------------------------------------------------------------------------
@@ -364,27 +383,37 @@ begin
   ------------------------------------------------------------------------
 
   monitor : process
-    variable rnd : RandomPType;
+
+    variable rnd : randomptype;
     variable expected_data : std_ulogic_vector(c_max_window_bits - 1 downto 0);
-    variable expected_first_tile, expected_last_tile, expected_last : std_ulogic;
+    variable expected_first_tile : std_ulogic;
+    variable expected_last_tile : std_ulogic;
+    variable expected_last : std_ulogic;
+
   begin
+
     rnd.InitSeed(get_string_seed(runner_cfg) & "_window_monitor");
     m_window_s2m.ready <= '0';
     wait until reset = '0' and rising_edge(clk);
 
     loop
+
       if rnd.RandInt(0, 99) < cur_stall_out then
         m_window_s2m.ready <= '0';
         for i in 1 to rnd.RandInt(1, 3) loop
+
           wait until rising_edge(clk);
         end loop;
+
       end if;
 
       if cur_ready_mode = 1 then
         m_window_s2m.ready <= '0';
         for i in 1 to 4 loop
+
           wait until rising_edge(clk);
         end loop;
+
       end if;
 
       m_window_s2m.ready <= '1';
@@ -395,37 +424,45 @@ begin
         expected_first_tile := pop(expected_q);
         expected_last_tile := pop(expected_q);
         expected_last := pop(expected_q);
-        check_equal(
-          to_slv(m_window_m2s.data), expected_data, "m_window data mismatch"
-        );
+        check_equal(to_slv(m_window_m2s.data), expected_data, "m_window data mismatch");
         check_equal(m_window_m2s.first_tile, expected_first_tile, "m_window first_tile mismatch");
         check_equal(m_window_m2s.last_tile, expected_last_tile, "m_window last_tile mismatch");
         check_equal(m_window_m2s.last, expected_last, "m_window last mismatch");
       end if;
     end loop;
+
   end process;
 
   ------------------------------------------------------------------------
   main : process
-    variable rnd : RandomPType;
+
+    variable rnd : randomptype;
     variable frame : frame_t;
 
     procedure do_reset is
     begin
+
       reset <= '1';
       wait until rising_edge(clk);
       reset <= '0';
     end procedure;
 
-    procedure random_frame(in_h, in_w : natural) is
+    procedure random_frame (in_h, in_w : natural) is
     begin
+
       for r in 0 to in_h - 1 loop
+
         for c in 0 to in_w - 1 loop
+
           for ch in 0 to c_channels_max - 1 loop
+
             frame(r, c, ch) := rnd.RandInt(-128, 127);
           end loop;
+
         end loop;
+
       end loop;
+
     end procedure;
 
     -- Pushes one 's_stream' beat carrying tile 'tile_idx' of pixel
@@ -435,28 +472,30 @@ begin
     -- deliberately *non-zero* garbage, not 0: the point is to prove the
     -- DUT's own write-side zeroing (not a coincidentally-zero source)
     -- is what makes those lanes read back as 0.
-    procedure push_tile(
-      r, c : natural; in_channels, tile_idx : natural; stall_percent : natural
-    ) is
+    procedure push_tile (r, c : natural; in_channels, tile_idx : natural; stall_percent : natural) is
+
       variable data : std_ulogic_vector(axi_stream_data_sz - 1 downto 0) := (others => '0');
       variable abs_channel : integer;
     begin
+
       for lane in 0 to c_tile_channels - 1 loop
+
         abs_channel := tile_idx * c_tile_channels + lane;
         if abs_channel <= in_channels - 1 then
-          data(8 * (lane + 1) - 1 downto 8 * lane) :=
-            std_ulogic_vector(to_signed(frame(r, c, abs_channel), 8));
+          data(8 * (lane + 1) - 1 downto 8 * lane) := std_ulogic_vector(to_signed(frame(r, c, abs_channel), 8));
         else
-          data(8 * (lane + 1) - 1 downto 8 * lane) :=
-            std_ulogic_vector(to_signed(rnd.RandInt(1, 127), 8));
+          data(8 * (lane + 1) - 1 downto 8 * lane) := std_ulogic_vector(to_signed(rnd.RandInt(1, 127), 8));
         end if;
       end loop;
+
       s_stream_m2s.data <= data;
       if rnd.RandInt(0, 99) < stall_percent then
         s_stream_m2s.valid <= '0';
         for i in 1 to rnd.RandInt(1, 3) loop
+
           wait until rising_edge(clk);
         end loop;
+
       end if;
       s_stream_m2s.valid <= '1';
       wait until rising_edge(clk) and s_stream_s2m.ready = '1';
@@ -473,33 +512,37 @@ begin
     -- correct, ordinary empty 'for' loop in VHDL, not a special case.
     -- Every pixel actually streamed pushes 'n_tiles(in_channels)'
     -- consecutive tile beats, mirroring the DUT's own write-side tiling.
-    procedure stream_frame(
-      in_h, in_w, in_channels : natural; stall_percent : natural; last_col_needed : integer
-    ) is
+    procedure stream_frame (in_h, in_w, in_channels : natural; stall_percent : natural; last_col_needed : integer) is
+
       variable col_limit : integer;
     begin
+
       for r in 0 to in_h - 1 loop
+
         if r = in_h - 1 then
           col_limit := last_col_needed;
         else
           col_limit := in_w - 1;
         end if;
         for c in 0 to col_limit loop
+
           for tile in 0 to n_tiles(in_channels) - 1 loop
+
             push_tile(r, c, in_channels, tile, stall_percent);
           end loop;
+
         end loop;
+
       end loop;
+
     end procedure;
 
     -- Latches the 'cfg_*' configuration and pulses 'start'; the DUT
     -- samples 'cfg_*' the same edge 'start' is high, so these must be
     -- assigned before (not after) the pulse.
-    procedure begin_frame(
-      kh, kw, sh, sw, pt, pb, pl, pr, inw, inh, in_channels : natural;
-      pad_value : integer := 0
-    ) is
+    procedure begin_frame (kh, kw, sh, sw, pt, pb, pl, pr, inw, inh, in_channels : natural; pad_value : integer := 0) is
     begin
+
       cfg_pad_value <= std_ulogic_vector(to_signed(pad_value, 8));
       cfg_kernel_h <= std_ulogic_vector(to_unsigned(kh, 8));
       cfg_kernel_w <= std_ulogic_vector(to_unsigned(kw, 8));
@@ -524,39 +567,64 @@ begin
     -- above. 'first_tile'/'last_tile' are both '1' on the single beat
     -- when 'T = 1'; 'last' fires only on the last tile beat of the final
     -- pixel.
-    procedure enqueue_frame_expected(
+    procedure enqueue_frame_expected (
       in_h, in_w, in_channels, kh, kw, sh, sw, pad_top, pad_left, out_h, out_w : natural;
       pad_value : integer := 0
     ) is
+
       variable t : natural;
     begin
+
       t := n_tiles(in_channels);
       for orow in 0 to out_h - 1 loop
+
         for ocol in 0 to out_w - 1 loop
+
           for tile in 0 to t - 1 loop
-            push(expected_q, golden_window(
-              frame, in_h, in_w, in_channels, kh, kw, sh, sw, pad_top, pad_left, orow, ocol,
-              tile, pad_value
-            ));
+
+            push(
+              expected_q,
+              golden_window(
+                frame,
+                in_h,
+                in_w,
+                in_channels,
+                kh,
+                kw,
+                sh,
+                sw,
+                pad_top,
+                pad_left,
+                orow,
+                ocol,
+                tile,
+                pad_value
+              )
+            );
             push(expected_q, to_sl(tile = 0));
             push(expected_q, to_sl(tile = t - 1));
-            push(expected_q, to_sl(
-              orow = out_h - 1 and ocol = out_w - 1 and tile = t - 1
-            ));
+            push(expected_q, to_sl(orow = out_h - 1 and ocol = out_w - 1 and tile = t - 1));
           end loop;
+
         end loop;
+
       end loop;
+
     end procedure;
 
     -- Waits (bounded) until 'expected_q' has drained, then confirms it is
     -- truly empty (every expected window beat actually arrived).
-    procedure drain_and_check(max_wait_cycles : positive) is
+    procedure drain_and_check (max_wait_cycles : positive) is
+
       variable cycles : natural := 0;
     begin
+
       while not is_empty(expected_q) and cycles < max_wait_cycles loop
+
         wait until rising_edge(clk);
         cycles := cycles + 1;
       end loop;
+
       check_true(is_empty(expected_q), "m_window scoreboard queue did not drain in time");
     end procedure;
 
@@ -564,25 +632,25 @@ begin
     -- golden expected window beats, stream the frame's pixel-tile beats
     -- (honoring 'stall_in'), drain the scoreboard, and confirm exactly
     -- one 'done' pulse fired.
-    procedure run_frame(
+    procedure run_frame (
       in_h, in_w, kh, kw, sh, sw, pt, pb, pl, pr : natural;
-      stall_in, stall_out : natural;
-      max_wait_cycles : positive;
-      in_channels : natural := c_tile_channels;
-      pad_value : integer := 0;
-      ready_mode : natural := 0
+      stall_in, stall_out                        : natural;
+      max_wait_cycles                            : positive;
+      in_channels                                : natural := c_tile_channels;
+      pad_value                                  : integer := 0;
+      ready_mode                                 : natural := 0
     ) is
+
       variable out_w, out_h : natural;
       variable last_row_needed, last_col_needed : integer;
       variable rows_to_stream : natural;
     begin
+
       do_reset;
       begin_frame(kh, kw, sh, sw, pt, pb, pl, pr, in_w, in_h, in_channels, pad_value);
       out_w := (in_w + pl + pr - kw) / sw + 1;
       out_h := (in_h + pt + pb - kh) / sh + 1;
-      enqueue_frame_expected(
-        in_h, in_w, in_channels, kh, kw, sh, sw, pt, pl, out_h, out_w, pad_value
-      );
+      enqueue_frame_expected(in_h, in_w, in_channels, kh, kw, sh, sw, pt, pl, out_h, out_w, pad_value);
       cur_stall_out <= stall_out;
       cur_ready_mode <= ready_mode;
       -- The DUT can legitimately finish a frame (deassert
@@ -625,28 +693,26 @@ begin
     end procedure;
 
   begin
+
     test_runner_setup(runner, runner_cfg);
     rnd.InitSeed(get_string_seed(runner_cfg));
 
     if run("test_kernel_stride_shapes") then
       for s in c_shapes'range loop
+
         for st in c_strides'range loop
+
           random_frame(7, 8);
-          run_frame(
-            7, 8, c_shapes(s).h, c_shapes(s).w, c_strides(st).h, c_strides(st).w,
-            0, 0, 0, 0, 15, 15, 2000
-          );
+          run_frame(7, 8, c_shapes(s).h, c_shapes(s).w, c_strides(st).h, c_strides(st).w, 0, 0, 0, 0, 15, 15, 2000);
         end loop;
+
       end loop;
 
     elsif run("test_padding_all_sides") then
       for p in c_pads'range loop
+
         random_frame(5, 5);
-        run_frame(
-          5, 5, 3, 3, 1, 1,
-          c_pads(p).top, c_pads(p).bottom, c_pads(p).left, c_pads(p).right,
-          15, 15, 2000
-        );
+        run_frame(5, 5, 3, 3, 1, 1, c_pads(p).top, c_pads(p).bottom, c_pads(p).left, c_pads(p).right, 15, 15, 2000);
       end loop;
 
     elsif run("test_pad_value") then
@@ -658,25 +724,62 @@ begin
       -- combination, so both the spatial pad taps and the
       -- beyond-the-kernel taps are checked against the golden model.
       for p in c_pads'range loop
+
         random_frame(5, 5);
         run_frame(
-          5, 5, 3, 3, 1, 1,
-          c_pads(p).top, c_pads(p).bottom, c_pads(p).left, c_pads(p).right,
-          15, 15, 2000, c_tile_channels, -128
+          5,
+          5,
+          3,
+          3,
+          1,
+          1,
+          c_pads(p).top,
+          c_pads(p).bottom,
+          c_pads(p).left,
+          c_pads(p).right,
+          15,
+          15,
+          2000,
+          c_tile_channels,
+          -128
         );
 
         random_frame(5, 5);
         run_frame(
-          5, 5, 3, 3, 1, 1,
-          c_pads(p).top, c_pads(p).bottom, c_pads(p).left, c_pads(p).right,
-          15, 15, 2000, c_tile_channels, 127
+          5,
+          5,
+          3,
+          3,
+          1,
+          1,
+          c_pads(p).top,
+          c_pads(p).bottom,
+          c_pads(p).left,
+          c_pads(p).right,
+          15,
+          15,
+          2000,
+          c_tile_channels,
+          127
         );
 
         random_frame(5, 5);
         run_frame(
-          5, 5, 3, 3, 1, 1,
-          c_pads(p).top, c_pads(p).bottom, c_pads(p).left, c_pads(p).right,
-          15, 15, 2000, c_tile_channels, 37
+          5,
+          5,
+          3,
+          3,
+          1,
+          1,
+          c_pads(p).top,
+          c_pads(p).bottom,
+          c_pads(p).left,
+          c_pads(p).right,
+          15,
+          15,
+          2000,
+          c_tile_channels,
+          37
         );
       end loop;
 
@@ -702,7 +805,6 @@ begin
       -- 'cfg_pad_value' is the descriptor's field instead of a tie-off:
       -- 1x1 and non-square kernels, strided windows, and the multi-tile
       -- channel walk a real convolution does.
-
       -- 3x3 / stride 1 / pad 1 with a zero-point fill: YOLOv8n's shape in
       -- essentially every layer, and the one the whole change exists for.
       random_frame(6, 6);
@@ -727,11 +829,24 @@ begin
       -- combination: the four counts are independent ISA fields sharing
       -- one fill value.
       for p in c_pads'range loop
+
         random_frame(5, 5);
         run_frame(
-          5, 5, 3, 3, 1, 1,
-          c_pads(p).top, c_pads(p).bottom, c_pads(p).left, c_pads(p).right,
-          20, 20, 3000, c_tile_channels, 100
+          5,
+          5,
+          3,
+          3,
+          1,
+          1,
+          c_pads(p).top,
+          c_pads(p).bottom,
+          c_pads(p).left,
+          c_pads(p).right,
+          20,
+          20,
+          3000,
+          c_tile_channels,
+          100
         );
       end loop;
 
@@ -839,20 +954,31 @@ begin
       -- Narrow frames only, deliberately: the effect needs the write side
       -- to reach the reader's column inside a 'kernel_w'-cycle walk.
       for w in 2 to 6 loop
+
         for h in 3 to 6 loop
+
           for kh in 1 to 3 loop
+
             for kw in 1 to 3 loop
+
               for pl in 0 to 2 loop
+
                 for pt in 0 to 2 loop
+
                   if w + pl >= kw and h + pt >= kh then
                     random_frame(h, w);
                     run_frame(h, w, kh, kw, 1, 1, pt, 0, pl, 0, 0, 0, 3000);
                   end if;
                 end loop;
+
               end loop;
+
             end loop;
+
           end loop;
+
         end loop;
+
       end loop;
 
     elsif run("test_channel_tiling_partial_single") then
@@ -889,6 +1015,7 @@ begin
       begin_frame(3, 3, 1, 1, 0, 0, 0, 0, 6, 6, c_tile_channels);
       cur_stall_out <= 0;
       for i in 0 to 9 loop
+
         push_tile(0, 0, c_tile_channels, 0, 0);
       end loop;
 
@@ -906,7 +1033,6 @@ begin
       -- aborted session leaking in.
       random_frame(6, 6);
       run_frame(6, 6, 3, 3, 1, 1, 0, 0, 0, 0, 20, 20, 1000);
-
     end if;
 
     test_runner_cleanup(runner);

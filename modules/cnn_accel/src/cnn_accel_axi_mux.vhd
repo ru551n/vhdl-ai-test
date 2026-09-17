@@ -1,9 +1,9 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library axi;
-use axi.axi_pkg.all;
+  use axi.axi_pkg.all;
 
 -- DDR port concentrator (doc/cnn_accel_top_v2_arch.md section 2's
 -- 'cnn_accel_axi_mux' block: "axi.axi_simple_read_crossbar 3:1 + write
@@ -58,41 +58,38 @@ entity cnn_accel_axi_mux is
   generic (
     -- Data width of the shared AXI4 port; sizes the read byte increment
     -- and bounds the 'WSTRB' popcount.
-    g_axi_data_width : positive := 64;
+    g_axi_data_width   : positive := 64;
     -- Number of read requesters. Default 3 = descriptor fetch +
     -- activation/LOAD read DMA + weight/LUT read DMA (section 2).
-    g_num_read_inputs : positive := 3;
+    g_num_read_inputs  : positive := 3;
     -- Number of write requesters. Default 1 = the STORE/spill
     -- 'cnn_accel_ofmap_dma' (section 2's "write passthru").
-    g_num_write_inputs : positive := 1
-  );
+    g_num_write_inputs : positive := 1);
   port (
-    clk : in std_ulogic;
+    clk             : in  std_ulogic;
 
     --# {{}}
     -- Read requesters, index 0 highest priority in the crossbar's own
     -- lowest-index-first scan.
-    input_read_m2s : in axi_read_m2s_vec_t(0 to g_num_read_inputs - 1);
-    input_read_s2m : out axi_read_s2m_vec_t(0 to g_num_read_inputs - 1) :=
-      (others => axi_read_s2m_init);
+    input_read_m2s  : in  axi_read_m2s_vec_t(0 to g_num_read_inputs - 1);
+    input_read_s2m  : out axi_read_s2m_vec_t(0 to g_num_read_inputs - 1) := (others => axi_read_s2m_init);
 
     --# {{}}
     -- Write requesters.
-    input_write_m2s : in axi_write_m2s_vec_t(0 to g_num_write_inputs - 1);
-    input_write_s2m : out axi_write_s2m_vec_t(0 to g_num_write_inputs - 1) :=
-      (others => axi_write_s2m_init);
+    input_write_m2s : in  axi_write_m2s_vec_t(0 to g_num_write_inputs - 1);
+    input_write_s2m : out axi_write_s2m_vec_t(0 to g_num_write_inputs - 1) := (others => axi_write_s2m_init);
 
     --# {{}}
     -- The IP's single external AXI4 master port.
-    m_axi_m2s : out axi_m2s_t := axi_m2s_init;
-    m_axi_s2m : in axi_s2m_t;
+    m_axi_m2s       : out axi_m2s_t := axi_m2s_init;
+    m_axi_s2m       : in  axi_s2m_t;
 
     --# {{}}
     -- Per-cycle byte increments for the spec section 8 traffic counters;
     -- '0' on a cycle with no accepted data beat. Accumulated by
     -- 'cnn_accel_cmd_proc' (see the entity-level comment).
-    rd_bytes : out unsigned(7 downto 0) := (others => '0');
-    wr_bytes : out unsigned(7 downto 0) := (others => '0')
+    rd_bytes        : out unsigned(7 downto 0) := (others => '0');
+    wr_bytes        : out unsigned(7 downto 0) := (others => '0')
   );
 end entity cnn_accel_axi_mux;
 
@@ -123,7 +120,7 @@ begin
   read_bypass_gen : if g_num_read_inputs = 1 generate
     read_m2s <= input_read_m2s(0);
     input_read_s2m(0) <= read_s2m;
-  end generate;
+  end generate read_bypass_gen;
 
   read_crossbar_gen : if g_num_read_inputs > 1 generate
     read_crossbar_inst : entity axi.axi_simple_read_crossbar
@@ -131,13 +128,14 @@ begin
         num_inputs => g_num_read_inputs
       )
       port map (
-        clk => clk,
+        clk             => clk,
         input_ports_m2s => input_read_m2s,
         input_ports_s2m => input_read_s2m,
-        output_m2s => read_m2s,
-        output_s2m => read_s2m
+        output_m2s      => read_m2s,
+        output_s2m      => read_s2m
       );
-  end generate;
+
+  end generate read_crossbar_gen;
 
   ------------------------------------------------------------------------
   -- Write side.
@@ -146,7 +144,7 @@ begin
   write_bypass_gen : if g_num_write_inputs = 1 generate
     write_m2s <= input_write_m2s(0);
     input_write_s2m(0) <= write_s2m;
-  end generate;
+  end generate write_bypass_gen;
 
   write_crossbar_gen : if g_num_write_inputs > 1 generate
     write_crossbar_inst : entity axi.axi_simple_write_crossbar
@@ -154,22 +152,26 @@ begin
         num_inputs => g_num_write_inputs
       )
       port map (
-        clk => clk,
+        clk             => clk,
         input_ports_m2s => input_write_m2s,
         input_ports_s2m => input_write_s2m,
-        output_m2s => write_m2s,
-        output_s2m => write_s2m
+        output_m2s      => write_m2s,
+        output_s2m      => write_s2m
       );
-  end generate;
+
+  end generate write_crossbar_gen;
 
   ------------------------------------------------------------------------
   -- Traffic measurement. Combinational: one cycle's worth of bytes, to be
   -- accumulated by the consumer.
   ------------------------------------------------------------------------
 
-  count_bytes : process(all)
+  count_bytes : process (all)
+
     variable strb_bytes : natural range 0 to axi_w_strb_sz;
+
   begin
+
     if read_s2m.r.valid = '1' and read_m2s.r.ready = '1' then
       rd_bytes <= to_unsigned(c_beat_bytes, rd_bytes'length);
     else
@@ -179,10 +181,12 @@ begin
     strb_bytes := 0;
     if write_m2s.w.valid = '1' and write_s2m.w.ready = '1' then
       for lane in 0 to axi_w_strb_sz - 1 loop
+
         if write_m2s.w.strb(lane) = '1' then
           strb_bytes := strb_bytes + 1;
         end if;
       end loop;
+
     end if;
     wr_bytes <= to_unsigned(strb_bytes, wr_bytes'length);
   end process;

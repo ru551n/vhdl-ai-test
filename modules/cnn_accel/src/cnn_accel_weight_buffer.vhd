@@ -1,17 +1,17 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library axi_stream;
-use axi_stream.axi_stream_pkg.all;
+  use axi_stream.axi_stream_pkg.all;
 
 library math;
-use math.math_pkg.all;
+  use math.math_pkg.all;
 
 library fifo;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_pkg.all;
 
 -- Single-buffered on-chip weight/bias cache. See
 -- modules/cnn_accel/doc/cnn_accel_weight_buffer_req.md and
@@ -57,29 +57,28 @@ entity cnn_accel_weight_buffer is
     -- Rows in the (separate, much shallower) bias region -- independent of
     -- 'g_weight_buffer_depth' so it can fall out of block RAM into
     -- LUTRAM/registers (see proposal doc section 3.2).
-    g_bias_buffer_depth : positive := 8;
+    g_bias_buffer_depth   : positive := 8;
     -- Output-channel parallelism: rows per read tile, and bias lanes per
     -- read tile.
-    g_pe_rows : positive;
+    g_pe_rows             : positive;
     -- Input-channel/MAC parallelism: weight lanes per read tile, together
     -- with 'g_pe_rows'.
-    g_pe_cols : positive;
+    g_pe_cols             : positive;
     -- Bit width of one bias lane (int32 accumulator width elsewhere in
     -- this IP). Added by vhdesign to give 'bias_rd_data' a well-typed
     -- width -- see proposal doc section 3.1.
-    g_accum_width : positive := 32;
+    g_accum_width         : positive := 32;
     -- Depth of the shallow prefetch FIFO placed on the fill stream, ahead
     -- of the row-assembly/write logic, to absorb DDR4/DMA burst latency.
     -- '0' means no FIFO is instantiated at all (the fill stream connects
     -- straight through, exactly the old single-bank timing). Reuses
     -- hdl-modules' 'fifo.fifo' (shared/ReusableRTL.md) -- must be a power
     -- of two whenever nonzero (that entity's own constraint).
-    g_fill_fifo_depth : natural := 32
-  );
+    g_fill_fifo_depth     : natural := 32);
   port (
-    clk : in std_ulogic;
+    clk            : in  std_ulogic;
     -- Synchronous active-high reset ('reset_internal' at the IP top level).
-    reset : in std_ulogic := '0';
+    reset          : in  std_ulogic := '0';
     --# {{}}
     -- AXI4-Stream fill port, from the weight/bias 'cnn_accel_axi_read_dma'
     -- instance (optionally through the internal prefetch FIFO). One
@@ -87,8 +86,8 @@ entity cnn_accel_weight_buffer is
     -- 'data(7 downto 0)', or one bias lane on
     -- 'data(g_accum_width - 1 downto 0)') into the region selected by
     -- 'fill_is_bias'. 'last'/'user' are not used.
-    s_stream_m2s : in axi_stream_m2s_t;
-    s_stream_s2m : out axi_stream_s2m_t;
+    s_stream_m2s   : in  axi_stream_m2s_t;
+    s_stream_s2m   : out axi_stream_s2m_t;
     --# {{}}
     -- Pulse: starts a new fill session -- resets the weight and bias
     -- write row pointers/lane indices/row-assembly registers to 0. Must be
@@ -96,23 +95,23 @@ entity cnn_accel_weight_buffer is
     -- set (replaces the old 'fill_bank_sel'-edge-triggered "new fill
     -- session" detector -- see proposal doc section 3.4). A beat presented
     -- on the same cycle as 'fill_start' is not accepted.
-    fill_start : in std_ulogic := '0';
+    fill_start     : in  std_ulogic := '0';
     -- '0' routes fill beats to the weight region, '1' to the bias region
     -- (unless 'fill_is_scale' is '1').
-    fill_is_bias : in std_ulogic;
+    fill_is_bias   : in  std_ulogic;
     -- '1' routes fill beats to the per-channel scale region (ISA v1.2),
     -- overriding 'fill_is_bias'. One 'c_scale_entry_width'-bit lane
     -- ('data(c_scale_entry_width - 1 downto 0)') per accepted beat.
-    fill_is_scale : in std_ulogic := '0';
+    fill_is_scale  : in  std_ulogic := '0';
     --# {{}}
     -- Row (tile) address into the weight region.
-    weight_rd_addr : in std_ulogic_vector(num_bits_needed(g_weight_buffer_depth - 1) - 1 downto 0);
+    weight_rd_addr : in  std_ulogic_vector(num_bits_needed(g_weight_buffer_depth - 1) - 1 downto 0);
     -- Clock enable for the WEIGHT region's two-stage read pipeline (and
     -- only that -- the bias/scale reads are unaffected). '0' freezes both
     -- stages, so 'weight_rd_data' is bit-identical on a frozen cycle and
     -- the reader's own frozen pipeline stays paired with it. Defaults to
     -- '1', i.e. the always-on read this port used to be.
-    weight_rd_en : in std_ulogic := '1';
+    weight_rd_en   : in  std_ulogic := '1';
     -- One int8 weight per active PE ('g_pe_rows*g_pe_cols' lanes),
     -- registered, **2 cycle** read latency (see the block-RAM output
     -- register note on the read process below), advanced only on cycles
@@ -121,15 +120,15 @@ entity cnn_accel_weight_buffer is
     weight_rd_data : out std_ulogic_vector(8 * g_pe_rows * g_pe_cols - 1 downto 0);
     --# {{}}
     -- Row (tile) address into the bias region.
-    bias_rd_addr : in std_ulogic_vector(num_bits_needed(g_bias_buffer_depth - 1) - 1 downto 0);
+    bias_rd_addr   : in  std_ulogic_vector(num_bits_needed(g_bias_buffer_depth - 1) - 1 downto 0);
     -- One int32 (g_accum_width-bit) bias per output channel lane
     -- ('g_pe_rows' lanes), registered, 1 cycle read latency.
-    bias_rd_data : out std_ulogic_vector(g_accum_width * g_pe_rows - 1 downto 0);
+    bias_rd_data   : out std_ulogic_vector(g_accum_width * g_pe_rows - 1 downto 0);
     -- One per-channel requant table entry (multiplier + shift, see
     -- cnn_accel_pkg's 'c_scale_entry_width' comment) per output channel
     -- lane of the row addressed by 'bias_rd_addr', registered, 1 cycle
     -- read latency -- same timing as 'bias_rd_data'.
-    scale_rd_data : out std_ulogic_vector(c_scale_entry_width * g_pe_rows - 1 downto 0)
+    scale_rd_data  : out std_ulogic_vector(c_scale_entry_width * g_pe_rows - 1 downto 0)
   );
 end entity cnn_accel_weight_buffer;
 
@@ -157,8 +156,7 @@ architecture a of cnn_accel_weight_buffer is
   constant c_bias_ptr_width : positive := num_bits_needed(g_bias_buffer_depth);
   constant c_weight_depth : unsigned(c_weight_ptr_width - 1 downto 0) :=
     to_unsigned(g_weight_buffer_depth, c_weight_ptr_width);
-  constant c_bias_depth : unsigned(c_bias_ptr_width - 1 downto 0) :=
-    to_unsigned(g_bias_buffer_depth, c_bias_ptr_width);
+  constant c_bias_depth : unsigned(c_bias_ptr_width - 1 downto 0) := to_unsigned(g_bias_buffer_depth, c_bias_ptr_width);
 
   constant c_weight_lane_width : positive := num_bits_needed(c_weight_lanes - 1);
   constant c_bias_lane_width : positive := num_bits_needed(c_bias_lanes - 1);
@@ -167,8 +165,9 @@ architecture a of cnn_accel_weight_buffer is
   -- needs 8 bits, a bias lane needs 'g_accum_width', a scale lane
   -- 'c_scale_entry_width' -- the widest of the three is what has to
   -- survive a trip through the optional prefetch FIFO).
-  function max_pos(a, b : positive) return positive is
+  function max_pos (a, b : positive) return positive is
   begin
+
     if a > b then
       return a;
     else
@@ -194,16 +193,16 @@ architecture a of cnn_accel_weight_buffer is
   -- block RAM per region instead of one RAMB18 per lane.
   ------------------------------------------------------------------------
 
-  type weight_mem_t is array (0 to g_weight_buffer_depth - 1)
-    of std_ulogic_vector(c_weight_row_width - 1 downto 0);
+  type weight_mem_t is array (0 to g_weight_buffer_depth - 1) of std_ulogic_vector(c_weight_row_width - 1 downto 0);
+
   signal weight_mem : weight_mem_t;
 
-  type bias_mem_t is array (0 to g_bias_buffer_depth - 1)
-    of std_ulogic_vector(c_bias_row_width - 1 downto 0);
+  type bias_mem_t is array (0 to g_bias_buffer_depth - 1) of std_ulogic_vector(c_bias_row_width - 1 downto 0);
+
   signal bias_mem : bias_mem_t;
 
-  type scale_mem_t is array (0 to g_bias_buffer_depth - 1)
-    of std_ulogic_vector(c_scale_row_width - 1 downto 0);
+  type scale_mem_t is array (0 to g_bias_buffer_depth - 1) of std_ulogic_vector(c_scale_row_width - 1 downto 0);
+
   signal scale_mem : scale_mem_t;
 
   ------------------------------------------------------------------------
@@ -214,25 +213,21 @@ architecture a of cnn_accel_weight_buffer is
 
   signal weight_wr_row_q : unsigned(c_weight_ptr_width - 1 downto 0) := (others => '0');
   signal weight_lane_q : unsigned(c_weight_lane_width - 1 downto 0) := (others => '0');
-  signal weight_row_assemble_q : std_ulogic_vector(c_weight_row_width - 1 downto 0) :=
-    (others => '0');
+  signal weight_row_assemble_q : std_ulogic_vector(c_weight_row_width - 1 downto 0) := (others => '0');
 
   signal bias_wr_row_q : unsigned(c_bias_ptr_width - 1 downto 0) := (others => '0');
   signal bias_lane_q : unsigned(c_bias_lane_width - 1 downto 0) := (others => '0');
-  signal bias_row_assemble_q : std_ulogic_vector(c_bias_row_width - 1 downto 0) :=
-    (others => '0');
+  signal bias_row_assemble_q : std_ulogic_vector(c_bias_row_width - 1 downto 0) := (others => '0');
 
   signal scale_wr_row_q : unsigned(c_bias_ptr_width - 1 downto 0) := (others => '0');
   signal scale_lane_q : unsigned(c_bias_lane_width - 1 downto 0) := (others => '0');
-  signal scale_row_assemble_q : std_ulogic_vector(c_scale_row_width - 1 downto 0) :=
-    (others => '0');
+  signal scale_row_assemble_q : std_ulogic_vector(c_scale_row_width - 1 downto 0) := (others => '0');
 
   signal ready_i : std_ulogic;
 
   -- The weight region's block-RAM DO stage; 'weight_rd_data' is its
   -- output register. See the read process below.
-  signal weight_rd_data_p : std_ulogic_vector(8 * g_pe_rows * g_pe_cols - 1 downto 0) :=
-    (others => '0');
+  signal weight_rd_data_p : std_ulogic_vector(8 * g_pe_rows * g_pe_cols - 1 downto 0) := (others => '0');
 
   ------------------------------------------------------------------------
   -- Internal (post-FIFO, or straight-through when 'g_fill_fifo_depth=0')
@@ -261,11 +256,10 @@ begin
   -- has reached its own depth.
   ------------------------------------------------------------------------
 
-  ready_i <=
-    '0' when (is_scale_i = '1' and scale_wr_row_q >= c_bias_depth) else
-    '0' when (is_scale_i = '0' and is_bias_i = '0' and weight_wr_row_q >= c_weight_depth) else
-    '0' when (is_scale_i = '0' and is_bias_i = '1' and bias_wr_row_q >= c_bias_depth) else
-    '1';
+  ready_i <= '0' when (is_scale_i = '1' and scale_wr_row_q >= c_bias_depth) else
+             '0' when (is_scale_i = '0' and is_bias_i = '0' and weight_wr_row_q >= c_weight_depth) else
+             '0' when (is_scale_i = '0' and is_bias_i = '1' and bias_wr_row_q >= c_bias_depth) else
+             '1';
 
   ------------------------------------------------------------------------
   -- Optional shallow prefetch FIFO on the fill stream (proposal doc
@@ -281,7 +275,7 @@ begin
     is_bias_i <= fill_is_bias;
     is_scale_i <= fill_is_scale;
     s_stream_s2m.ready <= ready_i;
-  end generate;
+  end generate no_fifo_gen;
 
   fill_fifo_gen : if g_fill_fifo_depth > 0 generate
     fifo_write_valid <= s_stream_m2s.valid;
@@ -296,7 +290,7 @@ begin
 
     fill_fifo_inst : entity fifo.fifo
       generic map (
-        width => c_fifo_width,
+        width                  => c_fifo_width,
         -- '+ 1' because of 'enable_output_register' below: 'fifo.fifo'
         -- takes one word of 'depth' for the output register itself
         -- ('memory_depth := depth - 1') and then asserts that what is left
@@ -306,7 +300,7 @@ begin
         -- FIFO's usable capacity is one word MORE than before (the word
         -- sitting in the output register), never less -- so no fill
         -- sequence that fitted before can fail to fit now.
-        depth => g_fill_fifo_depth + 1,
+        depth                  => g_fill_fifo_depth + 1,
         -- Block-RAM OUTPUT REGISTER on the prefetch FIFO (shared/
         -- TimingAndResources.md, "Memories and lookup": use the block
         -- RAM's output register; never put logic between a RAM's data
@@ -333,15 +327,16 @@ begin
         enable_output_register => true
       )
       port map (
-        clk => clk,
+        clk         => clk,
         write_ready => fifo_write_ready,
         write_valid => fifo_write_valid,
-        write_data => fifo_write_data,
-        read_ready => fifo_read_ready,
-        read_valid => fifo_read_valid,
-        read_data => fifo_read_data
+        write_data  => fifo_write_data,
+        read_ready  => fifo_read_ready,
+        read_valid  => fifo_read_valid,
+        read_data   => fifo_read_data
       );
-  end generate;
+
+  end generate fill_fifo_gen;
 
   ------------------------------------------------------------------------
   -- Fill path: one lane per accepted beat, assembled into a row-wide
@@ -349,12 +344,15 @@ begin
   -- issued when the row's final lane arrives.
   ------------------------------------------------------------------------
 
-  fill : process(clk)
+  fill : process (clk)
+
     variable accepted : boolean;
     variable weight_row_next : std_ulogic_vector(c_weight_row_width - 1 downto 0);
     variable bias_row_next : std_ulogic_vector(c_bias_row_width - 1 downto 0);
     variable scale_row_next : std_ulogic_vector(c_scale_row_width - 1 downto 0);
+
   begin
+
     if rising_edge(clk) then
       accepted := valid_i = '1' and ready_i = '1';
 
@@ -387,11 +385,14 @@ begin
           -- the weight region below.
           scale_row_next := scale_row_assemble_q;
           for lane in 0 to c_bias_lanes - 1 loop
+
             if to_integer(scale_lane_q) = lane then
-              scale_row_next(c_scale_entry_width * (lane + 1) - 1 downto c_scale_entry_width * lane) :=
-                data_i(c_scale_entry_width - 1 downto 0);
+              scale_row_next(c_scale_entry_width * (lane + 1) - 1 downto c_scale_entry_width * lane) := data_i(
+                c_scale_entry_width - 1 downto 0
+              );
             end if;
           end loop;
+
           scale_row_assemble_q <= scale_row_next;
 
           if to_integer(scale_lane_q) = c_bias_lanes - 1 then
@@ -414,10 +415,12 @@ begin
           -- one whole-row write, no per-lane enables at all.
           weight_row_next := weight_row_assemble_q;
           for lane in 0 to c_weight_lanes - 1 loop
+
             if to_integer(weight_lane_q) = lane then
               weight_row_next(8 * (lane + 1) - 1 downto 8 * lane) := data_i(7 downto 0);
             end if;
           end loop;
+
           weight_row_assemble_q <= weight_row_next;
 
           if to_integer(weight_lane_q) = c_weight_lanes - 1 then
@@ -432,11 +435,14 @@ begin
           -- Constant-bound loop, same reason as the weight region above.
           bias_row_next := bias_row_assemble_q;
           for lane in 0 to c_bias_lanes - 1 loop
+
             if to_integer(bias_lane_q) = lane then
-              bias_row_next(g_accum_width * (lane + 1) - 1 downto g_accum_width * lane) :=
-                data_i(g_accum_width - 1 downto 0);
+              bias_row_next(g_accum_width * (lane + 1) - 1 downto g_accum_width * lane) := data_i(
+                g_accum_width - 1 downto 0
+              );
             end if;
           end loop;
+
           bias_row_assemble_q <= bias_row_next;
 
           if to_integer(bias_lane_q) = c_bias_lanes - 1 then
@@ -492,8 +498,9 @@ begin
   -- nowhere near the critical path.
   ------------------------------------------------------------------------
 
-  read_ports : process(clk)
+  read_ports : process (clk)
   begin
+
     if rising_edge(clk) then
       if weight_rd_en = '1' then
         weight_rd_data_p <= weight_mem(to_integer(unsigned(weight_rd_addr)));

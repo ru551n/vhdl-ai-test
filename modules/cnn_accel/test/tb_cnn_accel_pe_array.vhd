@@ -1,19 +1,19 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library vunit_lib;
 context vunit_lib.vunit_context;
-use vunit_lib.queue_pkg.all;
+  use vunit_lib.queue_pkg.all;
 
 library osvvm;
-use osvvm.RandomPkg.all;
+  use osvvm.randompkg.all;
 
 library math;
-use math.math_pkg.all;
+  use math.math_pkg.all;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_pkg.all;
 
 -- VUnit-5 testbench for cnn_accel_pe_array ("M4", the tiled-dataflow
 -- rewrite). See modules/cnn_accel/doc/cnn_accel_pe_array_req.md,
@@ -57,10 +57,9 @@ entity tb_cnn_accel_pe_array is
     -- ('s_window' is the one input link, 'm_accum' the one output link;
     -- 'weight_rd_addr'/'weight_rd_data' is not a handshaked link, so has
     -- no stall generic of its own).
-    stall_probability_percent_in : natural := 20;
+    stall_probability_percent_in  : natural := 20;
     stall_probability_percent_out : natural := 20;
-    runner_cfg : string
-  );
+    runner_cfg                    : string);
 end entity tb_cnn_accel_pe_array;
 
 architecture tb of tb_cnn_accel_pe_array is
@@ -89,18 +88,15 @@ architecture tb of tb_cnn_accel_pe_array is
   signal cfg_kernel_h : std_ulogic_vector(7 downto 0) := (others => '0');
   signal cfg_kernel_w : std_ulogic_vector(7 downto 0) := (others => '0');
 
-  signal s_window_m2s : window_m2s_t(data(0 to c_max_window_len - 1)) := (
-    valid => '0', last => '0', first_tile => '0', last_tile => '0',
-    data => (others => (others => '0'))
-  );
+  signal s_window_m2s : window_m2s_t(data(0 to c_max_window_len - 1)) :=
+    (valid => '0', last => '0', first_tile => '0', last_tile => '0', data => (others => (others => '0')));
   signal s_window_s2m : window_s2m_t;
 
   signal weight_rd_addr : std_ulogic_vector(c_addr_width - 1 downto 0);
   signal weight_rd_en : std_ulogic;
   -- The model's block-RAM DO stage; 'weight_rd_data' is its output
   -- register (2-cycle read latency, see 'weight_mem_model').
-  signal weight_rd_data_p : std_ulogic_vector(8 * c_weight_lanes - 1 downto 0) :=
-    (others => '0');
+  signal weight_rd_data_p : std_ulogic_vector(8 * c_weight_lanes - 1 downto 0) := (others => '0');
   signal weight_rd_data : std_ulogic_vector(8 * c_weight_lanes - 1 downto 0) := (others => '0');
 
   signal m_accum_m2s : accum_m2s_t(data(0 to c_pe_rows - 1)(c_accum_width - 1 downto 0));
@@ -124,10 +120,13 @@ architecture tb of tb_cnn_accel_pe_array is
   -- Lane 'l = r*c_pe_cols + c' (row-major), matching cnn_accel_pe_array's
   -- own 'weight_rd_data' lane layout.
   type weight_row_t is array (0 to c_weight_lanes - 1) of integer range -128 to 127;
+
   type weight_mem_t is array (0 to c_weight_buffer_depth - 1) of weight_row_t;
+
   signal weight_mem_s : weight_mem_t := (others => (others => 0));
 
   type window_row_t is array (0 to c_max_window_len - 1) of integer range -128 to 127;
+
   type accum_int_arr_t is array (0 to c_pe_rows - 1) of integer;
 
   -- Kernel shapes swept by test_varying_kernels: 1x1 up to
@@ -138,13 +137,14 @@ architecture tb of tb_cnn_accel_pe_array is
     h : natural;
     w : natural;
   end record;
-  type shape_arr_t is array (natural range <>) of shape_t;
-  constant c_shapes : shape_arr_t(0 to 4) := (
-    (1, 1), (2, 2), (3, 3), (2, 3), (3, 2)
-  );
 
-  function to_sl(cond : boolean) return std_ulogic is
+  type shape_arr_t is array (natural range <>) of shape_t;
+
+  constant c_shapes : shape_arr_t(0 to 4) := ((1, 1), (2, 2), (3, 3), (2, 3), (3, 2));
+
+  function to_sl (cond : boolean) return std_ulogic is
   begin
+
     if cond then
       return '1';
     end if;
@@ -157,40 +157,53 @@ architecture tb of tb_cnn_accel_pe_array is
 
   -- Packs one weight row (c_weight_lanes int8 lanes) into
   -- 'weight_rd_data's own bit layout (lane l at bits 8*(l+1)-1 downto 8*l).
-  function pack_weight_row(row : weight_row_t) return std_ulogic_vector is
+  function pack_weight_row (row : weight_row_t) return std_ulogic_vector is
+
     variable result : std_ulogic_vector(8 * c_weight_lanes - 1 downto 0);
   begin
+
     for i in 0 to c_weight_lanes - 1 loop
+
       result(8 * (i + 1) - 1 downto 8 * i) := std_ulogic_vector(to_signed(row(i), 8));
     end loop;
+
     return result;
   end function;
 
   -- Packs one pixel's expected per-row accumulator results, same lane
   -- layout ('m_accum_m2s.data' element 'r' at bits
   -- 'c_accum_width*(r+1)-1 downto c_accum_width*r' once flattened).
-  function pack_expected(values : accum_int_arr_t) return std_ulogic_vector is
+  function pack_expected (values : accum_int_arr_t) return std_ulogic_vector is
+
     variable result : std_ulogic_vector(c_accum_width * c_pe_rows - 1 downto 0);
   begin
+
     for i in 0 to c_pe_rows - 1 loop
-      result(c_accum_width * (i + 1) - 1 downto c_accum_width * i) :=
-        std_ulogic_vector(to_signed(values(i), c_accum_width));
+
+      result(c_accum_width * (i + 1) - 1 downto c_accum_width * i) := std_ulogic_vector(
+        to_signed(values(i), c_accum_width)
+      );
     end loop;
+
     return result;
   end function;
 
   -- Flattens the DUT's own 'm_accum_m2s.data' (an array of possibly-wide
   -- 'signed' elements, cnn_accel_pkg.vhd's 'accum_array_t') into the same
   -- flat layout as pack_expected, for a single check_equal comparison.
-  function pack_actual(data : accum_array_t) return std_ulogic_vector is
+  function pack_actual (data : accum_array_t) return std_ulogic_vector is
+
     constant elem_width : positive := data(data'left)'length;
     variable result : std_ulogic_vector(data'length * elem_width - 1 downto 0);
     variable idx : natural := 0;
   begin
+
     for i in data'range loop
+
       result(elem_width * (idx + 1) - 1 downto elem_width * idx) := std_ulogic_vector(data(i));
       idx := idx + 1;
     end loop;
+
     return result;
   end function;
 
@@ -208,28 +221,36 @@ architecture tb of tb_cnn_accel_pe_array is
   -- specifies.
   ------------------------------------------------------------------------
 
-  function golden_beat_partial(
-    window : window_row_t;
-    weight_mem : weight_mem_t;
+  function golden_beat_partial (
+    window      : window_row_t;
+    weight_mem  : weight_mem_t;
     weight_base : natural;
-    mac_taps : natural
+    mac_taps    : natural
   ) return accum_int_arr_t is
+
     variable result : accum_int_arr_t := (others => 0);
     variable num_groups : natural := (mac_taps + c_pe_cols - 1) / c_pe_cols;
     variable idx : natural;
     variable row_idx : natural;
   begin
+
     for g in 0 to num_groups - 1 loop
+
       row_idx := weight_base + g;
       for r in 0 to c_pe_rows - 1 loop
+
         for c in 0 to c_pe_cols - 1 loop
+
           idx := g * c_pe_cols + c;
           if idx < mac_taps then
             result(r) := result(r) + window(idx) * weight_mem(row_idx)(r * c_pe_cols + c);
           end if;
         end loop;
+
       end loop;
+
     end loop;
+
     return result;
   end function;
 
@@ -240,29 +261,29 @@ begin
   ------------------------------------------------------------------------
   dut : entity cnn_accel.cnn_accel_pe_array
     generic map (
-      g_pe_rows => c_pe_rows,
-      g_pe_cols => c_pe_cols,
-      g_accum_width => c_accum_width,
-      g_max_kernel_size => c_kernel_max,
-      g_tile_channels => c_tile_channels,
+      g_pe_rows             => c_pe_rows,
+      g_pe_cols             => c_pe_cols,
+      g_accum_width         => c_accum_width,
+      g_max_kernel_size     => c_kernel_max,
+      g_tile_channels       => c_tile_channels,
       g_weight_buffer_depth => c_weight_buffer_depth
     )
     port map (
-      clk => clk,
-      reset => reset,
+      clk            => clk,
+      reset          => reset,
 
-      cfg_kernel_h => cfg_kernel_h,
-      cfg_kernel_w => cfg_kernel_w,
+      cfg_kernel_h   => cfg_kernel_h,
+      cfg_kernel_w   => cfg_kernel_w,
 
-      s_window_m2s => s_window_m2s,
-      s_window_s2m => s_window_s2m,
+      s_window_m2s   => s_window_m2s,
+      s_window_s2m   => s_window_s2m,
 
       weight_rd_addr => weight_rd_addr,
-      weight_rd_en => weight_rd_en,
+      weight_rd_en   => weight_rd_en,
       weight_rd_data => weight_rd_data,
 
-      m_accum_m2s => m_accum_m2s,
-      m_accum_s2m => m_accum_s2m
+      m_accum_m2s    => m_accum_m2s,
+      m_accum_s2m    => m_accum_s2m
     );
 
   ------------------------------------------------------------------------
@@ -275,9 +296,12 @@ begin
   -- reset-cleared handshake state).
   ------------------------------------------------------------------------
 
-  weight_mem_model : process(clk)
+  weight_mem_model : process (clk)
+
     variable addr_int : natural;
+
   begin
+
     if rising_edge(clk) then
       if weight_rd_en = '1' then
         addr_int := to_integer(unsigned(weight_rd_addr));
@@ -295,20 +319,26 @@ begin
   ------------------------------------------------------------------------
 
   monitor_out : process
-    variable rnd : RandomPType;
+
+    variable rnd : randomptype;
     variable expected_data : std_ulogic_vector(c_accum_width * c_pe_rows - 1 downto 0);
     variable expected_last : std_ulogic;
+
   begin
+
     rnd.InitSeed(get_string_seed(runner_cfg) & "_monitor");
     m_accum_s2m.ready <= '0';
     wait until reset = '0' and rising_edge(clk);
 
     loop
+
       if rnd.RandInt(0, 99) < stall_pct_out then
         m_accum_s2m.ready <= '0';
         for i in 1 to rnd.RandInt(1, 4) loop
+
           wait until rising_edge(clk);
         end loop;
+
       end if;
 
       m_accum_s2m.ready <= '1';
@@ -321,14 +351,17 @@ begin
         check_equal(m_accum_m2s.last, expected_last, "m_accum last mismatch");
       end if;
     end loop;
+
   end process;
 
   ------------------------------------------------------------------------
   main : process
-    variable rnd : RandomPType;
+
+    variable rnd : randomptype;
 
     procedure do_reset is
     begin
+
       reset <= '1';
       wait until rising_edge(clk);
       reset <= '0';
@@ -340,11 +373,16 @@ begin
     -- filled before compute starts).
     procedure randomize_weight_mem is
     begin
+
       for row in 0 to c_weight_buffer_depth - 1 loop
+
         for lane in 0 to c_weight_lanes - 1 loop
+
           weight_mem_s(row)(lane) <= rnd.RandInt(-128, 127);
         end loop;
+
       end loop;
+
     end procedure;
 
     -- Randomizes a window's first 'mac_taps' taps; taps at/beyond
@@ -355,30 +393,36 @@ begin
     -- coincidentally-zero source) is what keeps those lanes out of the
     -- sum -- mirrors tb_cnn_accel_window_gen.vhd's identical
     -- 'push_tile' idiom.
-    procedure random_window(window : out window_row_t; mac_taps : natural) is
+    procedure random_window (window : out window_row_t; mac_taps : natural) is
     begin
+
       for i in 0 to c_max_window_len - 1 loop
+
         if i < mac_taps then
           window(i) := rnd.RandInt(-128, 127);
         else
           window(i) := rnd.RandInt(1, 127);
         end if;
       end loop;
+
     end procedure;
 
     -- Pushes one 's_window' beat, with randomized input-side stall
     -- (driven by 'stall_pct_in').
-    procedure send_window_beat(
-      window : window_row_t;
-      kh, kw : natural;
+    procedure send_window_beat (
+      window                           : window_row_t;
+      kh, kw                           : natural;
       first_tile, last_tile, beat_last : std_ulogic
     ) is
     begin
+
       cfg_kernel_h <= std_ulogic_vector(to_unsigned(kh, 8));
       cfg_kernel_w <= std_ulogic_vector(to_unsigned(kw, 8));
       for i in 0 to c_max_window_len - 1 loop
+
         s_window_m2s.data(i) <= std_ulogic_vector(to_signed(window(i), 8));
       end loop;
+
       s_window_m2s.first_tile <= first_tile;
       s_window_m2s.last_tile <= last_tile;
       s_window_m2s.last <= beat_last;
@@ -386,8 +430,10 @@ begin
       if rnd.RandInt(0, 99) < stall_pct_in then
         s_window_m2s.valid <= '0';
         for i in 1 to rnd.RandInt(1, 4) loop
+
           wait until rising_edge(clk);
         end loop;
+
       end if;
 
       s_window_m2s.valid <= '1';
@@ -405,7 +451,8 @@ begin
     -- num_groups afterwards) and its running accumulator sum (golden_
     -- beat_partial), pushing the expected (packed sum, last) pair onto
     -- the scoreboard once the final tile beat is issued.
-    procedure run_pixel(kh, kw, num_tiles : natural; is_last_pixel : boolean) is
+    procedure run_pixel (kh, kw, num_tiles : natural; is_last_pixel : boolean) is
+
       constant mac_taps : natural := kh * kw * c_tile_channels;
       constant num_groups : natural := (mac_taps + c_pe_cols - 1) / c_pe_cols;
       variable weight_base : natural := 0;
@@ -414,18 +461,19 @@ begin
       variable window : window_row_t;
       variable beat_last : std_ulogic;
     begin
+
       for tile in 0 to num_tiles - 1 loop
+
         random_window(window, mac_taps);
         beat_last := to_sl(is_last_pixel and tile = num_tiles - 1);
-        send_window_beat(
-          window, kh, kw,
-          to_sl(tile = 0), to_sl(tile = num_tiles - 1), beat_last
-        );
+        send_window_beat(window, kh, kw, to_sl(tile = 0), to_sl(tile = num_tiles - 1), beat_last);
 
         beat_partial := golden_beat_partial(window, weight_mem_s, weight_base, mac_taps);
         for r in 0 to c_pe_rows - 1 loop
+
           accum(r) := accum(r) + beat_partial(r);
         end loop;
+
         weight_base := weight_base + num_groups;
 
         if tile = num_tiles - 1 then
@@ -433,23 +481,29 @@ begin
           push(expected_q, beat_last);
         end if;
       end loop;
+
     end procedure;
 
     -- Waits (bounded) until 'expected_q' has drained, then confirms it is
     -- truly empty (every expected output actually arrived).
-    procedure drain_and_check(max_wait_cycles : positive) is
+    procedure drain_and_check (max_wait_cycles : positive) is
+
       variable cycles : natural := 0;
     begin
+
       while not is_empty(expected_q) and cycles < max_wait_cycles loop
+
         wait until rising_edge(clk);
         cycles := cycles + 1;
       end loop;
+
       check_true(is_empty(expected_q), "m_accum scoreboard queue did not drain in time");
     end procedure;
 
     variable start_time : time;
 
   begin
+
     test_runner_setup(runner, runner_cfg);
     rnd.InitSeed(get_string_seed(runner_cfg));
 
@@ -461,8 +515,10 @@ begin
       -- T=1: both first_tile/last_tile='1' on the pixel's one beat --
       -- window_m2s_t's own documented contract.
       for p in 0 to 19 loop
+
         run_pixel(3, 3, 1, false);
       end loop;
+
       drain_and_check(2000);
 
     elsif run("test_multi_tile_carry") then
@@ -475,8 +531,10 @@ begin
       run_pixel(2, 2, 3, false);
       run_pixel(1, 1, 4, false);
       for p in 0 to 9 loop
+
         run_pixel(3, 3, 2 + (p mod 3), false);
       end loop;
+
       drain_and_check(6000);
 
     elsif run("test_varying_kernels") then
@@ -484,10 +542,14 @@ begin
       -- kh*kw*c_tile_channels-not-a-multiple-of-c_pe_cols masking corner
       -- case (this file's header comment).
       for s in c_shapes'range loop
+
         for p in 0 to 4 loop
+
           run_pixel(c_shapes(s).h, c_shapes(s).w, 1, false);
         end loop;
+
       end loop;
+
       drain_and_check(3000);
 
     elsif run("test_full_throughput") then
@@ -511,8 +573,10 @@ begin
       -- regression that put back even ONE bubble per pixel fails here.
       start_time := now;
       for p in 0 to 39 loop
+
         run_pixel(3, 3, 1, p = 39);
       end loop;
+
       drain_and_check(200);
 
       check_relation(
@@ -526,8 +590,10 @@ begin
       -- weight-row-base restart (first_tile resets to 0) and accumulator
       -- clear never bleed state from the previous pixel into the next.
       for p in 0 to 7 loop
+
         run_pixel(3, 3, 1 + (p mod 3), p = 7);
       end loop;
+
       drain_and_check(3000);
 
     elsif run("test_pipelined_positions_backpressure") then
@@ -558,14 +624,18 @@ begin
       wait until rising_edge(clk);
 
       for p in 0 to 39 loop
+
         run_pixel(1, 1, 1, false);
       end loop;
+
       -- Then the same thing with multi-tile pixels, so a freeze can also
       -- land in the middle of one pixel's tile run (partial sums held in
       -- 'accum_q') while a LATER pixel's groups are already issued.
       for p in 0 to 19 loop
+
         run_pixel(1, 1, 1 + (p mod 3), p = 19);
       end loop;
+
       drain_and_check(6000);
 
       stall_pct_in <= stall_probability_percent_in;
@@ -581,13 +651,14 @@ begin
       wait until rising_edge(clk);
 
       for p in 0 to 14 loop
+
         run_pixel(3, 3, 1 + (p mod 4), p = 14);
       end loop;
+
       drain_and_check(6000);
 
       stall_pct_in <= stall_probability_percent_in;
       stall_pct_out <= stall_probability_percent_out;
-
     end if;
 
     test_runner_cleanup(runner);

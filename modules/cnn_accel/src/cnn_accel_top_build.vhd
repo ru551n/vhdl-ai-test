@@ -1,15 +1,15 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_regs_pkg.all;
+  use cnn_accel.cnn_accel_regs_pkg.all;
 
 library axi;
-use axi.axi_pkg.all;
+  use axi.axi_pkg.all;
 
 library axi_lite;
-use axi_lite.axi_lite_pkg.all;
+  use axi_lite.axi_lite_pkg.all;
 
 -- Pinnable build wrapper around 'cnn_accel_top', used ONLY by the top-level
 -- Vivado build project ('cnn_accel_top_build' in 'module_cnn_accel.py'). It is
@@ -52,21 +52,20 @@ entity cnn_accel_top_build is
     -- 'g_pe_rows = cnn_accel_constant_activation_plane_channels', so the
     -- 16-row point the conv datapath's netlist builds use does not
     -- elaborate here. See 'module_cnn_accel.py' for the full note.
-    g_pe_rows : positive := cnn_accel_constant_pe_rows
-  );
+    g_pe_rows : positive := cnn_accel_constant_pe_rows);
   port (
-    clk : in std_ulogic;
+    clk      : in  std_ulogic;
     -- Cold, synchronous active-high reset. Registered once here before it
     -- reaches the accelerator, see 'reset_int' below.
-    reset : in std_ulogic;
+    reset    : in  std_ulogic;
     --# {{}}
     -- Serial seed for the stimulus shift register that drives every
     -- accelerator input.
-    stimulus : in std_ulogic;
+    stimulus : in  std_ulogic;
     -- Registered exclusive-or reduction of every accelerator output.
-    result : out std_ulogic := '0';
+    result   : out std_ulogic := '0';
     -- The accelerator's interrupt, registered.
-    irq : out std_ulogic := '0'
+    irq      : out std_ulogic := '0'
   );
 end entity cnn_accel_top_build;
 
@@ -101,40 +100,37 @@ architecture a of cnn_accel_top_build is
   -- output bits exist, so 'c_out_width' cannot drift from what is actually
   -- collected: it is that function's own return length.
   ------------------------------------------------------------------------
-  function to_slv(
-    axi_lite_s2m : axi_lite_s2m_t; axi_m2s : axi_m2s_t; irq : std_ulogic
-  ) return std_ulogic_vector is
+  function to_slv (axi_lite_s2m : axi_lite_s2m_t; axi_m2s : axi_m2s_t; irq : std_ulogic) return std_ulogic_vector is
   begin
-    return (
-      axi_lite_s2m.read.ar.ready
-      & axi_lite_s2m.read.r.valid
-      & axi_lite_s2m.read.r.data
-      & axi_lite_s2m.read.r.resp
-      & axi_lite_s2m.write.aw.ready
-      & axi_lite_s2m.write.w.ready
-      & axi_lite_s2m.write.b.valid
-      & axi_lite_s2m.write.b.resp
-      & axi_m2s.read.ar.valid
-      & std_ulogic_vector(axi_m2s.read.ar.id)
-      & std_ulogic_vector(axi_m2s.read.ar.addr)
-      & std_ulogic_vector(axi_m2s.read.ar.len)
-      & std_ulogic_vector(axi_m2s.read.ar.size)
-      & axi_m2s.read.ar.burst
-      & axi_m2s.read.r.ready
-      & axi_m2s.write.aw.valid
-      & std_ulogic_vector(axi_m2s.write.aw.id)
-      & std_ulogic_vector(axi_m2s.write.aw.addr)
-      & std_ulogic_vector(axi_m2s.write.aw.len)
-      & std_ulogic_vector(axi_m2s.write.aw.size)
-      & axi_m2s.write.aw.burst
-      & axi_m2s.write.w.valid
-      & axi_m2s.write.w.data
-      & axi_m2s.write.w.strb
-      & axi_m2s.write.w.last
-      & std_ulogic_vector(axi_m2s.write.w.id)
-      & axi_m2s.write.b.ready
-      & irq
-    );
+
+    return (axi_lite_s2m.read.ar.ready
+            & axi_lite_s2m.read.r.valid
+            & axi_lite_s2m.read.r.data
+            & axi_lite_s2m.read.r.resp
+            & axi_lite_s2m.write.aw.ready
+            & axi_lite_s2m.write.w.ready
+            & axi_lite_s2m.write.b.valid
+            & axi_lite_s2m.write.b.resp
+            & axi_m2s.read.ar.valid
+            & std_ulogic_vector(axi_m2s.read.ar.id)
+            & std_ulogic_vector(axi_m2s.read.ar.addr)
+            & std_ulogic_vector(axi_m2s.read.ar.len)
+            & std_ulogic_vector(axi_m2s.read.ar.size)
+            & axi_m2s.read.ar.burst
+            & axi_m2s.read.r.ready
+            & axi_m2s.write.aw.valid
+            & std_ulogic_vector(axi_m2s.write.aw.id)
+            & std_ulogic_vector(axi_m2s.write.aw.addr)
+            & std_ulogic_vector(axi_m2s.write.aw.len)
+            & std_ulogic_vector(axi_m2s.write.aw.size)
+            & axi_m2s.write.aw.burst
+            & axi_m2s.write.w.valid
+            & axi_m2s.write.w.data
+            & axi_m2s.write.w.strb
+            & axi_m2s.write.w.last
+            & std_ulogic_vector(axi_m2s.write.w.id)
+            & axi_m2s.write.b.ready
+            & irq);
   end function;
 
   -- Elaboration-time probe of the collection function above, purely to learn its
@@ -195,12 +191,16 @@ architecture a of cnn_accel_top_build is
   attribute shreg_extract of irq_p2_q : signal is "no";
   attribute shreg_extract of irq_pad_q : signal is "no";
 
-  function xor_reduce(value : std_ulogic_vector) return std_ulogic is
+  function xor_reduce (value : std_ulogic_vector) return std_ulogic is
+
     variable result : std_ulogic := '0';
   begin
+
     for idx in value'range loop
+
       result := result xor value(idx);
     end loop;
+
     return result;
   end function;
 
@@ -209,10 +209,11 @@ begin
   ------------------------------------------------------------------------
   stim_block : process
   begin
+
     wait until rising_edge(clk);
 
     stim <= stim(c_stim_width - 2 downto 0)
-      & (stimulus xor stim(c_stim_width - 1) xor stim(c_stim_width - 61) xor stim(0));
+            & (stimulus xor stim(c_stim_width - 1) xor stim(c_stim_width - 61) xor stim(0));
 
     reset_int <= reset;
   end process;
@@ -243,20 +244,20 @@ begin
 
   ------------------------------------------------------------------------
   result_block : process
+
     variable out_v : std_ulogic_vector(c_padded_width - 1 downto 0) := (others => '0');
+
   begin
+
     wait until rising_edge(clk);
 
     out_v := (others => '0');
-    out_v(c_out_width - 1 downto 0) := to_slv(
-      axi_lite_s2m => s_axi_lite_s2m, axi_m2s => m_axi_m2s, irq => irq_int
-    );
+    out_v(c_out_width - 1 downto 0) := to_slv(axi_lite_s2m => s_axi_lite_s2m, axi_m2s => m_axi_m2s, irq => irq_int);
     out_q <= out_v;
 
     for chunk_idx in 0 to c_num_chunks - 1 loop
-      chunk_q(chunk_idx) <= xor_reduce(
-        out_q((chunk_idx + 1) * c_chunk_width - 1 downto chunk_idx * c_chunk_width)
-      );
+
+      chunk_q(chunk_idx) <= xor_reduce(out_q((chunk_idx + 1) * c_chunk_width - 1 downto chunk_idx * c_chunk_width));
     end loop;
 
     -- Pad chains: reduction/'irq_int' -> p1 -> p2 -> pad flop -> OBUF.
@@ -282,16 +283,16 @@ begin
       g_pe_rows => g_pe_rows
     )
     port map (
-      clk => clk,
-      reset => reset_int,
+      clk            => clk,
+      reset          => reset_int,
       --
       s_axi_lite_m2s => s_axi_lite_m2s,
       s_axi_lite_s2m => s_axi_lite_s2m,
       --
-      m_axi_m2s => m_axi_m2s,
-      m_axi_s2m => m_axi_s2m,
+      m_axi_m2s      => m_axi_m2s,
+      m_axi_s2m      => m_axi_s2m,
       --
-      irq => irq_int
+      irq            => irq_int
     );
 
 end architecture a;

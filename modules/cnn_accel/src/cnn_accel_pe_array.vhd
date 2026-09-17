@@ -1,12 +1,12 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library math;
-use math.math_pkg.all;
+  use math.math_pkg.all;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_pkg.all;
 
 -- int8 x int8 multiply-accumulate array with input-channel-tile partial-sum
 -- carry ("M4", the tiled dataflow rewrite). See
@@ -154,20 +154,20 @@ use cnn_accel.cnn_accel_pkg.all;
 entity cnn_accel_pe_array is
   generic (
     -- Output-channel parallelism: number of parallel accumulator lanes.
-    g_pe_rows : positive;
+    g_pe_rows             : positive;
     -- Input-channel/MAC parallelism per cycle: weight-buffer columns
     -- (and window taps) consumed per group.
-    g_pe_cols : positive;
+    g_pe_cols             : positive;
     -- Accumulator width (int32 default).
-    g_accum_width : positive := 32;
+    g_accum_width         : positive := 32;
     -- Upper bound on 'cfg_kernel_h'/'cfg_kernel_w' individually; also
     -- sizes 's_window_m2s.data' together with 'g_tile_channels' (must
     -- match the 'cnn_accel_window_gen' instance feeding this port).
-    g_max_kernel_size : positive;
+    g_max_kernel_size     : positive;
     -- Input channels per window-generator tile ("Ct"). Must match the
     -- 'cnn_accel_window_gen' instance feeding this port
     -- (doc/cnn_accel_tiled_dataflow_proposal.md section 1/3).
-    g_tile_channels : positive;
+    g_tile_channels       : positive;
     -- Rows in the active cnn_accel_weight_buffer bank. Added by vhdesign
     -- (not in the requirement) so 'weight_rd_addr' can be sized to match
     -- cnn_accel_weight_buffer's actual 'weight_rd_addr' width
@@ -176,10 +176,9 @@ entity cnn_accel_pe_array is
     -- cnn_accel_bias_requant's 'g_bias_addr_width' already set. Must cover
     -- the whole layer's rows ('T * groups_per_tile'), per
     -- doc/cnn_accel_tiled_dataflow_proposal.md section 4.
-    g_weight_buffer_depth : positive
-  );
+    g_weight_buffer_depth : positive);
   port (
-    clk : in std_ulogic;
+    clk            : in  std_ulogic;
     -- Synchronous active-high reset ('reset_internal' at the IP top
     -- level): clears the FSM to 'idle' and drops any in-flight/pending
     -- accumulation and any pending-but-undrained output beat. The
@@ -189,7 +188,7 @@ entity cnn_accel_pe_array is
     -- beat), and that flag LOADS 'accum_q' rather than adding into it, so
     -- no pre-reset value can survive into a result -- see the entity-level
     -- comment's "cross-position pipelining".
-    reset : in std_ulogic := '0';
+    reset          : in  std_ulogic := '0';
     --# {{}}
     -- Kernel height/width for the in-flight layer. Added by vhdesign (not
     -- in the requirement's port list, per pe_array_proposal.md section
@@ -197,8 +196,8 @@ entity cnn_accel_pe_array is
     -- 'cfg_kernel_h'/'cfg_kernel_w'. Sampled combinationally at
     -- 's_window' accept time; latched for the whole (multi-cycle) group
     -- sequence of that beat.
-    cfg_kernel_h : in std_ulogic_vector(7 downto 0);
-    cfg_kernel_w : in std_ulogic_vector(7 downto 0);
+    cfg_kernel_h   : in  std_ulogic_vector(7 downto 0);
+    cfg_kernel_w   : in  std_ulogic_vector(7 downto 0);
     --# {{}}
     -- One input-channel-tile window per beat, from cnn_accel_window_gen.
     -- 'data' element 'i' (row-major spatial tap 't = i / g_tile_channels',
@@ -207,8 +206,8 @@ entity cnn_accel_pe_array is
     -- element layout (cnn_accel_pkg.vhd's 'window_m2s_t' doc comment).
     -- 'first_tile'/'last_tile' mark the first/last of the 'T' tile beats
     -- of the current output pixel (both '1' when 'T = 1').
-    s_window_m2s : in window_m2s_t(data(0 to window_data_length(g_max_kernel_size, g_tile_channels) - 1));
-    s_window_s2m : out window_s2m_t;
+    s_window_m2s   : in  window_m2s_t(data(0 to window_data_length(g_max_kernel_size, g_tile_channels) - 1));
+    s_window_s2m   : out window_s2m_t;
     --# {{}}
     -- Row (tile) address into the active cnn_accel_weight_buffer bank's
     -- weight region. Sequenced 0 .. num_groups-1 per beat, continuing
@@ -222,19 +221,19 @@ entity cnn_accel_pe_array is
     -- Driven with this entity's own 'pipe_en', so the buffer's read
     -- pipeline freezes exactly when this one does and a group's weights
     -- can never overtake its activations. See 'tap2_q'.
-    weight_rd_en : out std_ulogic;
+    weight_rd_en   : out std_ulogic;
     -- One int8 weight per PE lane ('g_pe_rows*g_pe_cols' lanes), lane
     -- 'l = r*g_pe_cols + c' (row-major) at bits '8*(l+1)-1 downto 8*l'.
     -- Registered, 1 cycle read latency (cnn_accel_weight_buffer's own
     -- contract).
-    weight_rd_data : in std_ulogic_vector(8 * g_pe_rows * g_pe_cols - 1 downto 0);
+    weight_rd_data : in  std_ulogic_vector(8 * g_pe_rows * g_pe_cols - 1 downto 0);
     --# {{}}
     -- One int32 (g_accum_width-bit) accumulator per output-channel lane
     -- ('g_pe_rows' lanes), one beat per output pixel, emitted once that
     -- pixel's 'last_tile' beat's group sequence completes. 'last' mirrors
     -- the accepted window's 'last'. To cnn_accel_bias_requant.
-    m_accum_m2s : out accum_m2s_t(data(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0));
-    m_accum_s2m : in accum_s2m_t
+    m_accum_m2s    : out accum_m2s_t(data(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0));
+    m_accum_s2m    : in  accum_s2m_t
   );
 end entity cnn_accel_pe_array;
 
@@ -407,6 +406,7 @@ architecture a of cnn_accel_pe_array is
   -- completed pixel until the output register frees up) states are gone --
   -- see the entity-level comment.
   type state_t is (idle, run);
+
   signal state_q : state_t := idle;
 
   -- Per-beat latched configuration/data, captured at 's_window' accept
@@ -422,7 +422,6 @@ architecture a of cnn_accel_pe_array is
   signal first_tile_q : std_ulogic := '0';
   signal mac_taps_q : natural range 0 to c_window_len := 0;
   signal num_groups_q : natural range 0 to c_max_groups_per_tile := 0;
-
 
   -- Group-sequencing counter: runs 0 .. num_groups_q - 1, one weight-row
   -- address issued per cycle ('num_groups_q' cycles in 'run' per beat).
@@ -443,16 +442,14 @@ architecture a of cnn_accel_pe_array is
   -- (entity-level comment). Later pixels' groups may already be in the
   -- earlier stages; they reach this register strictly in issue order, so
   -- one bank still suffices.
-  signal accum_q : accum_array_t(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0) :=
-    (others => (others => '0'));
+  signal accum_q : accum_array_t(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0) := (others => (others => '0'));
 
   -- One-entry output register, decoupled from the compute engine
   -- (proposal doc section 3.6): the compute engine can already start the
   -- next tile beat's (or next pixel's) group sequence while a previous
   -- pixel's result still waits here on 'm_accum_s2m.ready'.
   signal out_valid_q : std_ulogic := '0';
-  signal out_data_q : accum_array_t(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0) :=
-    (others => (others => '0'));
+  signal out_data_q : accum_array_t(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0) := (others => (others => '0'));
   signal out_last_q : std_ulogic := '0';
 
   ------------------------------------------------------------------------
@@ -519,9 +516,13 @@ architecture a of cnn_accel_pe_array is
   -- DSP48E1's own M/P register, which is what makes the hard multiplier
   -- meet timing without an extra fabric stage.
   type prod_row_t is array (0 to g_pe_cols - 1) of signed(c_product_width - 1 downto 0);
+
   type prod_array_t is array (0 to g_pe_rows - 1) of prod_row_t;
+
   type dsp_row_t is array (0 to g_pe_cols - 1) of signed(c_dsp_p_width - 1 downto 0);
+
   type dsp_array_t is array (0 to c_pe_pairs - 1) of dsp_row_t;
+
   signal dsp_q : dsp_array_t := (others => (others => (others => '0')));
   signal prod_valid_q : std_ulogic := '0';
   signal prod_final_q : std_ulogic := '0';
@@ -553,8 +554,11 @@ architecture a of cnn_accel_pe_array is
   -- trims them. Declaring the full cube (rather than a per-level width)
   -- is what keeps the reduction loops static and generic in 'g_pe_cols'.
   type tree_level_t is array (0 to c_tree_width - 1) of signed(c_psum_width - 1 downto 0);
+
   type tree_rows_t is array (0 to g_pe_rows - 1) of tree_level_t;
+
   type tree_pipe_t is array (0 to c_last_reduce) of tree_rows_t;
+
   signal reduce_q : tree_pipe_t := (others => (others => (others => (others => '0'))));
   -- Keep the reduction tree in LUT fabric. Once the multiply above became
   -- a DSP48E1, Vivado also started absorbing these adders into the DSPs'
@@ -596,23 +600,25 @@ architecture a of cnn_accel_pe_array is
   -- is not itself a power of two). 'i' is a loop constant at every
   -- unrolled call site, so the branch resolves at elaboration time.
   -- One int8 weight lane out of the flat 'weight_rd_data' vector.
-  function weight_lane(data : std_ulogic_vector; lane : natural) return signed is
+  function weight_lane (data : std_ulogic_vector; lane : natural) return signed is
   begin
+
     return signed(data(8 * (lane + 1) - 1 downto 8 * lane));
   end function;
 
   -- Build the packed DSP A operand 'w_hi * 2**c_dsp_shift + w_lo'.
-  function pack_weights(w_hi : signed; w_lo : signed) return signed is
+  function pack_weights (w_hi : signed; w_lo : signed) return signed is
   begin
-    return shift_left(resize(w_hi, c_pack_a_width), c_dsp_shift)
-      + resize(w_lo, c_pack_a_width);
+
+    return shift_left(resize(w_hi, c_pack_a_width), c_dsp_shift) + resize(w_lo, c_pack_a_width);
   end function;
 
   -- Unpack the low lane: the bottom 'c_dsp_shift' bits of the packed
   -- product are exactly 'w_lo * tap' in two's complement, because that
   -- product's magnitude is within the field (OVERFLOW BOUND above).
-  function dsp_lo(p : signed) return signed is
+  function dsp_lo (p : signed) return signed is
   begin
+
     return resize(signed(p(c_dsp_shift - 1 downto 0)), c_product_width);
   end function;
 
@@ -620,9 +626,11 @@ architecture a of cnn_accel_pe_array is
   -- 'floor(p / 2**c_dsp_shift) = hi - 1' exactly when 'lo < 0' and 'hi'
   -- otherwise; bit 'c_dsp_shift-1' of 'p' IS that low field's sign bit,
   -- so adding it back recovers 'hi' bit-exactly, with no other case.
-  function dsp_hi(p : signed) return signed is
+  function dsp_hi (p : signed) return signed is
+
     variable result_v : signed(c_product_width - 1 downto 0);
   begin
+
     result_v := signed(p(c_dsp_shift + c_product_width - 1 downto c_dsp_shift));
     if p(c_dsp_shift - 1) = '1' then
       result_v := result_v + 1;
@@ -630,8 +638,9 @@ architecture a of cnn_accel_pe_array is
     return result_v;
   end function;
 
-  function padded_product(row : prod_row_t; i : natural) return signed is
+  function padded_product (row : prod_row_t; i : natural) return signed is
   begin
+
     if i < g_pe_cols then
       return resize(row(i), c_psum_width);
     end if;
@@ -646,16 +655,19 @@ begin
   ------------------------------------------------------------------------
 
   assert c_max_abs_product <= c_low_field_capacity - 1
-    report "cnn_accel_pe_array: packed DSP low field (" &
-      natural'image(c_dsp_shift) & " bits, capacity +/-" &
-      natural'image(c_low_field_capacity) & ") cannot hold one int8 x int8 product (" &
-      natural'image(c_max_abs_product) & ") -- the two packed lanes would corrupt each other"
+    report "cnn_accel_pe_array: packed DSP low field ("
+           & natural'image(c_dsp_shift)
+           & " bits, capacity +/-"
+           & natural'image(c_low_field_capacity)
+           & ") cannot hold one int8 x int8 product ("
+           & natural'image(c_max_abs_product)
+           & ") -- the two packed lanes would corrupt each other"
     severity failure;
 
   assert c_pack_a_width <= 25
-    report "cnn_accel_pe_array: packed DSP A operand is " &
-      natural'image(c_pack_a_width) &
-      " bits, wider than a DSP48E1's 25-bit multiplier port"
+    report "cnn_accel_pe_array: packed DSP A operand is "
+           & natural'image(c_pack_a_width)
+           & " bits, wider than a DSP48E1's 25-bit multiplier port"
     severity failure;
 
   ------------------------------------------------------------------------
@@ -678,18 +690,18 @@ begin
   -- (proposal doc section 10).
   ------------------------------------------------------------------------
 
-  pipe_en <= '1' when (out_valid_q = '0') or (m_accum_s2m.ready = '1') else '0';
+  pipe_en <= '1' when (out_valid_q = '0') or (m_accum_s2m.ready = '1') else
+             '0';
 
-  s_window_s2m.ready <=
-    pipe_en when (state_q = idle) or (cycle_q + 1 = num_groups_q) else '0';
+  s_window_s2m.ready <= pipe_en when (state_q = idle) or (cycle_q + 1 = num_groups_q) else
+                        '0';
 
-  issue_addr <=
-    std_ulogic_vector(
-      resize(weight_base_q + to_unsigned(cycle_q, c_ptr_width), c_addr_width)
-    ) when state_q = run else
-    (others => '0');
+  issue_addr <= std_ulogic_vector(resize(weight_base_q + to_unsigned(cycle_q, c_ptr_width), c_addr_width))
+                  when state_q = run else
+                (others => '0');
 
-  weight_rd_addr <= issue_addr when pipe_en = '1' else held_addr_q;
+  weight_rd_addr <= issue_addr when pipe_en = '1' else
+                    held_addr_q;
   weight_rd_en <= pipe_en;
 
   m_accum_m2s.valid <= out_valid_q;
@@ -709,7 +721,8 @@ begin
   -- not accepting. That is the only stall this module has.
   ------------------------------------------------------------------------
 
-  main : process(clk)
+  main : process (clk)
+
     -- Full-width reads of the two configuration ports, used ONLY by the
     -- range assert in the accept branch (which synthesis drops, taking
     -- this 8x8 arithmetic with it).
@@ -719,14 +732,13 @@ begin
     variable kernel_h_v : natural range 0 to c_kernel_max;
     variable kernel_w_v : natural range 0 to c_kernel_max;
     variable mac_taps_v : natural range 0 to c_kernel_max * c_kernel_max * g_tile_channels;
-    variable num_groups_v : natural range
-      0 to (c_kernel_max * c_kernel_max * g_tile_channels + g_pe_cols - 1) / g_pe_cols;
+    variable num_groups_v :
+      natural range 0 to (c_kernel_max * c_kernel_max * g_tile_channels + g_pe_cols - 1) / g_pe_cols;
     -- All three bounded ('shared/ModernVHDL.md', "Always constrain the
     -- range -- no exceptions"): unconstrained they synthesise the full
     -- 32-bit multiply/add even though every value here is a small index.
     variable effective_base_v : natural range 0 to 2 ** c_ptr_width - 1;
-    variable idx_v : natural range
-      0 to c_max_groups_per_tile * g_pe_cols + g_pe_cols - 1;
+    variable idx_v : natural range 0 to c_max_groups_per_tile * g_pe_cols + g_pe_cols - 1;
     variable weight_lane_v : natural range 0 to g_pe_rows * g_pe_cols - 1;
     variable final_accum_v : accum_array_t(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0);
     -- Set by the 'case' below when a new 's_window' beat is being accepted
@@ -743,7 +755,9 @@ begin
     variable prod_v : prod_array_t;
     variable w_hi_v : signed(7 downto 0);
     variable w_lo_v : signed(7 downto 0);
+
   begin
+
     if rising_edge(clk) then
       -- Stage 3 (the only place 'accum_q' is ever written): one
       -- 'g_accum_width'-bit add per PE row -- or a plain LOAD of the
@@ -756,11 +770,11 @@ begin
       -- value in the same cycle it is written back (no extra commit
       -- cycle).
       for r in 0 to g_pe_rows - 1 loop
+
         if reduce_first_q(c_last_reduce) = '1' then
           final_accum_v(r) := resize(reduce_q(c_last_reduce)(r)(0), g_accum_width);
         else
-          final_accum_v(r) :=
-            accum_q(r) + resize(reduce_q(c_last_reduce)(r)(0), g_accum_width);
+          final_accum_v(r) := accum_q(r) + resize(reduce_q(c_last_reduce)(r)(0), g_accum_width);
         end if;
       end loop;
 
@@ -820,12 +834,15 @@ begin
         -- register -- this is what replaces the old per-cell 'prod_q'
         -- register, so no pipeline stage is added or removed.
         for p in 0 to c_pe_pairs - 1 loop
+
           for c in 0 to g_pe_cols - 1 loop
+
             prod_v(2 * p)(c) := dsp_hi(dsp_q(p)(c));
             if 2 * p + 1 <= g_pe_rows - 1 then
               prod_v(2 * p + 1)(c) := dsp_lo(dsp_q(p)(c));
             end if;
           end loop;
+
         end loop;
 
         -- Reduction stage 0: pair up this row's products. Only the
@@ -833,13 +850,16 @@ begin
         -- 'padded_product' supplies a constant zero for the power-of-two
         -- padding lanes.
         for r in 0 to g_pe_rows - 1 loop
+
           for i in 0 to c_tree_width - 1 loop
+
             if i mod 2 = 0 then
-              reduce_q(0)(r)(i) <=
-                padded_product(prod_v(r), i) + padded_product(prod_v(r), i + 1);
+              reduce_q(0)(r)(i) <= padded_product(prod_v(r), i) + padded_product(prod_v(r), i + 1);
             end if;
           end loop;
+
         end loop;
+
         reduce_valid_q(0) <= prod_valid_q;
         reduce_final_q(0) <= prod_final_q;
         reduce_first_q(0) <= prod_first_q;
@@ -848,14 +868,18 @@ begin
         -- Reduction stages 1 .. c_last_reduce: one balanced tree level
         -- each. Null range when 'g_pe_cols' <= 2.
         for level in 1 to c_last_reduce loop
+
           for r in 0 to g_pe_rows - 1 loop
+
             for i in 0 to c_tree_width - 1 loop
+
               if i mod (2 ** (level + 1)) = 0 then
-                reduce_q(level)(r)(i) <=
-                  reduce_q(level - 1)(r)(i) + reduce_q(level - 1)(r)(i + 2 ** level);
+                reduce_q(level)(r)(i) <= reduce_q(level - 1)(r)(i) + reduce_q(level - 1)(r)(i + 2 ** level);
               end if;
             end loop;
+
           end loop;
+
           reduce_valid_q(level) <= reduce_valid_q(level - 1);
           reduce_final_q(level) <= reduce_final_q(level - 1);
           reduce_first_q(level) <= reduce_first_q(level - 1);
@@ -868,7 +892,9 @@ begin
         -- indexing ('r*g_pe_cols + c', row-major) is unchanged; only the
         -- arithmetic's physical mapping is.
         for p in 0 to c_pe_pairs - 1 loop
+
           for c in 0 to g_pe_cols - 1 loop
+
             weight_lane_v := (2 * p) * g_pe_cols + c;
             w_hi_v := weight_lane(weight_rd_data, weight_lane_v);
             if 2 * p + 1 <= g_pe_rows - 1 then
@@ -883,7 +909,9 @@ begin
             end if;
             dsp_q(p)(c) <= pack_weights(w_hi_v, w_lo_v) * signed(tap2_q(c));
           end loop;
+
         end loop;
+
         prod_valid_q <= tap2_valid_q;
         prod_final_q <= tap2_final_q;
         prod_first_q <= tap2_first_q;
@@ -905,15 +933,15 @@ begin
         tap_first_q <= '0';
 
         case state_q is
-
           when idle =>
+
             -- Nothing in 'window_q'. 's_window_s2m.ready' is 'pipe_en'
             -- here, so a valid beat is being accepted this cycle.
             if s_window_m2s.valid = '1' then
               accept_v := true;
             end if;
-
           when run =>
+
             -- Stage 0: issue group 'cycle_q's weight-row address (the
             -- concurrent 'weight_rd_addr' assignment above) and latch that
             -- group's activation taps. Tap 'idx = cycle_q*g_pe_cols + c'
@@ -927,6 +955,7 @@ begin
             -- variable-bound loop (this file's house rules,
             -- cnn_accel_pkg.vhd's 'window_m2s_t' doc comment).
             for c in 0 to g_pe_cols - 1 loop
+
               idx_v := cycle_q * g_pe_cols + c;
               if idx_v < mac_taps_q then
                 tap_q(c) <= window_q(idx_v);
@@ -934,6 +963,7 @@ begin
                 tap_q(c) <= (others => '0');
               end if;
             end loop;
+
             tap_valid_q <= '1';
 
             -- Group 0 of a 'first_tile' beat is the group that starts a
@@ -969,7 +999,6 @@ begin
             else
               cycle_q <= cycle_q + 1;
             end if;
-
         end case;
 
         --------------------------------------------------------------
@@ -983,8 +1012,7 @@ begin
           kernel_h_full_v := to_integer(unsigned(cfg_kernel_h));
           kernel_w_full_v := to_integer(unsigned(cfg_kernel_w));
 
-          assert kernel_h_full_v <= g_max_kernel_size
-            and kernel_w_full_v <= g_max_kernel_size
+          assert kernel_h_full_v <= g_max_kernel_size and kernel_w_full_v <= g_max_kernel_size
             report "cnn_accel_pe_array: cfg_kernel_h/cfg_kernel_w must be <= g_max_kernel_size"
             severity failure;
 
@@ -1004,9 +1032,11 @@ begin
             severity failure;
 
           assert mac_taps_v <= c_window_len
-            report "cnn_accel_pe_array: kernel_h*kernel_w*g_tile_channels (" &
-              natural'image(mac_taps_v) & ") exceeds s_window_m2s.data's element count (" &
-              natural'image(c_window_len) & ")"
+            report "cnn_accel_pe_array: kernel_h*kernel_w*g_tile_channels ("
+                   & natural'image(mac_taps_v)
+                   & ") exceeds s_window_m2s.data's element count ("
+                   & natural'image(c_window_len)
+                   & ")"
             severity failure;
 
           num_groups_v := (mac_taps_v + g_pe_cols - 1) / g_pe_cols;
@@ -1018,10 +1048,13 @@ begin
           end if;
 
           assert effective_base_v + num_groups_v <= g_weight_buffer_depth
-            report "cnn_accel_pe_array: weight_rd_addr sequence (base " &
-              natural'image(effective_base_v) & " + " & natural'image(num_groups_v) &
-              " groups) exceeds g_weight_buffer_depth (" &
-              natural'image(g_weight_buffer_depth) & ")"
+            report "cnn_accel_pe_array: weight_rd_addr sequence (base "
+                   & natural'image(effective_base_v)
+                   & " + "
+                   & natural'image(num_groups_v)
+                   & " groups) exceeds g_weight_buffer_depth ("
+                   & natural'image(g_weight_buffer_depth)
+                   & ")"
             severity failure;
 
           -- Overrides the 'weight_base_q <= base_after_v' the 'run'

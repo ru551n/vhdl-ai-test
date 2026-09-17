@@ -1,14 +1,14 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_v2_pkg.all;
-use cnn_accel.cnn_accel_regs_pkg.all;
-use cnn_accel.cnn_accel_register_record_pkg.all;
+  use cnn_accel.cnn_accel_v2_pkg.all;
+  use cnn_accel.cnn_accel_regs_pkg.all;
+  use cnn_accel.cnn_accel_register_record_pkg.all;
 
 library axi_lite;
-use axi_lite.axi_lite_pkg.all;
+  use axi_lite.axi_lite_pkg.all;
 
 -- AXI4-Lite control/status register block (doc/cnn_accel_top_v2_arch.md
 -- section 8). Direct-instantiates the `hdl-registers`-generated
@@ -36,10 +36,10 @@ use axi_lite.axi_lite_pkg.all;
 -- racing W1C.
 entity cnn_accel_csr is
   generic (
-    g_pe_rows : positive;
-    g_pe_cols : positive;
-    g_tile_channels : positive;
-    g_max_kernel_size : positive;
+    g_pe_rows              : positive;
+    g_pe_cols              : positive;
+    g_tile_channels        : positive;
+    g_max_kernel_size      : positive;
     -- Pooling's own, separate kernel bound (cnn_accel_top's
     -- 'g_max_pool_kernel_size'). Reported to the host via
     -- HW_INFO3.MAX_POOL_KERNEL_SIZE -- distinct from HW_INFO.MAX_KERNEL_SIZE.
@@ -47,19 +47,18 @@ entity cnn_accel_csr is
     -- Elaborated per-row activation tile depth (cnn_accel_top's
     -- 'g_max_row_tile_words'). Reported to the host via
     -- HW_INFO3.MAX_ROW_TILE_WORDS.
-    g_max_row_tile_words : positive;
+    g_max_row_tile_words   : positive;
     -- Size of the local tensor scratchpad (cnn_accel_tensor_mem), bytes.
     -- Reported to the host, in KiB, via HW_INFO2.TENSOR_MEM_KIB.
-    g_tensor_bytes : positive;
-    g_axi_addr_width : positive := 32
-  );
+    g_tensor_bytes         : positive;
+    g_axi_addr_width       : positive := 32);
   port (
-    clk : in std_ulogic;
-    reset : in std_ulogic := '0';
+    clk               : in  std_ulogic;
+    reset             : in  std_ulogic := '0';
 
     --# {{}}
-    s_axi_lite_m2s : in axi_lite_m2s_t;
-    s_axi_lite_s2m : out axi_lite_s2m_t := axi_lite_s2m_init;
+    s_axi_lite_m2s    : in  axi_lite_m2s_t;
+    s_axi_lite_s2m    : out axi_lite_s2m_t := axi_lite_s2m_init;
 
     --# {{}}
     -- Latched at the moment 'start' pulses (see the entity-level comment
@@ -76,28 +75,28 @@ entity cnn_accel_csr is
     -- takes effect on the next START, exactly like PROGRAM_BASE_ADDR;
     -- while BUSY='1' it instead queues (or, if a job is already queued,
     -- is rejected with ERR_QUEUE_FULL -- see CTRL.START's own comment).
-    input_addr : out std_ulogic_vector(g_axi_addr_width - 1 downto 0) := (others => '0');
-    output_addr : out std_ulogic_vector(g_axi_addr_width - 1 downto 0) := (others => '0');
+    input_addr        : out std_ulogic_vector(g_axi_addr_width - 1 downto 0) := (others => '0');
+    output_addr       : out std_ulogic_vector(g_axi_addr_width - 1 downto 0) := (others => '0');
     -- Pulses exactly one cycle AFTER the accepted CTRL.START write, so that
     -- 'program_base_addr' above (registered, captured on that same write)
     -- is already stable when the consumer samples it. Handing 'start' out
     -- in the write cycle itself would make the consumer latch the previous
     -- base address -- 0 on the very first run, which fetches an all-zero
     -- descriptor at address 0 and decodes as an immediate HALT.
-    start : out std_ulogic := '0';
-    soft_reset_pulse : out std_ulogic := '0';
+    start             : out std_ulogic := '0';
+    soft_reset_pulse  : out std_ulogic := '0';
 
     --# {{}}
-    seq_done : in std_ulogic;
-    seq_error : in std_ulogic;
-    err_code : in std_ulogic_vector(3 downto 0);
-    err_pc : in std_ulogic_vector(31 downto 0);
+    seq_done          : in  std_ulogic;
+    seq_error         : in  std_ulogic;
+    err_code          : in  std_ulogic_vector(3 downto 0);
+    err_pc            : in  std_ulogic_vector(31 downto 0);
 
     --# {{}}
-    counters : in csr_counters_t;
+    counters          : in  csr_counters_t;
 
     --# {{}}
-    irq : out std_ulogic := '0'
+    irq               : out std_ulogic := '0'
   );
 end entity cnn_accel_csr;
 
@@ -171,8 +170,9 @@ begin
   -- latching (spec section 8).
   ------------------------------------------------------------------------
 
-  status_tracking : process(clk)
+  status_tracking : process (clk)
   begin
+
     if rising_edge(clk) then
       if reset = '1' then
         busy_q <= '0';
@@ -253,14 +253,14 @@ begin
   -- accepted START pulses.
   ------------------------------------------------------------------------
 
-  program_base_addr_latch : process(clk)
+  program_base_addr_latch : process (clk)
   begin
+
     if rising_edge(clk) then
       if reset = '1' then
         program_base_addr_q <= (others => '0');
       elsif start_i = '1' then
-        program_base_addr_q <=
-          unsigned(regs_down.program_base_addr.addr(g_axi_addr_width - 1 downto 0));
+        program_base_addr_q <= unsigned(regs_down.program_base_addr.addr(g_axi_addr_width - 1 downto 0));
       end if;
     end if;
   end process;
@@ -276,8 +276,9 @@ begin
   -- would otherwise never clear.
   ------------------------------------------------------------------------
 
-  queue_tracking : process(clk)
+  queue_tracking : process (clk)
   begin
+
     if rising_edge(clk) then
       if reset = '1' then
         queued_q <= '0';
@@ -286,10 +287,8 @@ begin
       else
         if queue_i = '1' then
           queued_q <= '1';
-          queued_input_addr_q <=
-            unsigned(regs_down.input_addr.addr(g_axi_addr_width - 1 downto 0));
-          queued_output_addr_q <=
-            unsigned(regs_down.output_addr.addr(g_axi_addr_width - 1 downto 0));
+          queued_input_addr_q <= unsigned(regs_down.input_addr.addr(g_axi_addr_width - 1 downto 0));
+          queued_output_addr_q <= unsigned(regs_down.output_addr.addr(g_axi_addr_width - 1 downto 0));
         elsif auto_dispatch_i = '1' then
           queued_q <= '0';
         end if;
@@ -300,8 +299,9 @@ begin
     end if;
   end process;
 
-  input_output_addr_latch : process(clk)
+  input_output_addr_latch : process (clk)
   begin
+
     if rising_edge(clk) then
       if reset = '1' then
         input_addr_q <= (others => '0');
@@ -322,8 +322,9 @@ begin
   -- one cycle after the START write. 'start_q' delays the outgoing pulse by
   -- exactly that cycle; 'busy_q' is set in the same cycle as 'start_i', so
   -- the delay cannot let a second START through in between.
-  start_delay : process(clk)
+  start_delay : process (clk)
   begin
+
     if rising_edge(clk) then
       if reset = '1' then
         start_q <= '0';
@@ -355,20 +356,17 @@ begin
   -- driver binary works unmodified across build points (flow_status.md S3).
   regs_up.hw_info.pe_rows <= to_unsigned(g_pe_rows, cnn_accel_hw_info_pe_rows_width);
   regs_up.hw_info.pe_cols <= to_unsigned(g_pe_cols, cnn_accel_hw_info_pe_cols_width);
-  regs_up.hw_info.tile_channels <=
-    to_unsigned(g_tile_channels, cnn_accel_hw_info_tile_channels_width);
-  regs_up.hw_info.max_kernel_size <=
-    to_unsigned(g_max_kernel_size, cnn_accel_hw_info_max_kernel_size_width);
+  regs_up.hw_info.tile_channels <= to_unsigned(g_tile_channels, cnn_accel_hw_info_tile_channels_width);
+  regs_up.hw_info.max_kernel_size <= to_unsigned(g_max_kernel_size, cnn_accel_hw_info_max_kernel_size_width);
 
-  regs_up.hw_info2.isa_version <=
-    to_unsigned(cnn_accel_constant_isa_version, cnn_accel_hw_info2_isa_version_width);
-  regs_up.hw_info2.tensor_mem_kib <=
-    to_unsigned(g_tensor_bytes / 1024, cnn_accel_hw_info2_tensor_mem_kib_width);
+  regs_up.hw_info2.isa_version <= to_unsigned(cnn_accel_constant_isa_version, cnn_accel_hw_info2_isa_version_width);
+  regs_up.hw_info2.tensor_mem_kib <= to_unsigned(g_tensor_bytes / 1024, cnn_accel_hw_info2_tensor_mem_kib_width);
 
-  regs_up.hw_info3.max_pool_kernel_size <=
-    to_unsigned(g_max_pool_kernel_size, cnn_accel_hw_info3_max_pool_kernel_size_width);
-  regs_up.hw_info3.max_row_tile_words <=
-    to_unsigned(g_max_row_tile_words, cnn_accel_hw_info3_max_row_tile_words_width);
+  regs_up.hw_info3.max_pool_kernel_size <= to_unsigned(
+    g_max_pool_kernel_size,
+    cnn_accel_hw_info3_max_pool_kernel_size_width
+  );
+  regs_up.hw_info3.max_row_tile_words <= to_unsigned(g_max_row_tile_words, cnn_accel_hw_info3_max_row_tile_words_width);
 
   -- Counters: pure pass-through from the consolidated 'counters' input
   -- (csr_counters_t, src/cnn_accel_v2_pkg.vhd) into the individual
@@ -390,8 +388,7 @@ begin
   -- Register write-side ('regs_down') consumers.
   ------------------------------------------------------------------------
 
-  irq <= (done_sticky_q and regs_down.irq_mask.done) or
-    (error_sticky_q and regs_down.irq_mask.error);
+  irq <= (done_sticky_q and regs_down.irq_mask.done) or (error_sticky_q and regs_down.irq_mask.error);
 
   ------------------------------------------------------------------------
   -- The generated AXI4-Lite register file itself (regs_src/
@@ -401,16 +398,16 @@ begin
 
   axi_lite_register_file_inst : entity cnn_accel.cnn_accel_register_file_axi_lite
     port map (
-      clk => clk,
+      clk             => clk,
       -- Unmodified external reset only, per the spec's reset policy: an
       -- abort ('soft_reset_pulse') must not erase 'PROGRAM_BASE_ADDR' or
       -- 'IRQ_MASK', and this reset clears every register's storage.
-      reset => reset,
-      axi_lite_m2s => s_axi_lite_m2s,
-      axi_lite_s2m => s_axi_lite_s2m,
-      regs_up => regs_up,
-      regs_down => regs_down,
-      reg_was_read => reg_was_read,
+      reset           => reset,
+      axi_lite_m2s    => s_axi_lite_m2s,
+      axi_lite_s2m    => s_axi_lite_s2m,
+      regs_up         => regs_up,
+      regs_down       => regs_down,
+      reg_was_read    => reg_was_read,
       reg_was_written => reg_was_written
     );
 

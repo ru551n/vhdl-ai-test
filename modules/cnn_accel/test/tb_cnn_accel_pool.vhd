@@ -1,21 +1,21 @@
 library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+  use ieee.std_logic_1164.all;
+  use ieee.numeric_std.all;
 
 library vunit_lib;
 context vunit_lib.vunit_context;
-use vunit_lib.queue_pkg.all;
+  use vunit_lib.queue_pkg.all;
 
 library osvvm;
-use osvvm.RandomPkg.all;
+  use osvvm.randompkg.all;
 
 library axi_stream;
-use axi_stream.axi_stream_pkg.all;
+  use axi_stream.axi_stream_pkg.all;
 
 library cnn_accel;
-use cnn_accel.cnn_accel_pkg.all;
-use cnn_accel.cnn_accel_isa_pkg.all;
-use cnn_accel.cnn_accel_regs_pkg.all;
+  use cnn_accel.cnn_accel_pkg.all;
+  use cnn_accel.cnn_accel_isa_pkg.all;
+  use cnn_accel.cnn_accel_regs_pkg.all;
 
 -- VUnit-5 testbench for cnn_accel_pool. See
 -- modules/cnn_accel/doc/cnn_accel_pool_req.md and
@@ -31,11 +31,10 @@ entity tb_cnn_accel_pool is
     -- module_cnn_accel.py's setup_vunit (0/0/0 for the dedicated
     -- full-throughput test, nonzero otherwise): one input, multiple
     -- independently-stalled outputs.
-    stall_probability_percent_in : natural := 20;
-    stall_probability_percent_max : natural := 20;
+    stall_probability_percent_in     : natural := 20;
+    stall_probability_percent_max    : natural := 20;
     stall_probability_percent_avgsum : natural := 20;
-    runner_cfg : string
-  );
+    runner_cfg                       : string);
 end entity tb_cnn_accel_pool;
 
 architecture tb of tb_cnn_accel_pool is
@@ -61,10 +60,8 @@ architecture tb of tb_cnn_accel_pool is
   signal cfg_pool_kernel_h : std_ulogic_vector(7 downto 0) := (others => '0');
   signal cfg_pool_kernel_w : std_ulogic_vector(7 downto 0) := (others => '0');
 
-  signal s_window_m2s : window_m2s_t(data(0 to c_max_taps - 1)) := (
-    valid => '0', last => '0', first_tile => '1', last_tile => '1',
-    data => (others => (others => '0'))
-  );
+  signal s_window_m2s : window_m2s_t(data(0 to c_max_taps - 1)) :=
+    (valid => '0', last => '0', first_tile => '1', last_tile => '1', data => (others => (others => '0')));
   signal s_window_s2m : window_s2m_t;
 
   signal m_max_m2s : axi_stream_m2s_t;
@@ -91,16 +88,25 @@ architecture tb of tb_cnn_accel_pool is
     h : natural;
     w : natural;
   end record;
+
   type shape_arr_t is array (natural range <>) of shape_t;
+
   constant c_shapes : shape_arr_t(0 to 7) := (
-    (1, 1), (2, 2), (3, 3), (2, 3), (3, 2),
+    (1, 1),
+    (2, 2),
+    (3, 3),
+    (2, 3),
+    (3, 2),
     -- The pool-only shapes the conv datapath is deliberately NOT sized
     -- for; (5, 5) is YOLOv8n's SPPF kernel.
-    (5, 5), (4, 5), (5, 2)
+    (5, 5),
+    (4, 5),
+    (5, 2)
   );
 
-  function to_sl(cond : boolean) return std_ulogic is
+  function to_sl (cond : boolean) return std_ulogic is
   begin
+
     if cond then
       return '1';
     end if;
@@ -116,35 +122,46 @@ architecture tb of tb_cnn_accel_pool is
   -- Python model.
   ------------------------------------------------------------------------
 
-  function golden_max(taps : taps_arr_t; active_count : natural) return integer is
+  function golden_max (taps : taps_arr_t; active_count : natural) return integer is
+
     variable result : integer := -128;
   begin
+
     for i in 0 to c_max_taps - 1 loop
+
       if i < active_count and taps(i) > result then
         result := taps(i);
       end if;
     end loop;
+
     return result;
   end function;
 
-  function golden_sum(taps : taps_arr_t; active_count : natural) return integer is
+  function golden_sum (taps : taps_arr_t; active_count : natural) return integer is
+
     variable result : integer := 0;
   begin
+
     for i in 0 to c_max_taps - 1 loop
+
       if i < active_count then
         result := result + taps(i);
       end if;
     end loop;
+
     return result;
   end function;
 
   -- Packs a tap array into an 's_window_m2s.data' tap array, per the
   -- element layout documented on cnn_accel_pool's 's_window_m2s' port
   -- (row-major, ascending index).
-  function pack_window(taps : taps_arr_t; active_count : natural) return tap_array_t is
+  function pack_window (taps : taps_arr_t; active_count : natural) return tap_array_t is
+
     variable result : tap_array_t(0 to c_max_taps - 1) := (others => (others => '0'));
   begin
+
     for i in 0 to c_max_taps - 1 loop
+
       if i < active_count then
         result(i) := std_ulogic_vector(to_signed(taps(i), 8));
       else
@@ -156,6 +173,7 @@ architecture tb of tb_cnn_accel_pool is
         result(i) := std_ulogic_vector(to_signed(127, 8));
       end if;
     end loop;
+
     return result;
   end function;
 
@@ -170,8 +188,9 @@ begin
   -- for) the per-port scoreboard's own routing check.
   ------------------------------------------------------------------------
 
-  mutual_exclusion_check : process(clk)
+  mutual_exclusion_check : process (clk)
   begin
+
     if rising_edge(clk) and reset = '0' then
       check_false(
         m_max_m2s.valid = '1' and m_avgsum_m2s.valid = '1',
@@ -184,20 +203,20 @@ begin
   dut : entity cnn_accel.cnn_accel_pool
     generic map (
       g_max_kernel_size => c_kernel_max,
-      g_accum_width => c_accum_width
+      g_accum_width     => c_accum_width
     )
     port map (
-      clk => clk,
-      reset => reset,
-      cfg_opcode => cfg_opcode,
+      clk               => clk,
+      reset             => reset,
+      cfg_opcode        => cfg_opcode,
       cfg_pool_kernel_h => cfg_pool_kernel_h,
       cfg_pool_kernel_w => cfg_pool_kernel_w,
-      s_window_m2s => s_window_m2s,
-      s_window_s2m => s_window_s2m,
-      m_max_m2s => m_max_m2s,
-      m_max_s2m => m_max_s2m,
-      m_avgsum_m2s => m_avgsum_m2s,
-      m_avgsum_s2m => m_avgsum_s2m
+      s_window_m2s      => s_window_m2s,
+      s_window_s2m      => s_window_s2m,
+      m_max_m2s         => m_max_m2s,
+      m_max_s2m         => m_max_s2m,
+      m_avgsum_m2s      => m_avgsum_m2s,
+      m_avgsum_s2m      => m_avgsum_s2m
     );
 
   ------------------------------------------------------------------------
@@ -206,20 +225,26 @@ begin
   ------------------------------------------------------------------------
 
   monitor_max : process
-    variable rnd : RandomPType;
+
+    variable rnd : randomptype;
     variable expected_value : signed(7 downto 0);
     variable expected_last : std_ulogic;
+
   begin
+
     rnd.InitSeed(get_string_seed(runner_cfg) & "_max_monitor");
     m_max_s2m.ready <= '0';
     wait until reset = '0' and rising_edge(clk);
 
     loop
+
       if rnd.RandInt(0, 99) < stall_probability_percent_max then
         m_max_s2m.ready <= '0';
         for i in 1 to rnd.RandInt(1, 4) loop
+
           wait until rising_edge(clk);
         end loop;
+
       end if;
 
       m_max_s2m.ready <= '1';
@@ -232,23 +257,30 @@ begin
         check_equal(m_max_m2s.last, expected_last, "m_max last mismatch");
       end if;
     end loop;
+
   end process;
 
   monitor_avgsum : process
-    variable rnd : RandomPType;
+
+    variable rnd : randomptype;
     variable expected_value : signed(c_accum_width - 1 downto 0);
     variable expected_last : std_ulogic;
+
   begin
+
     rnd.InitSeed(get_string_seed(runner_cfg) & "_avgsum_monitor");
     m_avgsum_s2m.ready <= '0';
     wait until reset = '0' and rising_edge(clk);
 
     loop
+
       if rnd.RandInt(0, 99) < stall_probability_percent_avgsum then
         m_avgsum_s2m.ready <= '0';
         for i in 1 to rnd.RandInt(1, 4) loop
+
           wait until rising_edge(clk);
         end loop;
+
       end if;
 
       m_avgsum_s2m.ready <= '1';
@@ -258,17 +290,20 @@ begin
         expected_value := pop(avgsum_expected_q);
         expected_last := pop(avgsum_expected_q);
         check_equal(
-          m_avgsum_m2s.data(c_accum_width - 1 downto 0), std_ulogic_vector(expected_value),
+          m_avgsum_m2s.data(c_accum_width - 1 downto 0),
+          std_ulogic_vector(expected_value),
           "m_avgsum data mismatch"
         );
         check_equal(m_avgsum_m2s.last, expected_last, "m_avgsum last mismatch");
       end if;
     end loop;
+
   end process;
 
   ------------------------------------------------------------------------
   main : process
-    variable rnd : RandomPType;
+
+    variable rnd : randomptype;
     variable taps : taps_arr_t;
     variable opcode : std_ulogic_vector(7 downto 0);
     variable beat_idx : natural;
@@ -276,30 +311,36 @@ begin
 
     procedure do_reset is
     begin
+
       reset <= '1';
       wait until rising_edge(clk);
       reset <= '0';
     end procedure;
 
     -- Generates 'count' random taps in -128..127.
-    procedure random_taps(p_taps : out taps_arr_t) is
+    procedure random_taps (p_taps : out taps_arr_t) is
     begin
+
       for i in 0 to c_max_taps - 1 loop
+
         p_taps(i) := rnd.RandInt(-128, 127);
       end loop;
+
     end procedure;
 
     -- Pushes one 's_window' beat (with randomized input-side stall) and
     -- enqueues its expected result onto the matching scoreboard queue.
-    procedure send_beat(
-      kernel_h : natural;
-      kernel_w : natural;
-      p_taps : taps_arr_t;
-      p_opcode : std_ulogic_vector(7 downto 0);
+    procedure send_beat (
+      kernel_h  : natural;
+      kernel_w  : natural;
+      p_taps    : taps_arr_t;
+      p_opcode  : std_ulogic_vector(7 downto 0);
       beat_last : std_ulogic
     ) is
+
       variable active_count : natural;
     begin
+
       active_count := kernel_h * kernel_w;
 
       cfg_opcode <= p_opcode;
@@ -311,8 +352,10 @@ begin
       if rnd.RandInt(0, 99) < stall_probability_percent_in then
         s_window_m2s.valid <= '0';
         for i in 1 to rnd.RandInt(1, 4) loop
+
           wait until rising_edge(clk);
         end loop;
+
       end if;
 
       s_window_m2s.valid <= '1';
@@ -334,15 +377,17 @@ begin
     -- changes with a beat continuously in flight. That is the hazard the
     -- registered tap mask introduces, and the DUT absorbs it by holding
     -- 'ready' low for the one cycle in which the mask is stale.
-    procedure send_beat_held(
-      kernel_h : natural;
-      kernel_w : natural;
-      p_taps : taps_arr_t;
-      p_opcode : std_ulogic_vector(7 downto 0);
+    procedure send_beat_held (
+      kernel_h  : natural;
+      kernel_w  : natural;
+      p_taps    : taps_arr_t;
+      p_opcode  : std_ulogic_vector(7 downto 0);
       beat_last : std_ulogic
     ) is
+
       variable active_count : natural;
     begin
+
       active_count := kernel_h * kernel_w;
 
       cfg_opcode <= p_opcode;
@@ -365,47 +410,64 @@ begin
 
     -- Random beats across the full kernel-shape sweep, all with the same
     -- fixed opcode.
-    procedure run_kernel_sweep(p_opcode : std_ulogic_vector(7 downto 0); beats_per_shape : positive) is
+    procedure run_kernel_sweep (p_opcode : std_ulogic_vector(7 downto 0); beats_per_shape : positive) is
+
       variable local_taps : taps_arr_t;
     begin
+
       for s in c_shapes'range loop
+
         for beat in 0 to beats_per_shape - 1 loop
+
           random_taps(local_taps);
           send_beat(c_shapes(s).h, c_shapes(s).w, local_taps, p_opcode, '0');
         end loop;
+
       end loop;
+
     end procedure;
 
     -- Directed extremes: every active tap forced to 'value', for every
     -- kernel shape -- exercises the full accumulator width (all-127 /
     -- all--128 sums) and the max identity element (-128 seed) not
     -- accidentally winning over a real, larger tap.
-    procedure run_directed_extremes(p_opcode : std_ulogic_vector(7 downto 0); value : integer) is
+    procedure run_directed_extremes (p_opcode : std_ulogic_vector(7 downto 0); value : integer) is
+
       variable local_taps : taps_arr_t;
     begin
+
       for s in c_shapes'range loop
+
         for i in 0 to c_max_taps - 1 loop
+
           local_taps(i) := value;
         end loop;
+
         send_beat(c_shapes(s).h, c_shapes(s).w, local_taps, p_opcode, '0');
       end loop;
+
     end procedure;
 
     -- Waits (bounded) until both scoreboard queues have drained, then
     -- confirms they are truly empty (every expected output actually
     -- arrived) rather than just timing out.
-    procedure drain_and_check(max_wait_cycles : positive) is
+    procedure drain_and_check (max_wait_cycles : positive) is
+
       variable cycles : natural := 0;
     begin
+
       while (not is_empty(max_expected_q) or not is_empty(avgsum_expected_q)) and cycles < max_wait_cycles loop
+
         wait until rising_edge(clk);
         cycles := cycles + 1;
       end loop;
+
       check_true(is_empty(max_expected_q), "m_max scoreboard queue did not drain in time");
       check_true(is_empty(avgsum_expected_q), "m_avgsum scoreboard queue did not drain in time");
     end procedure;
 
   begin
+
     test_runner_setup(runner, runner_cfg);
     rnd.InitSeed(get_string_seed(runner_cfg));
 
@@ -420,12 +482,14 @@ begin
       -- One beat with both extremes co-present: max must pick 127, not be
       -- confused by -128 also being present.
       for i in 0 to c_max_taps - 1 loop
+
         if i mod 2 = 0 then
           taps(i) := -128;
         else
           taps(i) := 127;
         end if;
       end loop;
+
       send_beat(3, 3, taps, OPCODE_POOL_MAX, '1');
 
       drain_and_check(500);
@@ -440,6 +504,7 @@ begin
       -- Back-to-back alternating opcode, fixed 3x3 kernel, minimal
       -- interleave to stress simultaneous overlap possibilities.
       for beat in 0 to 59 loop
+
         random_taps(taps);
         if beat mod 2 = 0 then
           opcode := OPCODE_POOL_MAX;
@@ -448,6 +513,7 @@ begin
         end if;
         send_beat(3, 3, taps, opcode, to_sl(beat = 59));
       end loop;
+
       drain_and_check(500);
 
     elsif run("test_backpressure") then
@@ -457,7 +523,9 @@ begin
       -- "Verification plan".
       beat_idx := 0;
       for s in c_shapes'range loop
+
         for beat in 0 to 19 loop
+
           random_taps(taps);
           if beat_idx mod 2 = 0 then
             opcode := OPCODE_POOL_MAX;
@@ -467,7 +535,9 @@ begin
           send_beat(c_shapes(s).h, c_shapes(s).w, taps, opcode, '0');
           beat_idx := beat_idx + 1;
         end loop;
+
       end loop;
+
       drain_and_check(2000);
 
     elsif run("test_config_change_back_to_back") then
@@ -476,6 +546,7 @@ begin
       -- beat that is already being offered. Values must still be exact --
       -- the DUT may only insert bubbles, never mispair a mask with a beat.
       for beat in 0 to 199 loop
+
         random_taps(taps);
         if beat mod 2 = 0 then
           opcode := OPCODE_POOL_MAX;
@@ -485,9 +556,12 @@ begin
         send_beat_held(
           c_shapes(beat mod c_shapes'length).h,
           c_shapes(beat mod c_shapes'length).w,
-          taps, opcode, to_sl(beat = 199)
+          taps,
+          opcode,
+          to_sl(beat = 199)
         );
       end loop;
+
       s_window_m2s.valid <= '0';
       drain_and_check(2000);
 
@@ -496,16 +570,17 @@ begin
       -- output beat per accepted input beat.
       start_time := now;
       for beat in 0 to 299 loop
+
         random_taps(taps);
         send_beat(3, 3, taps, OPCODE_POOL_MAX, to_sl(beat = 299));
       end loop;
+
       drain_and_check(350);
 
       check_relation(
         (now - start_time) < 320 * c_clk_period,
         "cnn_accel_pool did not sustain full throughput at zero stall"
       );
-
     end if;
 
     test_runner_cleanup(runner);
