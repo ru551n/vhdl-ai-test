@@ -154,20 +154,20 @@ library cnn_accel;
 entity cnn_accel_pe_array is
   generic (
     -- Output-channel parallelism: number of parallel accumulator lanes.
-    g_pe_rows             : positive;
+    g_pe_rows : positive;
     -- Input-channel/MAC parallelism per cycle: weight-buffer columns
     -- (and window taps) consumed per group.
-    g_pe_cols             : positive;
+    g_pe_cols : positive;
     -- Accumulator width (int32 default).
-    g_accum_width         : positive := 32;
+    g_accum_width : positive := 32;
     -- Upper bound on 'cfg_kernel_h'/'cfg_kernel_w' individually; also
     -- sizes 's_window_m2s.data' together with 'g_tile_channels' (must
     -- match the 'cnn_accel_window_gen' instance feeding this port).
-    g_max_kernel_size     : positive;
+    g_max_kernel_size : positive;
     -- Input channels per window-generator tile ("Ct"). Must match the
     -- 'cnn_accel_window_gen' instance feeding this port
     -- (doc/cnn_accel_tiled_dataflow_proposal.md section 1/3).
-    g_tile_channels       : positive;
+    g_tile_channels : positive;
     -- Rows in the active cnn_accel_weight_buffer bank. Added by vhdesign
     -- (not in the requirement) so 'weight_rd_addr' can be sized to match
     -- cnn_accel_weight_buffer's actual 'weight_rd_addr' width
@@ -178,7 +178,7 @@ entity cnn_accel_pe_array is
     -- doc/cnn_accel_tiled_dataflow_proposal.md section 4.
     g_weight_buffer_depth : positive);
   port (
-    clk            : in  std_ulogic;
+    clk : in std_ulogic;
     -- Synchronous active-high reset ('reset_internal' at the IP top
     -- level): clears the FSM to 'idle' and drops any in-flight/pending
     -- accumulation and any pending-but-undrained output beat. The
@@ -188,7 +188,7 @@ entity cnn_accel_pe_array is
     -- beat), and that flag LOADS 'accum_q' rather than adding into it, so
     -- no pre-reset value can survive into a result -- see the entity-level
     -- comment's "cross-position pipelining".
-    reset          : in  std_ulogic := '0';
+    reset : in std_ulogic := '0';
     --# {{}}
     -- Kernel height/width for the in-flight layer. Added by vhdesign (not
     -- in the requirement's port list, per pe_array_proposal.md section
@@ -196,8 +196,8 @@ entity cnn_accel_pe_array is
     -- 'cfg_kernel_h'/'cfg_kernel_w'. Sampled combinationally at
     -- 's_window' accept time; latched for the whole (multi-cycle) group
     -- sequence of that beat.
-    cfg_kernel_h   : in  std_ulogic_vector(7 downto 0);
-    cfg_kernel_w   : in  std_ulogic_vector(7 downto 0);
+    cfg_kernel_h : in std_ulogic_vector(7 downto 0);
+    cfg_kernel_w : in std_ulogic_vector(7 downto 0);
     --# {{}}
     -- One input-channel-tile window per beat, from cnn_accel_window_gen.
     -- 'data' element 'i' (row-major spatial tap 't = i / g_tile_channels',
@@ -206,8 +206,8 @@ entity cnn_accel_pe_array is
     -- element layout (cnn_accel_pkg.vhd's 'window_m2s_t' doc comment).
     -- 'first_tile'/'last_tile' mark the first/last of the 'T' tile beats
     -- of the current output pixel (both '1' when 'T = 1').
-    s_window_m2s   : in  window_m2s_t(data(0 to window_data_length(g_max_kernel_size, g_tile_channels) - 1));
-    s_window_s2m   : out window_s2m_t;
+    s_window_m2s : in window_m2s_t(data(0 to window_data_length(g_max_kernel_size, g_tile_channels) - 1));
+    s_window_s2m : out window_s2m_t;
     --# {{}}
     -- Row (tile) address into the active cnn_accel_weight_buffer bank's
     -- weight region. Sequenced 0 .. num_groups-1 per beat, continuing
@@ -221,19 +221,19 @@ entity cnn_accel_pe_array is
     -- Driven with this entity's own 'pipe_en', so the buffer's read
     -- pipeline freezes exactly when this one does and a group's weights
     -- can never overtake its activations. See 'tap2_q'.
-    weight_rd_en   : out std_ulogic;
+    weight_rd_en : out std_ulogic;
     -- One int8 weight per PE lane ('g_pe_rows*g_pe_cols' lanes), lane
     -- 'l = r*g_pe_cols + c' (row-major) at bits '8*(l+1)-1 downto 8*l'.
     -- Registered, 1 cycle read latency (cnn_accel_weight_buffer's own
     -- contract).
-    weight_rd_data : in  std_ulogic_vector(8 * g_pe_rows * g_pe_cols - 1 downto 0);
+    weight_rd_data : in std_ulogic_vector(8 * g_pe_rows * g_pe_cols - 1 downto 0);
     --# {{}}
     -- One int32 (g_accum_width-bit) accumulator per output-channel lane
     -- ('g_pe_rows' lanes), one beat per output pixel, emitted once that
     -- pixel's 'last_tile' beat's group sequence completes. 'last' mirrors
     -- the accepted window's 'last'. To cnn_accel_bias_requant.
-    m_accum_m2s    : out accum_m2s_t(data(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0));
-    m_accum_s2m    : in  accum_s2m_t
+    m_accum_m2s : out accum_m2s_t(data(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0));
+    m_accum_s2m : in accum_s2m_t
   );
 end entity cnn_accel_pe_array;
 

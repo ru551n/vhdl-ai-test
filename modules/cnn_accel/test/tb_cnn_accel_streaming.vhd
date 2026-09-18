@@ -87,8 +87,8 @@ architecture tb of tb_cnn_accel_streaming is
   constant memory : memory_t := new_memory;
 
   constant c_axi_read_slave : axi_slave_t := new_axi_slave(
-    memory               => memory,
-    address_fifo_depth   => 4,
+    memory => memory,
+    address_fifo_depth => 4,
     min_response_latency => 0 ns,
     max_response_latency => 0 ns
   );
@@ -191,8 +191,8 @@ begin
     -- 'tb_cnn_accel_top's own final step, just callable per completion
     -- since this testbench observes more than one.
     procedure check_completed_job (
-      base            : natural;
-      bytes           : natural;
+      base : natural;
+      bytes : natural;
       -- True for job A's own check in a queued pair: its auto-dispatched
       -- successor starts in the SAME cycle its DONE asserts (spec
       -- section 6a -- no idle gap between frames is the entire point),
@@ -407,33 +407,33 @@ begin
 
   dut : entity cnn_accel.cnn_accel_top
     port map (
-      clk            => clk,
-      reset          => reset,
+      clk => clk,
+      reset => reset,
       s_axi_lite_m2s => s_axi_lite_m2s,
       s_axi_lite_s2m => s_axi_lite_s2m,
-      m_axi_m2s      => m_axi_m2s,
-      m_axi_s2m      => m_axi_s2m,
-      irq            => irq
+      m_axi_m2s => m_axi_m2s,
+      m_axi_s2m => m_axi_s2m,
+      irq => irq
     );
 
   axi_lite_master_inst : entity bfm.axi_lite_master
     port map (
-      clk          => clk,
+      clk => clk,
       axi_lite_m2s => s_axi_lite_m2s,
       axi_lite_s2m => s_axi_lite_s2m
     );
 
   axi_slave_inst : entity bfm.axi_slave
     generic map (
-      axi_read_slave  => c_axi_read_slave,
+      axi_read_slave => c_axi_read_slave,
       axi_write_slave => c_axi_write_slave,
-      data_width      => c_axi_data_width,
-      id_width        => c_axi_id_width
+      data_width => c_axi_data_width,
+      id_width => c_axi_id_width
     )
     port map (
-      clk           => clk,
-      axi_read_m2s  => m_axi_m2s.read,
-      axi_read_s2m  => m_axi_s2m.read,
+      clk => clk,
+      axi_read_m2s => m_axi_m2s.read,
+      axi_read_s2m => m_axi_s2m.read,
       axi_write_m2s => m_axi_m2s.write,
       axi_write_s2m => m_axi_s2m.write
     );

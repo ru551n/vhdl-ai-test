@@ -42,7 +42,7 @@ entity tb_cnn_accel_window_gen is
     -- scheduling property, not a numerical one -- which is exactly what
     -- makes running the whole suite twice the right check.
     g_assembly_buffers : positive := 1;
-    runner_cfg         : string);
+    runner_cfg : string);
 end entity tb_cnn_accel_window_gen;
 
 architecture tb of tb_cnn_accel_window_gen is
@@ -196,10 +196,10 @@ architecture tb of tb_cnn_accel_window_gen is
   -- deliberately still 0: that is a *channel* lane that does not exist,
   -- not a spatial position outside the frame), the real pixel otherwise.
   function golden_tap (
-    frame                   : frame_t;
+    frame : frame_t;
     in_h, in_w, in_channels : natural;
-    row, col, channel       : integer;
-    pad_value               : integer
+    row, col, channel : integer;
+    pad_value : integer
   ) return integer is
   begin
 
@@ -218,10 +218,10 @@ architecture tb of tb_cnn_accel_window_gen is
   -- wide vector, per cnn_accel_pkg's documented 'window_m2s_t.data'
   -- layout; remaining high bits stay 0.
   function golden_window (
-    frame                                                      : frame_t;
+    frame : frame_t;
     in_h, in_w, in_channels, kh, kw, sh, sw, pad_top, pad_left : natural;
-    out_row, out_col, tile_idx                                 : natural;
-    pad_value                                                  : integer
+    out_row, out_col, tile_idx : natural;
+    pad_value : integer
   ) return std_ulogic_vector is
 
     -- Every element starts at the pad value, not 0: the DUT clears its
@@ -342,34 +342,34 @@ begin
   ------------------------------------------------------------------------
   dut : entity cnn_accel.cnn_accel_window_gen
     generic map (
-      g_max_kernel_size    => c_kernel_max,
+      g_max_kernel_size => c_kernel_max,
       g_max_row_tile_words => c_row_tile_words_max,
-      g_tile_channels      => c_tile_channels,
-      g_assembly_buffers   => g_assembly_buffers
+      g_tile_channels => c_tile_channels,
+      g_assembly_buffers => g_assembly_buffers
     )
     port map (
-      clk             => clk,
-      reset           => reset,
-      cfg_kernel_h    => cfg_kernel_h,
-      cfg_kernel_w    => cfg_kernel_w,
-      cfg_stride_h    => cfg_stride_h,
-      cfg_stride_w    => cfg_stride_w,
-      cfg_pad_top     => cfg_pad_top,
-      cfg_pad_bottom  => cfg_pad_bottom,
-      cfg_pad_left    => cfg_pad_left,
-      cfg_pad_right   => cfg_pad_right,
-      cfg_pad_value   => cfg_pad_value,
-      cfg_in_width    => cfg_in_width,
-      cfg_in_height   => cfg_in_height,
-      cfg_out_width   => cfg_out_width,
-      cfg_out_height  => cfg_out_height,
+      clk => clk,
+      reset => reset,
+      cfg_kernel_h => cfg_kernel_h,
+      cfg_kernel_w => cfg_kernel_w,
+      cfg_stride_h => cfg_stride_h,
+      cfg_stride_w => cfg_stride_w,
+      cfg_pad_top => cfg_pad_top,
+      cfg_pad_bottom => cfg_pad_bottom,
+      cfg_pad_left => cfg_pad_left,
+      cfg_pad_right => cfg_pad_right,
+      cfg_pad_value => cfg_pad_value,
+      cfg_in_width => cfg_in_width,
+      cfg_in_height => cfg_in_height,
+      cfg_out_width => cfg_out_width,
+      cfg_out_height => cfg_out_height,
       cfg_in_channels => cfg_in_channels,
-      start           => start,
-      done            => done,
-      s_stream_m2s    => s_stream_m2s,
-      s_stream_s2m    => s_stream_s2m,
-      m_window_m2s    => m_window_m2s,
-      m_window_s2m    => m_window_s2m
+      start => start,
+      done => done,
+      s_stream_m2s => s_stream_m2s,
+      s_stream_s2m => s_stream_s2m,
+      m_window_m2s => m_window_m2s,
+      m_window_s2m => m_window_s2m
     );
 
   ------------------------------------------------------------------------
@@ -634,11 +634,11 @@ begin
     -- one 'done' pulse fired.
     procedure run_frame (
       in_h, in_w, kh, kw, sh, sw, pt, pb, pl, pr : natural;
-      stall_in, stall_out                        : natural;
-      max_wait_cycles                            : positive;
-      in_channels                                : natural := c_tile_channels;
-      pad_value                                  : integer := 0;
-      ready_mode                                 : natural := 0
+      stall_in, stall_out : natural;
+      max_wait_cycles : positive;
+      in_channels : natural := c_tile_channels;
+      pad_value : integer := 0;
+      ready_mode : natural := 0
     ) is
 
       variable out_w, out_h : natural;

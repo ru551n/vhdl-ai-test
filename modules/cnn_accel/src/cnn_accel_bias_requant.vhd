@@ -87,16 +87,16 @@ library cnn_accel;
 entity cnn_accel_bias_requant is
   generic (
     -- Input accumulator width (int32 default).
-    g_accum_width       : positive := 32;
+    g_accum_width : positive := 32;
     -- Output-channel parallelism: number of independent lanes.
-    g_pe_rows           : positive := 8;
+    g_pe_rows : positive := 8;
     -- Width of 'bias_rd_addr'. Added by vhdesign (not in the requirement)
     -- so this module's read-address port can be sized to match
     -- cnn_accel_weight_buffer's actual 'bias_rd_addr' width
     -- (num_bits_needed(g_weight_buffer_depth - 1)) at cnn_accel_top
     -- integration time. The value driven is always all-zeros in v1 (see
     -- entity-level comment above) regardless of this generic's value.
-    g_bias_addr_width   : positive := 1;
+    g_bias_addr_width : positive := 1;
     -- Added by vhdesign: upper bound on the runtime-variable
     -- 'cfg_requant_shift' that this module supports at full precision.
     -- 'cfg_requant_shift' values above this bound are clamped to it (a
@@ -104,41 +104,41 @@ entity cnn_accel_bias_requant is
     -- proposal doc §4).
     g_max_requant_shift : natural := 31);
   port (
-    clk                : in  std_ulogic;
-    reset              : in  std_ulogic;
+    clk : in std_ulogic;
+    reset : in std_ulogic;
 
-    cfg_bias_en        : in  std_ulogic;
-    cfg_requant_en     : in  std_ulogic;
-    cfg_relu_en        : in  std_ulogic;
-    cfg_requant_scale  : in  std_ulogic_vector(31 downto 0);
-    cfg_requant_shift  : in  std_ulogic_vector(7 downto 0);
+    cfg_bias_en : in std_ulogic;
+    cfg_requant_en : in std_ulogic;
+    cfg_relu_en : in std_ulogic;
+    cfg_requant_scale : in std_ulogic_vector(31 downto 0);
+    cfg_requant_shift : in std_ulogic_vector(7 downto 0);
     -- ISA v1.1 (H1) epilogue fields, instruction word W13. Signed int16 /
     -- int8 / int8; all-zero (and cfg_clamp_en='0') reproduces v1.0.
-    cfg_output_offset  : in  std_ulogic_vector(15 downto 0) := (others => '0');
-    cfg_clamp_en       : in  std_ulogic := '0';
-    cfg_clamp_min      : in  std_ulogic_vector(7 downto 0) := (others => '0');
-    cfg_clamp_max      : in  std_ulogic_vector(7 downto 0) := (others => '0');
+    cfg_output_offset : in std_ulogic_vector(15 downto 0) := (others => '0');
+    cfg_clamp_en : in std_ulogic := '0';
+    cfg_clamp_min : in std_ulogic_vector(7 downto 0) := (others => '0');
+    cfg_clamp_max : in std_ulogic_vector(7 downto 0) := (others => '0');
     -- ISA v1.2 (H2) FLAG_PER_CHANNEL_EN: '1' selects lane-wise
     -- (multiplier, shift) from 'scale_rd_data' instead of the two cfg_*
     -- ports above. Sampled per beat like every other cfg_* port.
-    cfg_per_channel_en : in  std_ulogic := '0';
+    cfg_per_channel_en : in std_ulogic := '0';
 
-    bias_rd_addr       : out std_ulogic_vector(g_bias_addr_width - 1 downto 0);
-    bias_rd_data       : in  std_ulogic_vector(g_accum_width * g_pe_rows - 1 downto 0);
+    bias_rd_addr : out std_ulogic_vector(g_bias_addr_width - 1 downto 0);
+    bias_rd_data : in std_ulogic_vector(g_accum_width * g_pe_rows - 1 downto 0);
     -- Per-channel requant table row for the same 'bias_rd_addr' (cnn_accel_
     -- weight_buffer's 'scale_rd_data'), 'c_scale_entry_width' bits per
     -- lane; only read while cfg_per_channel_en='1'.
-    scale_rd_data      : in  std_ulogic_vector(c_scale_entry_width * g_pe_rows - 1 downto 0) := (others => '0');
+    scale_rd_data : in std_ulogic_vector(c_scale_entry_width * g_pe_rows - 1 downto 0) := (others => '0');
 
     -- One int32-ish (g_accum_width-bit) partial sum per PE row, from
     -- cnn_accel_pe_array's 'm_accum_m2s'. An array of lanes (D15), not a
     -- packed AXI4-Stream payload, so lane 'l' is indexed directly --
     -- see cnn_accel_pkg.vhd's 'accum_m2s_t' doc comment.
-    s_accum_m2s        : in  accum_m2s_t(data(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0));
-    s_accum_s2m        : out accum_s2m_t;
+    s_accum_m2s : in accum_m2s_t(data(0 to g_pe_rows - 1)(g_accum_width - 1 downto 0));
+    s_accum_s2m : out accum_s2m_t;
 
-    m_out_m2s          : out axi_stream_m2s_t;
-    m_out_s2m          : in  axi_stream_s2m_t
+    m_out_m2s : out axi_stream_m2s_t;
+    m_out_s2m : in axi_stream_s2m_t
   );
 end entity cnn_accel_bias_requant;
 
@@ -464,16 +464,16 @@ begin
 
     bypass_saturate_wide_inst : entity math.saturate_signed
       generic map (
-        input_width            => c_sum_width,
-        result_width           => c_bypass_sat_width,
+        input_width => c_sum_width,
+        result_width => c_bypass_sat_width,
         enable_output_register => false
       )
       port map (
-        clk                 => clk,
-        input_valid         => '1',
-        input_value         => total_2(l),
-        result_valid        => open,
-        result_value        => bypass_sat_next(l),
+        clk => clk,
+        input_valid => '1',
+        input_value => total_2(l),
+        result_valid => open,
+        result_value => bypass_sat_next(l),
         result_is_saturated => open
       );
 
@@ -481,16 +481,16 @@ begin
 
     bypass_saturate_signed_inst : entity math.saturate_signed
       generic map (
-        input_width            => c_bypass_sum_width,
-        result_width           => 8,
+        input_width => c_bypass_sum_width,
+        result_width => 8,
         enable_output_register => false
       )
       port map (
-        clk                 => clk,
-        input_valid         => '1',
-        input_value         => bypass_4(l),
-        result_valid        => open,
-        result_value        => bypass_sat8_next(l),
+        clk => clk,
+        input_valid => '1',
+        input_value => bypass_4(l),
+        result_valid => open,
+        result_value => bypass_sat8_next(l),
         result_is_saturated => open
       );
 
@@ -563,16 +563,16 @@ begin
 
     saturate_signed_inst : entity math.saturate_signed
       generic map (
-        input_width            => c_product_width,
-        result_width           => 8,
+        input_width => c_product_width,
+        result_width => 8,
         enable_output_register => false
       )
       port map (
-        clk                 => clk,
-        input_valid         => '1',
-        input_value         => scaled_6(l),
-        result_valid        => open,
-        result_value        => sat_result_l,
+        clk => clk,
+        input_valid => '1',
+        input_value => scaled_6(l),
+        result_valid => open,
+        result_value => sat_result_l,
         result_is_saturated => open
       );
 

@@ -36,10 +36,10 @@ library axi_lite;
 -- racing W1C.
 entity cnn_accel_csr is
   generic (
-    g_pe_rows              : positive;
-    g_pe_cols              : positive;
-    g_tile_channels        : positive;
-    g_max_kernel_size      : positive;
+    g_pe_rows : positive;
+    g_pe_cols : positive;
+    g_tile_channels : positive;
+    g_max_kernel_size : positive;
     -- Pooling's own, separate kernel bound (cnn_accel_top's
     -- 'g_max_pool_kernel_size'). Reported to the host via
     -- HW_INFO3.MAX_POOL_KERNEL_SIZE -- distinct from HW_INFO.MAX_KERNEL_SIZE.
@@ -47,18 +47,18 @@ entity cnn_accel_csr is
     -- Elaborated per-row activation tile depth (cnn_accel_top's
     -- 'g_max_row_tile_words'). Reported to the host via
     -- HW_INFO3.MAX_ROW_TILE_WORDS.
-    g_max_row_tile_words   : positive;
+    g_max_row_tile_words : positive;
     -- Size of the local tensor scratchpad (cnn_accel_tensor_mem), bytes.
     -- Reported to the host, in KiB, via HW_INFO2.TENSOR_MEM_KIB.
-    g_tensor_bytes         : positive;
-    g_axi_addr_width       : positive := 32);
+    g_tensor_bytes : positive;
+    g_axi_addr_width : positive := 32);
   port (
-    clk               : in  std_ulogic;
-    reset             : in  std_ulogic := '0';
+    clk : in std_ulogic;
+    reset : in std_ulogic := '0';
 
     --# {{}}
-    s_axi_lite_m2s    : in  axi_lite_m2s_t;
-    s_axi_lite_s2m    : out axi_lite_s2m_t := axi_lite_s2m_init;
+    s_axi_lite_m2s : in axi_lite_m2s_t;
+    s_axi_lite_s2m : out axi_lite_s2m_t := axi_lite_s2m_init;
 
     --# {{}}
     -- Latched at the moment 'start' pulses (see the entity-level comment
@@ -75,28 +75,28 @@ entity cnn_accel_csr is
     -- takes effect on the next START, exactly like PROGRAM_BASE_ADDR;
     -- while BUSY='1' it instead queues (or, if a job is already queued,
     -- is rejected with ERR_QUEUE_FULL -- see CTRL.START's own comment).
-    input_addr        : out std_ulogic_vector(g_axi_addr_width - 1 downto 0) := (others => '0');
-    output_addr       : out std_ulogic_vector(g_axi_addr_width - 1 downto 0) := (others => '0');
+    input_addr : out std_ulogic_vector(g_axi_addr_width - 1 downto 0) := (others => '0');
+    output_addr : out std_ulogic_vector(g_axi_addr_width - 1 downto 0) := (others => '0');
     -- Pulses exactly one cycle AFTER the accepted CTRL.START write, so that
     -- 'program_base_addr' above (registered, captured on that same write)
     -- is already stable when the consumer samples it. Handing 'start' out
     -- in the write cycle itself would make the consumer latch the previous
     -- base address -- 0 on the very first run, which fetches an all-zero
     -- descriptor at address 0 and decodes as an immediate HALT.
-    start             : out std_ulogic := '0';
-    soft_reset_pulse  : out std_ulogic := '0';
+    start : out std_ulogic := '0';
+    soft_reset_pulse : out std_ulogic := '0';
 
     --# {{}}
-    seq_done          : in  std_ulogic;
-    seq_error         : in  std_ulogic;
-    err_code          : in  std_ulogic_vector(3 downto 0);
-    err_pc            : in  std_ulogic_vector(31 downto 0);
+    seq_done : in std_ulogic;
+    seq_error : in std_ulogic;
+    err_code : in std_ulogic_vector(3 downto 0);
+    err_pc : in std_ulogic_vector(31 downto 0);
 
     --# {{}}
-    counters          : in  csr_counters_t;
+    counters : in csr_counters_t;
 
     --# {{}}
-    irq               : out std_ulogic := '0'
+    irq : out std_ulogic := '0'
   );
 end entity cnn_accel_csr;
 
@@ -398,16 +398,16 @@ begin
 
   axi_lite_register_file_inst : entity cnn_accel.cnn_accel_register_file_axi_lite
     port map (
-      clk             => clk,
+      clk => clk,
       -- Unmodified external reset only, per the spec's reset policy: an
       -- abort ('soft_reset_pulse') must not erase 'PROGRAM_BASE_ADDR' or
       -- 'IRQ_MASK', and this reset clears every register's storage.
-      reset           => reset,
-      axi_lite_m2s    => s_axi_lite_m2s,
-      axi_lite_s2m    => s_axi_lite_s2m,
-      regs_up         => regs_up,
-      regs_down       => regs_down,
-      reg_was_read    => reg_was_read,
+      reset => reset,
+      axi_lite_m2s => s_axi_lite_m2s,
+      axi_lite_s2m => s_axi_lite_s2m,
+      regs_up => regs_up,
+      regs_down => regs_down,
+      reg_was_read => reg_was_read,
       reg_was_written => reg_was_written
     );
 

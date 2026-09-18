@@ -173,29 +173,29 @@ begin
   ------------------------------------------------------------------------
   dut : entity cnn_accel.cnn_accel_pe_array
     generic map (
-      g_pe_rows             => c_pe_rows,
-      g_pe_cols             => c_pe_cols,
-      g_accum_width         => c_accum_width,
-      g_max_kernel_size     => c_max_kernel,
-      g_tile_channels       => c_tile_channels,
+      g_pe_rows => c_pe_rows,
+      g_pe_cols => c_pe_cols,
+      g_accum_width => c_accum_width,
+      g_max_kernel_size => c_max_kernel,
+      g_tile_channels => c_tile_channels,
       g_weight_buffer_depth => c_weight_buffer_depth
     )
     port map (
-      clk            => clk,
-      reset          => reset,
+      clk => clk,
+      reset => reset,
 
-      cfg_kernel_h   => cfg_kernel_h,
-      cfg_kernel_w   => cfg_kernel_w,
+      cfg_kernel_h => cfg_kernel_h,
+      cfg_kernel_w => cfg_kernel_w,
 
-      s_window_m2s   => s_window_m2s,
-      s_window_s2m   => s_window_s2m,
+      s_window_m2s => s_window_m2s,
+      s_window_s2m => s_window_s2m,
 
       weight_rd_addr => weight_rd_addr,
-      weight_rd_en   => weight_rd_en,
+      weight_rd_en => weight_rd_en,
       weight_rd_data => weight_rd_data,
 
-      m_accum_m2s    => m_accum_m2s,
-      m_accum_s2m    => m_accum_s2m
+      m_accum_m2s => m_accum_m2s,
+      m_accum_s2m => m_accum_s2m
     );
 
   ------------------------------------------------------------------------

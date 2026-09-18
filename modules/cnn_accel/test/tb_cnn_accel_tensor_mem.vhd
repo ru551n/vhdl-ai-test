@@ -53,7 +53,7 @@ library axi_stream;
 -- those queues once 'rN_done' pulses.
 entity tb_cnn_accel_tensor_mem is
   generic (
-    runner_cfg                       : string;
+    runner_cfg : string;
     -- Lowers the DUT's 'g_illegal_request_severity' from its 'failure'
     -- default to 'error' -- set ONLY by
     -- 'test_bank_crossing_request_is_detected', which has to survive the
@@ -220,10 +220,10 @@ architecture tb of tb_cnn_accel_tensor_mem is
   ------------------------------------------------------------------------
 
   procedure push_write_beat (
-    signal clk_i : in  std_ulogic;
-    signal m2s   : out axi_stream_m2s_t;
-    signal s2m   : in  axi_stream_s2m_t;
-    data_value   : in  std_ulogic_vector
+    signal clk_i : in std_ulogic;
+    signal m2s : out axi_stream_m2s_t;
+    signal s2m : in axi_stream_s2m_t;
+    data_value : in std_ulogic_vector
   ) is
   begin
 
@@ -240,38 +240,38 @@ begin
 
   dut : entity cnn_accel.cnn_accel_tensor_mem
     generic map (
-      g_num_banks                => c_num_banks,
-      g_bank_words               => c_bank_words,
-      g_data_width               => c_data_width,
+      g_num_banks => c_num_banks,
+      g_bank_words => c_bank_words,
+      g_data_width => c_data_width,
       g_illegal_request_severity => illegal_request_severity
     )
     port map (
-      clk        => clk,
-      reset      => reset,
+      clk => clk,
+      reset => reset,
       --
       w0_req_m2s => w0_req_m2s,
       w0_req_s2m => w0_req_s2m,
-      s_w0_m2s   => s_w0_m2s,
-      s_w0_s2m   => s_w0_s2m,
-      w0_done    => w0_done,
+      s_w0_m2s => s_w0_m2s,
+      s_w0_s2m => s_w0_s2m,
+      w0_done => w0_done,
       --
       w1_req_m2s => w1_req_m2s,
       w1_req_s2m => w1_req_s2m,
-      s_w1_m2s   => s_w1_m2s,
-      s_w1_s2m   => s_w1_s2m,
-      w1_done    => w1_done,
+      s_w1_m2s => s_w1_m2s,
+      s_w1_s2m => s_w1_s2m,
+      w1_done => w1_done,
       --
       r0_req_m2s => r0_req_m2s,
       r0_req_s2m => r0_req_s2m,
-      m_r0_m2s   => m_r0_m2s,
-      m_r0_s2m   => m_r0_s2m,
-      r0_done    => r0_done,
+      m_r0_m2s => m_r0_m2s,
+      m_r0_s2m => m_r0_s2m,
+      r0_done => r0_done,
       --
       r1_req_m2s => r1_req_m2s,
       r1_req_s2m => r1_req_s2m,
-      m_r1_m2s   => m_r1_m2s,
-      m_r1_s2m   => m_r1_s2m,
-      r1_done    => r1_done
+      m_r1_m2s => m_r1_m2s,
+      m_r1_s2m => m_r1_s2m,
+      r1_done => r1_done
     );
 
   ------------------------------------------------------------------------
@@ -453,13 +453,13 @@ begin
     -- starting at 'salt', blocking until the last beat is accepted.
     procedure write_words (
       signal wr_req_m2s : out dma_req_m2s_t;
-      signal wr_req_s2m : in  dma_req_s2m_t;
-      signal wr_m2s     : out axi_stream_m2s_t;
-      signal wr_s2m     : in  axi_stream_s2m_t;
-      bank              : natural;
-      offset            : natural;
-      num_words         : natural;
-      salt              : natural
+      signal wr_req_s2m : in dma_req_s2m_t;
+      signal wr_m2s : out axi_stream_m2s_t;
+      signal wr_s2m : in axi_stream_s2m_t;
+      bank : natural;
+      offset : natural;
+      num_words : natural;
+      salt : natural
     ) is
     begin
 
@@ -483,10 +483,10 @@ begin
     -- channel's whole transfer before starting the other.
     procedure issue_write (
       signal wr_req_m2s : out dma_req_m2s_t;
-      signal wr_req_s2m : in  dma_req_s2m_t;
-      bank              : natural;
-      offset            : natural;
-      num_words         : natural
+      signal wr_req_s2m : in dma_req_s2m_t;
+      bank : natural;
+      offset : natural;
+      num_words : natural
     ) is
     begin
 
@@ -503,10 +503,10 @@ begin
     -- request out (used by the concurrency test).
     procedure issue_read (
       signal rd_req_m2s : out dma_req_m2s_t;
-      signal rd_req_s2m : in  dma_req_s2m_t;
-      bank              : natural;
-      offset            : natural;
-      num_words         : natural
+      signal rd_req_s2m : in dma_req_s2m_t;
+      bank : natural;
+      offset : natural;
+      num_words : natural
     ) is
     begin
 
@@ -606,11 +606,11 @@ begin
     -- so that span is a single exact number under correct RTL, and a
     -- refill bubble after the stall can only inflate it.
     procedure check_no_refill_bubble (
-      t_from    : time;
-      t_to      : time;
+      t_from : time;
+      t_to : time;
       num_words : natural;
       stall_len : natural;
-      msg       : string
+      msg : string
     ) is
 
       variable span_cycles : natural;

@@ -75,12 +75,12 @@ architecture tb of tb_cnn_accel_axi_read_dma is
   constant c_memory_bytes : positive := 32 * 1024;
   constant memory : memory_t := new_memory;
   constant axi_slave : axi_slave_t := new_axi_slave(
-    memory                    => memory,
-    address_fifo_depth        => 4,
+    memory => memory,
+    address_fifo_depth => 4,
     address_stall_probability => 0.3,
-    data_stall_probability    => 0.3,
-    min_response_latency      => 0 ns,
-    max_response_latency      => 3 * c_clk_period
+    data_stall_probability => 0.3,
+    min_response_latency => 0 ns,
+    max_response_latency => 3 * c_clk_period
   );
 
   signal m_stream_m2s : axi_stream_m2s_t := axi_stream_m2s_init;
@@ -139,8 +139,8 @@ architecture tb of tb_cnn_accel_axi_read_dma is
       for byte_in_word in 0 to c_bytes_per_beat - 1 loop
 
         set(
-          arr   => ref,
-          idx   => byte_idx,
+          arr => ref,
+          idx => byte_idx,
           value => to_integer(word_value(8 * (byte_in_word + 1) - 1 downto 8 * byte_in_word))
         );
         byte_idx := byte_idx + 1;
@@ -157,9 +157,9 @@ architecture tb of tb_cnn_accel_axi_read_dma is
     for word_offset in 0 to length_bytes / c_bytes_per_beat - 1 loop
 
       write_word(
-        memory  => memory,
+        memory => memory,
         address => base_addr + word_offset * c_bytes_per_beat,
-        word    => std_ulogic_vector(word_pattern(base_addr + word_offset * c_bytes_per_beat))
+        word => std_ulogic_vector(word_pattern(base_addr + word_offset * c_bytes_per_beat))
       );
     end loop;
 
@@ -182,9 +182,9 @@ begin
     variable num_packets_expected : natural := 0;
 
     procedure do_request (
-      addr              : natural;
-      length_bytes      : natural;
-      push_reference    : boolean := true;
+      addr : natural;
+      length_bytes : natural;
+      push_reference : boolean := true;
       expect_resp_error : boolean := false
     ) is
     begin
@@ -322,13 +322,13 @@ begin
 
   axi_read_slave_inst : entity bfm.axi_read_slave
     generic map (
-      axi_slave     => axi_slave,
-      data_width    => c_axi_data_width,
-      id_width      => c_axi_id_width,
+      axi_slave => axi_slave,
+      data_width => c_axi_data_width,
+      id_width => c_axi_id_width,
       address_width => c_axi_addr_width
     )
     port map (
-      clk          => clk,
+      clk => clk,
       --
       axi_read_m2s => axi_read_m2s,
       axi_read_s2m => axi_read_s2m_bfm
@@ -362,19 +362,19 @@ begin
   ------------------------------------------------------------------------------
   axi_stream_slave_inst : entity bfm.axi_stream_slave
     generic map (
-      data_width           => c_axi_data_width,
+      data_width => c_axi_data_width,
       reference_data_queue => reference_data_queue,
-      stall_config         => (stall_probability => 0.5, min_stall_cycles => 1, max_stall_cycles => 8)
+      stall_config => (stall_probability => 0.5, min_stall_cycles => 1, max_stall_cycles => 8)
     )
     port map (
-      clk                 => clk,
+      clk => clk,
       --
-      ready               => m_stream_s2m.ready,
-      valid               => m_stream_m2s.valid,
-      last                => m_stream_m2s.last,
-      data                => m_stream_m2s.data(c_axi_data_width - 1 downto 0),
+      ready => m_stream_s2m.ready,
+      valid => m_stream_m2s.valid,
+      last => m_stream_m2s.last,
+      data => m_stream_m2s.data(c_axi_data_width - 1 downto 0),
       --
-      enable              => stream_checker_enable,
+      enable => stream_checker_enable,
       num_packets_checked => num_packets_checked
     );
 
@@ -383,22 +383,22 @@ begin
     generic map (
       g_axi_addr_width => c_axi_addr_width,
       g_axi_data_width => c_axi_data_width,
-      g_axi_id_width   => c_axi_id_width
+      g_axi_id_width => c_axi_id_width
     )
     port map (
-      clk          => clk,
-      reset        => reset,
+      clk => clk,
+      reset => reset,
       --
-      req_m2s      => req_m2s,
-      req_s2m      => req_s2m,
+      req_m2s => req_m2s,
+      req_s2m => req_s2m,
       --
-      dma_done     => dma_done,
-      resp_error   => resp_error,
+      dma_done => dma_done,
+      resp_error => resp_error,
       --
       m_axi_ar_m2s => m_axi_ar_m2s,
       m_axi_ar_s2m => m_axi_ar_s2m,
-      m_axi_r_m2s  => m_axi_r_m2s,
-      m_axi_r_s2m  => m_axi_r_s2m,
+      m_axi_r_m2s => m_axi_r_m2s,
+      m_axi_r_s2m => m_axi_r_s2m,
       --
       m_stream_m2s => m_stream_m2s,
       m_stream_s2m => m_stream_s2m
