@@ -6,7 +6,7 @@ name: VHDL style
 # locally:
 #
 #   pip install vsg-rs
-#   vsg-rs -c vsg.yaml --recursive modules --fix
+#   vsg-rs -c vsg.yaml --fix
 
 on:
   push:
@@ -36,4 +36,5 @@ jobs:
 
       - uses: ru551n/vsg-rs@v0.9.6
         with:
-          args: -c vsg.yaml --recursive modules
+          # The files come from vsg.yaml's file_list.
+          args: -c vsg.yaml
