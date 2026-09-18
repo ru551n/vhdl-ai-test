@@ -57,9 +57,9 @@ entity tb_cnn_accel_pe_array is
     -- ('s_window' is the one input link, 'm_accum' the one output link;
     -- 'weight_rd_addr'/'weight_rd_data' is not a handshaked link, so has
     -- no stall generic of its own).
-    stall_probability_percent_in  : natural := 20;
+    stall_probability_percent_in : natural := 20;
     stall_probability_percent_out : natural := 20;
-    runner_cfg                    : string);
+    runner_cfg : string);
 end entity tb_cnn_accel_pe_array;
 
 architecture tb of tb_cnn_accel_pe_array is
@@ -222,10 +222,10 @@ architecture tb of tb_cnn_accel_pe_array is
   ------------------------------------------------------------------------
 
   function golden_beat_partial (
-    window      : window_row_t;
-    weight_mem  : weight_mem_t;
+    window : window_row_t;
+    weight_mem : weight_mem_t;
     weight_base : natural;
-    mac_taps    : natural
+    mac_taps : natural
   ) return accum_int_arr_t is
 
     variable result : accum_int_arr_t := (others => 0);
@@ -261,29 +261,29 @@ begin
   ------------------------------------------------------------------------
   dut : entity cnn_accel.cnn_accel_pe_array
     generic map (
-      g_pe_rows             => c_pe_rows,
-      g_pe_cols             => c_pe_cols,
-      g_accum_width         => c_accum_width,
-      g_max_kernel_size     => c_kernel_max,
-      g_tile_channels       => c_tile_channels,
+      g_pe_rows => c_pe_rows,
+      g_pe_cols => c_pe_cols,
+      g_accum_width => c_accum_width,
+      g_max_kernel_size => c_kernel_max,
+      g_tile_channels => c_tile_channels,
       g_weight_buffer_depth => c_weight_buffer_depth
     )
     port map (
-      clk            => clk,
-      reset          => reset,
+      clk => clk,
+      reset => reset,
 
-      cfg_kernel_h   => cfg_kernel_h,
-      cfg_kernel_w   => cfg_kernel_w,
+      cfg_kernel_h => cfg_kernel_h,
+      cfg_kernel_w => cfg_kernel_w,
 
-      s_window_m2s   => s_window_m2s,
-      s_window_s2m   => s_window_s2m,
+      s_window_m2s => s_window_m2s,
+      s_window_s2m => s_window_s2m,
 
       weight_rd_addr => weight_rd_addr,
-      weight_rd_en   => weight_rd_en,
+      weight_rd_en => weight_rd_en,
       weight_rd_data => weight_rd_data,
 
-      m_accum_m2s    => m_accum_m2s,
-      m_accum_s2m    => m_accum_s2m
+      m_accum_m2s => m_accum_m2s,
+      m_accum_s2m => m_accum_s2m
     );
 
   ------------------------------------------------------------------------
@@ -410,8 +410,8 @@ begin
     -- Pushes one 's_window' beat, with randomized input-side stall
     -- (driven by 'stall_pct_in').
     procedure send_window_beat (
-      window                           : window_row_t;
-      kh, kw                           : natural;
+      window : window_row_t;
+      kh, kw : natural;
       first_tile, last_tile, beat_last : std_ulogic
     ) is
     begin

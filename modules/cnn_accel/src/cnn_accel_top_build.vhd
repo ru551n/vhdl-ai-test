@@ -54,18 +54,18 @@ entity cnn_accel_top_build is
     -- elaborate here. See 'module_cnn_accel.py' for the full note.
     g_pe_rows : positive := cnn_accel_constant_pe_rows);
   port (
-    clk      : in  std_ulogic;
+    clk : in std_ulogic;
     -- Cold, synchronous active-high reset. Registered once here before it
     -- reaches the accelerator, see 'reset_int' below.
-    reset    : in  std_ulogic;
+    reset : in std_ulogic;
     --# {{}}
     -- Serial seed for the stimulus shift register that drives every
     -- accelerator input.
-    stimulus : in  std_ulogic;
+    stimulus : in std_ulogic;
     -- Registered exclusive-or reduction of every accelerator output.
-    result   : out std_ulogic := '0';
+    result : out std_ulogic := '0';
     -- The accelerator's interrupt, registered.
-    irq      : out std_ulogic := '0'
+    irq : out std_ulogic := '0'
   );
 end entity cnn_accel_top_build;
 
@@ -283,16 +283,16 @@ begin
       g_pe_rows => g_pe_rows
     )
     port map (
-      clk            => clk,
-      reset          => reset_int,
+      clk => clk,
+      reset => reset_int,
       --
       s_axi_lite_m2s => s_axi_lite_m2s,
       s_axi_lite_s2m => s_axi_lite_s2m,
       --
-      m_axi_m2s      => m_axi_m2s,
-      m_axi_s2m      => m_axi_s2m,
+      m_axi_m2s => m_axi_m2s,
+      m_axi_s2m => m_axi_s2m,
       --
-      irq            => irq_int
+      irq => irq_int
     );
 
 end architecture a;

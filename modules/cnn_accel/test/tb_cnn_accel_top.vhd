@@ -82,22 +82,22 @@ entity tb_cnn_accel_top is
     -- Size of the modelled DDR, bytes. One flat read_and_write allocation
     -- starting at address 0, so DUT addresses map 1:1 onto memory
     -- addresses. Matches the DUT's 'g_ddr_limit' by default.
-    g_ddr_bytes               : positive := 16#0020_0000#;
+    g_ddr_bytes : positive := 16#0020_0000#;
     -- Testbench-level liveness bound: cycles waited after START before
     -- the TB itself fails the test. Independent of the DUT's own
     -- watchdog ('g_watchdog_cycles'). The DUT is contractually required
     -- never to hang (arch doc section 9), so hitting this is a real DUT
     -- bug, not a test-tuning knob.
-    g_timeout_cycles          : positive := 2_000_000;
+    g_timeout_cycles : positive := 2_000_000;
     -- DUT geometry, forwarded straight to the DUT generics of the same
     -- name. Every other DUT generic is left at its default: they are tied
     -- to the generated constants and to each other by assertions inside
     -- the DUT.
-    g_num_banks               : positive := 2;
-    g_bank_words              : positive := 1024;
-    g_pe_rows                 : positive := 8;
-    g_ddr_limit               : positive := 16#0020_0000#;
-    g_watchdog_cycles         : positive := 1_000_000;
+    g_num_banks : positive := 2;
+    g_bank_words : positive := 1024;
+    g_pe_rows : positive := 8;
+    g_ddr_limit : positive := 16#0020_0000#;
+    g_watchdog_cycles : positive := 1_000_000;
     -- AXI slave BFM randomized stalling, percent. 0 = no stalling.
     stall_probability_percent : natural := 0;
     -- Which pre-built 'TbCase' this run checks against -- passed to
@@ -111,8 +111,8 @@ entity tb_cnn_accel_top is
     -- there is no reason for 'module_cnn_accel.py' to also copy it into
     -- a generic (see 'get_program_start_address'/'get_output_region'/
     -- 'get_input_region'/'get_expect_error' in top_level_bridge.py).
-    g_case_name               : string;
-    runner_cfg                : string);
+    g_case_name : string;
+    runner_cfg : string);
 end entity tb_cnn_accel_top;
 
 architecture tb of tb_cnn_accel_top is
@@ -172,20 +172,20 @@ architecture tb of tb_cnn_accel_top is
   constant c_max_response_latency : time := axi_response_latency(stall_probability_percent, c_clk_period);
 
   constant c_axi_read_slave : axi_slave_t := new_axi_slave(
-    memory                    => memory,
-    address_fifo_depth        => 4,
+    memory => memory,
+    address_fifo_depth => 4,
     address_stall_probability => c_stall_probability,
-    data_stall_probability    => c_stall_probability,
-    min_response_latency      => 0 ns,
-    max_response_latency      => c_max_response_latency
+    data_stall_probability => c_stall_probability,
+    min_response_latency => 0 ns,
+    max_response_latency => c_max_response_latency
   );
 
   constant c_axi_write_slave : axi_slave_t := new_axi_slave(
-    memory                    => memory,
-    address_fifo_depth        => 4,
+    memory => memory,
+    address_fifo_depth => 4,
     write_response_fifo_depth => 4,
     address_stall_probability => c_stall_probability,
-    data_stall_probability    => c_stall_probability
+    data_stall_probability => c_stall_probability
   );
 
   ------------------------------------------------------------------------
@@ -495,23 +495,23 @@ begin
   ------------------------------------------------------------------------
   dut : entity cnn_accel.cnn_accel_top
     generic map (
-      g_pe_rows         => g_pe_rows,
-      g_num_banks       => g_num_banks,
-      g_bank_words      => g_bank_words,
-      g_ddr_limit       => g_ddr_limit,
+      g_pe_rows => g_pe_rows,
+      g_num_banks => g_num_banks,
+      g_bank_words => g_bank_words,
+      g_ddr_limit => g_ddr_limit,
       g_watchdog_cycles => g_watchdog_cycles
     )
     port map (
-      clk            => clk,
-      reset          => reset,
+      clk => clk,
+      reset => reset,
       --
       s_axi_lite_m2s => s_axi_lite_m2s,
       s_axi_lite_s2m => s_axi_lite_s2m,
       --
-      m_axi_m2s      => m_axi_m2s,
-      m_axi_s2m      => m_axi_s2m,
+      m_axi_m2s => m_axi_m2s,
+      m_axi_s2m => m_axi_s2m,
       --
-      irq            => irq
+      irq => irq
     );
 
   ------------------------------------------------------------------------
@@ -522,7 +522,7 @@ begin
   ------------------------------------------------------------------------
   axi_lite_master_inst : entity bfm.axi_lite_master
     port map (
-      clk          => clk,
+      clk => clk,
       --
       axi_lite_m2s => s_axi_lite_m2s,
       axi_lite_s2m => s_axi_lite_s2m
@@ -535,16 +535,16 @@ begin
   ------------------------------------------------------------------------
   axi_slave_inst : entity bfm.axi_slave
     generic map (
-      axi_read_slave  => c_axi_read_slave,
+      axi_read_slave => c_axi_read_slave,
       axi_write_slave => c_axi_write_slave,
-      data_width      => c_axi_data_width,
-      id_width        => c_axi_id_width
+      data_width => c_axi_data_width,
+      id_width => c_axi_id_width
     )
     port map (
-      clk           => clk,
+      clk => clk,
       --
-      axi_read_m2s  => m_axi_m2s.read,
-      axi_read_s2m  => m_axi_s2m.read,
+      axi_read_m2s => m_axi_m2s.read,
+      axi_read_s2m => m_axi_s2m.read,
       --
       axi_write_m2s => m_axi_m2s.write,
       axi_write_s2m => m_axi_s2m.write

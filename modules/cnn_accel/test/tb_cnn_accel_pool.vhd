@@ -31,10 +31,10 @@ entity tb_cnn_accel_pool is
     -- module_cnn_accel.py's setup_vunit (0/0/0 for the dedicated
     -- full-throughput test, nonzero otherwise): one input, multiple
     -- independently-stalled outputs.
-    stall_probability_percent_in     : natural := 20;
-    stall_probability_percent_max    : natural := 20;
+    stall_probability_percent_in : natural := 20;
+    stall_probability_percent_max : natural := 20;
     stall_probability_percent_avgsum : natural := 20;
-    runner_cfg                       : string);
+    runner_cfg : string);
 end entity tb_cnn_accel_pool;
 
 architecture tb of tb_cnn_accel_pool is
@@ -203,20 +203,20 @@ begin
   dut : entity cnn_accel.cnn_accel_pool
     generic map (
       g_max_kernel_size => c_kernel_max,
-      g_accum_width     => c_accum_width
+      g_accum_width => c_accum_width
     )
     port map (
-      clk               => clk,
-      reset             => reset,
-      cfg_opcode        => cfg_opcode,
+      clk => clk,
+      reset => reset,
+      cfg_opcode => cfg_opcode,
       cfg_pool_kernel_h => cfg_pool_kernel_h,
       cfg_pool_kernel_w => cfg_pool_kernel_w,
-      s_window_m2s      => s_window_m2s,
-      s_window_s2m      => s_window_s2m,
-      m_max_m2s         => m_max_m2s,
-      m_max_s2m         => m_max_s2m,
-      m_avgsum_m2s      => m_avgsum_m2s,
-      m_avgsum_s2m      => m_avgsum_s2m
+      s_window_m2s => s_window_m2s,
+      s_window_s2m => s_window_s2m,
+      m_max_m2s => m_max_m2s,
+      m_max_s2m => m_max_s2m,
+      m_avgsum_m2s => m_avgsum_m2s,
+      m_avgsum_s2m => m_avgsum_s2m
     );
 
   ------------------------------------------------------------------------
@@ -331,10 +331,10 @@ begin
     -- Pushes one 's_window' beat (with randomized input-side stall) and
     -- enqueues its expected result onto the matching scoreboard queue.
     procedure send_beat (
-      kernel_h  : natural;
-      kernel_w  : natural;
-      p_taps    : taps_arr_t;
-      p_opcode  : std_ulogic_vector(7 downto 0);
+      kernel_h : natural;
+      kernel_w : natural;
+      p_taps : taps_arr_t;
+      p_opcode : std_ulogic_vector(7 downto 0);
       beat_last : std_ulogic
     ) is
 
@@ -378,10 +378,10 @@ begin
     -- registered tap mask introduces, and the DUT absorbs it by holding
     -- 'ready' low for the one cycle in which the mask is stale.
     procedure send_beat_held (
-      kernel_h  : natural;
-      kernel_w  : natural;
-      p_taps    : taps_arr_t;
-      p_opcode  : std_ulogic_vector(7 downto 0);
+      kernel_h : natural;
+      kernel_w : natural;
+      p_taps : taps_arr_t;
+      p_opcode : std_ulogic_vector(7 downto 0);
       beat_last : std_ulogic
     ) is
 

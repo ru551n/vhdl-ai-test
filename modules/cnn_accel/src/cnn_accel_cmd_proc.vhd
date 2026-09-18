@@ -87,155 +87,155 @@ library axi_stream;
 entity cnn_accel_cmd_proc is
   generic (
     -- Output-channel parallelism; the OT loop's tile size (section 5.4).
-    g_pe_rows              : positive;
+    g_pe_rows : positive;
     -- Input-channel/MAC parallelism; weight-image lane count per row.
-    g_pe_cols              : positive;
+    g_pe_cols : positive;
     -- Input channels per window_gen beat ("Ct").
-    g_tile_channels        : positive;
+    g_tile_channels : positive;
     -- Upper bound on kernel_h/kernel_w, for 'c_err_bad_geometry'.
-    g_max_kernel_size      : positive;
+    g_max_kernel_size : positive;
     -- Upper bound on pool_kernel_h/pool_kernel_w, for
     -- 'c_err_bad_geometry'. Separate from (and larger than)
     -- 'g_max_kernel_size' -- see cnn_accel_top's own generic comment.
     g_max_pool_kernel_size : positive;
     -- Upper bound on 'in_width * ceil(in_channels/g_tile_channels)', for
     -- 'c_err_bad_geometry' and for sizing the transpose buffer above.
-    g_max_row_tile_words   : positive;
+    g_max_row_tile_words : positive;
     -- Size of 'cnn_accel_tensor_mem', bytes; bound for 'c_err_local_range'.
-    g_tensor_bytes         : positive;
+    g_tensor_bytes : positive;
     -- Exclusive upper bound on any DDR byte address ('g_ddr_limit',
     -- section 6); bound for 'c_err_ddr_range'.
-    g_ddr_limit            : positive := 16#0020_0000#;
+    g_ddr_limit : positive := 16#0020_0000#;
     -- Cycles any single wait may take before 'c_err_timeout' (section 9).
-    g_watchdog_cycles      : positive := 1_000_000);
+    g_watchdog_cycles : positive := 1_000_000);
   port (
-    clk                     : in  std_ulogic;
+    clk : in std_ulogic;
     -- Synchronous active-high reset ('reset_internal' at the IP top level).
-    reset                   : in  std_ulogic := '0';
+    reset : in std_ulogic := '0';
 
     --# {{}}
     -- Run control from 'cnn_accel_csr'.
-    start                   : in  std_ulogic;
-    program_base_addr       : in  std_ulogic_vector(31 downto 0);
+    start : in std_ulogic;
+    program_base_addr : in std_ulogic_vector(31 downto 0);
     -- ISA v2.3 streaming-inference relocation (spec section 6a): added to
     -- a descriptor's 'in_addr'/'out_addr' when it sets 'reloc_input'/
     -- 'reloc_output' (see 'effective_in_addr'/'effective_out_addr'
     -- below). 'cnn_accel_csr' latches these once at dispatch, exactly
     -- like 'program_base_addr' -- a mid-run bus write to either register
     -- never affects the command already in flight.
-    input_addr              : in  std_ulogic_vector(31 downto 0) := (others => '0');
-    output_addr             : in  std_ulogic_vector(31 downto 0) := (others => '0');
-    soft_reset_pulse        : in  std_ulogic;
-    seq_done                : out std_ulogic := '0';
-    seq_error               : out std_ulogic := '0';
-    err_code                : out std_ulogic_vector(3 downto 0) := (others => '0');
-    err_pc                  : out std_ulogic_vector(31 downto 0) := (others => '0');
-    counters                : out csr_counters_t := csr_counters_init;
+    input_addr : in std_ulogic_vector(31 downto 0) := (others => '0');
+    output_addr : in std_ulogic_vector(31 downto 0) := (others => '0');
+    soft_reset_pulse : in std_ulogic;
+    seq_done : out std_ulogic := '0';
+    seq_error : out std_ulogic := '0';
+    err_code : out std_ulogic_vector(3 downto 0) := (others => '0');
+    err_pc : out std_ulogic_vector(31 downto 0) := (others => '0');
+    counters : out csr_counters_t := csr_counters_init;
 
     --# {{}}
     -- Per-cycle external-traffic increments from 'cnn_accel_axi_mux'.
-    axi_rd_bytes            : in  unsigned(7 downto 0);
-    axi_wr_bytes            : in  unsigned(7 downto 0);
+    axi_rd_bytes : in unsigned(7 downto 0);
+    axi_wr_bytes : in unsigned(7 downto 0);
 
     --# {{}}
     -- 'cnn_accel_cmd_fetch'.
-    fetch_start             : out std_ulogic := '0';
-    fetch_addr              : out unsigned(31 downto 0) := (others => '0');
-    fetch_desc              : in  desc_v2_t;
-    fetch_pc                : in  unsigned(31 downto 0);
-    fetch_desc_valid        : in  std_ulogic;
-    fetch_desc_ready        : out std_ulogic := '0';
-    fetch_error             : in  std_ulogic;
-    fetch_error_code        : in  err_code_t;
+    fetch_start : out std_ulogic := '0';
+    fetch_addr : out unsigned(31 downto 0) := (others => '0');
+    fetch_desc : in desc_v2_t;
+    fetch_pc : in unsigned(31 downto 0);
+    fetch_desc_valid : in std_ulogic;
+    fetch_desc_ready : out std_ulogic := '0';
+    fetch_error : in std_ulogic;
+    fetch_error_code : in err_code_t;
 
     --# {{}}
     -- 'load' DDR read DMA: activations and 'LOAD'.
-    load_req_m2s            : out dma_req_m2s_t;
-    load_req_s2m            : in  dma_req_s2m_t;
-    load_dma_done           : in  std_ulogic;
-    load_resp_error         : in  std_ulogic;
-    s_load_stream_m2s       : in  axi_stream_m2s_t;
-    s_load_stream_s2m       : out axi_stream_s2m_t := axi_stream_s2m_init;
+    load_req_m2s : out dma_req_m2s_t;
+    load_req_s2m : in dma_req_s2m_t;
+    load_dma_done : in std_ulogic;
+    load_resp_error : in std_ulogic;
+    s_load_stream_m2s : in axi_stream_m2s_t;
+    s_load_stream_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
 
     --# {{}}
     -- 'wgt' DDR read DMA: weight/bias/scale images, ACT LUT, ADD src1.
-    wgt_req_m2s             : out dma_req_m2s_t;
-    wgt_req_s2m             : in  dma_req_s2m_t;
-    wgt_dma_done            : in  std_ulogic;
-    wgt_resp_error          : in  std_ulogic;
-    s_wgt_stream_m2s        : in  axi_stream_m2s_t;
-    s_wgt_stream_s2m        : out axi_stream_s2m_t := axi_stream_s2m_init;
+    wgt_req_m2s : out dma_req_m2s_t;
+    wgt_req_s2m : in dma_req_s2m_t;
+    wgt_dma_done : in std_ulogic;
+    wgt_resp_error : in std_ulogic;
+    s_wgt_stream_m2s : in axi_stream_m2s_t;
+    s_wgt_stream_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
 
     --# {{}}
     -- 'cnn_accel_ofmap_dma': every DDR write the IP ever performs.
-    store_req_m2s           : out dma_req_m2s_t;
-    store_req_s2m           : in  dma_req_s2m_t;
-    store_dma_done          : in  std_ulogic;
-    store_resp_error        : in  std_ulogic;
-    m_store_stream_m2s      : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_store_stream_s2m      : in  axi_stream_s2m_t;
+    store_req_m2s : out dma_req_m2s_t;
+    store_req_s2m : in dma_req_s2m_t;
+    store_dma_done : in std_ulogic;
+    store_resp_error : in std_ulogic;
+    m_store_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_store_stream_s2m : in axi_stream_s2m_t;
 
     --# {{}}
     -- 'cnn_accel_tensor_mem' write channel 0 (DDR -> LOCAL landing).
-    tm_w0_req_m2s           : out dma_req_m2s_t;
-    tm_w0_req_s2m           : in  dma_req_s2m_t;
-    m_tm_w0_m2s             : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_tm_w0_s2m             : in  axi_stream_s2m_t;
-    tm_w0_done              : in  std_ulogic;
+    tm_w0_req_m2s : out dma_req_m2s_t;
+    tm_w0_req_s2m : in dma_req_s2m_t;
+    m_tm_w0_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_tm_w0_s2m : in axi_stream_s2m_t;
+    tm_w0_done : in std_ulogic;
 
     --# {{}}
     -- 'cnn_accel_tensor_mem' write channel 1 (engine output).
-    tm_w1_req_m2s           : out dma_req_m2s_t;
-    tm_w1_req_s2m           : in  dma_req_s2m_t;
-    m_tm_w1_m2s             : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_tm_w1_s2m             : in  axi_stream_s2m_t;
-    tm_w1_done              : in  std_ulogic;
+    tm_w1_req_m2s : out dma_req_m2s_t;
+    tm_w1_req_s2m : in dma_req_s2m_t;
+    m_tm_w1_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_tm_w1_s2m : in axi_stream_s2m_t;
+    tm_w1_done : in std_ulogic;
 
     --# {{}}
     -- 'cnn_accel_tensor_mem' read channel 0 (engine input A / store source).
-    tm_r0_req_m2s           : out dma_req_m2s_t;
-    tm_r0_req_s2m           : in  dma_req_s2m_t;
-    s_tm_r0_m2s             : in  axi_stream_m2s_t;
-    s_tm_r0_s2m             : out axi_stream_s2m_t := axi_stream_s2m_init;
-    tm_r0_done              : in  std_ulogic;
+    tm_r0_req_m2s : out dma_req_m2s_t;
+    tm_r0_req_s2m : in dma_req_s2m_t;
+    s_tm_r0_m2s : in axi_stream_m2s_t;
+    s_tm_r0_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
+    tm_r0_done : in std_ulogic;
 
     --# {{}}
     -- 'cnn_accel_tensor_mem' read channel 1 (engine input B / weights / LUT).
-    tm_r1_req_m2s           : out dma_req_m2s_t;
-    tm_r1_req_s2m           : in  dma_req_s2m_t;
-    s_tm_r1_m2s             : in  axi_stream_m2s_t;
-    s_tm_r1_s2m             : out axi_stream_s2m_t := axi_stream_s2m_init;
-    tm_r1_done              : in  std_ulogic;
+    tm_r1_req_m2s : out dma_req_m2s_t;
+    tm_r1_req_s2m : in dma_req_s2m_t;
+    s_tm_r1_m2s : in axi_stream_m2s_t;
+    s_tm_r1_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
+    tm_r1_done : in std_ulogic;
 
     --# {{}}
     -- 'cnn_accel_conv_core' configuration and control.
-    conv_cfg_kernel_h       : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_kernel_w       : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_stride_h       : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_stride_w       : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_pad_top        : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_pad_bottom     : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_pad_left       : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_pad_right      : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_kernel_h : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_kernel_w : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_stride_h : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_stride_w : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_pad_top : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_pad_bottom : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_pad_left : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_pad_right : out std_ulogic_vector(7 downto 0) := (others => '0');
     -- ISA v2.1 'pad_value' for convolution: the int8 value a padded tap
     -- takes -- the input tensor's quantization zero-point, not 0. Driven
     -- straight from the descriptor and NOT gated on FLAG_PAD_EN, exactly
     -- like 'pool_cfg_pad_value' below: with the flag clear the four pad
     -- counts above are already zero, so no tap is ever padded and the
     -- fill value cannot be observed.
-    conv_cfg_pad_value      : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_in_width       : out std_ulogic_vector(15 downto 0) := (others => '0');
-    conv_cfg_in_height      : out std_ulogic_vector(15 downto 0) := (others => '0');
-    conv_cfg_in_channels    : out std_ulogic_vector(15 downto 0) := (others => '0');
-    conv_cfg_bias_en        : out std_ulogic := '0';
-    conv_cfg_requant_en     : out std_ulogic := '0';
-    conv_cfg_relu_en        : out std_ulogic := '0';
-    conv_cfg_requant_scale  : out std_ulogic_vector(31 downto 0) := (others => '0');
-    conv_cfg_requant_shift  : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_output_offset  : out std_ulogic_vector(15 downto 0) := (others => '0');
-    conv_cfg_clamp_en       : out std_ulogic := '0';
-    conv_cfg_clamp_min      : out std_ulogic_vector(7 downto 0) := (others => '0');
-    conv_cfg_clamp_max      : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_pad_value : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_in_width : out std_ulogic_vector(15 downto 0) := (others => '0');
+    conv_cfg_in_height : out std_ulogic_vector(15 downto 0) := (others => '0');
+    conv_cfg_in_channels : out std_ulogic_vector(15 downto 0) := (others => '0');
+    conv_cfg_bias_en : out std_ulogic := '0';
+    conv_cfg_requant_en : out std_ulogic := '0';
+    conv_cfg_relu_en : out std_ulogic := '0';
+    conv_cfg_requant_scale : out std_ulogic_vector(31 downto 0) := (others => '0');
+    conv_cfg_requant_shift : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_output_offset : out std_ulogic_vector(15 downto 0) := (others => '0');
+    conv_cfg_clamp_en : out std_ulogic := '0';
+    conv_cfg_clamp_min : out std_ulogic_vector(7 downto 0) := (others => '0');
+    conv_cfg_clamp_max : out std_ulogic_vector(7 downto 0) := (others => '0');
     conv_cfg_per_channel_en : out std_ulogic := '0';
     -- Output frame dimensions for the command being started:
     -- '(in_dim + pad_lo + pad_hi - kernel) / stride + 1' per axis, from
@@ -248,92 +248,92 @@ entity cnn_accel_cmd_proc is
     -- engine is ever started for a given descriptor, and the divider is
     -- fed from the conv or the pool kernel/stride fields according to
     -- that same class decision.
-    geom_out_width          : out std_ulogic_vector(15 downto 0) := (others => '0');
-    geom_out_height         : out std_ulogic_vector(15 downto 0) := (others => '0');
-    conv_start              : out std_ulogic := '0';
-    conv_done               : in  std_ulogic;
-    m_conv_stream_m2s       : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_conv_stream_s2m       : in  axi_stream_s2m_t;
-    conv_fill_start         : out std_ulogic := '0';
-    conv_fill_is_bias       : out std_ulogic := '0';
-    conv_fill_is_scale      : out std_ulogic := '0';
-    m_conv_weight_m2s       : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_conv_weight_s2m       : in  axi_stream_s2m_t;
-    s_conv_out_m2s          : in  axi_stream_m2s_t;
-    s_conv_out_s2m          : out axi_stream_s2m_t := axi_stream_s2m_init;
+    geom_out_width : out std_ulogic_vector(15 downto 0) := (others => '0');
+    geom_out_height : out std_ulogic_vector(15 downto 0) := (others => '0');
+    conv_start : out std_ulogic := '0';
+    conv_done : in std_ulogic;
+    m_conv_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_conv_stream_s2m : in axi_stream_s2m_t;
+    conv_fill_start : out std_ulogic := '0';
+    conv_fill_is_bias : out std_ulogic := '0';
+    conv_fill_is_scale : out std_ulogic := '0';
+    m_conv_weight_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_conv_weight_s2m : in axi_stream_s2m_t;
+    s_conv_out_m2s : in axi_stream_m2s_t;
+    s_conv_out_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
 
     --# {{}}
     -- Pooling path: the top level's dedicated 'cnn_accel_window_gen'
     -- instance plus its lane-parallel 'cnn_accel_pool' bank (see
     -- 'cnn_accel_top'). One activation plane is processed per pass, so
     -- the window generator always runs with 'T = 1'.
-    pool_cfg_kernel_h       : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_kernel_w       : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_stride_h       : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_stride_w       : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_kernel_h : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_kernel_w : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_stride_h : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_stride_w : out std_ulogic_vector(7 downto 0) := (others => '0');
     -- ISA v2.1 pooling padding. The four counts are already gated on
     -- FLAG_PAD_EN here (zero when the flag is clear), exactly as the
     -- conv path's are, so the window generator never has to know about
     -- the flag. 'pool_cfg_pad_value' is the int8 value a padded tap
     -- takes -- the tensor's zero-point, not 0.
-    pool_cfg_pad_top        : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_pad_bottom     : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_pad_left       : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_pad_right      : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_pad_value      : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_in_width       : out std_ulogic_vector(15 downto 0) := (others => '0');
-    pool_cfg_in_height      : out std_ulogic_vector(15 downto 0) := (others => '0');
-    pool_cfg_opcode         : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_cfg_requant_scale  : out std_ulogic_vector(31 downto 0) := (others => '0');
-    pool_cfg_requant_shift  : out std_ulogic_vector(7 downto 0) := (others => '0');
-    pool_start              : out std_ulogic := '0';
-    pool_done               : in  std_ulogic;
-    m_pool_stream_m2s       : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_pool_stream_s2m       : in  axi_stream_s2m_t;
-    s_pool_out_m2s          : in  axi_stream_m2s_t;
-    s_pool_out_s2m          : out axi_stream_s2m_t := axi_stream_s2m_init;
+    pool_cfg_pad_top : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_pad_bottom : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_pad_left : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_pad_right : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_pad_value : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_in_width : out std_ulogic_vector(15 downto 0) := (others => '0');
+    pool_cfg_in_height : out std_ulogic_vector(15 downto 0) := (others => '0');
+    pool_cfg_opcode : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_cfg_requant_scale : out std_ulogic_vector(31 downto 0) := (others => '0');
+    pool_cfg_requant_shift : out std_ulogic_vector(7 downto 0) := (others => '0');
+    pool_start : out std_ulogic := '0';
+    pool_done : in std_ulogic;
+    m_pool_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_pool_stream_s2m : in axi_stream_s2m_t;
+    s_pool_out_m2s : in axi_stream_m2s_t;
+    s_pool_out_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
 
     --# {{}}
     -- 'cnn_accel_elementwise' (ADD / UPSAMPLE / COPY / ACT /
     -- DEPTH_TO_SPACE).
-    ew_start                : out std_ulogic := '0';
-    ew_opcode               : out std_ulogic_vector(7 downto 0) := (others => '0');
-    ew_src0_addr            : out unsigned(31 downto 0) := (others => '0');
-    ew_src1_addr            : out unsigned(31 downto 0) := (others => '0');
-    ew_dst_addr             : out unsigned(31 downto 0) := (others => '0');
-    ew_lut_addr             : out unsigned(31 downto 0) := (others => '0');
-    ew_xfer_bytes           : out unsigned(31 downto 0) := (others => '0');
-    ew_in_width             : out unsigned(15 downto 0) := (others => '0');
-    ew_in_height            : out unsigned(15 downto 0) := (others => '0');
-    ew_in_channels          : out unsigned(15 downto 0) := (others => '0');
+    ew_start : out std_ulogic := '0';
+    ew_opcode : out std_ulogic_vector(7 downto 0) := (others => '0');
+    ew_src0_addr : out unsigned(31 downto 0) := (others => '0');
+    ew_src1_addr : out unsigned(31 downto 0) := (others => '0');
+    ew_dst_addr : out unsigned(31 downto 0) := (others => '0');
+    ew_lut_addr : out unsigned(31 downto 0) := (others => '0');
+    ew_xfer_bytes : out unsigned(31 downto 0) := (others => '0');
+    ew_in_width : out unsigned(15 downto 0) := (others => '0');
+    ew_in_height : out unsigned(15 downto 0) := (others => '0');
+    ew_in_channels : out unsigned(15 downto 0) := (others => '0');
     -- DEPTH_TO_SPACE only: the OUTPUT channel count and the upscale
     -- factor. Every other elementwise opcode is channel-preserving and
     -- has no use for either.
-    ew_out_channels         : out unsigned(15 downto 0) := (others => '0');
-    ew_dts_factor           : out unsigned(7 downto 0) := (others => '0');
-    ew_requant_scale        : out signed(31 downto 0) := (others => '0');
-    ew_requant_shift        : out unsigned(7 downto 0) := (others => '0');
-    ew_done                 : in  std_ulogic;
-    ew_error                : in  std_ulogic;
-    ew_error_code           : in  err_code_t;
+    ew_out_channels : out unsigned(15 downto 0) := (others => '0');
+    ew_dts_factor : out unsigned(7 downto 0) := (others => '0');
+    ew_requant_scale : out signed(31 downto 0) := (others => '0');
+    ew_requant_shift : out unsigned(7 downto 0) := (others => '0');
+    ew_done : in std_ulogic;
+    ew_error : in std_ulogic;
+    ew_error_code : in err_code_t;
     -- The engine's own four request/stream ports, muxed onto the physical
     -- ports above according to the command's space tags.
-    ew_src0_req_m2s         : in  dma_req_m2s_t;
-    ew_src0_req_s2m         : out dma_req_s2m_t;
-    m_ew_src0_stream_m2s    : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_ew_src0_stream_s2m    : in  axi_stream_s2m_t;
-    ew_src1_req_m2s         : in  dma_req_m2s_t;
-    ew_src1_req_s2m         : out dma_req_s2m_t;
-    m_ew_src1_stream_m2s    : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_ew_src1_stream_s2m    : in  axi_stream_s2m_t;
-    ew_dst_req_m2s          : in  dma_req_m2s_t;
-    ew_dst_req_s2m          : out dma_req_s2m_t;
-    s_ew_dst_stream_m2s     : in  axi_stream_m2s_t;
-    s_ew_dst_stream_s2m     : out axi_stream_s2m_t := axi_stream_s2m_init;
-    ew_lut_req_m2s          : in  dma_req_m2s_t;
-    ew_lut_req_s2m          : out dma_req_s2m_t;
-    m_ew_lut_stream_m2s     : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_ew_lut_stream_s2m     : in  axi_stream_s2m_t
+    ew_src0_req_m2s : in dma_req_m2s_t;
+    ew_src0_req_s2m : out dma_req_s2m_t;
+    m_ew_src0_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_ew_src0_stream_s2m : in axi_stream_s2m_t;
+    ew_src1_req_m2s : in dma_req_m2s_t;
+    ew_src1_req_s2m : out dma_req_s2m_t;
+    m_ew_src1_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_ew_src1_stream_s2m : in axi_stream_s2m_t;
+    ew_dst_req_m2s : in dma_req_m2s_t;
+    ew_dst_req_s2m : out dma_req_s2m_t;
+    s_ew_dst_stream_m2s : in axi_stream_m2s_t;
+    s_ew_dst_stream_s2m : out axi_stream_s2m_t := axi_stream_s2m_init;
+    ew_lut_req_m2s : in dma_req_m2s_t;
+    ew_lut_req_s2m : out dma_req_s2m_t;
+    m_ew_lut_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
+    m_ew_lut_stream_s2m : in axi_stream_s2m_t
   );
 end entity cnn_accel_cmd_proc;
 

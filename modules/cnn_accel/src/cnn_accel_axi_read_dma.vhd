@@ -70,27 +70,27 @@ entity cnn_accel_axi_read_dma is
   generic (
     g_axi_addr_width : positive;
     g_axi_data_width : positive;
-    g_axi_id_width   : natural);
+    g_axi_id_width : natural);
   port (
-    clk          : in  std_ulogic;
+    clk : in std_ulogic;
     -- Synchronous active-high reset ('reset_internal' at the IP top level).
-    reset        : in  std_ulogic := '0';
+    reset : in std_ulogic := '0';
     --# {{}}
-    req_m2s      : in  dma_req_m2s_t;
-    req_s2m      : out dma_req_s2m_t;
-    dma_done     : out std_ulogic := '0';
-    resp_error   : out std_ulogic := '0';
+    req_m2s : in dma_req_m2s_t;
+    req_s2m : out dma_req_s2m_t;
+    dma_done : out std_ulogic := '0';
+    resp_error : out std_ulogic := '0';
     --# {{}}
     m_axi_ar_m2s : out axi_m2s_a_t := axi_m2s_a_init;
-    m_axi_ar_s2m : in  axi_s2m_a_t;
+    m_axi_ar_s2m : in axi_s2m_a_t;
     -- Direction fixed vs. the (defective) requirement port table -- 'RREADY'
     -- is this master's output, 'RVALID'/'RDATA'/'RRESP'/'RLAST' are inputs,
     -- mirroring the 'AR' row exactly. See proposal doc section 3.2.
-    m_axi_r_m2s  : out axi_m2s_r_t := axi_m2s_r_init;
-    m_axi_r_s2m  : in  axi_s2m_r_t;
+    m_axi_r_m2s : out axi_m2s_r_t := axi_m2s_r_init;
+    m_axi_r_s2m : in axi_s2m_r_t;
     --# {{}}
     m_stream_m2s : out axi_stream_m2s_t := axi_stream_m2s_init;
-    m_stream_s2m : in  axi_stream_s2m_t
+    m_stream_s2m : in axi_stream_s2m_t
   );
 end entity cnn_accel_axi_read_dma;
 
@@ -647,35 +647,35 @@ begin
 
   axi_read_throttle_inst : entity axi.axi_read_throttle
     generic map (
-      data_fifo_depth        => c_r_fifo_depth,
+      data_fifo_depth => c_r_fifo_depth,
       max_burst_length_beats => axi_max_burst_length_beats,
-      id_width               => g_axi_id_width,
-      addr_width             => g_axi_addr_width,
-      full_ar_throughput     => true
+      id_width => g_axi_id_width,
+      addr_width => g_axi_addr_width,
+      full_ar_throughput => true
     )
     port map (
-      clk             => clk,
+      clk => clk,
       --
       data_fifo_level => r_fifo_level,
       --
-      input_m2s       => throttle_input_m2s,
-      input_s2m       => throttle_input_s2m,
+      input_m2s => throttle_input_m2s,
+      input_s2m => throttle_input_s2m,
       --
-      throttled_m2s   => throttled_m2s,
-      throttled_s2m   => throttled_s2m
+      throttled_m2s => throttled_m2s,
+      throttled_s2m => throttled_s2m
     );
 
   axi_read_pipeline_inst : entity axi.axi_read_pipeline
     generic map (
       addr_width => g_axi_addr_width,
-      id_width   => g_axi_id_width,
+      id_width => g_axi_id_width,
       data_width => g_axi_data_width
     )
     port map (
-      clk       => clk,
+      clk => clk,
       --
-      left_m2s  => throttled_m2s,
-      left_s2m  => throttled_s2m,
+      left_m2s => throttled_m2s,
+      left_s2m => throttled_s2m,
       --
       right_m2s => pipeline_right_m2s,
       right_s2m => pipeline_right_s2m
@@ -691,33 +691,33 @@ begin
   axi_r_fifo_inst : entity axi.axi_r_fifo
     generic map (
       asynchronous => false,
-      id_width     => g_axi_id_width,
-      data_width   => g_axi_data_width,
-      depth        => c_r_fifo_depth
+      id_width => g_axi_id_width,
+      data_width => g_axi_data_width,
+      depth => c_r_fifo_depth
     )
     port map (
-      clk          => clk,
+      clk => clk,
       --
-      input_m2s    => r_fifo_input_m2s,
-      input_s2m    => r_fifo_input_s2m,
+      input_m2s => r_fifo_input_m2s,
+      input_s2m => r_fifo_input_s2m,
       --
-      output_m2s   => r_fifo_output_m2s,
-      output_s2m   => throttle_input_s2m.r,
+      output_m2s => r_fifo_output_m2s,
+      output_s2m => throttle_input_s2m.r,
       output_level => r_fifo_level
     );
 
   axi_stream_fifo_inst : entity axi_stream.axi_stream_fifo
     generic map (
-      data_width   => g_axi_data_width,
-      user_width   => 0,
+      data_width => g_axi_data_width,
+      user_width => 0,
       asynchronous => false,
-      depth        => c_stream_fifo_depth
+      depth => c_stream_fifo_depth
     )
     port map (
-      clk        => clk,
+      clk => clk,
       --
-      input_m2s  => stream_fifo_input_m2s,
-      input_s2m  => stream_fifo_input_s2m,
+      input_m2s => stream_fifo_input_m2s,
+      input_s2m => stream_fifo_input_s2m,
       --
       output_m2s => m_stream_m2s,
       output_s2m => m_stream_s2m
