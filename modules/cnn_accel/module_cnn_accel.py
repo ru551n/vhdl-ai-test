@@ -2506,12 +2506,17 @@ class Module(BaseModule):
                     # holds for everything that stayed: window_gen 12 +
                     # weight_buffer 16 = 28, less the 4 that scale_mem
                     # took with it = 24.
+                    # ===== SCALE REGION BACK IN BLOCK RAM (2026-09-23) ==
+                    # Later source changes flipped the heuristic back:
+                    # measured 28 RAMB36 + 2 RAMB18 and 0 LUTRAMs, the
+                    # "pristine" mapping above and the one the real
+                    # top-level build uses. Re-pinned at the measurement.
                     checkers=[
                         TotalLuts(LessThan(13200)),
                         Ffs(LessThan(9800)),
-                        Ramb36(EqualTo(24)),
-                        Ramb18(EqualTo(1)),
-                        LutRams(EqualTo(216)),
+                        Ramb36(EqualTo(28)),
+                        Ramb18(EqualTo(2)),
+                        LutRams(EqualTo(0)),
                         DspBlocks(EqualTo(68)),
                     ],
                     analyze_synthesis_timing=True,
@@ -2819,12 +2824,15 @@ class Module(BaseModule):
                     # single RAMB18 went too), and DSP is bit-identical at
                     # 132, so the int8 packing is intact at the scaled
                     # point as well.
+                    # ===== SCALE REGION BACK IN BLOCK RAM (2026-09-23) ==
+                    # Flipped back, as in the 8-row build: measured
+                    # 43 RAMB36 + 2 RAMB18 and 0 LUTRAMs. Re-pinned.
                     checkers=[
                         TotalLuts(LessThan(20700)),
                         Ffs(LessThan(16100)),
-                        Ramb36(EqualTo(34)),
+                        Ramb36(EqualTo(43)),
                         Ramb18(EqualTo(2)),
-                        LutRams(EqualTo(428)),
+                        LutRams(EqualTo(0)),
                         DspBlocks(EqualTo(132)),
                     ],
                     analyze_synthesis_timing=True,
