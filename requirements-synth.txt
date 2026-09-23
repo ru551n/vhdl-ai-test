@@ -12,7 +12,7 @@
 # Install:  python3 -m venv .venv-synth
 #           .venv-synth/bin/pip install -r requirements-synth.txt
 vunit_hdl==4.7.1
-tsfpga @ git+https://github.com/ru551n/tsfpga.git@6304052f52d13b2b9986cdfba5d0ee02eb2b16ff
+tsfpga @ git+https://github.com/ru551n/tsfpga.git@a2a1471f6ed1e2c1dbae71625553b4f91fcca04c
 
 # cnn_accel's constants are declared in Python and generated into VHDL
 # packages; see the longer note in requirements.txt. Unlike VUnit, this is the
